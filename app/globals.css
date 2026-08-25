@@ -1,0 +1,22 @@
+:root { color-scheme: light; font-family: system-ui, sans-serif; background: #f5f3ef; color: #1d1b19; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 860px; margin: 0 auto; padding: 48px 20px 80px; }
+h1 { margin: 0 0 12px; font-size: 2rem; }
+h2 { margin-top: 32px; }
+p { line-height: 1.55; }
+form, .panel { display: grid; gap: 16px; background: white; border: 1px solid #ddd7ce; border-radius: 12px; padding: 24px; }
+label { display: grid; gap: 6px; font-weight: 650; }
+input, textarea, button { font: inherit; }
+input, textarea { border: 1px solid #aaa298; border-radius: 7px; padding: 10px; }
+textarea { min-height: 360px; width: 100%; font-family: ui-monospace, monospace; font-size: .9rem; }
+button { width: fit-content; border: 0; border-radius: 7px; background: #25221f; color: white; padding: 10px 16px; cursor: pointer; }
+button:disabled { opacity: .55; cursor: wait; }
+.muted { color: #635d57; }
+.error { border-left: 4px solid #a52b2b; background: #fff1f1; padding: 12px 16px; }
+.success { border-left: 4px solid #286b43; background: #effaf2; padding: 12px 16px; }
+.sides { display: flex; flex-wrap: wrap; gap: 14px; }
+.sides label { display: flex; align-items: center; font-weight: 500; }
+.candidate-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.candidate { border: 1px solid #ddd7ce; border-radius: 8px; padding: 14px; }
+@media (max-width: 640px) { .candidate-grid { grid-template-columns: 1fr; } main { padding-top: 28px; } }
