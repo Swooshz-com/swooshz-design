@@ -1,6 +1,6 @@
 import { AppError } from "./types";
 import { sanitizeFileName, sha256 } from "./utils";
-import { structuralPdfText } from "./pdf-structure";
+import { parsePdf } from "./pdf-parser";
 
 export const MAX_BRIEF_BYTES = 20 * 1024 * 1024;
 export const MAX_BRIEF_PAGES = 20;
@@ -15,18 +15,12 @@ function pdfError(field: string, code: string): AppError {
   return new AppError(400, "BRIEF_UPLOAD_INVALID", [{ field, code }]);
 }
 
-/**
- * Keeps the SQAG safety invariants that apply to this slice: validate bytes,
- * require a complete PDF marker, reject encrypted input, and cap work before
- * any bytes enter private storage. No filesystem, network, or child process
- * is used while examining media.
- */
-export function validatePdfUpload(input: PdfUpload): {
+export async function validatePdfUpload(input: PdfUpload): Promise<{
   originalFileName: string;
   byteSize: number;
   pageCount: number;
   sha256: string;
-} {
+}> {
   const originalFileName = sanitizeFileName(input.fileName);
   if (!input.fileName.trim().toLowerCase().endsWith(".pdf")) {
     throw pdfError("file", "PDF_EXTENSION_REQUIRED");
@@ -34,40 +28,36 @@ export function validatePdfUpload(input: PdfUpload): {
   if (input.mimeType !== "application/pdf") {
     throw pdfError("file", "PDF_MIME_REQUIRED");
   }
-  const bytes = Buffer.from(input.bytes);
-  if (bytes.length < 1 || bytes.length > MAX_BRIEF_BYTES) {
+  const byteSize = input.bytes.byteLength;
+  if (byteSize < 1 || byteSize > MAX_BRIEF_BYTES) {
     throw pdfError("file", "PDF_SIZE_INVALID");
   }
-  if (bytes.subarray(0, 5).toString("ascii") !== "%PDF-") {
+  if (Buffer.from(input.bytes).subarray(0, 5).toString("ascii") !== "%PDF-") {
     throw pdfError("file", "PDF_SIGNATURE_INVALID");
   }
-  const tail = bytes.subarray(Math.max(0, bytes.length - 4096)).toString("latin1");
-  if (!tail.includes("%%EOF")) {
+  const trailingText = Buffer.from(input.bytes).subarray(Math.max(0, byteSize - 4096)).toString("latin1").trimEnd();
+  if (!trailingText.endsWith("%%EOF")) {
     throw pdfError("file", "PDF_INCOMPLETE");
   }
-  if (/\/Encrypt\b/.test(bytes.toString("latin1"))) {
-    throw pdfError("file", "PDF_ENCRYPTED");
-  }
 
-  const text = bytes.toString("latin1");
-  const structuralText = structuralPdfText(text);
-  const hasCatalog = /\/Type\s*\/Catalog\b/.test(structuralText);
-  const hasPages = /\/Type\s*\/Pages\b/.test(structuralText);
-  const hasKids = /\/Kids\s*\[/.test(structuralText);
-  const pageMatches = structuralText.match(/\/Type\s*\/Page(?!s)\b/g) ?? [];
-  const pageCounts = Array.from(structuralText.matchAll(/\/Count\s+(\d+)/g), (match) => Number(match[1]));
-  if (!hasCatalog || !hasPages || !hasKids || pageMatches.length < 1 || !pageCounts.includes(pageMatches.length)) {
-    throw pdfError("file", "PDF_PAGE_TREE_INVALID");
+  try {
+    const parsed = await parsePdf(input.bytes);
+    if (parsed.pageCount > MAX_BRIEF_PAGES) {
+      throw pdfError("file", "PDF_PAGE_LIMIT");
+    }
+    return {
+      originalFileName,
+      byteSize,
+      pageCount: parsed.pageCount,
+      sha256: sha256(input.bytes),
+    };
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    if (error instanceof Error && error.message === "PDF password required") {
+      throw pdfError("file", "PDF_ENCRYPTED");
+    }
+    throw pdfError("file", "PDF_PARSE_FAILED");
   }
-  if (pageMatches.length > MAX_BRIEF_PAGES) {
-    throw pdfError("file", "PDF_PAGE_LIMIT");
-  }
-  return {
-    originalFileName,
-    byteSize: bytes.length,
-    pageCount: pageMatches.length,
-    sha256: sha256(bytes),
-  };
 }
 
 export function validatePng(bytes: Uint8Array): void {

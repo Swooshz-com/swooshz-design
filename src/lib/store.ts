@@ -1,7 +1,25 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { AppError, type StoreState } from "./types";
+
+const LOCK_WAIT_MS = 15_000;
+const LOCK_STALE_MS = 30_000;
+
+function sleepSync(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
 
 export function emptyStoreState(): StoreState {
   return {
@@ -16,6 +34,8 @@ export function emptyStoreState(): StoreState {
     candidates: [],
     idempotency: [],
     extractionAttempts: {},
+    extractionOperations: [],
+    generationOperations: [],
   };
 }
 
@@ -47,9 +67,25 @@ export class PrivateObjectStore {
   put(key: string, bytes: Uint8Array): void {
     const path = this.pathFor(key);
     mkdirSync(dirname(path), { recursive: true });
+    if (existsSync(path)) {
+      throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: key });
+    }
+    const temporary = path + "." + randomUUID() + ".tmp";
+    let descriptor: number | null = null;
     try {
-      writeFileSync(path, Buffer.from(bytes), { flag: "wx" });
-    } catch (error) {
+      descriptor = openSync(temporary, "wx");
+      writeFileSync(descriptor, Buffer.from(bytes));
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = null;
+      renameSync(temporary, path);
+    } catch {
+      if (descriptor !== null) closeSync(descriptor);
+      try {
+        rmSync(temporary, { force: true });
+      } catch {
+        // Preserve the original persistence failure without exposing a path.
+      }
       throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: key });
     }
   }
@@ -93,11 +129,15 @@ export class PrivateObjectStore {
 export class JsonRepository {
   readonly root: string;
   readonly statePath: string;
+  readonly lockPath: string;
   private current: StoreState;
+  private readonly beforeCommit: (() => void) | undefined;
 
-  constructor(root: string) {
+  constructor(root: string, options: { beforeCommit?: () => void } = {}) {
     this.root = resolve(root);
     this.statePath = join(this.root, "state.json");
+    this.lockPath = join(this.root, "state.json.lock");
+    this.beforeCommit = options.beforeCommit;
     mkdirSync(this.root, { recursive: true });
     this.current = this.load();
   }
@@ -107,28 +147,97 @@ export class JsonRepository {
     try {
       const parsed: unknown = JSON.parse(readFileSync(this.statePath, "utf8"));
       if (typeof parsed !== "object" || parsed === null) throw new Error("invalid state");
-      return { ...emptyStoreState(), ...(parsed as Partial<StoreState>) };
+      const merged = { ...emptyStoreState(), ...(parsed as Partial<StoreState>) };
+      if (!Array.isArray(merged.extractionOperations)) merged.extractionOperations = [];
+      if (!Array.isArray(merged.generationOperations)) merged.generationOperations = [];
+      return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
     }
   }
 
   state(): StoreState {
+    this.current = this.load();
     return this.current;
   }
 
-  save(): void {
-    const temporary = `${this.statePath}.${randomUUID()}.tmp`;
+  private acquireLock(): number {
+    const deadline = Date.now() + LOCK_WAIT_MS;
+    while (true) {
+      let descriptor: number | null = null;
+      try {
+        descriptor = openSync(this.lockPath, "wx");
+        writeFileSync(descriptor, process.pid + "\n");
+        return descriptor;
+      } catch (error) {
+        if (descriptor !== null) {
+          closeSync(descriptor);
+          try {
+            rmSync(this.lockPath, { force: true });
+          } catch {
+            // Preserve the original lock or persistence failure.
+          }
+        }
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST") throw new AppError(500, "PERSISTENCE_FAILED");
+        try {
+          if (Date.now() - statSync(this.lockPath).mtimeMs > LOCK_STALE_MS) {
+            rmSync(this.lockPath, { force: true });
+            continue;
+          }
+        } catch {
+          // The owner may have released the lock between stat and removal.
+        }
+        if (Date.now() >= deadline) throw new AppError(503, "PERSISTENCE_BUSY");
+        sleepSync(5);
+      }
+    }
+  }
+
+  private releaseLock(descriptor: number): void {
     try {
-      writeFileSync(temporary, JSON.stringify(this.current), { encoding: "utf8", flag: "wx" });
+      closeSync(descriptor);
+    } finally {
+      try {
+        rmSync(this.lockPath, { force: true });
+      } catch {
+        // A later transaction can recover a stale lock after the bounded lease.
+      }
+    }
+  }
+
+  private commit(state: StoreState): void {
+    const temporary = this.statePath + "." + randomUUID() + ".tmp";
+    let descriptor: number | null = null;
+    try {
+      this.beforeCommit?.();
+      descriptor = openSync(temporary, "wx");
+      writeFileSync(descriptor, JSON.stringify(state), { encoding: "utf8" });
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = null;
       renameSync(temporary, this.statePath);
     } catch {
+      if (descriptor !== null) closeSync(descriptor);
       try {
         rmSync(temporary, { force: true });
       } catch {
         // Preserve the original persistence failure without exposing a path.
       }
       throw new AppError(500, "PERSISTENCE_FAILED");
+    }
+  }
+
+  transact<T>(mutation: (state: StoreState) => T): T {
+    const lock = this.acquireLock();
+    try {
+      const fresh = this.load();
+      const result = mutation(fresh);
+      this.commit(fresh);
+      this.current = fresh;
+      return result;
+    } finally {
+      this.releaseLock(lock);
     }
   }
 }

@@ -281,6 +281,8 @@ export type StoreState = {
   candidates: ConceptCandidate[];
   idempotency: IdempotencyRecord[];
   extractionAttempts: Record<UUID, number>;
+  extractionOperations: ExtractionOperation[];
+  generationOperations: GenerationOperation[];
 };
 
 export type FieldError = {
@@ -308,3 +310,29 @@ export class AppError extends Error {
     this.logContext = logContext;
   }
 }
+
+export type ExtractionOperation = {
+  extractionRequestId: UUID;
+  projectId: UUID;
+  assetId: UUID;
+  attempt: 1 | 2;
+  referenceId: UUID;
+  status: "queued" | "running" | "succeeded" | "failed";
+  claimedBy: string | null;
+  createdAt: Timestamp;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  failureCode: string | null;
+};
+
+export type GenerationOperation = {
+  generationSetId: UUID;
+  projectId: UUID;
+  attempt: 1 | 2;
+  status: "queued" | "running" | "succeeded" | "failed";
+  claimedBy: string | null;
+  createdAt: Timestamp;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  failureCode: string | null;
+};

@@ -1,6 +1,8 @@
 import { GenerationProgressScreen } from "../../../../components/FlowClient";
+import { guardProjectRoute } from "../../route-guard";
 
 export default async function GenerationPage({ params }: { params: Promise<{ projectId: string; generationSetId: string }> }) {
-  const values = await params;
-  return <GenerationProgressScreen projectId={values.projectId} generationSetId={values.generationSetId} />;
+  const { projectId, generationSetId } = await params;
+  guardProjectRoute(projectId, "generation", generationSetId);
+  return <GenerationProgressScreen projectId={projectId} generationSetId={generationSetId} />;
 }

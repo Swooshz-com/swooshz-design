@@ -283,6 +283,25 @@ export function assertBriefData(
   }
 }
 
+export function normalizeProviderBriefData(value: unknown): StructuredBriefData {
+  const errors = briefValidationErrors(value);
+  if (errors.length > 0) {
+    throw new AppError(422, "INVALID_BRIEF_SCHEMA", errors.slice(0, 40));
+  }
+  const normalized = JSON.parse(JSON.stringify(value)) as StructuredBriefData;
+  normalized.unknowns = normalized.unknowns.map((item) => ({
+    ...item,
+    acceptedByUser: false,
+  }));
+  normalized.assumptions = normalized.assumptions.map((item) => ({
+    ...item,
+    source: "model",
+    acceptedByUser: false,
+  }));
+  assertBriefData(normalized, { extraction: true });
+  return normalized;
+}
+
 export const BRIEF_V1_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
