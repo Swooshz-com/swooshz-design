@@ -121,7 +121,7 @@ storage, prompt, stack, and private path details are never returned.
 | Existing S1 source | Binding S2 reuse |
 | --- | --- |
 | src/lib/types.ts | UUID, Timestamp, Sha256, BoothGeometry, StructuredBriefVersion, UserConfirmedBrief, ConceptCandidate, ConceptAsset, AppError, and provider metadata shapes. |
-| src/lib/utils.ts | JCS-compatible canonical JSON, SHA-256, UUID validation, safe filenames, and private key segment validation. |
+| src/lib/utils.ts | Existing jcs()-based RFC 8785-compatible JSON semantics, SHA-256, UUID validation, safe filenames, and private key segment validation. |
 | src/lib/store.ts | JsonRepository.transact, state.json.mutex, PrivateObjectStore.put/promote/read/remove, atomic JSON commit, private path containment, and safe persistence errors. |
 | src/lib/workflow.ts | Project lookup, succeeded S1 generation-set lookup, OS-backed claim/recovery, worker/process identity, claim token fencing, and safe operation logging. |
 | src/lib/api.ts | Request reference IDs, bounded streaming body reads, exact request-key validation, and generic JSON error responses. |
@@ -247,16 +247,17 @@ table says otherwise. A value above it is rejected before the next stage.
 | RGBA-equivalent bytes per asset | 67,108,864 bytes (64 MiB) | width times height times 4 |
 | RGBA-equivalent bytes per bound input | 134,217,728 bytes (128 MiB) | Aggregate decoded safety bound |
 | Normalized bytes per asset | 16,777,216 bytes (16 MiB) | PNG after orientation and color normalization |
-| Normalized bytes per bound input | 33,554,432 bytes (32 MiB) | Source candidates plus selected references/logos |
+| Provider-bound encoded bytes per input | 33,554,432 bytes (32 MiB) | Exact S1 source PNG bytes plus selected normalized references/logos |
 | Repair provider input count | 9 | One source candidate, up to six references, up to two logos |
 | Repair provider output | 16,777,216 bytes (16 MiB) | Provider PNG before final normalization |
 | Provider QA input count | 1 | The source candidate only |
 
-The bound-input aggregate includes exactly four S1 source candidates and every
-selected reference and logo asset. Empty reference/logo slots contribute zero.
-The repair aggregate includes one source candidate and the selected
-reference/logo assets for that repair. A repair MUST be rejected if any
-aggregate bound is exceeded; it MUST NOT silently omit an asset.
+The provider-bound encoded aggregate includes the exact persisted PNG bytes for
+all four S1 source candidates and every selected reference and logo asset.
+Empty reference/logo slots contribute zero. The repair aggregate includes the
+exact source PNG bytes plus the selected normalized reference/logo bytes. A
+repair MUST be rejected if any aggregate bound is exceeded; it MUST NOT
+silently omit an asset.
 
 ### 4.2 Enforcement order
 
@@ -274,7 +275,7 @@ the only protection for an earlier resource bound.
 | Full decode | Oriented width/height, pixels, RGBA-equivalent bytes and decoded aggregate | MEDIA_DIMENSIONS_EXCEEDED, MEDIA_PIXEL_LIMIT_EXCEEDED, MEDIA_AGGREGATE_LIMIT_EXCEEDED |
 | Normalization | sRGB, alpha preservation, metadata removal, deterministic PNG and 16 MiB limit | MEDIA_NORMALIZATION_FAILED or MEDIA_TOO_LARGE |
 | Draft mutation | Kind, slot count, duplicate hash, project ownership and optimistic revision | INVALID_ASSET_KIND, DRAFT_REVISION_CONFLICT, ASSET_* |
-| Atomic bind | Four source candidates, selected assets and 32 MiB/128 MiB aggregates | S2_BINDING_CONFLICT or MEDIA_AGGREGATE_LIMIT_EXCEEDED |
+| Atomic bind | Four source candidates, selected assets and 32 MiB/128 MiB aggregates | QA_BINDING_CONFLICT or MEDIA_AGGREGATE_LIMIT_EXCEEDED |
 | Repair admission | Eligible finding set and repair input aggregate before provider call | REPAIR_NOT_ELIGIBLE or MEDIA_AGGREGATE_LIMIT_EXCEEDED |
 
 The server MUST reject before an unbounded buffer is accumulated. A streaming
@@ -399,11 +400,14 @@ type S2ReferenceDraft = {
 type S2CandidateSource = {
   candidateId: UUID;
   candidateIndex: 1 | 2 | 3 | 4;
-  sourceAssetId: UUID;
-  sourceSha256: Sha256;
-  width: number;
-  height: number;
-  normalizedBytes: number;
+  sourceAssetId: UUID;       // canonical S1 ConceptAsset.assetId
+  sourceStorageKey: string;  // private ConceptAsset.storageKey; server-only
+  sourceSha256: Sha256;      // exact canonical S1 ConceptAsset.sha256
+  sourceByteSize: number;    // exact canonical S1 ConceptAsset.byteSize
+  sourceWidth: number;       // derived by the pinned S2 decoder
+  sourceHeight: number;      // derived by the pinned S2 decoder
+  sourcePixelCount: number;  // derived width times height
+  sourceDecodedRgbaBytes: number; // derived pixel safety value
 };
 
 type S2InputVersion = {
@@ -418,6 +422,7 @@ type S2InputVersion = {
   canonicalRequirements: S2Requirement[];
   requirementHash: Sha256;
   designRulesVersion: "s2-design-rules-v1";
+  designRuleSnapshot: S2DesignRuleSnapshot[];
   decoderProfile: "s2-media-v1";
   qaModel: "gpt-5.4-mini-2026-03-17";
   qaSchema: "s2-qa-v1";
@@ -442,6 +447,13 @@ type S2Requirement = {
   criticality: "material" | "warning";
   source: "confirmed_brief" | "geometry_snapshot";
   text: string;
+};
+
+type S2DesignRuleSnapshot = {
+  ruleId: string;
+  applicability: "applicable" | "not_applicable";
+  materiality: "material" | "warning";
+  repairable: boolean;
 };
 
 type S2RequirementObservation = {
@@ -470,6 +482,8 @@ type S2QaCandidateResult = {
   candidateId: UUID;
   candidateIndex: 1 | 2 | 3 | 4;
   attempt: 1 | 2;
+  sourceAssetId: UUID;
+  sourceByteSize: number;
   sourceSha256: Sha256;
   status: S2CandidateStatus;
   verdict: S2Verdict;
@@ -510,6 +524,8 @@ type S2RepairAttempt = {
   attempt: 1;
   status: S2RepairStatus;
   eligibleFindingIds: string[];
+  sourceAssetId: UUID;
+  sourceByteSize: number;
   sourceSha256: Sha256;
   repairInputHash: Sha256;
   repairPromptHash: Sha256;
@@ -530,6 +546,8 @@ type S2DerivedCandidate = {
   qaRunId: UUID;
   sourceCandidateId: UUID;
   repairAttemptId: UUID;
+  sourceAssetId: UUID;
+  sourceByteSize: number;
   sourceSha256: Sha256;
   outputSha256: Sha256;
   normalizedBytes: number;
@@ -577,11 +595,23 @@ payloads, provider URLs, prompts, or operation claim tokens.
 
 ### 6.1 Canonical bytes
 
-Every content hash uses UTF-8 bytes of the existing S1 JCS-compatible
-canonical JSON implementation. The implementation MUST follow RFC 8785
-semantics: object keys sorted by Unicode code point, arrays preserved in
-order, no insignificant whitespace, JSON booleans/null unchanged, and
-canonical JSON number rendering. Hashes are lowercase SHA-256 hex.
+Every content hash MUST call the existing S1 jcs() implementation from
+src/lib/utils.ts and hash the UTF-8 bytes of its returned string with the
+existing S1 sha256() helper. S2 MUST NOT create, wrap, fork or imply a second
+canonicalizer. For the JSON data used by S1/S2, the current implementation:
+
+- recursively renders null, strings and booleans with JSON serialization;
+- preserves array order and recursively canonicalizes each element;
+- sorts object keys with JavaScript string comparison over UTF-16 code units,
+  which is the RFC 8785/JCS property-order representation for the supported
+  JSON values; it does not perform a second canonicalization or Unicode
+  normalization step;
+- rejects non-finite numbers, renders negative zero as 0, and uses
+  ECMAScript JSON number serialization for other finite numbers; and
+- emits no insignificant whitespace and rejects unsupported non-JSON values.
+
+The returned compact string is encoded as UTF-8 before hashing. Hashes are
+lowercase SHA-256 hex.
 
 The following values MUST NOT appear in a content-hash input: timestamps,
 UUIDs generated solely for an attempt, operation claims, worker IDs, process
@@ -596,20 +626,28 @@ The hash name, input schema and order below are locked:
 | --- | --- |
 | originalSha256 | SHA-256 of the exact accepted original file bytes |
 | normalizedSha256 | SHA-256 of exact s2-media-v1 normalized PNG bytes |
-| confirmedBriefContentHash | Existing S1 contentHash of JCS({schemaVersion, geometrySnapshot, data}) for the immutable confirmed brief; S2 MUST use the stored S1 value |
-| geometryHash | SHA-256 of JCS({widthMm, depthMm, openSides, maxHeightMm}) in the existing BoothGeometry field order |
-| requirementHash | SHA-256 of JCS({schemaVersion:"s2-requirements-v1", requirements:[...]}) with requirements in canonical requirement ID order |
-| inputHash | SHA-256 of JCS({schemaVersion:"s2-input-v1", sourceGenerationSetId, sourceCandidates, confirmedBriefVersionId, confirmedBriefContentHash, geometryHash, requirementHash, designRulesVersion, decoderProfile, qaModel, qaSchema, referenceAssets, logoAssets}) |
-| bindingHash | SHA-256 of JCS({schemaVersion:"s2-binding-v1", projectId, sourceGenerationSetId, draftRevision, inputHash, sourceCandidates, referenceAssets, logoAssets}) |
-| repairInputHash | SHA-256 of JCS({schemaVersion:"s2-repair-v1", inputVersionId, qaRunId, candidateId, sourceSha256, bindingHash, orderedFindingIds, referenceAssets, logoAssets, confirmedBriefContentHash, geometryHash, attempt:1}) |
+| confirmedBriefContentHash | Existing S1 contentHash of UTF-8 jcs({schemaVersion, geometrySnapshot, data}) for the immutable confirmed brief; S2 MUST use the stored S1 value |
+| geometryHash | SHA-256 of UTF-8 jcs({widthMm, depthMm, openSides, maxHeightMm}); jcs sorts object keys, so insertion order is not authority |
+| requirementHash | SHA-256 of UTF-8 jcs({schemaVersion:"s2-requirements-v1", requirements:[...]}) with requirements in canonical requirement ID order |
+| inputHash | SHA-256 of UTF-8 jcs({schemaVersion:"s2-input-v1", sourceGenerationSetId, sourceCandidates, confirmedBriefVersionId, confirmedBriefContentHash, geometryHash, requirementHash, designRulesVersion, designRuleSnapshot, decoderProfile, qaModel, qaSchema, referenceAssets, logoAssets}) |
+| bindingHash | SHA-256 of UTF-8 jcs({schemaVersion:"s2-binding-v1", projectId, sourceGenerationSetId, draftRevision, inputHash, sourceCandidates, referenceAssets, logoAssets}) |
+| repairInputHash | SHA-256 of UTF-8 jcs({schemaVersion:"s2-repair-v1", inputVersionId, qaRunId, candidateId, sourceAssetId, sourceSha256, sourceByteSize, sourceWidth, sourceHeight, sourcePixelCount, sourceDecodedRgbaBytes, bindingHash, orderedFindingIds, referenceAssets, logoAssets, confirmedBriefContentHash, geometryHash, attempt:1}) |
 | repairPromptHash | SHA-256 of UTF-8 bytes of the exact rendered s2-repair-v1 prompt, before provider submission |
 | outputSha256 | SHA-256 of the exact repaired normalized PNG bytes after provider output validation and s2-media-v1 normalization |
 
 sourceCandidates is an array of four objects ordered by candidateIndex. Each
-object contains candidateId, candidateIndex, sourceAssetId, sourceSha256,
-width, height and normalizedBytes. referenceAssets and logoAssets are arrays
-of objects containing assetId, normalizedSha256, width, height,
-normalizedBytes, and their one-based slot order. Their order is the persisted
+persisted object contains candidateId, candidateIndex, sourceAssetId,
+sourceStorageKey, sourceSha256, sourceByteSize, sourceWidth, sourceHeight,
+sourcePixelCount and sourceDecodedRgbaBytes. The private sourceStorageKey is
+provenance only and is never included in a content-hash input.
+For inputHash and bindingHash, the canonical sourceCandidates hash projection
+contains candidateId, candidateIndex, sourceAssetId, sourceSha256,
+sourceByteSize, sourceWidth, sourceHeight, sourcePixelCount and
+sourceDecodedRgbaBytes; it excludes sourceStorageKey and other forbidden values.
+sourceSha256/sourceByteSize are the verified canonical S1
+ConceptAsset.sha256/byteSize values, not a new S2 normalization. The
+referenceAssets and logoAssets arrays contain assetId, normalizedSha256, width,
+height, normalizedBytes and one-based slot order. Their order is the persisted
 draft order, not hash order.
 
 The inputHash and bindingHash MUST be recomputed from persisted snapshots
@@ -623,7 +661,7 @@ each operation, the server computes:
 
 ~~~text
 operationInputHash =
-  sha256(JCS({operation, projectId, input}))
+  sha256(UTF-8 jcs({operation, projectId, input}))
 ~~~
 
 The exact input values are:
@@ -666,7 +704,7 @@ before the freeze leaves the editable draft unchanged.
 
 The route is:
 
-    POST /api/projects/{projectId}/s2/assets
+    POST /api/projects/{projectId}/s2/reference-assets
 
 The request is multipart/form-data with exactly these application fields:
 file, kind, and optional filename metadata. kind is reference or logo. The
@@ -708,9 +746,9 @@ in the draft only for its declared kind.
 
 | Method and route | Request | Success |
 | --- | --- | --- |
-| GET /api/projects/{projectId}/s2/draft | None | 200 with draft and current asset projections |
-| PATCH /api/projects/{projectId}/s2/draft | {expectedRevision, referenceAssetIds, logoAssetIds} | 200 with the new persisted draft |
-| GET /api/projects/{projectId}/s2/assets/{assetId} | None | Private authorized normalized image response |
+| GET /api/projects/{projectId}/s2/reference-draft | None | 200 with draft and current asset projections |
+| PATCH /api/projects/{projectId}/s2/reference-draft | {expectedRevision, referenceAssetIds, logoAssetIds} | 200 with the new persisted draft |
+| GET /api/projects/{projectId}/s2/reference-assets/{assetId} | None | Private authorized normalized image response |
 
 PATCH requires Idempotency-Key. The body MUST contain exactly the three
 fields shown; expectedRevision is a positive integer and arrays contain UUIDs.
@@ -787,19 +825,35 @@ The bind operation MUST verify, inside one repository transaction:
    S1 concepts_ready.
 2. sourceGenerationSetId exists, belongs to the project, is succeeded, and
    has exactly four immutable candidates in candidateIndex order 1 through 4.
-3. Each candidate has its existing immutable private normalized PNG asset,
-   candidate ID, source asset ID, sourceSha256, dimensions and normalized
-   byte size.
-4. The project has exactly one confirmed immutable brief version and its
-   stored content hash, plus the hard geometry snapshot from that version.
-5. The draft exists, is editable, has the supplied expected revision, and
-   contains no duplicate, deleted, cross-project, or wrong-kind asset.
-6. Every selected asset has a ready normalized object and passes the aggregate
-   decoded, RGBA-equivalent, normalized-byte and count limits.
-7. No S2InputVersion or S2QaRun already exists for the source generation set.
 
-A source candidate is never re-decoded from a client upload and a client
-cannot select or reorder the four S1 candidates.
+The canonical S1 ConceptAsset persists its immutable asset identity, private
+storageKey, mimeType, byteSize and sha256. It does not persist S2
+width/height, pixel/RGBA metadata or normalizedBytes; S2 derives those from
+the verified private PNG bytes.
+
+3. Each candidate resolves to its canonical immutable S1 ConceptAsset by
+   candidate.assetId. The server reads the private object at the persisted
+   ConceptAsset.storageKey, verifies image/png, exact byteSize and
+   sha256(sourceBytes) equal the persisted ConceptAsset.byteSize/sha256, and
+   rejects missing, changed, corrupt or mismatched objects.
+4. The server safely inspects those exact sourceBytes with the pinned S2
+   decoder to derive sourceWidth, sourceHeight, sourcePixelCount and
+   sourceDecodedRgbaBytes. It validates the 16 MiB provider-bound per-source
+   encoded limit and all decoded/RGBA limits. It MUST NOT write, replace or
+   silently renormalize the canonical S1 object.
+5. The project has exactly one confirmed immutable brief version and its
+   stored content hash, plus the hard geometry snapshot from that version.
+6. The draft exists, is editable, has the supplied expected revision, and
+   contains no duplicate, deleted, cross-project, or wrong-kind asset.
+7. Every selected asset has a ready normalized object and passes the aggregate
+   decoded, RGBA-equivalent, normalized-byte and count limits together with
+   the exact source-byte aggregate.
+8. No S2InputVersion or S2QaRun already exists for the source generation set.
+
+A source candidate is never read from a client upload and a client cannot
+select or reorder the four S1 candidates. QA and repair use the exact verified
+canonical S1 sourceBytes and sourceSha256; only reference/logo assets use the
+S2 normalized derivative.
 
 ### 8.2 Required atomic sequence
 
@@ -812,7 +866,9 @@ order with the same all-or-nothing result:
    invariant.
 3. Re-read selected asset records and validate kind, status, ownership,
    normalized objects and all aggregate limits.
-4. Build the canonical requirement snapshot and immutable design-rule version.
+4. Build the canonical requirement snapshot and the server-owned
+   designRuleSnapshot, including max-height applicability from the bound
+   geometry; provider output cannot set applicability.
 5. Build the ordered source, reference and logo manifests.
 6. Compute geometryHash, requirementHash, inputHash and bindingHash from these
    persisted snapshots.
@@ -836,10 +892,17 @@ reported as a fake QA result.
 
 ### 8.3 Snapshot rules
 
-The input version stores the source candidate manifest, confirmed brief
-identity/hash, geometry, canonical requirements, design-rule version, decoder
-profile, QA model/schema, and selected reference/logo manifests. It does not
-store provider evidence or mutable draft pointers.
+The input version stores the source candidate manifest, including the verified
+canonical S1 asset identity, private storage key, exact source hash/byte size,
+and decoder-derived dimensions/pixel safety metadata. It stores the confirmed
+brief identity/hash, geometry, canonical requirements, server-owned
+design-rule applicability/materiality/repair snapshot, decoder profile, QA
+model/schema, and selected reference/logo manifests. It does not store
+provider evidence or mutable draft pointers.
+The exact verified source byte string is the sole QA input_image, the first
+repair image[] part, and the source contribution to encoded and decoded
+aggregate limits. sourceAssetId, sourceSha256, sourceByteSize and all derived
+source metadata are bound into the S2 input/binding/repair hashes; the private storage key remains provenance only and is never hashed.
 
 The four source candidates are always evaluated in candidateIndex order. The
 input version is immutable even if the project later changes its brief,
@@ -914,15 +977,20 @@ is rejected during S1 confirmation according to existing S1 rules.
 The server MUST accept a provider result only when:
 
 1. requirements contains each canonical requirement ID exactly once;
-2. designRules contains each rule ID in section 10 exactly once;
-3. no unknown IDs, duplicate IDs, missing IDs, extra properties, wrong enum,
-   wrong scalar type, negative count, non-finite value, or overlong evidence
-   is present;
+2. designRules contains each applicable rule ID from the server-owned
+   designRuleSnapshot exactly once. A not_applicable rule is not part of
+   expected coverage, and a returned record for it is an unexpected ID;
+3. no unknown or non-applicable IDs, duplicate IDs, missing applicable IDs,
+   extra properties, wrong enum, wrong scalar type, negative count,
+   non-finite value, or overlong evidence is present;
 4. expected and expectedCount exactly echo the server snapshot;
 5. confidence is a JSON number from 0 through 1 inclusive and evidence is a
    string no longer than 400 Unicode code points;
-6. observedCount is null unless observed is present, absent, uncertain or
-   not_verifiable and the relevant requirement is count-bearing; and
+6. observedCount is null or a non-negative integer. It MUST be null for a
+   non-count-bearing requirement. For an exact-count requirement, a
+   non-negative integer is required only when the observation is judged
+   present or absent at confidence >= 0.75; null remains valid for uncertain,
+   not_verifiable, or lower-confidence observations; and
 7. the top-level result has no free-form prose field.
 
 The provider output is an observation record only. The server assigns
@@ -942,9 +1010,9 @@ criticality, verdict, or repair eligibility.
 | access.open-sides | The supplied open sides remain visibly accessible | material | yes |
 | circulation.primary-access | Primary circulation and approach remain visibly usable | material | yes |
 | zones.inside-footprint | Functional zones remain inside the footprint | material | yes |
-| scale.human | Doors, counters, furniture and circulation read as human scale | warning | no |
+| scale.human | Doors, counters, furniture and circulation read as human scale; a clear high-confidence non-compliant observation is material and uncertainty is WARNING | material | yes, bounded |
 | structure.no-floating | Elements do not visibly float without support | material | yes |
-| structure.overhead-support | Overhead elements show a plausible visual support concept | material | no |
+| structure.overhead-support | Overhead elements show a plausible visual support concept; a clear high-confidence non-compliant observation is material and uncertainty is WARNING | material | yes, bounded |
 | structure.screen-support | Screens and heavy display elements show a plausible visual support concept | material | yes |
 | geometry.max-height | Nothing visibly exceeds a supplied maximum height | material when supplied, otherwise not applicable | no |
 | geometry.intersections | Major elements do not visibly intersect, collide or occupy impossible space | material | yes |
@@ -959,11 +1027,28 @@ binding; they do not become independent QA targets.
 
 ### 10.2 Rule semantics
 
-The expected rule state for every applicable rule is compliant. A rule can be
-not applicable only when the server explicitly marks it not_applicable in the
-input snapshot; v0.1 uses this only for geometry.max-height when maxHeightMm is
-null. The provider still returns a required record with not_verifiable for a
-rule that cannot be judged visually.
+At bind, the server creates exactly one designRuleSnapshot entry for every
+catalogue rule. \`geometry.max-height\` is \`applicable\` if and only if
+\`geometrySnapshot.maxHeightMm\` is not null. Every other v0.1 rule is
+applicable. The server sends only applicable rules in the QA expected coverage
+and validates exactly that set; a returned record for a server-marked
+not_applicable rule is an unexpected record and maps to QA_SCHEMA_INVALID.
+Provider output cannot add, remove, or change applicability.
+
+For scale.human and structure.overhead-support, the server snapshot sets
+materiality to material and repairable to true. A high-confidence non_compliant
+observation is a server-owned MATERIAL_FAIL candidate; uncertainty is WARNING
+and never repair-eligible.
+
+
+The expected rule state for every applicable rule is compliant. A
+not_applicable rule is excluded from provider coverage, finding
+classification, warnings, repair eligibility, run completion and PASS
+evaluation. Thus an absent maxHeightMm produces no max-height uncertainty or
+WARNING and cannot prevent PASS. An applicable rule that cannot be judged
+visually returns uncertain or not_verifiable and follows section 12. The
+server-owned snapshot, not provider output, supplies applicability, materiality
+and repairability.
 
 The rigging rule is a disclosure guard, not engineering verification. A
 candidate that appears to require rigging is not treated as approved by S2.
@@ -1016,8 +1101,9 @@ existing server-only OpenAI adapter and the pinned values:
 }
 ~~~
 
-The illustrative data URL above is generated from the private normalized
-source object at request time. The literal placeholder MUST never be sent.
+The illustrative data URL above is generated from the exact verified canonical
+S1 PNG bytes read from the private ConceptAsset.storageKey at request time.
+The literal placeholder MUST never be sent.
 The request MUST contain no reference or logo pixels. Reference and logo
 objects are inputs for repair only.
 
@@ -1117,11 +1203,17 @@ After strict schema validation, the server:
    value to the 0.75 threshold;
 2. treats confidence < 0.75 as uncertain regardless of provider wording;
 3. treats not_verifiable as uncertain for verdict purposes;
-4. rejects an exact-count requirement unless observed is present and
-   observedCount is a non-negative integer;
-5. derives a finding ID from the canonical requirement/rule ID and stable
+4. treats an exact-count observation as a judged count only when normalized
+   observed is present or absent at confidence >= 0.75; that case requires a
+   non-negative integer observedCount. Uncertain, not_verifiable, and
+   lower-confidence observations may keep observedCount null and remain
+   uncertainty, not QA_SCHEMA_INVALID. A non-count-bearing requirement MUST
+   keep observedCount null;
+5. excludes every server-marked not_applicable rule before finding
+   classification; provider output cannot make a rule applicable;
+6. derives a finding ID from the canonical requirement/rule ID and stable
    finding kind, never from provider evidence; and
-6. persists the original bounded evidence string only in the private
+7. persists the original bounded evidence string only in the private
    authorized result projection.
 
 ### 12.2 Finding classification
@@ -1132,21 +1224,27 @@ For a requirement:
 | --- | --- |
 | expected present and observed absent at confidence >= 0.75 | violation |
 | expected absent and observed present at confidence >= 0.75 | violation |
-| expected exact_count and observedCount differs at confidence >= 0.75 | violation |
-| observed uncertain or not_verifiable, or confidence < 0.75 | uncertain |
+| expected exact_count and judged count observedCount differs at confidence >= 0.75 | violation |
+| expected exact_count and judged count observedCount equals expectedCount at confidence >= 0.75 | compliant |
+| observed uncertain or not_verifiable, or confidence < 0.75; observedCount may be null | uncertain |
+| non-count requirement has non-null observedCount, or judged exact count lacks a non-negative integer | QA_SCHEMA_INVALID, not a verdict |
 | expected/observed mismatch in a malformed or missing record | QA_SCHEMA_INVALID, not a verdict |
 
 For a design rule:
 
 | Condition | Finding |
 | --- | --- |
+| server snapshot is not_applicable | excluded; no finding, warning, repair eligibility or PASS blocker |
 | observed non_compliant at confidence >= 0.75 | violation |
 | observed uncertain or not_verifiable, or confidence < 0.75 | uncertain |
 | observed compliant at confidence >= 0.75 | compliant |
 
 A violation is material only when the server snapshot marks the requirement
 or design rule material. An uncertain observation is never promoted to a
-material failure. Provider evidence cannot change this classification.
+material failure. Low-confidence, uncertain and not_verifiable observations
+are valid observations and contribute WARNING when no clear material violation
+exists; they do not become QA_SCHEMA_INVALID merely because observedCount is
+null. Provider evidence cannot change this classification.
 
 ### 12.3 Verdict precedence
 
@@ -1159,14 +1257,19 @@ The server assigns exactly one candidate verdict:
    and the complete observation set is otherwise valid.
 3. WARNING when there is no material violation but there is an uncertainty,
    not_verifiable state, or warning-level violation.
-4. PASS only when every required record is complete, every applicable
-   requirement and material rule is compliant at confidence >= 0.75, and
-   there are no warning-level violations or uncertain/not_verifiable states.
+4. PASS only when every required applicable record is complete, every
+   applicable requirement and material rule is compliant at confidence >=
+   0.75, and there are no warning-level violations or
+   uncertain/not_verifiable states. Server-marked not_applicable rules are
+   excluded and cannot block PASS.
 
 MATERIAL_FAIL takes precedence over WARNING for the same complete observation
 set. QA_UNAVAILABLE takes precedence when the observation set is incomplete
 or invalid; a partial provider response MUST NOT be combined with a
-material-failure claim.
+material-failure claim. Low-confidence, uncertain and not_verifiable
+observations are valid and contribute WARNING when no clear material violation
+exists; they do not become QA_SCHEMA_INVALID merely because observedCount is
+null.
 
 ### 12.4 Run completion
 
@@ -1229,8 +1332,10 @@ A repair is eligible only when all of the following are true:
 4. The candidate has no existing S2RepairAttempt, regardless of its status.
 5. The repair does not change confirmed width, depth, open sides, supplied max
    height, required candidate count, brief identity, or S1 source lineage.
-6. The repair does not require engineering, rigging, venue, code, structural,
-   legal, cost, or fabrication facts.
+6. The repair does not require engineering, rigging, venue, code, legal, cost,
+   fabrication, or structural adequacy/approval facts. A bounded visual
+   correction for a clearly judged unsupported overhead/screen appearance or
+   plausible scale issue may be allowed without asserting those facts.
 7. The source and every selected reference/logo input pass the section 4
    limits before any provider call.
 
@@ -1249,6 +1354,8 @@ The only v0.1 repairable finding IDs are:
 | zones.inside-footprint | High-confidence visible zone placement outside the footprint |
 | structure.no-floating | High-confidence visible floating element that can be grounded or supported visually |
 | structure.screen-support | High-confidence visible screen-support omission that can be corrected without engineering claims |
+| structure.overhead-support | Clear server-owned high-confidence material unsupported overhead visual issue that can be corrected with a bounded visibly plausible support arrangement; no engineering or approval claim |
+| scale.human | Clear server-owned high-confidence material visual scale failure with a plausible bounded correction; no engineering, venue or structural claim |
 | geometry.intersections | High-confidence visible major intersection/collision |
 | branding.prohibited | High-confidence prohibited visual treatment or text that can be removed |
 | brief.functional.NNN | High-confidence missing or wrong-count explicit functional item, when a deterministic visual correction is possible |
@@ -1257,10 +1364,9 @@ The only v0.1 repairable finding IDs are:
 The following are never repairable in v0.1:
 geometry.width, geometry.depth, access.open-sides when the requested change
 would alter the supplied fact rather than remove a blockage,
-geometry.max-height, structure.overhead-support, scale.human,
-branding.style, rigging.confirmation, budget.complexity, free-text
-requirements, uncertain observations, not_verifiable observations, provider
-failures, and any finding that needs a new fact.
+geometry.max-height, branding.style, rigging.confirmation, budget.complexity,
+free-text requirements, uncertain observations, not_verifiable observations,
+provider failures, and any finding that needs a new fact.
 
 The access.open-sides rule may repair an obstruction while preserving the
 exact open-side fact. It MUST NOT add an open side, move the footprint, or
@@ -1270,9 +1376,9 @@ change the requested entry geometry.
 
 Let S be the spatial set:
 footprint.within-boundary, access.open-sides, circulation.primary-access,
-zones.inside-footprint, structure.no-floating, structure.screen-support, and
-geometry.intersections. Let B be branding.prohibited. Let F be one
-brief.functional.NNN or brief.mandatory.NNN ID.
+zones.inside-footprint, structure.no-floating, structure.overhead-support,
+structure.screen-support, scale.human, geometry.intersections. Let B be
+branding.prohibited. Let F be one brief.functional.NNN or brief.mandatory.NNN ID.
 
 The only accepted eligible sets are:
 
@@ -1300,7 +1406,8 @@ ambiguous competing brief changes.
 
 The repair endpoint creates exactly one attempt value 1 after the eligibility
 decision and idempotency claim are persisted. It stores the ordered finding
-IDs, source hash, input hash, prompt hash placeholder, and immutable lineage.
+IDs, sourceAssetId/sourceByteSize/sourceSha256, input hash, prompt hash
+placeholder, and immutable lineage.
 The prompt hash is filled before the provider call; any failure before the
 call leaves no claimable success. A failed provider call leaves the attempt
 failed and does not permit a second attempt.
@@ -1311,18 +1418,20 @@ failed and does not permit a second attempt.
 
 The provider input manifest is ordered exactly:
 
-1. source candidate: the bound S1 normalized PNG;
+1. source candidate: the exact verified canonical S1 PNG bytes identified by
+   sourceAssetId/sourceSha256/sourceByteSize; no S2-normalized replacement;
 2. reference_image_01 through reference_image_06: selected reference assets
    in draft order, with absent slots omitted;
 3. logo_01 through logo_02: selected logo assets in draft order, with absent
    slots omitted.
 
-The manifest contains one source image and zero through eight user assets.
-Every image is normalized PNG bytes from private storage. The total manifest
-must satisfy the nine-image, decoded aggregate, RGBA-equivalent aggregate,
-normalized-byte aggregate and 16 MiB provider-output bounds. The source
-candidate is authoritative; references and logos are style/context inputs and
-cannot override the hard facts.
+The manifest contains one exact S1 source image and zero through eight user
+assets. The source image uses the verified canonical bytes; references and
+logos use their S2 normalized PNG bytes. The total manifest must satisfy the
+nine-image, decoded aggregate, RGBA-equivalent aggregate, provider-bound
+encoded-byte aggregate and 16 MiB provider-output bounds. The source candidate
+is authoritative; references and logos are style/context inputs and cannot
+override the hard facts.
 
 ### 15.2 Images edit request
 
@@ -1397,6 +1506,8 @@ The compiler uses the following fixed objective text:
 | zones.inside-footprint | Keep every confirmed functional zone inside the exact footprint. |
 | structure.no-floating | Remove visible floating or unsupported appearance by using a simple grounded visual arrangement; do not claim structural approval. |
 | structure.screen-support | Give visible screens a plausible local support or grounded arrangement without inventing engineering facts. |
+| structure.overhead-support | Correct the clearly unsupported overhead visual issue with a bounded visibly plausible support/grounded arrangement; do not claim engineering adequacy or approval. |
+| scale.human | Apply a bounded plausible visual scale correction so doors, counters, furniture and circulation read coherently; do not change hard geometry or claim engineering/venue approval. |
 | geometry.intersections | Resolve the named visible collision or impossible overlap while preserving unaffected confirmed elements. |
 | branding.prohibited | Remove the prohibited visual treatment or text and preserve only approved, explicitly supplied branding. |
 | brief.functional.NNN | Make the explicit functional requirement visible and correctly represented without inventing a new requirement. |
@@ -1848,48 +1959,51 @@ limits to make a fixture pass.
 | DRAFT-008 | Bind freezes the draft atomically; all later writes return DRAFT_FROZEN. |
 | DRAFT-009 | Failed bind rolls back without freezing or incrementing the draft. |
 | BIND-001 | Only a succeeded source generation set with exactly four immutable candidates binds. |
-| BIND-002 | Candidate IDs, indexes 1-4, source asset IDs, hashes and dimensions are snapshotted exactly. |
+| BIND-002 | Candidate IDs, indexes 1-4, canonical S1 asset IDs, verified byteSize/sha256 identity, decoder-derived dimensions and decoded safety metadata are snapshotted exactly. |
 | BIND-003 | Confirmed brief version/content hash and geometry snapshot are snapshotted exactly. |
-| BIND-004 | Input, requirement and binding hashes match independent JCS recomputation. |
+| BIND-004 | Input, requirement and binding hashes match independent recomputation with the existing jcs() implementation. |
 | BIND-005 | Four queued candidate records and one QA run are created in one transaction. |
 | BIND-006 | Concurrent bind requests produce one input/run and one frozen draft. |
 | BIND-007 | Same idempotency key and same input replays; same key with changed input rejects. |
 | BIND-008 | Second bind for the same source generation set returns S2_QA_RUN_EXISTS or S2_ALREADY_BOUND. |
-| BIND-009 | The 32 MiB normalized and 128 MiB decoded aggregate includes all four sources and selected assets. |
-| BIND-010 | Source assets are read from existing S1 keys and are never replaced by client bytes. |
+| BIND-009 | The 32 MiB provider-bound encoded and 128 MiB decoded aggregates include exact S1 source bytes and selected normalized assets. |
+| BIND-010 | Bind reads the immutable S1 ConceptAsset private PNG, verifies exact byte identity, derives S2 metadata safely, and never mutates or renormalizes the S1 object. |
 | QA-001 | One QA request is made per candidate, using only the source candidate image. |
-| QA-002 | Responses request uses the pinned model, store false, high image detail and strict s2_qa_v1 schema. |
-| QA-003 | Exact valid requirement/rule coverage persists observations and server-derived findings. |
-| QA-004 | Missing, duplicate, unknown, extra-property, wrong-type and out-of-range outputs map to QA_SCHEMA_INVALID. |
-| QA-005 | Expected values and counts are server-owned; provider echo mismatch is rejected. |
-| QA-006 | Confidence 0.7499 is uncertain and 0.75 is eligible for high-confidence classification. |
-| QA-007 | Present, absent, exact-count, prohibited, compliant and non-compliant cases classify correctly. |
+| QA-002 | The QA request uses the pinned model, store false, high image detail and strict s2_qa_v1 schema. |
+| QA-003 | Exact valid requirement coverage and exactly the server-applicable design-rule coverage persist observations and server-derived findings. |
+| QA-004 | Missing, duplicate, unknown, non-applicable, extra-property, wrong-type and out-of-range outputs map to QA_SCHEMA_INVALID. |
+| QA-005 | Expected values, counts and applicability are server-owned; provider echo or applicability mismatch is rejected. |
+| QA-006 | Confidence 0.7499 is uncertain, null observedCount remains valid for uncertainty, and 0.75 is eligible for high-confidence classification. |
+| QA-007 | Present, absent, judged exact-count, uncertain/null-count, prohibited, compliant and non-compliant cases classify correctly. |
 | QA-008 | Provider severity, verdict, criticality or repair flags are ignored if supplied. |
-| QA-009 | PASS requires complete high-confidence compliance and no warnings or uncertainty. |
-| QA-010 | WARNING covers only non-material warning or uncertainty with no material violation. |
-| QA-011 | MATERIAL_FAIL requires a complete high-confidence material violation. |
+| QA-009 | PASS requires complete high-confidence compliance for applicable records; an absent maxHeightMm cannot block PASS. |
+| QA-010 | WARNING covers uncertainty, not_verifiable or warning-level findings with no material violation and is not a schema failure solely because observedCount is null. |
+| QA-011 | MATERIAL_FAIL requires a complete high-confidence server-owned material violation, including eligible overhead/scale visual failures. |
 | QA-012 | Incomplete, timeout, decoder, persistence, refusal and provider failures never become MATERIAL_FAIL. |
 | QA-013 | Run counters and candidate order remain correct after refresh and restart. |
 | QA-014 | Evidence is bounded to 400 Unicode code points and is not logged. |
+| QA-015 | With maxHeightMm null, geometry.max-height is omitted from expected schema/coverage and cannot create uncertainty, WARNING or a PASS blocker; with a supplied maxHeightMm it is applicable. |
 | RETRY-001 | Only retryable unavailable state exposes the explicit retry operation. |
 | RETRY-002 | QA retry uses attempt 2, same immutable input/model/schema and no new run/input/draft. |
 | RETRY-003 | Retry after a terminal result or after attempt 2 returns QA_NOT_RETRYABLE or QA_RETRY_EXHAUSTED. |
 | RETRY-004 | Hidden SDK retries are absent; one logical attempt makes at most one provider call. |
 | RETRY-005 | Late attempt-1 completion cannot overwrite attempt 2 or terminal state. |
-| REPAIR-001 | A complete material failure with one eligible spatial finding creates one repair attempt. |
+| REPAIR-001 | A complete material failure with one eligible allowlisted spatial/visual finding, including overhead-support or scale, creates one repair attempt. |
 | REPAIR-002 | Warning, pass, unavailable, uncertain-only and not-verifiable-only results are not repairable. |
 | REPAIR-003 | Each allowlisted singleton repairs only its own intended correction. |
 | REPAIR-004 | Compatible spatial pairs and triples follow the exact matrix; two F findings fail. |
-| REPAIR-005 | Max-height, overhead support, scale, style, rigging, budget and free-text findings reject repair. |
+| REPAIR-005 | Max-height, style, rigging, budget, free-text and hard-fact findings reject repair; clear material overhead/scale failures may be eligible, while warning/uncertain/not-verifiable findings remain ineligible. |
 | REPAIR-006 | Geometry facts, open-side count, source identity and confirmed brief remain unchanged. |
 | REPAIR-007 | A second repair request returns REPAIR_ALREADY_EXISTS or REPAIR_EXHAUSTED. |
 | REPAIR-008 | Repair input manifest order is source, references in draft order, logos in draft order. |
-| REPAIR-009 | Repair aggregate count, decoded, RGBA and normalized limits are checked before provider call. |
+| REPAIR-009 | Repair aggregate count, decoded, RGBA and provider-bound encoded limits are checked before provider call. |
 | REPAIR-010 | Image edit request uses repeated image parts, pinned model, n=1, 1536x1024, medium, PNG, no mask and no input_fidelity. |
 | REPAIR-011 | Empty, multiple, non-PNG, invalid-base64, oversized and corrupt provider output is rejected. |
 | REPAIR-012 | Repair prompt hash is stable and changes when the immutable finding set or manifest hash changes. |
 | REPAIR-013 | Provider evidence text cannot change the deterministic repair objective. |
 | REPAIR-014 | Staging failure, stale claim and publication failure leave no false derived success. |
+| REPAIR-015 | A clear material overhead-support failure receives only a bounded visibly plausible support/grounded correction and no engineering or approval claim. |
+| REPAIR-016 | A clear material scale failure receives only a plausible bounded visual scale correction and no hard-geometry, engineering or venue claim. |
 | REQA-001 | One and only one re-QA operation is created after a valid derived output. |
 | REQA-002 | Re-QA uses the same hard facts, requirements, schema, model and server verdict algorithm. |
 | REQA-003 | Re-QA can persist pass, warning, material_fail and unavailable independently of source verdict. |
@@ -1969,7 +2083,7 @@ This document is a contract, not an implementation report. Missing runtime
 evidence is expected before G3 and MUST NOT be represented as a fake pass.
 G2 does not self-accept, mark Ready, merge, deploy, or invoke a live provider.
 The symbolic data URL and schema reference in section 11.1 are notation only;
-section 11.2 and the server-generated private normalized asset define the
+section 11.2 and the server-generated private canonical S1 PNG bytes define the
 exact wire content, so no material behavior is unresolved.
 
 ## 26. Source traceability
@@ -1982,7 +2096,7 @@ The S2 lock is grounded in these local authoritative sources:
 | docs/DESIGN_RULES.md | Hard geometry, brief, footprint, circulation, structure, branding, rigging, QA and visual-only boundaries |
 | docs/ARCHITECTURE.md | Private storage, immutable revisions, narrow AI interfaces, QA/repair flow and no fake success |
 | src/lib/types.ts | Existing shared UUID, geometry, brief, provider, concept, operation and error shapes |
-| src/lib/utils.ts | Existing SHA-256, JCS, UUID and private-key behavior |
+| src/lib/utils.ts | Existing SHA-256, jcs(), UUID and private-key behavior |
 | src/lib/store.ts | Existing transaction, lock, atomic object and persistence behavior |
 | src/lib/workflow.ts | Existing claims, fencing, recovery, idempotency and staging behavior |
 
