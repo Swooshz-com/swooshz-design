@@ -36,6 +36,7 @@ import {
 } from "./openai";
 import { JsonRepository, PrivateObjectStore, defaultDataRoot } from "./store";
 import { assertUuid, cloneJson, jcs, newUuid, nowUtc, privateStorageKey, sha256 } from "./utils";
+import { S2WorkflowService } from "./s2";
 
 
 export type WorkflowServiceOptions = {
@@ -74,7 +75,7 @@ export type PublicBriefState = {
   extractionRetryEligible: boolean;
 };
 
-export type S1Route = "geometry" | "brief" | "review" | "generate" | "generation";
+export type S1Route = "geometry" | "brief" | "review" | "generate" | "generation" | "s2";
 
 function operationInputHash(operation: string, projectId: UUID, input: unknown): Sha256 {
   return sha256(jcs({ operation, projectId, input }));
@@ -128,6 +129,7 @@ export function projectContinuationPath(
   if (requested === "geometry" && project.status !== "brief_confirmed" && !["generating", "generation_failed", "concepts_ready"].includes(project.status)) {
     return null;
   }
+  if (requested === "s2" && project.status === "concepts_ready") return null;
   if (
     requested === "brief" &&
     ["geometry_ready", "extracting", "brief_extraction_failed"].includes(project.status)
@@ -150,6 +152,7 @@ export class WorkflowService {
   readonly repository: JsonRepository;
   readonly objects: PrivateObjectStore;
   readonly provider: OpenAIProviderContract;
+  readonly s2: S2WorkflowService;
   private readonly clock: () => string;
   private readonly uuid: () => UUID;
   private readonly workerId: string;
@@ -171,6 +174,16 @@ export class WorkflowService {
     this.isProcessAlive = options.isProcessAlive ?? processIsAlive;
     this.workerId = options.workerId ?? `process-${this.processId}-${newUuid()}`;
     this.recoverPendingOperations();
+    this.s2 = new S2WorkflowService({
+      repository: this.repository,
+      objects: this.objects,
+      provider: this.provider,
+      clock: this.clock,
+      uuid: this.uuid,
+      workerId: this.workerId,
+      processId: this.processId,
+      isProcessAlive: this.isProcessAlive,
+    });
   }
 
   private state(): StoreState {

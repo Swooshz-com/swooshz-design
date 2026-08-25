@@ -283,6 +283,15 @@ export type StoreState = {
   extractionAttempts: Record<UUID, number>;
   extractionOperations: ExtractionOperation[];
   generationOperations: GenerationOperation[];
+  s2Assets: S2AssetRecord[];
+  s2Drafts: S2ReferenceDraft[];
+  s2Inputs: S2InputVersion[];
+  s2QaRuns: S2QaRun[];
+  s2Operations: S2Operation[];
+  s2Repairs: S2RepairAttempt[];
+  s2DerivedCandidates: S2DerivedCandidate[];
+  s2ReQaResults: S2ReQaResult[];
+  s2Transitions: S2StateTransition[];
 };
 
 export type FieldError = {
@@ -342,3 +351,262 @@ export type GenerationOperation = {
   completedAt: Timestamp | null;
   failureCode: string | null;
 };
+export type S2AssetKind = "reference" | "logo";
+export type S2AssetStatus = "ready" | "deleted";
+export type S2DraftStatus = "editable" | "frozen";
+export type S2InputStatus = "bound";
+export type S2QaRunStatus = "queued" | "running" | "completed" | "failed";
+export type S2CandidateStatus =
+  | "queued"
+  | "running"
+  | "pass"
+  | "warning"
+  | "material_fail"
+  | "qa_unavailable_retryable"
+  | "qa_unavailable_terminal";
+export type S2RepairStatus =
+  | "not_eligible"
+  | "eligible"
+  | "queued"
+  | "running"
+  | "failed"
+  | "derived_ready"
+  | "re_qa_running"
+  | "re_qa_pass"
+  | "re_qa_warning"
+  | "re_qa_material_fail"
+  | "re_qa_unavailable";
+export type S2Verdict = "PASS" | "WARNING" | "MATERIAL_FAIL" | "QA_UNAVAILABLE";
+export type S2Observed = "present" | "absent" | "compliant" | "non_compliant" | "uncertain" | "not_verifiable";
+export type S2RequirementObserved = "present" | "absent" | "uncertain" | "not_verifiable";
+
+export type S2AssetRecord = {
+  id: UUID;
+  projectId: UUID;
+  kind: S2AssetKind;
+  status: S2AssetStatus;
+  originalSha256: Sha256;
+  originalBytes: number;
+  normalizedSha256: Sha256;
+  normalizedBytes: number;
+  detectedMime: "image/png" | "image/jpeg" | "image/webp";
+  width: number;
+  height: number;
+  pixelCount: number;
+  hasAlpha: boolean;
+  storageKeyOriginal: string;
+  storageKeyNormalized: string;
+  createdAt: Timestamp;
+  deletedAt: Timestamp | null;
+};
+
+export type S2ReferenceDraft = {
+  id: UUID;
+  projectId: UUID;
+  revision: number;
+  status: S2DraftStatus;
+  referenceAssetIds: UUID[];
+  logoAssetIds: UUID[];
+  updatedAt: Timestamp;
+  frozenAt: Timestamp | null;
+  frozenByQaRunId: UUID | null;
+};
+
+export type S2CandidateSource = {
+  candidateId: UUID;
+  candidateIndex: 1 | 2 | 3 | 4;
+  sourceAssetId: UUID;
+  sourceStorageKey: string;
+  sourceSha256: Sha256;
+  sourceByteSize: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  sourcePixelCount: number;
+  sourceDecodedRgbaBytes: number;
+};
+
+export type S2Requirement = {
+  requirementId: string;
+  category: "geometry" | "functional" | "mandatory" | "prohibited" | "free_text";
+  expected: "present" | "absent" | "exact_count";
+  expectedCount: number | null;
+  expectedValue: string | number | boolean | null;
+  criticality: "material" | "warning";
+  source: "confirmed_brief" | "geometry_snapshot";
+  text: string;
+};
+
+export type S2DesignRuleSnapshot = {
+  ruleId: string;
+  applicability: "applicable" | "not_applicable";
+  materiality: "material" | "warning";
+  repairable: boolean;
+};
+
+export type S2InputVersion = {
+  id: UUID;
+  projectId: UUID;
+  sourceGenerationSetId: UUID;
+  sourceCandidates: S2CandidateSource[];
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  canonicalRequirements: S2Requirement[];
+  requirementHash: Sha256;
+  designRulesVersion: "s2-design-rules-v1";
+  designRuleSnapshot: S2DesignRuleSnapshot[];
+  decoderProfile: "s2-media-v1";
+  qaModel: "gpt-5.4-mini-2026-03-17";
+  qaSchema: "s2-qa-v1";
+  referenceAssetIds: UUID[];
+  logoAssetIds: UUID[];
+  draftRevision: number;
+  inputHash: Sha256;
+  bindingHash: Sha256;
+  status: S2InputStatus;
+  createdAt: Timestamp;
+  boundAt: Timestamp;
+  qaRunId: UUID;
+};
+
+export type S2RequirementObservation = {
+  requirementId: string;
+  expected: "present" | "absent" | "exact_count";
+  expectedCount: number | null;
+  expectedValue: string | number | boolean | null;
+  observed: S2RequirementObserved;
+  observedCount: number | null;
+  confidence: number;
+  evidence: string;
+};
+
+export type S2DesignObservation = {
+  ruleId: string;
+  observed: "compliant" | "non_compliant" | "uncertain" | "not_verifiable";
+  confidence: number;
+  evidence: string;
+};
+
+export type S2QaCandidateResult = {
+  id: UUID;
+  qaRunId: UUID;
+  inputVersionId: UUID;
+  candidateId: UUID;
+  candidateIndex: 1 | 2 | 3 | 4;
+  attempt: 1 | 2;
+  sourceAssetId: UUID;
+  sourceByteSize: number;
+  sourceSha256: Sha256;
+  status: S2CandidateStatus;
+  verdict: S2Verdict;
+  requirementObservations: S2RequirementObservation[];
+  designObservations: S2DesignObservation[];
+  materialFindingIds: string[];
+  warningFindingIds: string[];
+  uncertainFindingIds: string[];
+  providerRequestId: string | null;
+  repairAttemptId: UUID | null;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+};
+
+export type S2QaRun = {
+  id: UUID;
+  projectId: UUID;
+  inputVersionId: UUID;
+  sourceGenerationSetId: UUID;
+  status: S2QaRunStatus;
+  candidateResults: S2QaCandidateResult[];
+  completedCandidateCount: number;
+  passCount: number;
+  warningCount: number;
+  materialFailCount: number;
+  unavailableCount: number;
+  createdAt: Timestamp;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+};
+
+export type S2RepairAttempt = {
+  id: UUID;
+  projectId: UUID;
+  qaRunId: UUID;
+  inputVersionId: UUID;
+  candidateId: UUID;
+  attempt: 1;
+  status: S2RepairStatus;
+  eligibleFindingIds: string[];
+  sourceAssetId: UUID;
+  sourceByteSize: number;
+  sourceSha256: Sha256;
+  repairInputHash: Sha256;
+  repairPromptHash: Sha256;
+  outputSha256: Sha256 | null;
+  derivedCandidateId: UUID | null;
+  reQaCandidateResultId: UUID | null;
+  providerRequestId: string | null;
+  createdAt: Timestamp;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+};
+
+export type S2DerivedCandidate = {
+  id: UUID;
+  projectId: UUID;
+  sourceGenerationSetId: UUID;
+  inputVersionId: UUID;
+  qaRunId: UUID;
+  sourceCandidateId: UUID;
+  repairAttemptId: UUID;
+  sourceAssetId: UUID;
+  sourceByteSize: number;
+  sourceSha256: Sha256;
+  outputSha256: Sha256;
+  normalizedBytes: number;
+  width: number;
+  height: number;
+  storageKeyNormalized: string;
+  createdAt: Timestamp;
+};
+
+export type S2ReQaResult = Omit<S2QaCandidateResult, "status"> & {
+  status: S2CandidateStatus | "re_qa_unavailable";
+  phase: "re_qa";
+  derivedCandidateId: UUID;
+  repairAttemptId: UUID;
+};
+
+export type S2Operation = {
+  id: UUID;
+  projectId: UUID;
+  phase: "qa" | "repair" | "re_qa";
+  attempt: 1 | 2;
+  qaRunId: UUID;
+  candidateId: UUID;
+  repairAttemptId: UUID | null;
+  inputHash: Sha256;
+  referenceId: UUID;
+  status: "queued" | "running" | "succeeded" | "failed";
+  claimedBy: string | null;
+  claimedProcessId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  failureCode: string | null;
+  resultId: UUID | null;
+};
+
+export type S2StateTransition = {
+  id: UUID;
+  projectId: UUID;
+  operationId: UUID;
+  phase: S2Operation["phase"];
+  attempt: 1 | 2;
+  from: string;
+  to: string;
+  referenceId: UUID;
+  at: Timestamp;
+};
+

@@ -5,6 +5,8 @@ import {
   type StructuredBriefData,
   type Timestamp,
 } from "./types";
+import type { S2ProviderContract } from "./s2-provider";
+import { buildS2QaRequest, buildS2RepairRequest } from "./s2-provider";
 import { nowUtc } from "./utils";
 
 export const EXTRACTION_MODEL = "gpt-5.4-mini" as const;
@@ -28,7 +30,7 @@ export type ImageProviderResult = {
 export type OpenAIProviderContract = {
   extractBrief(pdfBytes: Uint8Array): Promise<BriefProviderResult>;
   generateImage(promptText: string): Promise<ImageProviderResult>;
-};
+} & S2ProviderContract;
 
 export class ProviderFailure extends Error {
   readonly safeCode: string;
@@ -115,7 +117,7 @@ export function buildImageRequest(promptText: string): Record<string, unknown> {
   };
 }
 
-function textFromResponse(body: Record<string, unknown>): string {
+function textFromResponse(body: Record<string, unknown>, refusalCode = "EXTRACTION_REFUSED", emptyCode = "EXTRACTION_EMPTY"): string {
   if (typeof body.output_text === "string") return body.output_text;
   const output = Array.isArray(body.output) ? body.output : [];
   for (const item of output) {
@@ -127,12 +129,12 @@ function textFromResponse(body: Record<string, unknown>): string {
       if (typeof part !== "object" || part === null) continue;
       const record = part as Record<string, unknown>;
       if (record.type === "refusal" || typeof record.refusal === "string") {
-        throw new ProviderFailure("EXTRACTION_REFUSED");
+        throw new ProviderFailure(refusalCode);
       }
       if (typeof record.text === "string") return record.text;
     }
   }
-  throw new ProviderFailure("EXTRACTION_EMPTY");
+  throw new ProviderFailure(emptyCode);
 }
 
 function requestIdFrom(response: Response, body: Record<string, unknown>): string | null {
@@ -195,6 +197,42 @@ export class OpenAIProvider implements OpenAIProviderContract {
     }
   }
 
+  private async postMultipart(path: string, form: FormData): Promise<{ response: Response; json: Record<string, unknown> }> {
+    if (!this.apiKey) throw new ProviderFailure("PROVIDER_NOT_CONFIGURED");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      let response: Response;
+      try {
+        response = await this.fetchImpl("https://api.openai.com/v1/" + path, {
+          method: "POST",
+          headers: { authorization: "Bearer " + this.apiKey },
+          body: form,
+          signal: controller.signal,
+        });
+      } catch {
+        if (controller.signal.aborted) throw new ProviderFailure("PROVIDER_TIMEOUT");
+        throw new ProviderFailure("PROVIDER_UNAVAILABLE");
+      }
+      let json: Record<string, unknown>;
+      try {
+        const parsed: unknown = await response.json();
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("non-object provider response");
+        json = parsed as Record<string, unknown>;
+      } catch {
+        throw new ProviderFailure(response.ok ? "PROVIDER_MALFORMED_RESPONSE" : "PROVIDER_HTTP_ERROR");
+      }
+      if (!response.ok) {
+        if (response.status === 429) throw new ProviderFailure("PROVIDER_RATE_LIMIT");
+        if (response.status >= 500) throw new ProviderFailure("PROVIDER_SERVER_ERROR");
+        throw new ProviderFailure("PROVIDER_CLIENT_ERROR");
+      }
+      return { response, json };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async extractBrief(pdfBytes: Uint8Array): Promise<BriefProviderResult> {
     const { response, json } = await this.post("responses", buildExtractionRequest(pdfBytes));
     if (json.status === "incomplete" || json.incomplete_details) {
@@ -223,6 +261,43 @@ export class OpenAIProvider implements OpenAIProviderContract {
         nowUtc(),
       ),
     };
+  }
+
+  async runS2Qa(input: import("./s2-provider").S2QaProviderInput): Promise<import("./s2-provider").S2QaProviderResult> {
+    const { response, json } = await this.post("responses", buildS2QaRequest(input));
+    if (json.status === "incomplete" || json.incomplete_details) throw new ProviderFailure("QA_PROVIDER_INCOMPLETE");
+    let payload: unknown;
+    try {
+      payload = JSON.parse(textFromResponse(json, "QA_PROVIDER_REFUSED", "QA_PROVIDER_EMPTY"));
+    } catch (error) {
+      if (error instanceof ProviderFailure) throw error;
+      throw new ProviderFailure("QA_SCHEMA_INVALID");
+    }
+    return { payload, providerRequestId: requestIdFrom(response, json) };
+  }
+
+  async runS2Repair(input: import("./s2-provider").S2RepairProviderInput): Promise<import("./s2-provider").S2RepairProviderResult> {
+    const request = buildS2RepairRequest(input);
+    const form = new FormData();
+    form.append("model", request.model);
+    form.append("n", String(request.n));
+    form.append("size", request.size);
+    form.append("quality", request.quality);
+    form.append("output_format", request.output_format);
+    form.append("prompt", request.prompt);
+    request.images.forEach((image, index) => {
+      form.append("image[]", new Blob([Buffer.from(image)], { type: "image/png" }), "s2-input-" + (index + 1) + ".png");
+    });
+    const { response, json } = await this.postMultipart("images/edits", form);
+    const data = Array.isArray(json.data) ? json.data : [];
+    if (data.length !== 1 || typeof data[0] !== "object" || data[0] === null) throw new ProviderFailure("REPAIR_OUTPUT_INVALID");
+    const encoded = (data[0] as Record<string, unknown>).b64_json;
+    if (typeof encoded !== "string" || !encoded || encoded.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+      throw new ProviderFailure("REPAIR_OUTPUT_INVALID");
+    }
+    const pngBytes = Buffer.from(encoded, "base64");
+    if (!pngBytes.length) throw new ProviderFailure("REPAIR_OUTPUT_INVALID");
+    return { pngBytes, providerRequestId: requestIdFrom(response, json) };
   }
 
   async generateImage(promptText: string): Promise<ImageProviderResult> {
@@ -266,6 +341,11 @@ export type MockProviderOptions = {
   imageFailures?: Map<number, string>;
   imageMalformedIndexes?: Set<number>;
   onImagePrompt?: (promptText: string, callIndex: number) => void;
+  s2QaResponses?: unknown[];
+  s2QaResponseFactory?: (input: import("./s2-provider").S2QaProviderInput, callIndex: number) => unknown;
+  s2RepairResponses?: Array<Uint8Array | Error>;
+  onS2QaRequest?: (input: import("./s2-provider").S2QaProviderInput, callIndex: number) => void;
+  onS2RepairRequest?: (input: import("./s2-provider").S2RepairProviderInput, callIndex: number) => void;
 };
 
 /** Explicit test/local adapter. It simulates OpenAI and is never a runtime fallback. */
@@ -273,6 +353,8 @@ export class MockOpenAIProvider implements OpenAIProviderContract {
   readonly options: MockProviderOptions;
   extractionCalls = 0;
   imageCalls = 0;
+  s2QaCalls = 0;
+  s2RepairCalls = 0;
 
   constructor(options: MockProviderOptions) {
     this.options = options;
@@ -320,6 +402,46 @@ export class MockOpenAIProvider implements OpenAIProviderContract {
         receivedAt: nowUtc(),
       },
     };
+  }
+
+  async runS2Qa(input: import("./s2-provider").S2QaProviderInput): Promise<import("./s2-provider").S2QaProviderResult> {
+    const index = this.s2QaCalls;
+    this.s2QaCalls += 1;
+    this.options.onS2QaRequest?.(input, index);
+    const generated = this.options.s2QaResponseFactory?.(input, index);
+    if (generated !== undefined) return { payload: generated, providerRequestId: "mock-s2-qa-" + (index + 1) };
+    const configured = this.options.s2QaResponses?.[index];
+    if (configured instanceof Error) throw configured;
+    if (configured !== undefined) return { payload: configured, providerRequestId: "mock-s2-qa-" + (index + 1) };
+    return {
+      payload: {
+        requirements: input.requirements.map((requirement) => ({
+          requirementId: requirement.requirementId,
+          expected: requirement.expected,
+          expectedCount: requirement.expectedCount,
+          observed: requirement.expected === "absent" ? "absent" : "present",
+          observedCount: requirement.expected === "exact_count" ? requirement.expectedCount : null,
+          confidence: 0.99,
+          evidence: "mock observation",
+        })),
+        designRules: input.designRules.filter((rule) => rule.applicability === "applicable").map((rule) => ({
+          ruleId: rule.ruleId,
+          observed: "compliant",
+          confidence: 0.99,
+          evidence: "mock observation",
+        })),
+      },
+      providerRequestId: "mock-s2-qa-" + (index + 1),
+    };
+  }
+
+  async runS2Repair(input: import("./s2-provider").S2RepairProviderInput): Promise<import("./s2-provider").S2RepairProviderResult> {
+    const index = this.s2RepairCalls;
+    this.s2RepairCalls += 1;
+    this.options.onS2RepairRequest?.(input, index);
+    const configured = this.options.s2RepairResponses?.[index];
+    if (configured instanceof Error) throw configured;
+    return { pngBytes: configured ? new Uint8Array(configured) : new Uint8Array(MOCK_PNG), providerRequestId: "mock-s2-repair-" + (index + 1) };
   }
 }
 
