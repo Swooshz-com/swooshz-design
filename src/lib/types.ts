@@ -609,4 +609,3 @@ export type S2StateTransition = {
   referenceId: UUID;
   at: Timestamp;
 };
-
