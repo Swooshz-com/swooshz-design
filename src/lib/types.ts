@@ -319,6 +319,9 @@ export type ExtractionOperation = {
   referenceId: UUID;
   status: "queued" | "running" | "succeeded" | "failed";
   claimedBy: string | null;
+  claimedProcessId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
   createdAt: Timestamp;
   startedAt: Timestamp | null;
   completedAt: Timestamp | null;
@@ -331,6 +334,9 @@ export type GenerationOperation = {
   attempt: 1 | 2;
   status: "queued" | "running" | "succeeded" | "failed";
   claimedBy: string | null;
+  claimedProcessId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
   createdAt: Timestamp;
   startedAt: Timestamp | null;
   completedAt: Timestamp | null;

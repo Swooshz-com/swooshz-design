@@ -7,7 +7,6 @@ import {
   readFileSync,
   renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -15,7 +14,30 @@ import { randomUUID } from "node:crypto";
 import { AppError, type StoreState } from "./types";
 
 const LOCK_WAIT_MS = 15_000;
-const LOCK_STALE_MS = 30_000;
+
+export type RepositoryLockRecord = {
+  ownerToken: string;
+  processId: number;
+  acquiredAt: number;
+};
+
+type RepositoryLock = {
+  descriptor: number;
+  record: RepositoryLockRecord;
+};
+
+type ProcessLiveness = (processId: number) => boolean;
+
+function processIsAlive(processId: number): boolean {
+  if (!Number.isInteger(processId) || processId <= 0) return false;
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "EPERM" || code === "EACCES";
+  }
+}
 
 function sleepSync(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -132,12 +154,26 @@ export class JsonRepository {
   readonly lockPath: string;
   private current: StoreState;
   private readonly beforeCommit: (() => void) | undefined;
+  private readonly lockWaitMs: number;
+  private readonly processId: number;
+  private readonly isProcessAlive: ProcessLiveness;
 
-  constructor(root: string, options: { beforeCommit?: () => void } = {}) {
+  constructor(
+    root: string,
+    options: {
+      beforeCommit?: () => void;
+      lockWaitMs?: number;
+      processId?: number;
+      isProcessAlive?: ProcessLiveness;
+    } = {},
+  ) {
     this.root = resolve(root);
     this.statePath = join(this.root, "state.json");
     this.lockPath = join(this.root, "state.json.lock");
     this.beforeCommit = options.beforeCommit;
+    this.lockWaitMs = options.lockWaitMs ?? LOCK_WAIT_MS;
+    this.processId = options.processId ?? process.pid;
+    this.isProcessAlive = options.isProcessAlive ?? processIsAlive;
     mkdirSync(this.root, { recursive: true });
     this.current = this.load();
   }
@@ -161,32 +197,80 @@ export class JsonRepository {
     return this.current;
   }
 
-  private acquireLock(): number {
-    const deadline = Date.now() + LOCK_WAIT_MS;
+  private readLockRecord(): RepositoryLockRecord | null {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(this.lockPath, "utf8"));
+      if (typeof parsed !== "object" || parsed === null) return null;
+      const record = parsed as Partial<RepositoryLockRecord>;
+      if (
+        typeof record.ownerToken !== "string" ||
+        record.ownerToken.length < 1 ||
+        !Number.isInteger(record.processId) ||
+        (record.processId as number) <= 0 ||
+        typeof record.acquiredAt !== "number" ||
+        !Number.isFinite(record.acquiredAt)
+      ) {
+        return null;
+      }
+      return {
+        ownerToken: record.ownerToken,
+        processId: record.processId as number,
+        acquiredAt: record.acquiredAt,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private removeLockIfOwned(record: RepositoryLockRecord): boolean {
+    const current = this.readLockRecord();
+    if (
+      !current ||
+      current.ownerToken !== record.ownerToken ||
+      current.processId !== record.processId
+    ) {
+      return false;
+    }
+    try {
+      rmSync(this.lockPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private acquireLock(): RepositoryLock {
+    const deadline = Date.now() + this.lockWaitMs;
+    const record: RepositoryLockRecord = {
+      ownerToken: randomUUID(),
+      processId: this.processId,
+      acquiredAt: Date.now(),
+    };
     while (true) {
       let descriptor: number | null = null;
       try {
         descriptor = openSync(this.lockPath, "wx");
-        writeFileSync(descriptor, process.pid + "\n");
-        return descriptor;
+        writeFileSync(descriptor, JSON.stringify(record), { encoding: "utf8" });
+        fsyncSync(descriptor);
+        return { descriptor, record };
       } catch (error) {
         if (descriptor !== null) {
           closeSync(descriptor);
+          // This descriptor created the path, so it is safe to remove the
+          // incomplete lock record before another owner can acquire it.
           try {
             rmSync(this.lockPath, { force: true });
           } catch {
-            // Preserve the original lock or persistence failure.
+            // Preserve the original persistence failure.
           }
+          throw new AppError(500, "PERSISTENCE_FAILED");
         }
         const code = (error as NodeJS.ErrnoException).code;
         if (code !== "EEXIST") throw new AppError(500, "PERSISTENCE_FAILED");
-        try {
-          if (Date.now() - statSync(this.lockPath).mtimeMs > LOCK_STALE_MS) {
-            rmSync(this.lockPath, { force: true });
-            continue;
-          }
-        } catch {
-          // The owner may have released the lock between stat and removal.
+        const existing = this.readLockRecord();
+        if (existing && !this.isProcessAlive(existing.processId)) {
+          this.removeLockIfOwned(existing);
+          continue;
         }
         if (Date.now() >= deadline) throw new AppError(503, "PERSISTENCE_BUSY");
         sleepSync(5);
@@ -194,15 +278,11 @@ export class JsonRepository {
     }
   }
 
-  private releaseLock(descriptor: number): void {
+  private releaseLock(lock: RepositoryLock): void {
     try {
-      closeSync(descriptor);
+      closeSync(lock.descriptor);
     } finally {
-      try {
-        rmSync(this.lockPath, { force: true });
-      } catch {
-        // A later transaction can recover a stale lock after the bounded lease.
-      }
+      this.removeLockIfOwned(lock.record);
     }
   }
 

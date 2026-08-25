@@ -1,14 +1,16 @@
 import { strict as assert } from "node:assert";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { deflateSync } from "node:zlib";
 import { test } from "node:test";
+import { createIdempotencyKeyRetainer } from "../src/lib/client-idempotency";
 import { handleApiRequest } from "../src/lib/api";
 import { BUILDABILITY_BOUNDARY, compilePrompt, DIRECTIONS, HARD_CONSTRAINT_TEXT } from "../src/lib/compiler";
 import { validateGeometry, metresToMillimetres } from "../src/lib/geometry";
 import { MAX_BRIEF_BYTES, validatePdfUpload } from "../src/lib/media";
+import { parsePdf, PdfPageLimitError } from "../src/lib/pdf-parser";
 import {
   buildExtractionRequest,
   buildImageRequest,
@@ -232,7 +234,7 @@ function uuid(): string {
 
 function newService(
   provider: OpenAIProviderContract,
-  options: { dataRoot?: string; repository?: JsonRepository; objects?: PrivateObjectStore; workerId?: string } = {},
+  options: { dataRoot?: string; repository?: JsonRepository; objects?: PrivateObjectStore; workerId?: string; processId?: number; isProcessAlive?: (processId: number) => boolean } = {},
 ): { service: WorkflowService; root: string } {
   const root = options.dataRoot ?? mkdtempSync(join(tmpdir(), "swooshz-design-g3-"));
   const service = createWorkflowService({ dataRoot: root, provider, ...options });
@@ -319,7 +321,9 @@ async function seedConfirmed(service: WorkflowService): Promise<{
 
 class ExtractionGateProvider extends MockOpenAIProvider {
   readonly release = deferred<void>();
+  startedExtractions = 0;
   override async extractBrief(bytes: Uint8Array): Promise<BriefProviderResult> {
+    this.startedExtractions += 1;
     await this.release.promise;
     return super.extractBrief(bytes);
   }
@@ -363,6 +367,30 @@ test("real PDF validation accepts compressed one/twenty-page files and rejects s
   await assert.rejects(() => validatePdfUpload({ fileName: "brief.pdf", mimeType: "application/pdf", bytes: pdfFixture(1, { truncated: true }) }));
   await assert.rejects(() => validatePdfUpload({ fileName: "brief.pdf", mimeType: "application/pdf", bytes: pdfFixture(1, { encrypted: true }) }));
   await assert.rejects(() => validatePdfUpload({ fileName: "brief.pdf", mimeType: "application/pdf", bytes: Buffer.alloc(MAX_BRIEF_BYTES + 1, 0x20) }));
+});
+
+test("PDF page-limit rejection happens before any getPage traversal", async () => {
+  let getPageCalls = 0;
+  let destroyed = false;
+  const fakeTask = {
+    onPassword: undefined,
+    promise: Promise.resolve({
+      numPages: 1_000_000,
+      getPage: async () => {
+        getPageCalls += 1;
+        return {};
+      },
+    }),
+    destroy: async () => {
+      destroyed = true;
+    },
+  } as any;
+  await assert.rejects(
+    () => parsePdf(Buffer.from("not parsed by the opener"), { openDocument: () => fakeTask }),
+    (error: unknown) => error instanceof PdfPageLimitError,
+  );
+  assert.equal(getPageCalls, 0);
+  assert.equal(destroyed, true);
 });
 
 test("brief-v1 is strict and provider authority is normalized at the server boundary", () => {
@@ -477,14 +505,17 @@ test("draft revisioning and confirmation gates are enforced", async () => {
   } finally { cleanup(root); }
 });
 
-test("duplicate generation submit is idempotent and does not call the provider again", async () => {
+test("duplicate generation submit reuses the client key and does not call the provider again", async () => {
   const provider = new MockOpenAIProvider({ briefData: completeBrief() });
   const { service, root } = newService(provider);
   try {
     const seeded = await seedConfirmed(service);
-    const key = uuid();
+    const operationKeys = createIdempotencyKeyRetainer(() => uuid());
+    const key = operationKeys.keyFor("generation_create", seeded.project.projectId);
     const first = service.createGeneration(seeded.project.projectId, key, uuid());
-    const duplicate = service.createGeneration(seeded.project.projectId, key, uuid());
+    const uncertainResponseRetryKey = operationKeys.keyFor("generation_create", seeded.project.projectId);
+    assert.equal(uncertainResponseRetryKey, key);
+    const duplicate = service.createGeneration(seeded.project.projectId, uncertainResponseRetryKey, uuid());
     assert.equal(duplicate.generationSet.generationSetId, first.generationSet.generationSetId);
     await service.waitForGeneration(seeded.project.projectId, first.generationSet.generationSetId);
     assert.equal(provider.imageCalls, 4);
@@ -533,6 +564,78 @@ test("extraction failure keeps the persisted asset for one refresh-safe retry", 
   } finally { cleanup(root); }
 });
 
+test("terminal extraction failure removes retry action and survives refresh", async () => {
+  const provider = new MockOpenAIProvider({ briefData: completeBrief(), extractionFailure: "EXTRACTION_REFUSED" });
+  const { service, root } = newService(provider);
+  try {
+    const project = service.createProject("Terminal extraction");
+    service.saveGeometry(project.projectId, { widthMm: 5000, depthMm: 5000, openSides: ["north"], maxHeightMm: null });
+    const upload = await service.uploadBrief(project.projectId, uuid(), { fileName: "brief.pdf", mimeType: "application/pdf", bytes: pdfFixture() }, uuid());
+    await assert.rejects(service.waitForDraft(project.projectId));
+    assert.equal(service.getBriefState(project.projectId).extractionRetryEligible, true);
+    const retry = service.retryExtraction(project.projectId, upload.asset.assetId, uuid(), uuid());
+    assert.equal(retry.asset.assetId, upload.asset.assetId);
+    await assert.rejects(service.waitForDraft(project.projectId));
+    assert.equal(service.getBriefState(project.projectId).extractionRetryEligible, false);
+    const reloaded = createWorkflowService({
+      dataRoot: root,
+      provider: new MockOpenAIProvider({ briefData: completeBrief(), extractionFailure: "EXTRACTION_REFUSED" }),
+      workerId: "terminal-refresh-worker",
+    });
+    assert.equal(reloaded.getBriefState(project.projectId).extractionRetryEligible, false);
+    const response = await handleApiRequest(new Request("http://localhost", {
+      method: "POST",
+      body: JSON.stringify({ assetId: upload.asset.assetId, idempotencyKey: uuid() }),
+      headers: { "content-type": "application/json" },
+    }), ["projects", project.projectId, "brief", "extraction-retry"], reloaded);
+    assert.equal(response.status, 409);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("terminal generation failure removes retry action and survives refresh", async () => {
+  const failures = new Map(Array.from({ length: 8 }, (_, index) => [index, "PROVIDER_TIMEOUT" as const]));
+  const provider = new MockOpenAIProvider({ briefData: completeBrief(), imageFailures: failures });
+  const { service, root } = newService(provider);
+  try {
+    const seeded = await seedConfirmed(service);
+    const first = service.createGeneration(seeded.project.projectId, uuid(), uuid());
+    await assert.rejects(service.waitForGeneration(seeded.project.projectId, first.generationSet.generationSetId));
+    assert.equal(service.getGeneration(seeded.project.projectId, first.generationSet.generationSetId).retryEligible, true);
+    const retry = service.retryGeneration(seeded.project.projectId, first.generationSet.generationSetId, uuid(), uuid());
+    await assert.rejects(service.waitForGeneration(seeded.project.projectId, retry.generationSet.generationSetId));
+    assert.equal(service.getGeneration(seeded.project.projectId, retry.generationSet.generationSetId).retryEligible, false);
+    const reloaded = createWorkflowService({
+      dataRoot: root,
+      provider: new MockOpenAIProvider({ briefData: completeBrief(), imageFailures: failures }),
+      workerId: "generation-terminal-refresh-worker",
+    });
+    assert.equal(reloaded.getGeneration(seeded.project.projectId, retry.generationSet.generationSetId).retryEligible, false);
+    const response = await handleApiRequest(new Request("http://localhost", {
+      method: "POST",
+      body: JSON.stringify({ idempotencyKey: uuid() }),
+      headers: { "content-type": "application/json" },
+    }), ["projects", seeded.project.projectId, "generation-sets", retry.generationSet.generationSetId, "retry"], reloaded);
+    assert.equal(response.status, 409);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("client idempotency keys persist through uncertain retries and separate new operations", () => {
+  let sequence = 0;
+  const operationKeys = createIdempotencyKeyRetainer(() => `key-${++sequence}`);
+  const uploadKey = operationKeys.keyFor("brief_upload", "file-a");
+  assert.equal(operationKeys.keyFor("brief_upload", "file-a"), uploadKey);
+  const changedInputKey = operationKeys.keyFor("brief_upload", "file-b");
+  assert.notEqual(changedInputKey, uploadKey);
+  const generationKey = operationKeys.keyFor("generation_create", "project-a");
+  assert.notEqual(generationKey, changedInputKey);
+  assert.equal(operationKeys.keyFor("generation_create", "project-a"), generationKey);
+  operationKeys.clear();
+  assert.notEqual(operationKeys.keyFor("generation_create", "project-a"), generationKey);
+});
 test("provider-origin authority and PDF prompt-injection text cannot satisfy confirmation", async () => {
   const provider = new MockOpenAIProvider({
     briefData: completeBrief({
@@ -594,6 +697,72 @@ test("independent repository instances preserve concurrent projects and idempote
   } finally { cleanup(root); }
 });
 
+test("repository locks use owner identity, do not steal live owners, and reclaim dead owners", () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-liveness-"));
+  const lockPath = join(root, "state.json.lock");
+  try {
+    writeFileSync(lockPath, JSON.stringify({ ownerToken: "live-owner", processId: 101, acquiredAt: 0 }));
+    utimesSync(lockPath, new Date(0), new Date(0));
+    const liveContender = new JsonRepository(root, {
+      lockWaitMs: 25,
+      processId: 202,
+      isProcessAlive: (processId) => processId === 101,
+    });
+    assert.throws(
+      () => liveContender.transact(() => "not committed"),
+      (error: any) => error?.code === "PERSISTENCE_BUSY",
+    );
+
+    writeFileSync(lockPath, JSON.stringify({ ownerToken: "dead-owner", processId: 303, acquiredAt: 0 }));
+    const deadContender = new JsonRepository(root, {
+      lockWaitMs: 100,
+      processId: 404,
+      isProcessAlive: () => false,
+    });
+    assert.equal(deadContender.transact((state) => {
+      state.projects.push({
+        projectId: uuid(),
+        name: "reclaimed",
+        status: "draft",
+        boothGeometry: null,
+        briefAssetId: null,
+        briefDraftId: null,
+        confirmedBriefVersionId: null,
+        activeGenerationSetId: null,
+        createdAt: "2026-08-25T00:00:00.000Z",
+        updatedAt: "2026-08-25T00:00:00.000Z",
+      });
+      return state.projects.length;
+    }), 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("a stale owner cannot release a replacement lock", () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-owner-"));
+  const lockPath = join(root, "state.json.lock");
+  let replaced = false;
+  const repository = new JsonRepository(root, {
+    processId: 505,
+    beforeCommit: () => {
+      const owner = JSON.parse(readFileSync(lockPath, "utf8"));
+      assert.equal(owner.processId, 505);
+      assert.equal(typeof owner.ownerToken, "string");
+      rmSync(lockPath);
+      writeFileSync(lockPath, JSON.stringify({ ownerToken: "successor-owner", processId: 606, acquiredAt: Date.now() }));
+      replaced = true;
+    },
+  });
+  try {
+    repository.transact((state) => state.projects.length);
+    assert.equal(replaced, true);
+    assert.equal(JSON.parse(readFileSync(lockPath, "utf8")).ownerToken, "successor-owner");
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("persistence failure after four provider outputs rolls back candidate assets and publishes truthful failure", async () => {
   let failNextCommit = false;
   const root = mkdtempSync(join(tmpdir(), "swooshz-design-persistence-failure-"));
@@ -626,43 +795,143 @@ test("persistence failure after four provider outputs rolls back candidate asset
   }
 });
 
-test("restart during extraction reclaims the persisted operation without a duplicate draft", async () => {
-  const root = mkdtempSync(join(tmpdir(), "swooshz-design-extraction-restart-"));
+test("temporarily delayed live extraction owner is not stolen and calls the provider once", async () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-extraction-live-owner-"));
   const blocked = new ExtractionGateProvider({ briefData: completeBrief() });
-  const serviceA = createWorkflowService({ dataRoot: root, provider: blocked, workerId: "worker-a" });
+  const serviceA = createWorkflowService({
+    dataRoot: root,
+    provider: blocked,
+    workerId: "worker-a",
+    processId: 7101,
+    isProcessAlive: (processId) => processId === 7101 || processId === 7102,
+  });
   try {
-    const project = serviceA.createProject("Extraction restart");
+    const project = serviceA.createProject("Extraction live owner");
     serviceA.saveGeometry(project.projectId, { widthMm: 6000, depthMm: 3000, openSides: ["north"], maxHeightMm: null });
     await serviceA.uploadBrief(project.projectId, uuid(), { fileName: "brief.pdf", mimeType: "application/pdf", bytes: pdfFixture() }, uuid());
-    await waitUntil(() => serviceA.repository.state().extractionOperations.some((operation) => operation.status === "running"));
-    const serviceB = createWorkflowService({ dataRoot: root, provider: new MockOpenAIProvider({ briefData: completeBrief() }), workerId: "worker-b" });
+    await waitUntil(() => serviceA.repository.state().extractionOperations.some((operation) => operation.status === "running") && blocked.startedExtractions === 1);
+    const serviceB = createWorkflowService({
+      dataRoot: root,
+      provider: new MockOpenAIProvider({ briefData: completeBrief() }),
+      workerId: "worker-b",
+      processId: 7102,
+      isProcessAlive: (processId) => processId === 7101 || processId === 7102,
+    });
+    assert.equal(blocked.startedExtractions, 1);
+    assert.equal(serviceB.repository.state().extractionOperations[0].status, "running");
+    blocked.release.resolve(undefined);
     const draft = await serviceB.waitForDraft(project.projectId);
     assert.equal(draft.revision, 1);
-    blocked.release.resolve(undefined);
-    await waitUntil(() => serviceB.repository.state().extractionOperations.filter((operation) => operation.status === "succeeded").length === 1);
-    const state = serviceB.repository.state();
-    assert.equal(state.drafts.length, 1);
-    assert.equal(state.extractionOperations.length, 1);
-    assert.equal(state.projects[0].status, "brief_review");
+    assert.equal(blocked.extractionCalls, 1);
+    assert.equal(serviceB.repository.state().drafts.length, 1);
   } finally {
     blocked.release.resolve(undefined);
     cleanup(root);
   }
 });
 
-test("restart during generation reclaims the persisted operation and publishes one immutable set", async () => {
-  const root = mkdtempSync(join(tmpdir(), "swooshz-design-generation-restart-"));
+test("temporarily delayed live generation owner is not stolen and runs one four-image batch", async () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-generation-live-owner-"));
   const blocked = new ImageGateProvider({ briefData: completeBrief() });
-  const serviceA = createWorkflowService({ dataRoot: root, provider: blocked, workerId: "worker-a" });
+  const serviceA = createWorkflowService({
+    dataRoot: root,
+    provider: blocked,
+    workerId: "worker-a",
+    processId: 7201,
+    isProcessAlive: (processId) => processId === 7201 || processId === 7202,
+  });
   try {
     const seeded = await seedConfirmed(serviceA);
     const generation = serviceA.createGeneration(seeded.project.projectId, uuid(), uuid());
     await waitUntil(() => serviceA.repository.state().generationOperations.some((operation) => operation.generationSetId === generation.generationSet.generationSetId && operation.status === "running") && blocked.startedImages === 4);
-    const serviceB = createWorkflowService({ dataRoot: root, provider: new MockOpenAIProvider({ briefData: completeBrief() }), workerId: "worker-b" });
+    const serviceB = createWorkflowService({
+      dataRoot: root,
+      provider: new MockOpenAIProvider({ briefData: completeBrief() }),
+      workerId: "worker-b",
+      processId: 7202,
+      isProcessAlive: (processId) => processId === 7201 || processId === 7202,
+    });
+    assert.equal(blocked.startedImages, 4);
+    assert.equal(serviceB.repository.state().generationOperations[0].status, "running");
+    blocked.release.resolve(undefined);
     const ready = await serviceB.waitForGeneration(seeded.project.projectId, generation.generationSet.generationSetId);
     assert.equal(ready.candidates.length, 4);
+    assert.equal(blocked.imageCalls, 4);
+    assert.equal(serviceB.repository.state().candidates.filter((candidate) => candidate.generationSetId === generation.generationSet.generationSetId).length, 4);
+  } finally {
     blocked.release.resolve(undefined);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    cleanup(root);
+  }
+});
+
+test("dead extraction owner is reclaimed and its late completion cannot create a duplicate draft", async () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-extraction-dead-owner-"));
+  const blocked = new ExtractionGateProvider({ briefData: completeBrief() });
+  let ownerAlive = true;
+  const serviceA = createWorkflowService({
+    dataRoot: root,
+    provider: blocked,
+    workerId: "worker-a",
+    processId: 7301,
+    isProcessAlive: (processId) => processId === 7301 && ownerAlive,
+  });
+  try {
+    const project = serviceA.createProject("Extraction dead owner");
+    serviceA.saveGeometry(project.projectId, { widthMm: 6000, depthMm: 3000, openSides: ["north"], maxHeightMm: null });
+    await serviceA.uploadBrief(project.projectId, uuid(), { fileName: "brief.pdf", mimeType: "application/pdf", bytes: pdfFixture() }, uuid());
+    await waitUntil(() => serviceA.repository.state().extractionOperations.some((operation) => operation.status === "running") && blocked.startedExtractions === 1);
+    ownerAlive = false;
+    const recovered = new MockOpenAIProvider({ briefData: completeBrief() });
+    const serviceB = createWorkflowService({
+      dataRoot: root,
+      provider: recovered,
+      workerId: "worker-b",
+      processId: 7302,
+      isProcessAlive: (processId) => processId === 7302,
+    });
+    const draft = await serviceB.waitForDraft(project.projectId);
+    assert.equal(draft.revision, 1);
+    assert.equal(recovered.extractionCalls, 1);
+    assert.equal(serviceB.repository.state().drafts.length, 1);
+    assert.equal(serviceB.repository.state().extractionOperations.filter((operation) => operation.status === "succeeded").length, 1);
+    blocked.release.resolve(undefined);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(serviceB.repository.state().drafts.length, 1);
+  } finally {
+    blocked.release.resolve(undefined);
+    cleanup(root);
+  }
+});
+
+test("dead generation owner is reclaimed and its late completion cannot duplicate candidates", async () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-generation-dead-owner-"));
+  const blocked = new ImageGateProvider({ briefData: completeBrief() });
+  let ownerAlive = true;
+  const serviceA = createWorkflowService({
+    dataRoot: root,
+    provider: blocked,
+    workerId: "worker-a",
+    processId: 7401,
+    isProcessAlive: (processId) => processId === 7401 && ownerAlive,
+  });
+  try {
+    const seeded = await seedConfirmed(serviceA);
+    const generation = serviceA.createGeneration(seeded.project.projectId, uuid(), uuid());
+    await waitUntil(() => serviceA.repository.state().generationOperations.some((operation) => operation.generationSetId === generation.generationSet.generationSetId && operation.status === "running") && blocked.startedImages === 4);
+    ownerAlive = false;
+    const recovered = new MockOpenAIProvider({ briefData: completeBrief() });
+    const serviceB = createWorkflowService({
+      dataRoot: root,
+      provider: recovered,
+      workerId: "worker-b",
+      processId: 7402,
+      isProcessAlive: (processId) => processId === 7402,
+    });
+    const ready = await serviceB.waitForGeneration(seeded.project.projectId, generation.generationSet.generationSetId);
+    assert.equal(ready.candidates.length, 4);
+    assert.equal(recovered.imageCalls, 4);
+    blocked.release.resolve(undefined);
+    await new Promise((resolve) => setTimeout(resolve, 25));
     const state = serviceB.repository.state();
     assert.equal(state.candidates.filter((candidate) => candidate.generationSetId === generation.generationSet.generationSetId).length, 4);
     assert.equal(state.conceptAssets.filter((asset) => asset.generationSetId === generation.generationSet.generationSetId).length, 4);
@@ -771,6 +1040,8 @@ test("client bundle contains no provider credential or server authorization mate
   assert.equal(client.includes("OPENAI_API_KEY"), false);
   assert.equal(client.includes("api.openai.com"), false);
   assert.equal(client.includes("authorization"), false);
+  assert.equal(client.includes("crypto.randomUUID()"), false);
+  assert.match(client, /keyFor\("brief_upload"/);
 });
 
 test("the live adapter refuses an unconfigured environment without a fake fallback", async () => {

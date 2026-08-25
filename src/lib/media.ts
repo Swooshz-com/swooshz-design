@@ -1,6 +1,6 @@
 import { AppError } from "./types";
 import { sanitizeFileName, sha256 } from "./utils";
-import { parsePdf } from "./pdf-parser";
+import { parsePdf, PdfPageLimitError } from "./pdf-parser";
 
 export const MAX_BRIEF_BYTES = 20 * 1024 * 1024;
 export const MAX_BRIEF_PAGES = 20;
@@ -53,6 +53,7 @@ export async function validatePdfUpload(input: PdfUpload): Promise<{
     };
   } catch (error) {
     if (error instanceof AppError) throw error;
+    if (error instanceof PdfPageLimitError) throw pdfError("file", "PDF_PAGE_LIMIT");
     if (error instanceof Error && error.message === "PDF password required") {
       throw pdfError("file", "PDF_ENCRYPTED");
     }

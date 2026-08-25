@@ -37,7 +37,6 @@ import {
 import { JsonRepository, PrivateObjectStore, defaultDataRoot } from "./store";
 import { assertUuid, cloneJson, jcs, newUuid, nowUtc, privateStorageKey, sha256 } from "./utils";
 
-const DEFAULT_WORKER_ID = "process-" + process.pid + "-" + newUuid();
 
 export type WorkflowServiceOptions = {
   repository?: JsonRepository;
@@ -47,11 +46,14 @@ export type WorkflowServiceOptions = {
   clock?: () => string;
   uuid?: () => UUID;
   workerId?: string;
+  processId?: number;
+  isProcessAlive?: (processId: number) => boolean;
 };
 
 export type PublicGeneration = {
   generationSet: GenerationSet;
   candidates: ConceptCandidate[];
+  retryEligible: boolean;
 };
 
 export type UploadResult = {
@@ -69,6 +71,7 @@ export type PublicBriefState = {
     status: "stored";
   } | null;
   extractionStatus: ExtractionOperation["status"] | null;
+  extractionRetryEligible: boolean;
 };
 
 export type S1Route = "geometry" | "brief" | "review" | "generate" | "generation";
@@ -83,6 +86,17 @@ function safeResult(value: Record<string, unknown>): Record<string, unknown> {
 
 function pendingOperation(status: string): boolean {
   return status === "queued" || status === "running";
+}
+
+function processIsAlive(processId: number): boolean {
+  if (!Number.isInteger(processId) || processId <= 0) return false;
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "EPERM" || code === "EACCES";
+  }
 }
 
 export function projectContinuationPath(
@@ -139,16 +153,23 @@ export class WorkflowService {
   private readonly clock: () => string;
   private readonly uuid: () => UUID;
   private readonly workerId: string;
+  private readonly processId: number;
+  private readonly isProcessAlive: (processId: number) => boolean;
   private readonly inFlight = new Set<string>();
 
   constructor(options: WorkflowServiceOptions = {}) {
     const root = options.dataRoot ?? defaultDataRoot();
-    this.repository = options.repository ?? new JsonRepository(root);
+    this.repository = options.repository ?? new JsonRepository(root, {
+      processId: options.processId,
+      isProcessAlive: options.isProcessAlive,
+    });
     this.objects = options.objects ?? new PrivateObjectStore(root + "/objects");
     this.provider = options.provider ?? new OpenAIProvider();
     this.clock = options.clock ?? nowUtc;
     this.uuid = options.uuid ?? newUuid;
-    this.workerId = options.workerId ?? DEFAULT_WORKER_ID;
+    this.processId = options.processId ?? process.pid;
+    this.isProcessAlive = options.isProcessAlive ?? processIsAlive;
+    this.workerId = options.workerId ?? `process-${this.processId}-${newUuid()}`;
     this.recoverPendingOperations();
   }
 
@@ -184,6 +205,48 @@ export class WorkflowService {
     const generationSet = state.generationSets.find((item) => item.generationSetId === generationSetId);
     if (!generationSet) throw new AppError(404, "GENERATION_SET_NOT_FOUND");
     return generationSet;
+  }
+
+  private claimIsLive(operation: {
+    status: string;
+    claimedProcessId: number | null;
+  }): boolean {
+    if (operation.status !== "running") return false;
+    // An incomplete legacy claim cannot prove that its owner is dead. Hold it
+    // until an operator or a migration supplies a verifiable process identity.
+    if (operation.claimedProcessId === null) return true;
+    try {
+      return this.isProcessAlive(operation.claimedProcessId);
+    } catch {
+      return true;
+    }
+  }
+
+  private clearClaim(operation: {
+    claimedBy: string | null;
+    claimedProcessId: number | null;
+    claimToken: UUID | null;
+    claimedAt: string | null;
+  }): void {
+    operation.claimedBy = null;
+    operation.claimedProcessId = null;
+    operation.claimToken = null;
+    operation.claimedAt = null;
+  }
+
+  private claimMatches(
+    operation: {
+      status: string;
+      claimedBy: string | null;
+      claimedProcessId: number | null;
+      claimToken: UUID | null;
+    },
+    claimToken: UUID,
+  ): boolean {
+    return operation.status === "running" &&
+      operation.claimedBy === this.workerId &&
+      operation.claimedProcessId === this.processId &&
+      operation.claimToken === claimToken;
   }
 
   private idempotencyIn(
@@ -226,9 +289,9 @@ export class WorkflowService {
 
       for (const operation of state.extractionOperations) {
         if (!pendingOperation(operation.status)) continue;
-        if (operation.status === "running" && operation.claimedBy === this.workerId) continue;
+        if (operation.status === "running" && this.claimIsLive(operation)) continue;
         operation.status = "queued";
-        operation.claimedBy = null;
+        this.clearClaim(operation);
         operation.startedAt = null;
         extractionRequestIds.push(operation.extractionRequestId);
       }
@@ -255,6 +318,9 @@ export class WorkflowService {
           referenceId: this.uuid(),
           status: "queued",
           claimedBy: null,
+          claimedProcessId: null,
+          claimToken: null,
+          claimedAt: null,
           createdAt: this.clock(),
           startedAt: null,
           completedAt: null,
@@ -266,9 +332,9 @@ export class WorkflowService {
 
       for (const operation of state.generationOperations) {
         if (!pendingOperation(operation.status)) continue;
-        if (operation.status === "running" && operation.claimedBy === this.workerId) continue;
+        if (operation.status === "running" && this.claimIsLive(operation)) continue;
         operation.status = "queued";
-        operation.claimedBy = null;
+        this.clearClaim(operation);
         operation.startedAt = null;
         generationSetIds.push(operation.generationSetId);
       }
@@ -285,6 +351,9 @@ export class WorkflowService {
           attempt: generationSet.attempt,
           status: "queued",
           claimedBy: null,
+          claimedProcessId: null,
+          claimToken: null,
+          claimedAt: null,
           createdAt: generationSet.createdAt,
           startedAt: null,
           completedAt: null,
@@ -318,6 +387,7 @@ export class WorkflowService {
         .filter((item) => item.assetId === asset.assetId)
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0]
       : undefined;
+    const extractionAttempts = asset ? state.extractionAttempts[asset.assetId] ?? 0 : 0;
     return {
       project: cloneJson(project),
       asset: asset
@@ -330,6 +400,7 @@ export class WorkflowService {
         }
         : null,
       extractionStatus: operation?.status ?? null,
+      extractionRetryEligible: project.status === "brief_extraction_failed" && extractionAttempts < 2,
     };
   }
 
@@ -433,6 +504,9 @@ export class WorkflowService {
           referenceId,
           status: "queued",
           claimedBy: null,
+          claimedProcessId: null,
+          claimToken: null,
+          claimedAt: null,
           createdAt: this.clock(),
           startedAt: null,
           completedAt: null,
@@ -472,7 +546,11 @@ export class WorkflowService {
     this.inFlight.add(operationKey);
     void this.runExtraction(extractionRequestId)
       .catch((error) => {
-        this.failExtraction(extractionRequestId, providerErrorToCode(error));
+        console.error(JSON.stringify({
+          operation: "brief_extraction",
+          extractionRequestId,
+          code: providerErrorToCode(error),
+        }));
       })
       .finally(() => {
         this.inFlight.delete(operationKey);
@@ -485,12 +563,17 @@ export class WorkflowService {
         (item) => item.extractionRequestId === extractionRequestId,
       );
       if (!operation || operation.status !== "queued") return null;
+      const claimToken = this.uuid();
       operation.status = "running";
       operation.claimedBy = this.workerId;
+      operation.claimedProcessId = this.processId;
+      operation.claimToken = claimToken;
+      operation.claimedAt = this.clock();
       operation.startedAt = this.clock();
       return {
         projectId: operation.projectId,
         assetId: operation.assetId,
+        claimToken,
       };
     });
     if (!claim) return;
@@ -504,11 +587,12 @@ export class WorkflowService {
         const operation = state.extractionOperations.find(
           (item) => item.extractionRequestId === extractionRequestId,
         );
-        if (!operation || operation.status !== "running" || operation.claimedBy !== this.workerId) return;
+        if (!operation || !this.claimMatches(operation, claim.claimToken)) return;
         const project = this.projectIn(state, claim.projectId);
         if (project.briefDraftId) {
           operation.status = "succeeded";
           operation.completedAt = this.clock();
+          this.clearClaim(operation);
           return;
         }
         const timestamp = this.clock();
@@ -532,22 +616,24 @@ export class WorkflowService {
         operation.status = "succeeded";
         operation.completedAt = timestamp;
         operation.failureCode = null;
+        this.clearClaim(operation);
       });
     } catch (error) {
-      this.failExtraction(extractionRequestId, providerErrorToCode(error));
+      this.failExtraction(extractionRequestId, providerErrorToCode(error), claim.claimToken);
     }
   }
 
-  private failExtraction(extractionRequestId: UUID, failureCode: string): void {
+  private failExtraction(extractionRequestId: UUID, failureCode: string, claimToken: UUID): void {
     try {
       const committed = this.repository.transact((state) => {
         const operation = state.extractionOperations.find(
           (item) => item.extractionRequestId === extractionRequestId,
         );
-        if (!operation || operation.status !== "running" || operation.claimedBy !== this.workerId) return false;
+        if (!operation || !this.claimMatches(operation, claimToken)) return false;
         operation.status = "failed";
         operation.failureCode = failureCode;
         operation.completedAt = this.clock();
+        this.clearClaim(operation);
         const project = this.projectIn(state, operation.projectId);
         if (!project.briefDraftId && project.briefAssetId === operation.assetId) {
           project.status = "brief_extraction_failed";
@@ -603,6 +689,9 @@ export class WorkflowService {
         referenceId,
         status: "queued",
         claimedBy: null,
+        claimedProcessId: null,
+        claimToken: null,
+        claimedAt: null,
         createdAt: this.clock(),
         startedAt: null,
         completedAt: null,
@@ -807,6 +896,9 @@ export class WorkflowService {
       attempt,
       status: "queued",
       claimedBy: null,
+      claimedProcessId: null,
+      claimToken: null,
+      claimedAt: null,
       createdAt: compiledAt,
       startedAt: null,
       completedAt: null,
@@ -881,7 +973,11 @@ export class WorkflowService {
     this.inFlight.add(operationKey);
     void this.runGeneration(generationSetId)
       .catch((error) => {
-        this.failGeneration(generationSetId, providerErrorToCode(error));
+        console.error(JSON.stringify({
+          operation: "concept_generation",
+          generationSetId,
+          code: providerErrorToCode(error),
+        }));
       })
       .finally(() => {
         this.inFlight.delete(operationKey);
@@ -895,12 +991,16 @@ export class WorkflowService {
       const set = this.generationSetIn(state, generationSetId);
       const request = state.generationRequests.find((item) => item.generationRequestId === set.generationRequestId);
       if (!request) throw new AppError(500, "PERSISTENCE_FAILED");
+      const claimToken = this.uuid();
       operation.status = "running";
       operation.claimedBy = this.workerId;
+      operation.claimedProcessId = this.processId;
+      operation.claimToken = claimToken;
+      operation.claimedAt = this.clock();
       operation.startedAt = this.clock();
       set.status = "running";
       request.status = "running";
-      return { projectId: set.projectId, requestReferenceId: request.requestReferenceId };
+      return { projectId: set.projectId, requestReferenceId: request.requestReferenceId, claimToken };
     });
     if (!claim) return;
 
@@ -948,7 +1048,7 @@ export class WorkflowService {
 
     if (results.length !== 4 || staged.length !== 4 || failureCode) {
       for (const item of staged) this.objects.remove(item.stagingKey);
-      this.failGeneration(generationSetId, failureCode ?? "IMAGE_GENERATION_FAILED");
+      this.failGeneration(generationSetId, failureCode ?? "IMAGE_GENERATION_FAILED", claim.claimToken);
       return;
     }
 
@@ -989,7 +1089,7 @@ export class WorkflowService {
 
       const committed = this.repository.transact((current) => {
         const operation = current.generationOperations.find((item) => item.generationSetId === generationSetId);
-        if (!operation || operation.status !== "running" || operation.claimedBy !== this.workerId) return false;
+        if (!operation || !this.claimMatches(operation, claim.claimToken)) return false;
         if (current.candidates.some((item) => item.generationSetId === generationSetId)) {
           throw new AppError(500, "PERSISTENCE_FAILED");
         }
@@ -1008,6 +1108,7 @@ export class WorkflowService {
         operation.status = "succeeded";
         operation.completedAt = completedAt;
         operation.failureCode = null;
+        this.clearClaim(operation);
         const project = this.projectIn(current, currentSet.projectId);
         project.status = "concepts_ready";
         project.activeGenerationSetId = generationSetId;
@@ -1021,15 +1122,15 @@ export class WorkflowService {
     } catch (error) {
       for (const item of promoted) this.objects.remove(item);
       for (const item of staged) this.objects.remove(item.stagingKey);
-      this.failGeneration(generationSetId, providerErrorToCode(error));
+      this.failGeneration(generationSetId, providerErrorToCode(error), claim.claimToken);
     }
   }
 
-  private failGeneration(generationSetId: UUID, failureCode: string): void {
+  private failGeneration(generationSetId: UUID, failureCode: string, claimToken: UUID): void {
     try {
       this.repository.transact((state) => {
         const operation = state.generationOperations.find((item) => item.generationSetId === generationSetId);
-        if (!operation || operation.status !== "running" || operation.claimedBy !== this.workerId) return;
+        if (!operation || !this.claimMatches(operation, claimToken)) return;
         const set = this.generationSetIn(state, generationSetId);
         const request = state.generationRequests.find((item) => item.generationRequestId === set.generationRequestId);
         if (!request) throw new AppError(500, "PERSISTENCE_FAILED");
@@ -1043,6 +1144,7 @@ export class WorkflowService {
         operation.status = "failed";
         operation.failureCode = failureCode;
         operation.completedAt = completedAt;
+        this.clearClaim(operation);
         const project = this.projectIn(state, set.projectId);
         project.status = "generation_failed";
         project.activeGenerationSetId = set.generationSetId;
@@ -1125,7 +1227,10 @@ export class WorkflowService {
     if (set.status === "succeeded" && candidates.length !== set.expectedCandidateCount) {
       throw new AppError(500, "PERSISTENCE_FAILED");
     }
-    return { generationSet: cloneJson(set), candidates };
+    const retryEligible = set.status === "failed" &&
+      set.attempt === 1 &&
+      !state.generationSets.some((item) => item.retryOfGenerationSetId === generationSetId);
+    return { generationSet: cloneJson(set), candidates, retryEligible };
   }
 
   async waitForDraft(projectId: UUID, timeoutMs = 3_000): Promise<StructuredBriefDraft> {
