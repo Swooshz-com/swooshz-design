@@ -580,7 +580,9 @@ prevents brief upload, and makes confirm/generation return `409`
 `GEOMETRY_REQUIRED` or `GEOMETRY_INVALID`. The extractor cannot
 repair, replace, or override it. A geometry edit is allowed only before
 brief confirmation. After confirmation, the snapshot is frozen; a material
-geometry change requires a new project in G2.
+geometry change is not available after confirmation in G2. A future material
+geometry change MUST create a new immutable brief version and MUST NOT mutate
+this version.
 
 ## 6. Upload contract
 
@@ -741,8 +743,9 @@ The server creates exactly one confirmed version for the current draft.
 Confirmation is allowed only once in G2. A confirmed version cannot be
 edited or deleted. A material change after confirmation, including any
 geometry, functional, mandatory, prohibited, brand, budget, unknown
-resolution, or assumption change, requires a new project; G2 has no
-reopen or in-place revision behavior.
+resolution, or assumption change, MUST create a new immutable brief version;
+G2 exposes no post-confirmation edit route and has no in-place revision
+behavior.
 
 Generation is allowed only when `Project.confirmedBriefVersionId` points
 to a confirmed version and that version's geometry snapshot passes server
