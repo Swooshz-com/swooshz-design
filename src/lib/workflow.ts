@@ -1,0 +1,643 @@
+import { AppError, type BriefAsset, type ConceptAsset, type ConceptCandidate, type GenerationRequest, type GenerationSet, type IdempotencyRecord, type Project, type Sha256, type StoreState, type StructuredBriefData, type StructuredBriefDraft, type StructuredBriefVersion, type UserConfirmedBrief, type UUID } from "./types";
+import { assertBriefData } from "./schema";
+import { geometryIsValid, validateGeometry } from "./geometry";
+import { validatePdfUpload, validatePng, type PdfUpload } from "./media";
+import { COMPILER_VERSION, DIRECTIONS, IMAGE_MODEL_SNAPSHOT, compilePrompt, compilerInputHash, promptManifestHash } from "./compiler";
+import { OpenAIProvider, type ImageProviderResult, type OpenAIProviderContract, providerErrorToCode } from "./openai";
+import { JsonRepository, PrivateObjectStore, defaultDataRoot } from "./store";
+import { assertUuid, cloneJson, jcs, newUuid, nowUtc, privateStorageKey, sha256 } from "./utils";
+
+export type WorkflowServiceOptions = {
+  repository?: JsonRepository;
+  objects?: PrivateObjectStore;
+  dataRoot?: string;
+  provider?: OpenAIProviderContract;
+  clock?: () => string;
+  uuid?: () => UUID;
+};
+
+export type PublicGeneration = {
+  generationSet: GenerationSet;
+  candidates: ConceptCandidate[];
+};
+
+export type UploadResult = {
+  asset: BriefAsset;
+  project: Project;
+};
+
+function operationInputHash(operation: string, projectId: UUID, input: unknown): Sha256 {
+  return sha256(jcs({ operation, projectId, input }));
+}
+
+function safeResult(value: Record<string, unknown>): Record<string, unknown> {
+  return cloneJson(value);
+}
+
+
+export class WorkflowService {
+  readonly repository: JsonRepository;
+  readonly objects: PrivateObjectStore;
+  readonly provider: OpenAIProviderContract;
+  private readonly clock: () => string;
+  private readonly uuid: () => UUID;
+
+  constructor(options: WorkflowServiceOptions = {}) {
+    const root = options.dataRoot ?? defaultDataRoot();
+    this.repository = options.repository ?? new JsonRepository(root);
+    this.objects = options.objects ?? new PrivateObjectStore(`${root}/objects`);
+    this.provider = options.provider ?? new OpenAIProvider();
+    this.clock = options.clock ?? nowUtc;
+    this.uuid = options.uuid ?? newUuid;
+  }
+
+  private state(): StoreState {
+    return this.repository.state();
+  }
+
+  private save(): void {
+    this.repository.save();
+  }
+
+  private project(projectId: UUID): Project {
+    const project = this.state().projects.find((item) => item.projectId === projectId);
+    if (!project) throw new AppError(404, "PROJECT_NOT_FOUND");
+    return project;
+  }
+
+  private asset(assetId: UUID): BriefAsset {
+    const asset = this.state().briefAssets.find((item) => item.assetId === assetId);
+    if (!asset) throw new AppError(404, "ASSET_NOT_FOUND");
+    return asset;
+  }
+
+  private draft(draftId: UUID): StructuredBriefDraft {
+    const draft = this.state().drafts.find((item) => item.briefDraftId === draftId);
+    if (!draft) throw new AppError(404, "BRIEF_DRAFT_NOT_FOUND");
+    return draft;
+  }
+
+  private version(versionId: UUID): StructuredBriefVersion {
+    const version = this.state().briefVersions.find((item) => item.briefVersionId === versionId);
+    if (!version) throw new AppError(404, "BRIEF_VERSION_NOT_FOUND");
+    return version;
+  }
+
+  private generationSet(generationSetId: UUID): GenerationSet {
+    const set = this.state().generationSets.find((item) => item.generationSetId === generationSetId);
+    if (!set) throw new AppError(404, "GENERATION_SET_NOT_FOUND");
+    return set;
+  }
+
+  private idempotency(
+    key: UUID,
+    operation: string,
+    projectId: UUID,
+    inputHash: Sha256,
+  ): IdempotencyRecord | null {
+    const existing = this.state().idempotency.find((item) => item.key === key);
+    if (!existing) return null;
+    if (existing.operation !== operation || existing.projectId !== projectId || existing.inputHash !== inputHash) {
+      throw new AppError(409, "IDEMPOTENCY_KEY_REUSE");
+    }
+    return existing;
+  }
+
+  private rememberIdempotency(
+    key: UUID,
+    operation: string,
+    projectId: UUID,
+    inputHash: Sha256,
+    result: Record<string, unknown>,
+  ): void {
+    this.state().idempotency.push({
+      key,
+      operation,
+      projectId,
+      inputHash,
+      result: safeResult(result),
+      createdAt: this.clock(),
+    });
+  }
+
+  createProject(name: unknown): Project {
+    if (name !== null && typeof name !== "string") throw new AppError(400, "INVALID_REQUEST", [{ field: "name", code: "STRING_OR_NULL_REQUIRED" }]);
+    const normalized = typeof name === "string" ? name.trim() : "";
+    const value = normalized || "Untitled project";
+    if (Array.from(value).length < 1 || Array.from(value).length > 120) {
+      throw new AppError(400, "INVALID_REQUEST", [{ field: "name", code: "NAME_LENGTH" }]);
+    }
+    const timestamp = this.clock();
+    const project: Project = {
+      projectId: this.uuid(),
+      name: value,
+      status: "draft",
+      boothGeometry: null,
+      briefAssetId: null,
+      briefDraftId: null,
+      confirmedBriefVersionId: null,
+      activeGenerationSetId: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    this.state().projects.push(project);
+    this.save();
+    return cloneJson(project);
+  }
+
+  saveGeometry(projectId: UUID, input: unknown): Project {
+    const project = this.project(projectId);
+    if (project.confirmedBriefVersionId || project.status === "generating" || project.status === "concepts_ready") {
+      throw new AppError(409, "GEOMETRY_FROZEN");
+    }
+    const geometry = validateGeometry(input);
+    project.boothGeometry = geometry;
+    project.status = "geometry_ready";
+    project.updatedAt = this.clock();
+    this.save();
+    return cloneJson(project);
+  }
+
+  uploadBrief(projectId: UUID, key: unknown, input: PdfUpload, referenceId: UUID): UploadResult {
+    assertUuid(key, "idempotencyKey");
+    const project = this.project(projectId);
+    if (!project.boothGeometry || !geometryIsValid(project.boothGeometry)) {
+      throw new AppError(409, "GEOMETRY_REQUIRED");
+    }
+    const validated = validatePdfUpload(input);
+    const inputHash = operationInputHash("brief_upload", projectId, {
+      fileSha256: validated.sha256,
+      byteSize: validated.byteSize,
+    });
+    const existing = this.idempotency(key, "brief_upload", projectId, inputHash);
+    if (existing) {
+      const assetId = String(existing.result.assetId);
+      return { asset: cloneJson(this.asset(assetId)), project: cloneJson(project) };
+    }
+    if (project.briefAssetId) {
+      throw new AppError(409, "BRIEF_ASSET_EXISTS");
+    }
+    const assetId = this.uuid();
+    const storageKey = privateStorageKey("projects", projectId, "briefs", `${assetId}.pdf`);
+    const asset: BriefAsset = {
+      assetId,
+      projectId,
+      kind: "brief",
+      originalFileName: validated.originalFileName,
+      mimeType: "application/pdf",
+      byteSize: validated.byteSize,
+      pageCount: validated.pageCount,
+      storageKey,
+      sha256: validated.sha256,
+      status: "stored",
+      createdAt: this.clock(),
+    };
+    try {
+      this.objects.put(storageKey, input.bytes);
+      this.state().briefAssets.push(asset);
+      this.state().extractionAttempts[assetId] = 1;
+      project.briefAssetId = assetId;
+      project.status = "extracting";
+      project.updatedAt = this.clock();
+      this.rememberIdempotency(key, "brief_upload", projectId, inputHash, {
+        assetId,
+        extractionRequestId: this.uuid(),
+        referenceId,
+      });
+      this.save();
+    } catch (error) {
+      this.objects.remove(storageKey);
+      throw error;
+    }
+    const extractionRequestId = this.uuid();
+    void this.runExtraction(projectId, assetId, extractionRequestId, referenceId);
+    return { asset: cloneJson(asset), project: cloneJson(project) };
+  }
+
+  private async runExtraction(projectId: UUID, assetId: UUID, extractionRequestId: UUID, referenceId: UUID): Promise<void> {
+    const asset = this.asset(assetId);
+    try {
+      const result = await this.provider.extractBrief(this.objects.read(asset.storageKey));
+      assertBriefData(result.data, { extraction: true });
+      const project = this.project(projectId);
+      if (project.briefDraftId) throw new AppError(409, "BRIEF_DRAFT_EXISTS");
+      const timestamp = this.clock();
+      const draft: StructuredBriefDraft = {
+        briefDraftId: this.uuid(),
+        projectId,
+        sourceAssetId: assetId,
+        extractionRequestId,
+        schemaVersion: "brief-v1",
+        revision: 1,
+        status: "extracted",
+        data: cloneJson(result.data),
+        providerMetadata: cloneJson(result.metadata),
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      this.state().drafts.push(draft);
+      project.briefDraftId = draft.briefDraftId;
+      project.status = "brief_review";
+      project.updatedAt = timestamp;
+      this.save();
+    } catch (error) {
+      const project = this.project(projectId);
+      project.status = "brief_extraction_failed";
+      project.updatedAt = this.clock();
+      this.save();
+      console.error(JSON.stringify({ referenceId, operation: "brief_extraction", projectId, assetId, code: providerErrorToCode(error) }));
+    }
+  }
+
+  retryExtraction(projectId: UUID, assetId: unknown, key: unknown, referenceId: UUID): UploadResult {
+    assertUuid(assetId, "assetId");
+    assertUuid(key, "idempotencyKey");
+    const project = this.project(projectId);
+    const asset = this.asset(assetId);
+    if (asset.projectId !== projectId || project.briefAssetId !== assetId) {
+      throw new AppError(404, "ASSET_NOT_FOUND");
+    }
+    const inputHash = operationInputHash("extraction_retry", projectId, { assetId });
+    const existing = this.idempotency(key, "extraction_retry", projectId, inputHash);
+    if (existing) {
+      return { asset: cloneJson(asset), project: cloneJson(project) };
+    }
+    const attempts = this.state().extractionAttempts[assetId] ?? 0;
+    if (project.status !== "brief_extraction_failed" || attempts >= 2) {
+      throw new AppError(409, "RETRY_NOT_ALLOWED");
+    }
+    this.state().extractionAttempts[assetId] = attempts + 1;
+    project.status = "extracting";
+    project.updatedAt = this.clock();
+    this.rememberIdempotency(key, "extraction_retry", projectId, inputHash, { assetId, referenceId });
+    this.save();
+    void this.runExtraction(projectId, assetId, this.uuid(), referenceId);
+    return { asset: cloneJson(asset), project: cloneJson(project) };
+  }
+
+  getDraft(projectId: UUID): StructuredBriefDraft {
+    const project = this.project(projectId);
+    if (!project.briefDraftId) {
+      if (project.status === "brief_extraction_failed") throw new AppError(502, "EXTRACTION_FAILED");
+      throw new AppError(409, "BRIEF_DRAFT_NOT_READY");
+    }
+    return cloneJson(this.draft(project.briefDraftId));
+  }
+
+  editDraft(projectId: UUID, data: unknown, expectedRevision: unknown): StructuredBriefDraft {
+    const project = this.project(projectId);
+    if (project.status !== "brief_review" || !project.briefDraftId) {
+      throw new AppError(409, "BRIEF_REVIEW_REQUIRED");
+    }
+    const draft = this.draft(project.briefDraftId);
+    if (typeof expectedRevision !== "number" || !Number.isInteger(expectedRevision)) {
+      throw new AppError(400, "INVALID_REQUEST", [{ field: "expectedRevision", code: "INTEGER_REQUIRED" }]);
+    }
+    if (draft.revision !== expectedRevision) {
+      throw new AppError(409, "DRAFT_REVISION_CONFLICT");
+    }
+    assertBriefData(data);
+    draft.data = cloneJson(data);
+    draft.revision += 1;
+    draft.status = "edited";
+    draft.updatedAt = this.clock();
+    this.save();
+    return cloneJson(draft);
+  }
+
+  private confirmationAllowed(data: StructuredBriefData): boolean {
+    const unknownsReady = data.unknowns.every(
+      (item) => !item.critical || Boolean(item.resolution?.trim()) || item.acceptedByUser,
+    );
+    const assumptionsReady = data.assumptions.every(
+      (item) => !item.requiresConfirmation || item.acceptedByUser || item.source === "user",
+    );
+    return unknownsReady && assumptionsReady;
+  }
+
+  confirmBrief(projectId: UUID, draftId: unknown, expectedRevision: unknown, key: unknown, referenceId: UUID): StructuredBriefVersion {
+    assertUuid(draftId, "draftId");
+    assertUuid(key, "idempotencyKey");
+    const project = this.project(projectId);
+    const draft = this.draft(draftId);
+    const inputHash = operationInputHash("brief_confirm", projectId, {
+      draftId,
+      expectedRevision,
+      dataHash: sha256(jcs(draft.data)),
+    });
+    const existing = this.idempotency(key, "brief_confirm", projectId, inputHash);
+    if (existing) return cloneJson(this.version(String(existing.result.briefVersionId)));
+    if (project.status !== "brief_review" || project.briefDraftId !== draftId) {
+      throw new AppError(409, "BRIEF_CONFIRMATION_NOT_ALLOWED");
+    }
+    if (typeof expectedRevision !== "number" || !Number.isInteger(expectedRevision) || draft.revision !== expectedRevision) {
+      throw new AppError(409, "DRAFT_REVISION_CONFLICT");
+    }
+    if (!project.boothGeometry || !geometryIsValid(project.boothGeometry)) {
+      throw new AppError(409, "GEOMETRY_REQUIRED");
+    }
+    if (!this.confirmationAllowed(draft.data)) {
+      throw new AppError(409, "CONFIRMATION_REQUIRED");
+    }
+    if (project.confirmedBriefVersionId) throw new AppError(409, "BRIEF_ALREADY_CONFIRMED");
+    const timestamp = this.clock();
+    const geometrySnapshot = cloneJson(project.boothGeometry);
+    const contentHash = sha256(jcs({ schemaVersion: "brief-v1", geometrySnapshot, data: draft.data }));
+    const version: StructuredBriefVersion = {
+      briefVersionId: this.uuid(),
+      projectId,
+      sourceDraftId: draftId,
+      sourceAssetId: draft.sourceAssetId,
+      versionNumber: 1,
+      schemaVersion: "brief-v1",
+      status: "confirmed",
+      geometrySnapshot,
+      data: cloneJson(draft.data),
+      contentHash,
+      confirmationMode: "explicit_user_action",
+      confirmedAt: timestamp,
+      extractionProviderMetadata: cloneJson(draft.providerMetadata),
+    };
+    this.state().briefVersions.push(version);
+    project.confirmedBriefVersionId = version.briefVersionId;
+    project.status = "brief_confirmed";
+    project.updatedAt = timestamp;
+    this.rememberIdempotency(key, "brief_confirm", projectId, inputHash, { briefVersionId: version.briefVersionId, referenceId });
+    this.save();
+    return cloneJson(version);
+  }
+
+  private confirmedBrief(version: StructuredBriefVersion): UserConfirmedBrief {
+    return {
+      briefVersionId: version.briefVersionId,
+      projectId: version.projectId,
+      versionNumber: version.versionNumber,
+      sourceAssetId: version.sourceAssetId,
+      schemaVersion: version.schemaVersion,
+      geometrySnapshot: cloneJson(version.geometrySnapshot),
+      data: cloneJson(version.data),
+      contentHash: version.contentHash,
+      confirmedAt: version.confirmedAt,
+    };
+  }
+
+  createGeneration(projectId: UUID, key: unknown, referenceId: UUID): PublicGeneration {
+    assertUuid(key, "idempotencyKey");
+    const project = this.project(projectId);
+    if (!project.confirmedBriefVersionId) throw new AppError(409, "BRIEF_CONFIRMATION_REQUIRED");
+    const version = this.version(project.confirmedBriefVersionId);
+    if (!geometryIsValid(version.geometrySnapshot)) throw new AppError(409, "GEOMETRY_INVALID");
+    const compilerInputHashValue = compilerInputHash(this.confirmedBrief(version));
+    const inputHash = operationInputHash("generation_create", projectId, {
+      confirmedBriefVersionId: version.briefVersionId,
+      compilerInputHash: compilerInputHashValue,
+    });
+    const existingIdempotency = this.idempotency(key, "generation_create", projectId, inputHash);
+    if (existingIdempotency) return this.publicGeneration(String(existingIdempotency.result.generationSetId));
+    const existingSet = (project.activeGenerationSetId
+      ? this.state().generationSets.find((item) => item.generationSetId === project.activeGenerationSetId)
+      : undefined) ?? this.state().generationSets
+        .filter((item) => item.confirmedBriefVersionId === version.briefVersionId)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+    if (existingSet) {
+      this.rememberIdempotency(key, "generation_create", projectId, inputHash, { generationSetId: existingSet.generationSetId, referenceId });
+      this.save();
+      return this.publicGeneration(existingSet.generationSetId);
+    }
+    const created = this.createGenerationSet(project, version, 1, null, key as UUID, referenceId, compilerInputHashValue, inputHash);
+    return this.publicGeneration(created.generationSetId);
+  }
+
+  private createGenerationSet(
+    project: Project,
+    version: StructuredBriefVersion,
+    attempt: 1 | 2,
+    retryOfGenerationSetId: UUID | null,
+    key: UUID,
+    referenceId: UUID,
+    compilerInputHashValue: Sha256,
+    idempotencyInputHash: Sha256,
+  ): GenerationSet {
+    const setId = this.uuid();
+    const requestId = this.uuid();
+    const confirmed = this.confirmedBrief(version);
+    const compiledAt = this.clock();
+    const promptRecords = DIRECTIONS.map((direction) => {
+      const compiled = compilePrompt(confirmed, direction, compiledAt);
+      return {
+        compiledPromptId: this.uuid(),
+        generationSetId: setId,
+        candidateIndex: direction.candidateIndex,
+        directionKey: direction.key,
+        compilerMetadata: compiled.compilerMetadata,
+        promptText: compiled.promptText,
+        createdAt: compiledAt,
+      };
+    });
+    const set: GenerationSet = {
+      generationSetId: setId,
+      projectId: project.projectId,
+      confirmedBriefVersionId: version.briefVersionId,
+      generationRequestId: requestId,
+      attempt,
+      retryOfGenerationSetId,
+      status: "queued",
+      expectedCandidateCount: 4,
+      promptCompilerVersion: COMPILER_VERSION,
+      promptManifestHash: promptManifestHash(promptRecords.map((item) => item.compilerMetadata.promptHash)),
+      provider: "openai",
+      imageModelSnapshot: IMAGE_MODEL_SNAPSHOT,
+      createdAt: compiledAt,
+      completedAt: null,
+      failureCode: null,
+    };
+    const request: GenerationRequest = {
+      generationRequestId: requestId,
+      projectId: project.projectId,
+      confirmedBriefVersionId: version.briefVersionId,
+      generationSetId: setId,
+      idempotencyKey: key,
+      inputHash: compilerInputHashValue,
+      requestedCandidateCount: 4,
+      attempt,
+      status: "accepted",
+      requestReferenceId: referenceId,
+      failureCode: null,
+      createdAt: compiledAt,
+      completedAt: null,
+    };
+    this.state().generationRequests.push(request);
+    this.state().generationSets.push(set);
+    this.state().prompts.push(...promptRecords);
+    project.activeGenerationSetId = setId;
+    project.status = "generating";
+    project.updatedAt = compiledAt;
+    this.rememberIdempotency(key, attempt === 1 ? "generation_create" : "generation_retry", project.projectId, idempotencyInputHash, { generationSetId: setId, referenceId });
+    this.save();
+    void this.runGeneration(setId);
+    return set;
+  }
+
+  private async runGeneration(generationSetId: UUID): Promise<void> {
+    const set = this.generationSet(generationSetId);
+    const request = this.state().generationRequests.find((item) => item.generationRequestId === set.generationRequestId);
+    if (!request) return;
+    set.status = "running";
+    request.status = "running";
+    this.save();
+    const prompts = this.state().prompts
+      .filter((item) => item.generationSetId === generationSetId)
+      .sort((left, right) => left.candidateIndex - right.candidateIndex);
+    const results = await Promise.allSettled(prompts.map((prompt) => this.provider.generateImage(prompt.promptText)));
+    const staged: { candidateId: UUID; prompt: (typeof prompts)[number]; result: ImageProviderResult; stagingKey: string; finalKey: string }[] = [];
+    let failureCode: string | null = null;
+    for (let index = 0; index < results.length; index += 1) {
+      const result = results[index];
+      if (result.status === "rejected") {
+        failureCode = providerErrorToCode(result.reason);
+        continue;
+      }
+      try {
+        validatePng(result.value.pngBytes);
+        const candidateId = this.uuid();
+        const stagingKey = privateStorageKey("projects", set.projectId, "staging", generationSetId, `${candidateId}.png`);
+        const finalKey = privateStorageKey("projects", set.projectId, "concepts", `${candidateId}.png`);
+        this.objects.put(stagingKey, result.value.pngBytes);
+        staged.push({ candidateId, prompt: prompts[index], result: result.value, stagingKey, finalKey });
+      } catch (error) {
+        failureCode = providerErrorToCode(error);
+      }
+    }
+    if (results.length !== 4 || staged.length !== 4 || failureCode) {
+      for (const item of staged) this.objects.remove(item.stagingKey);
+      this.failGeneration(set, request, failureCode ?? "IMAGE_GENERATION_FAILED");
+      return;
+    }
+    const conceptAssets: ConceptAsset[] = [];
+    const candidates: ConceptCandidate[] = [];
+    const promoted: string[] = [];
+    try {
+      for (const item of staged) {
+        this.objects.promote(item.stagingKey, item.finalKey);
+        promoted.push(item.finalKey);
+        const assetId = this.uuid();
+        conceptAssets.push({
+          assetId,
+          projectId: set.projectId,
+          generationSetId,
+          storageKey: item.finalKey,
+          mimeType: "image/png",
+          byteSize: item.result.pngBytes.byteLength,
+          sha256: sha256(item.result.pngBytes),
+          status: "stored",
+          createdAt: this.clock(),
+        });
+        candidates.push({
+          candidateId: item.candidateId,
+          generationSetId,
+          projectId: set.projectId,
+          confirmedBriefVersionId: set.confirmedBriefVersionId,
+          candidateIndex: item.prompt.candidateIndex,
+          directionKey: item.prompt.directionKey,
+          assetId,
+          compilerMetadata: cloneJson(item.prompt.compilerMetadata),
+          providerMetadata: cloneJson(item.result.metadata),
+          createdAt: this.clock(),
+        });
+      }
+      if (candidates.length !== 4 || conceptAssets.length !== 4) throw new AppError(500, "PERSISTENCE_FAILED");
+      this.state().conceptAssets.push(...conceptAssets);
+      this.state().candidates.push(...candidates);
+      set.status = "succeeded";
+      set.completedAt = this.clock();
+      request.status = "succeeded";
+      request.completedAt = set.completedAt;
+      const project = this.project(set.projectId);
+      project.status = "concepts_ready";
+      project.activeGenerationSetId = set.generationSetId;
+      project.updatedAt = set.completedAt;
+      this.save();
+    } catch (error) {
+      for (const item of promoted) this.objects.remove(item);
+      for (const item of staged) this.objects.remove(item.stagingKey);
+      this.failGeneration(set, request, providerErrorToCode(error));
+    }
+  }
+
+  private failGeneration(set: GenerationSet, request: GenerationRequest, failureCode: string): void {
+    set.status = "failed";
+    set.failureCode = failureCode;
+    set.completedAt = this.clock();
+    request.status = "failed";
+    request.failureCode = failureCode;
+    request.completedAt = set.completedAt;
+    const project = this.project(set.projectId);
+    project.status = "generation_failed";
+    project.activeGenerationSetId = set.generationSetId;
+    project.updatedAt = set.completedAt;
+    console.error(JSON.stringify({ referenceId: request.requestReferenceId, operation: "concept_generation", projectId: set.projectId, generationSetId: set.generationSetId, code: failureCode }));
+    this.save();
+  }
+
+  retryGeneration(projectId: UUID, generationSetId: UUID, key: unknown, referenceId: UUID): PublicGeneration {
+    assertUuid(key, "idempotencyKey");
+    const project = this.project(projectId);
+    const failed = this.generationSet(generationSetId);
+    if (failed.projectId !== projectId || failed.status !== "failed" || failed.attempt !== 1) {
+      throw new AppError(409, "RETRY_NOT_ALLOWED");
+    }
+    const existingRetry = this.state().generationSets.find((item) => item.retryOfGenerationSetId === generationSetId);
+    const version = this.version(failed.confirmedBriefVersionId);
+    const compilerInputHashValue = compilerInputHash(this.confirmedBrief(version));
+    const inputHash = operationInputHash("generation_retry", projectId, { generationSetId, confirmedBriefVersionId: failed.confirmedBriefVersionId, compilerInputHash: compilerInputHashValue });
+    const existingIdempotency = this.idempotency(key, "generation_retry", projectId, inputHash);
+    if (existingIdempotency) return this.publicGeneration(String(existingIdempotency.result.generationSetId));
+    if (existingRetry) throw new AppError(409, "RETRY_NOT_ALLOWED");
+    const retrySet = this.createGenerationSet(project, version, 2, generationSetId, key as UUID, referenceId, compilerInputHashValue, inputHash);
+    return this.publicGeneration(retrySet.generationSetId);
+  }
+
+  getGeneration(projectId: UUID, generationSetId: UUID): PublicGeneration {
+    const project = this.project(projectId);
+    const set = this.generationSet(generationSetId);
+    if (set.projectId !== projectId) throw new AppError(404, "GENERATION_SET_NOT_FOUND");
+    return this.publicGeneration(set.generationSetId);
+  }
+
+  private publicGeneration(generationSetId: UUID): PublicGeneration {
+    const set = this.generationSet(generationSetId);
+    const candidates = set.status === "succeeded"
+      ? this.state().candidates
+        .filter((item) => item.generationSetId === generationSetId)
+        .sort((left, right) => left.candidateIndex - right.candidateIndex)
+        .map((item) => cloneJson(item))
+      : [];
+    return { generationSet: cloneJson(set), candidates };
+  }
+
+  async waitForDraft(projectId: UUID, timeoutMs = 3_000): Promise<StructuredBriefDraft> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const project = this.project(projectId);
+      if (project.briefDraftId) return this.getDraft(projectId);
+      if (project.status === "brief_extraction_failed") throw new AppError(502, "EXTRACTION_FAILED");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new AppError(504, "EXTRACTION_TIMEOUT");
+  }
+
+  async waitForGeneration(projectId: UUID, generationSetId: UUID, timeoutMs = 5_000): Promise<PublicGeneration> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const result = this.getGeneration(projectId, generationSetId);
+      if (result.generationSet.status === "succeeded") return result;
+      if (result.generationSet.status === "failed") throw new AppError(502, "IMAGE_GENERATION_FAILED");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new AppError(504, "GENERATION_TIMEOUT");
+  }
+}
+
+export function createWorkflowService(options: WorkflowServiceOptions = {}): WorkflowService {
+  return new WorkflowService(options);
+}
