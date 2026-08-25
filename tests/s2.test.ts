@@ -82,6 +82,7 @@ function seed(exactCount = false, provider?: MockOpenAIProvider) {
   });
   const actualProvider = provider ?? new MockOpenAIProvider({ briefData: data });
   const service = createWorkflowService({ repository, objects, provider: actualProvider });
+  service.s2.getReferenceDraft(projectId);
   return { root, service, provider: actualProvider, projectId, generationSetId };
 }
 

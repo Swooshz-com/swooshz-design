@@ -139,13 +139,13 @@ function scanWebp(bytes: Buffer): { animated: boolean } {
     const padded = length + (length % 2);
     if (padded > bytes.length - offset - 8) throw mediaError(422, "MEDIA_CORRUPT");
     if (type === "ANIM" || type === "ANMF") throw mediaError(422, "MEDIA_ANIMATED_NOT_ALLOWED");
-    if (type === "VP8 " || type === "VP8L" || type === "VP8X") {
+    if (type === "VP8X") {
+      if (length < 10) throw mediaError(422, "MEDIA_CORRUPT");
+      if ((bytes[offset + 8] & 0x02) !== 0) throw mediaError(422, "MEDIA_ANIMATED_NOT_ALLOWED");
+    }
+    if (type === "VP8 " || type === "VP8L") {
       imageChunks += 1;
       if (imageChunks > 1) throw mediaError(422, "MEDIA_ANIMATED_NOT_ALLOWED");
-      if (type === "VP8X") {
-        if (length < 10) throw mediaError(422, "MEDIA_CORRUPT");
-        if ((bytes[offset + 8] & 0x02) !== 0) throw mediaError(422, "MEDIA_ANIMATED_NOT_ALLOWED");
-      }
     }
     offset += 8 + padded;
   }
@@ -200,12 +200,13 @@ function enforceMeasure(measure: S2DecodedMeasure, options: {
   }
   if (measure.pixelCount > S2_MAX_PIXELS_PER_ASSET) throw mediaError(422, "MEDIA_PIXEL_LIMIT_EXCEEDED", options.field);
   if (measure.decodedRgbaBytes > S2_MAX_RGBA_BYTES_PER_ASSET) throw mediaError(422, "MEDIA_PIXEL_LIMIT_EXCEEDED", options.field);
-  if (options.maxNormalizedBytes !== undefined && (measure.normalizedBytes ?? 0) > options.maxNormalizedBytes) {
+  const normalizedLimit = options.maxNormalizedBytes ?? S2_MAX_NORMALIZED_BYTES;
+  if (measure.normalizedBytes !== undefined && measure.normalizedBytes > normalizedLimit) {
     throw mediaError(422, "MEDIA_NORMALIZATION_FAILED", options.field);
   }
 }
 
-export function enforceS2AggregateLimits(measures: readonly S2DecodedMeasure[], field = "assets"): void {
+export function enforceS2AggregateLimits(measures: readonly S2DecodedMeasure[], field = "assets", maxMeasureCount = S2_MAX_TOTAL_ASSETS): void {
   let totalPixels = 0;
   let totalRgba = 0;
   let totalEncoded = 0;
@@ -215,7 +216,7 @@ export function enforceS2AggregateLimits(measures: readonly S2DecodedMeasure[], 
     totalRgba += measure.decodedRgbaBytes;
     totalEncoded += measure.encodedBytes;
   }
-  if (measures.length > S2_MAX_TOTAL_ASSETS || totalPixels > S2_MAX_TOTAL_PIXELS ||
+  if (measures.length > maxMeasureCount || totalPixels > S2_MAX_TOTAL_PIXELS ||
       totalRgba > S2_MAX_TOTAL_RGBA_BYTES || totalEncoded > S2_MAX_PROVIDER_BYTES) {
     throw mediaError(422, "MEDIA_AGGREGATE_LIMIT_EXCEEDED", field);
   }
@@ -291,7 +292,7 @@ export async function inspectCanonicalS1Png(bytes: Uint8Array): Promise<S2Decode
     };
     enforceMeasure(measure, { maxEncodedBytes: S2_MAX_PROVIDER_BYTES, field: "source" });
     const decoded = await sharp(value, SHARP_OPTIONS).raw().toBuffer({ resolveWithObject: true });
-    if (decoded.info.width !== measure.width || decoded.info.height !== measure.height || decoded.data.length < measure.pixelCount) {
+    if (decoded.info.width !== measure.width || decoded.info.height !== measure.height || !decoded.info.channels || decoded.data.length !== measure.pixelCount * decoded.info.channels) {
       throw mediaError(422, "MEDIA_CORRUPT", "source");
     }
     return measure;

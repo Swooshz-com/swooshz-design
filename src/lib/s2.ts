@@ -384,7 +384,11 @@ function objectiveForFinding(id: string, requirements: readonly S2Requirement[])
   return "Make the explicit " + family + " requirement visible and correctly represented without changing the confirmed brief: " + requirement.text;
 }
 
-function renderRepairPrompt(input: S2InputVersion, findings: readonly string[]): string {
+function repairManifestHash(referenceAssets: readonly Record<string, unknown>[], logoAssets: readonly Record<string, unknown>[]): Sha256 {
+  return sha256(jcs({ referenceAssets, logoAssets }));
+}
+
+function renderRepairPrompt(input: S2InputVersion, source: S2CandidateSource, findings: readonly string[], manifestHash: Sha256): string {
   const requirements = input.canonicalRequirements;
   const objectives = orderedFindingIds(findings).map((id) => objectiveForFinding(id, requirements));
   const lines = [
@@ -393,7 +397,7 @@ function renderRepairPrompt(input: S2InputVersion, findings: readonly string[]):
     "Confirmed brief requirements: " + requirements.filter((item) => item.category !== "geometry").map((item) => item.text).join(" | ") + ".",
     "Confirmed prohibitions: " + requirements.filter((item) => item.category === "prohibited").map((item) => String(item.expectedValue)).join(" | ") + ".",
     "Repair objectives: " + objectives.join(" | "),
-    "Image roles: Image 1 is the exact canonical S1 source candidate. Following images, in order, are optional normalized reference assets and then optional normalized logo assets. Use them only as visual guidance.",
+    "Image roles: Image 1 is the exact canonical S1 source candidate (candidateIndex=" + source.candidateIndex + ", sourceSha256=" + source.sourceSha256 + "). Following images, in order, are optional normalized reference assets and then optional normalized logo assets. Use them only as visual guidance. Stable role-ordered manifest hash: " + manifestHash + ".",
     "Preservation constraints: Do not change width, depth, open sides, supplied maximum height, candidate identity, source lineage, or confirmed brief facts. Do not add engineering, rigging, venue, legal, fabrication, approval, cost, or unconfirmed branding claims.",
     "Visual-only disclosure: This bounded edit is a visual/design correction and is not engineering, structural, venue, fabrication, legal, or approval confirmation.",
   ];
@@ -612,6 +616,14 @@ export class S2WorkflowService {
     if (!state.projects.some((project) => project.projectId === projectId)) throw appError(404, "PROJECT_NOT_FOUND", "projectId");
   }
 
+  private s2Project(state: StoreState, projectId: UUID): void {
+    const project = state.projects.find((item) => item.projectId === projectId);
+    if (!project) throw appError(404, "PROJECT_NOT_FOUND", "projectId");
+    if (project.status !== "concepts_ready" || !project.confirmedBriefVersionId || !project.boothGeometry) {
+      throw appError(409, "S2_NOT_AVAILABLE");
+    }
+  }
+
   private draftIn(state: StoreState, projectId: UUID, create = false): S2ReferenceDraft {
     const existing = state.s2Drafts.find((draft) => draft.projectId === projectId);
     if (existing) return existing;
@@ -664,9 +676,22 @@ export class S2WorkflowService {
     operation.claimedAt = null;
   }
 
+  private verifyObject(storageKey: string, expectedBytes: number, expectedSha256: Sha256): void {
+    try {
+      const bytes = this.objects.read(storageKey);
+      if (bytes.byteLength !== expectedBytes || sha256(bytes) !== expectedSha256) throw new Error("object identity mismatch");
+    } catch {
+      throw appError(500, "PERSISTENCE_FAILED");
+    }
+  }
+
+  authorizeProject(projectId: UUID): void {
+    this.s2Project(this.state(), projectId);
+  }
+
   getReferenceDraft(projectId: UUID): S2PublicDraft {
     this.repository.transact((state) => {
-      this.projectExists(state, projectId);
+      this.s2Project(state, projectId);
       this.draftIn(state, projectId, true);
     });
     const state = this.state();
@@ -683,44 +708,37 @@ export class S2WorkflowService {
   ): Promise<S2Mutation<{ asset: S2PublicAsset; draft: S2PublicDraft }>> {
     if (kind !== "reference" && kind !== "logo") throw appError(400, "INVALID_ASSET_KIND", "kind");
     const stateBefore = this.state();
-    this.projectExists(stateBefore, projectId);
+    this.s2Project(stateBefore, projectId);
+    const existingDraft = stateBefore.s2Drafts.find((draft) => draft.projectId === projectId);
+    if (existingDraft?.status === "frozen") throw appError(409, "DRAFT_FROZEN");
     const normalized = await normalizeS2Media({ kind, fileName, mimeType, bytes, maxInputBytes: 8_388_608 });
     const inputHash = operationInputHash("s2_asset_upload", projectId, {
       kind,
       originalSha256: normalized.originalSha256,
       originalBytes: normalized.originalBytes.byteLength,
     });
-    const existingState = this.state();
-    const existingIdempotency = this.idempotencyIn(existingState, key, "s2_asset_upload", projectId, inputHash);
-    if (existingIdempotency) {
-      const assetId = String(existingIdempotency.result.assetId);
-      const current = this.state();
-      const asset = current.s2Assets.find((item) => item.id === assetId);
-      if (!asset) throw appError(500, "PERSISTENCE_FAILED");
-      const draft = this.draftIn(current, projectId, true);
-      return { asset: publicAsset(asset), draft: publicDraft(current, draft), replayed: true };
-    }
-    if (existingState.s2Assets.some((asset) => asset.projectId === projectId && asset.kind === kind && asset.originalSha256 === normalized.originalSha256 && asset.status === "ready")) {
-      throw appError(409, "MEDIA_DUPLICATE");
-    }
     const assetId = this.uuid();
     const stagingOriginal = privateStorageKey("projects", projectId, "s2", "staging", "reference-assets", assetId, "original");
     const stagingNormalized = privateStorageKey("projects", projectId, "s2", "staging", "reference-assets", assetId, "normalized.png");
     const finalOriginal = privateStorageKey("projects", projectId, "s2", "references", assetId, "original");
     const finalNormalized = privateStorageKey("projects", projectId, "s2", "references", assetId, "normalized.png");
-    let published = false;
     try {
       this.objects.put(stagingOriginal, normalized.originalBytes);
+      this.verifyObject(stagingOriginal, normalized.originalBytes.byteLength, normalized.originalSha256);
       this.objects.put(stagingNormalized, normalized.normalizedBytes);
+      this.verifyObject(stagingNormalized, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
       this.objects.promote(stagingOriginal, finalOriginal);
       this.objects.promote(stagingNormalized, finalNormalized);
-      published = true;
       const result = this.repository.transact((state) => {
-        this.projectExists(state, projectId);
+        this.s2Project(state, projectId);
         const draft = this.draftIn(state, projectId, true);
         if (draft.status === "frozen") throw appError(409, "DRAFT_FROZEN");
         const replay = this.idempotencyIn(state, key, "s2_asset_upload", projectId, inputHash);
         if (replay) return { assetId: String(replay.result.assetId), replayed: true };
+        if (state.s2Assets.some((asset) => asset.projectId === projectId &&
+            asset.originalSha256 === normalized.originalSha256 && asset.status === "ready")) {
+          throw appError(409, "MEDIA_DUPLICATE");
+        }
         const asset: S2AssetRecord = {
           id: assetId,
           projectId,
@@ -741,7 +759,7 @@ export class S2WorkflowService {
           deletedAt: null,
         };
         state.s2Assets.push(asset);
-        this.rememberIdempotency(state, key, "s2_asset_upload", projectId, inputHash, { assetId, referenceId: key });
+        this.rememberIdempotency(state, key, "s2_asset_upload", projectId, inputHash, { assetId });
         return { assetId, replayed: false };
       });
       if (result.replayed) {
@@ -753,16 +771,13 @@ export class S2WorkflowService {
       if (!asset) throw appError(500, "PERSISTENCE_FAILED");
       return { asset: publicAsset(asset), draft: publicDraft(current, this.draftIn(current, projectId, true)), replayed: result.replayed };
     } catch (error) {
-      if (published) {
-        this.objects.remove(finalOriginal);
-        this.objects.remove(finalNormalized);
-      }
+      this.objects.remove(finalOriginal);
+      this.objects.remove(finalNormalized);
       this.objects.remove(stagingOriginal);
       this.objects.remove(stagingNormalized);
       throw error;
     }
   }
-
   updateDraft(
     projectId: UUID,
     expectedRevision: unknown,
@@ -781,11 +796,11 @@ export class S2WorkflowService {
       logoAssetIds: logos,
     });
     const result = this.repository.transact((state) => {
-      this.projectExists(state, projectId);
+      this.s2Project(state, projectId);
       const draft = this.draftIn(state, projectId, true);
+      if (draft.status === "frozen") throw appError(409, "DRAFT_FROZEN");
       const replay = this.idempotencyIn(state, key, "s2_draft_update", projectId, inputHash);
       if (replay) return { draft: cloneJson(draft), replayed: true };
-      if (draft.status === "frozen") throw appError(409, "DRAFT_FROZEN");
       if (draft.revision !== expectedRevision) throw appError(409, "DRAFT_REVISION_CONFLICT");
       if (new Set(refs).size !== refs.length || new Set(logos).size !== logos.length ||
           new Set([...refs, ...logos]).size !== refs.length + logos.length) throw appError(409, "MEDIA_DUPLICATE");
@@ -823,19 +838,27 @@ export class S2WorkflowService {
 
   private sourcePreparation(projectId: UUID, generationSetId: UUID): Promise<S2CandidateSource[]> {
     const state = this.state();
-    this.projectExists(state, projectId);
+    this.s2Project(state, projectId);
     const set = state.generationSets.find((item) => item.generationSetId === generationSetId);
     if (!set || set.projectId !== projectId) throw appError(404, "GENERATION_SET_NOT_FOUND");
     if (set.status !== "succeeded") throw appError(409, "S2_NOT_AVAILABLE");
     const candidates = state.candidates.filter((item) => item.generationSetId === generationSetId)
       .sort((left, right) => left.candidateIndex - right.candidateIndex);
     if (candidates.length !== 4 || candidates.some((candidate, index) => candidate.candidateIndex !== index + 1)) throw appError(409, "QA_BINDING_CONFLICT");
+    const project = state.projects.find((item) => item.projectId === projectId);
     return Promise.all(candidates.map(async (candidate) => {
+      if (candidate.projectId !== projectId || candidate.confirmedBriefVersionId !== project?.confirmedBriefVersionId) throw appError(409, "QA_BINDING_CONFLICT");
       const asset = state.conceptAssets.find((item) => item.assetId === candidate.assetId);
-      if (!asset || asset.projectId !== projectId || asset.mimeType !== "image/png") throw appError(409, "QA_BINDING_CONFLICT");
-      const bytes = this.objects.read(asset.storageKey);
-      if (bytes.byteLength !== asset.byteSize || sha256(bytes) !== asset.sha256 || bytes.byteLength > SOURCE_PROVIDER_BYTES) throw appError(409, "QA_BINDING_CONFLICT");
-      const measure = await inspectCanonicalS1Png(bytes);
+      if (!asset || asset.projectId !== projectId || asset.generationSetId !== generationSetId || asset.status !== "stored" || asset.mimeType !== "image/png") throw appError(409, "QA_BINDING_CONFLICT");
+      let bytes: Buffer;
+      let measure: Awaited<ReturnType<typeof inspectCanonicalS1Png>>;
+      try {
+        bytes = this.objects.read(asset.storageKey);
+        if (bytes.byteLength !== asset.byteSize || sha256(bytes) !== asset.sha256 || bytes.byteLength > SOURCE_PROVIDER_BYTES) throw new Error("source identity mismatch");
+        measure = await inspectCanonicalS1Png(bytes);
+      } catch {
+        throw appError(409, "QA_BINDING_CONFLICT");
+      }
       return {
         candidateId: candidate.candidateId,
         candidateIndex: candidate.candidateIndex,
@@ -852,6 +875,16 @@ export class S2WorkflowService {
   }
 
   private validateSelectedAssets(state: StoreState, draft: S2ReferenceDraft, sourceCandidates: readonly S2CandidateSource[]): void {
+    const referenceIds = draft.referenceAssetIds;
+    const logoIds = draft.logoAssetIds;
+    if (new Set(referenceIds).size !== referenceIds.length || new Set(logoIds).size !== logoIds.length ||
+        new Set([...referenceIds, ...logoIds]).size !== referenceIds.length + logoIds.length) {
+      throw appError(409, "MEDIA_DUPLICATE");
+    }
+    if (referenceIds.length > S2_MAX_REFERENCES || logoIds.length > S2_MAX_LOGOS ||
+        referenceIds.length + logoIds.length > S2_MAX_TOTAL_ASSETS) {
+      throw appError(422, "DRAFT_LIMIT_EXCEEDED");
+    }
     const measures = sourceCandidates.map((source) => ({
       encodedBytes: source.sourceByteSize,
       width: source.sourceWidth,
@@ -859,10 +892,17 @@ export class S2WorkflowService {
       pixelCount: source.sourcePixelCount,
       decodedRgbaBytes: source.sourceDecodedRgbaBytes,
     }));
-    for (const id of [...draft.referenceAssetIds, ...draft.logoAssetIds]) {
-      const asset = state.s2Assets.find((item) => item.id === id);
-      if (!asset || asset.projectId !== draft.projectId) throw appError(404, "ASSET_PROJECT_MISMATCH");
+    const selected = [
+      ...referenceIds.map((id) => ({ id, kind: "reference" as const })),
+      ...logoIds.map((id) => ({ id, kind: "logo" as const })),
+    ];
+    for (const item of selected) {
+      const asset = state.s2Assets.find((candidate) => candidate.id === item.id);
+      if (!asset) throw appError(404, "ASSET_NOT_FOUND");
+      if (asset.projectId !== draft.projectId) throw appError(404, "ASSET_PROJECT_MISMATCH");
+      if (asset.kind !== item.kind) throw appError(409, "ASSET_KIND_MISMATCH");
       if (asset.status !== "ready") throw appError(404, "ASSET_NOT_FOUND");
+      if (asset.pixelCount !== asset.width * asset.height) throw appError(409, "QA_BINDING_CONFLICT");
       const bytes = this.objects.read(asset.storageKeyNormalized);
       if (bytes.byteLength !== asset.normalizedBytes || sha256(bytes) !== asset.normalizedSha256) throw appError(409, "QA_BINDING_CONFLICT");
       measures.push({
@@ -870,8 +910,7 @@ export class S2WorkflowService {
         encodedBytes: bytes.byteLength,
       });
     }
-    if (measures.length > S2_MAX_TOTAL_ASSETS) throw appError(422, "MEDIA_AGGREGATE_LIMIT_EXCEEDED");
-    enforceS2AggregateLimits(measures);
+    enforceS2AggregateLimits(measures, "assets", 4 + S2_MAX_TOTAL_ASSETS);
   }
 
   private inputManifest(state: StoreState, draft: S2ReferenceDraft, sources: readonly S2CandidateSource[]): {
@@ -892,19 +931,30 @@ export class S2WorkflowService {
     referenceId: UUID,
   ): Promise<S2Mutation<{ qaRun: S2QaRun; inputVersionId: UUID }>> {
     if (typeof expectedDraftRevision !== "number" || !Number.isInteger(expectedDraftRevision) || expectedDraftRevision < 1) throw appError(400, "INVALID_REQUEST");
+    const initialState = this.state();
+    this.s2Project(initialState, projectId);
+    const existingKey = initialState.idempotency.find((item) => item.key === key);
+    if (existingKey) {
+      if (existingKey.operation !== "s2_bind" || existingKey.projectId !== projectId) throw appError(409, "IDEMPOTENCY_KEY_REUSE");
+      const existingInputId = typeof existingKey.result.inputVersionId === "string" ? existingKey.result.inputVersionId : null;
+      const existingRunId = typeof existingKey.result.qaRunId === "string" ? existingKey.result.qaRunId : null;
+      const existingInput = existingInputId ? initialState.s2Inputs.find((item) => item.id === existingInputId) : null;
+      const existingRun = existingRunId ? initialState.s2QaRuns.find((item) => item.id === existingRunId) : null;
+      if (!existingInput || !existingRun || existingInput.sourceGenerationSetId !== sourceGenerationSetId || existingInput.draftRevision !== expectedDraftRevision) {
+        throw appError(409, "IDEMPOTENCY_KEY_REUSE");
+      }
+      return { qaRun: cloneJson(existingRun), inputVersionId: existingInput.id, replayed: true };
+    }
     const sources = await this.sourcePreparation(projectId, sourceGenerationSetId);
-    const before = this.state();
-    const project = before.projects.find((item) => item.projectId === projectId);
-    if (!project?.confirmedBriefVersionId) throw appError(409, "S2_NOT_AVAILABLE");
-    const briefVersion = before.briefVersions.find((item) => item.briefVersionId === project.confirmedBriefVersionId);
-    if (!briefVersion) throw appError(409, "S2_NOT_AVAILABLE");
-    const draftBefore = before.s2Drafts.find((item) => item.projectId === projectId);
-    if (!draftBefore) this.getReferenceDraft(projectId);
-    const inputPreview = operationInputHash("s2_bind", projectId, { sourceGenerationSetId, expectedDraftRevision });
     const result = this.repository.transact((state) => {
-      this.projectExists(state, projectId);
+      this.s2Project(state, projectId);
       const currentProject = state.projects.find((item) => item.projectId === projectId)!;
-      const draft = this.draftIn(state, projectId, true);
+      if (currentProject.activeGenerationSetId !== sourceGenerationSetId) throw appError(409, "QA_BINDING_CONFLICT");
+      const confirmedBriefVersionId = currentProject.confirmedBriefVersionId;
+      if (!confirmedBriefVersionId) throw appError(409, "S2_NOT_AVAILABLE");
+      const briefVersion = state.briefVersions.find((item) => item.briefVersionId === confirmedBriefVersionId);
+      if (!briefVersion || briefVersion.projectId !== projectId || briefVersion.status !== "confirmed") throw appError(409, "S2_NOT_AVAILABLE");
+      const draft = this.draftIn(state, projectId, false);
       const rules = ruleSnapshot(briefVersion.geometrySnapshot);
       const requirements = requirementSnapshot(briefVersion.data, briefVersion.geometrySnapshot);
       const manifests = this.inputManifest(state, draft, sources);
@@ -945,16 +995,25 @@ export class S2WorkflowService {
       if (existing) {
         return { inputVersionId: String(existing.result.inputVersionId), qaRunId: String(existing.result.qaRunId), replayed: true };
       }
-      if (draft.status === "frozen") throw appError(409, "DRAFT_FROZEN");
-      if (draft.revision !== expectedDraftRevision) throw appError(409, "DRAFT_REVISION_CONFLICT");
       if (state.s2Inputs.some((item) => item.sourceGenerationSetId === sourceGenerationSetId) ||
           state.s2QaRuns.some((item) => item.sourceGenerationSetId === sourceGenerationSetId)) {
         throw appError(409, "S2_QA_RUN_EXISTS");
       }
+      if (draft.status === "frozen") throw appError(409, "DRAFT_FROZEN");
+      if (draft.revision !== expectedDraftRevision) throw appError(409, "DRAFT_REVISION_CONFLICT");
       const currentSet = state.generationSets.find((item) => item.generationSetId === sourceGenerationSetId);
       if (!currentSet || currentSet.projectId !== projectId || currentSet.status !== "succeeded") throw appError(409, "QA_BINDING_CONFLICT");
-      const currentCandidates = state.candidates.filter((item) => item.generationSetId === sourceGenerationSetId);
-      if (currentCandidates.length !== 4) throw appError(409, "QA_BINDING_CONFLICT");
+      const currentCandidates = state.candidates.filter((item) => item.generationSetId === sourceGenerationSetId)
+        .sort((left, right) => left.candidateIndex - right.candidateIndex);
+      if (currentCandidates.length !== 4 || currentCandidates.some((candidate, index) => candidate.candidateIndex !== index + 1 ||
+          candidate.projectId !== projectId || candidate.generationSetId !== sourceGenerationSetId || candidate.confirmedBriefVersionId !== briefVersion.briefVersionId)) {
+        throw appError(409, "QA_BINDING_CONFLICT");
+      }
+      for (let index = 0; index < currentCandidates.length; index += 1) {
+        if (currentCandidates[index].candidateId !== sources[index].candidateId || currentCandidates[index].assetId !== sources[index].sourceAssetId) {
+          throw appError(409, "QA_BINDING_CONFLICT");
+        }
+      }
       this.validateSelectedAssets(state, draft, sources);
       for (const source of sources) {
         const asset = state.conceptAssets.find((item) => item.assetId === source.sourceAssetId);
@@ -1067,20 +1126,21 @@ export class S2WorkflowService {
         operationIds,
         referenceId,
       });
-      return { inputVersionId, qaRunId, replayed: false };
+      return { inputVersionId, qaRunId, qaRun: cloneJson(run), replayed: false };
     });
     if (!result.replayed) {
       for (const operation of this.state().s2Operations.filter((item) => item.qaRunId === result.qaRunId && item.phase === "qa")) this.startOperation(operation.id);
     }
     const current = this.state();
-    const run = current.s2QaRuns.find((item) => item.id === result.qaRunId);
+    const currentRun = current.s2QaRuns.find((item) => item.id === result.qaRunId);
+    const run = result.replayed ? currentRun : result.qaRun;
     if (!run) throw appError(500, "PERSISTENCE_FAILED");
     return { qaRun: cloneJson(run), inputVersionId: result.inputVersionId, replayed: result.replayed };
   }
 
   getAsset(projectId: UUID, assetId: UUID): { bytes: Buffer; contentType: "image/png" } {
     const state = this.state();
-    this.projectExists(state, projectId);
+    this.s2Project(state, projectId);
     const asset = state.s2Assets.find((item) => item.id === assetId);
     if (!asset) throw appError(404, "ASSET_NOT_FOUND");
     if (asset.projectId !== projectId) throw appError(404, "ASSET_PROJECT_MISMATCH");
@@ -1107,11 +1167,21 @@ export class S2WorkflowService {
     const latest = Array.from(new Set(run.candidateResults.map((item) => item.candidateId)))
       .map((candidateId) => this.latestResult(run, candidateId))
       .sort((left, right) => left.candidateIndex - right.candidateIndex);
+    const publicLatest = latest.map((result) => {
+      let repairEligible = false;
+      try {
+        this.repairFindingIds(result, input);
+        repairEligible = true;
+      } catch {
+        repairEligible = false;
+      }
+      return { ...cloneJson(result), repairEligible };
+    });
     const attempts = cloneJson(run.candidateResults).sort((left, right) => left.candidateIndex - right.candidateIndex || left.attempt - right.attempt);
     return {
       qaRun: {
         ...cloneJson(run),
-        candidateResults: latest,
+        candidateResults: publicLatest,
         candidateAttempts: attempts,
         repairs: state.s2Repairs.filter((item) => item.qaRunId === run.id).map((item) => ({
           id: item.id,
@@ -1156,7 +1226,7 @@ export class S2WorkflowService {
 
   getQaRun(projectId: UUID, qaRunId: UUID): Record<string, unknown> {
     const state = this.state();
-    this.projectExists(state, projectId);
+    this.s2Project(state, projectId);
     const run = state.s2QaRuns.find((item) => item.id === qaRunId);
     if (!run || run.projectId !== projectId) throw appError(404, "QA_NOT_FOUND");
     return this.publicRun(state, run);
@@ -1255,7 +1325,7 @@ export class S2WorkflowService {
       candidateIndex: source.candidateIndex,
       geometrySnapshot: input.geometrySnapshot,
       requirements: input.canonicalRequirements,
-      designRules: input.designRuleSnapshot,
+      designRules: input.designRuleSnapshot.filter((rule) => rule.applicability === "applicable"),
     };
   }
 
@@ -1301,7 +1371,11 @@ export class S2WorkflowService {
   }
 
   private failQaOperation(operationId: UUID, token: UUID, error: unknown): void {
-    const failureCode = error instanceof AppError ? error.code : error instanceof ProviderFailure ? error.safeCode : "QA_PROVIDER_FAILED";
+    const failureCode = error instanceof AppError
+      ? error.code
+      : error instanceof ProviderFailure
+        ? error.safeCode === "QA_SCHEMA_INVALID" ? "QA_SCHEMA_INVALID" : "QA_PROVIDER_FAILED"
+        : "QA_PROVIDER_FAILED";
     try {
       this.repository.transact((state) => {
         const operation = state.s2Operations.find((item) => item.id === operationId);
@@ -1344,7 +1418,7 @@ export class S2WorkflowService {
 
   async retryQa(projectId: UUID, qaRunId: UUID, candidateId: UUID, key: UUID, referenceId: UUID): Promise<S2Mutation<Record<string, unknown>>> {
     const result = this.repository.transact((state) => {
-      this.projectExists(state, projectId);
+      this.s2Project(state, projectId);
       const run = state.s2QaRuns.find((item) => item.id === qaRunId);
       if (!run || run.projectId !== projectId) throw appError(404, "QA_NOT_FOUND");
       const current = this.latestResult(run, candidateId);
@@ -1417,66 +1491,100 @@ export class S2WorkflowService {
     for (const id of ids) {
       const requirement = input.canonicalRequirements.find((item) => item.requirementId === id);
       const rule = ruleMap.get(id);
+      if (id.startsWith("brief.functional.") && (!requirement || requirement.category !== "functional")) throw appError(409, "REPAIR_NOT_ELIGIBLE");
+      if (id.startsWith("brief.mandatory.") && (!requirement || requirement.category !== "mandatory")) throw appError(409, "REPAIR_NOT_ELIGIBLE");
+      if (!requirement && !rule) throw appError(409, "REPAIR_NOT_ELIGIBLE");
       if (requirement && requirement.criticality !== "material") throw appError(409, "REPAIR_NOT_ELIGIBLE");
       if (rule && (!rule.repairable || rule.applicability !== "applicable")) throw appError(409, "REPAIR_NOT_ELIGIBLE");
     }
     return ids;
   }
 
-  private repairManifests(state: StoreState, input: S2InputVersion): { refs: Record<string, unknown>[]; logos: Record<string, unknown>[]; images: Buffer[] } {
+  private repairManifests(state: StoreState, input: S2InputVersion, candidateId: UUID): {
+    refs: Record<string, unknown>[];
+    logos: Record<string, unknown>[];
+    images: Buffer[];
+    manifestHash: Sha256;
+  } {
+    const source = input.sourceCandidates.find((item) => item.candidateId === candidateId);
+    if (!source) throw appError(409, "QA_BINDING_CONFLICT");
     const refs: Record<string, unknown>[] = [];
     const logos: Record<string, unknown>[] = [];
-    const images: Buffer[] = [this.readSource(input, input.sourceCandidates[0].candidateId)];
-    for (const id of input.referenceAssetIds) {
+    const images: Buffer[] = [this.readSource(input, candidateId)];
+    const measures = [{
+      encodedBytes: images[0].byteLength,
+      width: source.sourceWidth,
+      height: source.sourceHeight,
+      pixelCount: source.sourcePixelCount,
+      decodedRgbaBytes: source.sourceDecodedRgbaBytes,
+    }];
+    const appendAsset = (id: UUID, kind: "reference" | "logo", slot: number): void => {
       const asset = state.s2Assets.find((item) => item.id === id);
-      if (!asset || asset.status !== "ready") throw appError(409, "QA_BINDING_CONFLICT");
-      const bytes = this.objects.read(asset.storageKeyNormalized);
-      if (bytes.byteLength !== asset.normalizedBytes || sha256(bytes) !== asset.normalizedSha256) throw appError(409, "QA_BINDING_CONFLICT");
-      refs.push({ assetId: id, normalizedSha256: asset.normalizedSha256, width: asset.width, height: asset.height, normalizedBytes: asset.normalizedBytes, slot: refs.length + 1 });
+      if (!asset || asset.status !== "ready" || asset.kind !== kind || asset.pixelCount !== asset.width * asset.height) {
+        throw appError(409, "QA_BINDING_CONFLICT");
+      }
+      let bytes: Buffer;
+      try {
+        bytes = this.objects.read(asset.storageKeyNormalized);
+      } catch {
+        throw appError(409, "QA_BINDING_CONFLICT");
+      }
+      if (bytes.byteLength !== asset.normalizedBytes || sha256(bytes) !== asset.normalizedSha256) {
+        throw appError(409, "QA_BINDING_CONFLICT");
+      }
+      const manifest = {
+        assetId: id,
+        normalizedSha256: asset.normalizedSha256,
+        width: asset.width,
+        height: asset.height,
+        normalizedBytes: asset.normalizedBytes,
+        slot,
+      };
+      if (kind === "reference") refs.push(manifest);
+      else logos.push(manifest);
       images.push(bytes);
-    }
-    for (const id of input.logoAssetIds) {
-      const asset = state.s2Assets.find((item) => item.id === id);
-      if (!asset || asset.status !== "ready") throw appError(409, "QA_BINDING_CONFLICT");
-      const bytes = this.objects.read(asset.storageKeyNormalized);
-      if (bytes.byteLength !== asset.normalizedBytes || sha256(bytes) !== asset.normalizedSha256) throw appError(409, "QA_BINDING_CONFLICT");
-      logos.push({ assetId: id, normalizedSha256: asset.normalizedSha256, width: asset.width, height: asset.height, normalizedBytes: asset.normalizedBytes, slot: logos.length + 1 });
-      images.push(bytes);
-    }
+      measures.push({
+        ...s2NormalizedMeasure({ normalizedBytes: bytes, width: asset.width, height: asset.height }),
+        encodedBytes: bytes.byteLength,
+      });
+    };
+    input.referenceAssetIds.forEach((id, index) => appendAsset(id, "reference", index + 1));
+    input.logoAssetIds.forEach((id, index) => appendAsset(id, "logo", index + 1));
     if (images.length > S2_MAX_REPAIR_IMAGES) throw appError(422, "MEDIA_AGGREGATE_LIMIT_EXCEEDED");
-    const measures = images.map((bytes, index) => index === 0
-      ? { encodedBytes: bytes.byteLength, width: input.sourceCandidates[0].sourceWidth, height: input.sourceCandidates[0].sourceHeight, pixelCount: input.sourceCandidates[0].sourcePixelCount, decodedRgbaBytes: input.sourceCandidates[0].sourceDecodedRgbaBytes }
-      : { encodedBytes: bytes.byteLength, width: 1, height: 1, pixelCount: 1, decodedRgbaBytes: 4 });
-    enforceS2AggregateLimits(measures);
-    return { refs, logos, images };
+    enforceS2AggregateLimits(measures, "assets", S2_MAX_REPAIR_IMAGES);
+    return { refs, logos, images, manifestHash: repairManifestHash(refs, logos) };
   }
-
   async repairCandidate(projectId: UUID, qaRunId: UUID, candidateId: UUID, expectedInputVersionId: unknown, key: UUID, referenceId: UUID): Promise<S2Mutation<Record<string, unknown>>> {
     if (typeof expectedInputVersionId !== "string") throw appError(400, "INVALID_REQUEST");
     const result = this.repository.transact((state) => {
-      this.projectExists(state, projectId);
+      this.s2Project(state, projectId);
       const run = state.s2QaRuns.find((item) => item.id === qaRunId);
       if (!run || run.projectId !== projectId) throw appError(404, "QA_NOT_FOUND");
       const input = this.inputForRun(state, run);
       if (input.id !== expectedInputVersionId) throw appError(409, "QA_BINDING_CONFLICT");
       const current = this.latestResult(run, candidateId);
+      const source = input.sourceCandidates.find((item) => item.candidateId === candidateId);
+      if (!source || current.sourceAssetId !== source.sourceAssetId || current.sourceSha256 !== source.sourceSha256 || current.sourceByteSize !== source.sourceByteSize) {
+        throw appError(409, "QA_BINDING_CONFLICT");
+      }
       const findingIds = this.repairFindingIds(current, input);
+      const manifest = this.repairManifests(state, input, candidateId);
       const inputHash = sha256(jcs({
         schemaVersion: "s2-repair-v1",
         inputVersionId: input.id,
         qaRunId,
         candidateId,
-        sourceAssetId: current.sourceAssetId,
-        sourceSha256: current.sourceSha256,
-        sourceByteSize: current.sourceByteSize,
-        sourceWidth: input.sourceCandidates.find((item) => item.candidateId === candidateId)?.sourceWidth,
-        sourceHeight: input.sourceCandidates.find((item) => item.candidateId === candidateId)?.sourceHeight,
-        sourcePixelCount: input.sourceCandidates.find((item) => item.candidateId === candidateId)?.sourcePixelCount,
-        sourceDecodedRgbaBytes: input.sourceCandidates.find((item) => item.candidateId === candidateId)?.sourceDecodedRgbaBytes,
+        sourceAssetId: source.sourceAssetId,
+        sourceSha256: source.sourceSha256,
+        sourceByteSize: source.sourceByteSize,
+        sourceWidth: source.sourceWidth,
+        sourceHeight: source.sourceHeight,
+        sourcePixelCount: source.sourcePixelCount,
+        sourceDecodedRgbaBytes: source.sourceDecodedRgbaBytes,
         bindingHash: input.bindingHash,
         orderedFindingIds: findingIds,
-        referenceAssets: input.referenceAssetIds,
-        logoAssets: input.logoAssetIds,
+        referenceAssets: manifest.refs,
+        logoAssets: manifest.logos,
         confirmedBriefContentHash: input.confirmedBriefContentHash,
         geometryHash: input.geometryHash,
         attempt: 1,
@@ -1491,7 +1599,7 @@ export class S2WorkflowService {
       if (existing) return { repairAttemptId: String(existing.result.repairAttemptId), replayed: true };
       if (state.s2Repairs.some((item) => item.qaRunId === qaRunId && item.candidateId === candidateId)) throw appError(409, "REPAIR_ALREADY_EXISTS");
       const repairAttemptId = this.uuid();
-      const prompt = renderRepairPrompt(input, findingIds);
+      const prompt = renderRepairPrompt(input, source, findingIds, manifest.manifestHash);
       const attempt: S2RepairAttempt = {
         id: repairAttemptId,
         projectId,
@@ -1560,25 +1668,39 @@ export class S2WorkflowService {
       const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
       if (!repair || !run) throw appError(500, "PERSISTENCE_FAILED");
       const input = this.inputForRun(state, run);
-      const manifest = this.repairManifests(state, input);
+      const manifest = this.repairManifests(state, input, operation.candidateId);
+      const source = input.sourceCandidates.find((item) => item.candidateId === operation.candidateId);
+      if (!source) throw appError(409, "QA_BINDING_CONFLICT");
+      stageKey = privateStorageKey("projects", operation.projectId, "s2", "repairs", repair.id, "staged", "provider-output.png");
+      finalKey = privateStorageKey("projects", operation.projectId, "s2", "repairs", repair.id, "output.png");
       if (!this.provider.runS2Repair) throw new ProviderFailure("PROVIDER_NOT_CONFIGURED");
       const providerInput: S2RepairProviderInput = {
-        promptText: renderRepairPrompt(input, repair.eligibleFindingIds),
+        promptText: renderRepairPrompt(input, source, repair.eligibleFindingIds, manifest.manifestHash),
         images: manifest.images,
       };
       const response = await this.provider.runS2Repair(providerInput);
       assertS2Png(response.pngBytes, S2_MAX_REPAIR_OUTPUT_BYTES);
-      const normalized = await normalizeS2Media({
-        kind: "reference",
-        fileName: "provider-output.png",
-        mimeType: "image/png",
-        bytes: response.pngBytes,
-        maxInputBytes: S2_MAX_REPAIR_OUTPUT_BYTES,
-      });
-      stageKey = privateStorageKey("projects", operation.projectId, "s2", "repairs", repair.id, "staged", "provider-output.png");
-      finalKey = privateStorageKey("projects", operation.projectId, "s2", "repairs", repair.id, "output.png");
+      this.objects.put(stageKey, response.pngBytes);
+      this.verifyObject(stageKey, response.pngBytes.byteLength, sha256(response.pngBytes));
+      let normalized;
+      try {
+        const raw = this.objects.read(stageKey);
+        normalized = await normalizeS2Media({
+          kind: "reference",
+          fileName: "provider-output.png",
+          mimeType: "image/png",
+          bytes: raw,
+          maxInputBytes: S2_MAX_REPAIR_OUTPUT_BYTES,
+        });
+      } catch (error) {
+        if (error instanceof AppError && error.code === "REPAIR_OUTPUT_INVALID") throw error;
+        throw new AppError(422, "REPAIR_OUTPUT_INVALID");
+      }
+      this.objects.remove(stageKey);
       this.objects.put(stageKey, normalized.normalizedBytes);
+      this.verifyObject(stageKey, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
       this.objects.promote(stageKey, finalKey);
+      this.verifyObject(finalKey, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
       const derivedId = this.uuid();
       const reQaResultId = this.uuid();
       const reQaOperationId = this.uuid();
@@ -1680,7 +1802,11 @@ export class S2WorkflowService {
   }
 
   private failRepairOperation(operationId: UUID, token: UUID, error: unknown): void {
-    const code = error instanceof AppError ? error.code : error instanceof ProviderFailure ? error.safeCode : "REPAIR_PROVIDER_FAILED";
+    const code = error instanceof AppError
+      ? error.code
+      : error instanceof ProviderFailure
+        ? error.safeCode === "REPAIR_OUTPUT_INVALID" ? "REPAIR_OUTPUT_INVALID" : "REPAIR_PROVIDER_FAILED"
+        : "REPAIR_PROVIDER_FAILED";
     try {
       this.repository.transact((state) => {
         const operation = state.s2Operations.find((item) => item.id === operationId);
@@ -1746,7 +1872,7 @@ export class S2WorkflowService {
   }
 
   private failReQaOperation(operationId: UUID, token: UUID, error: unknown): void {
-    const code = error instanceof AppError ? error.code : error instanceof ProviderFailure ? error.safeCode : "RE_QA_UNAVAILABLE";
+    const code = "RE_QA_UNAVAILABLE";
     try {
       this.repository.transact((state) => {
         const operation = state.s2Operations.find((item) => item.id === operationId);
@@ -1779,9 +1905,43 @@ export class S2WorkflowService {
       for (const operation of state.s2Operations) {
         if (!isPending(operation.status)) continue;
         if (operation.status === "running" && this.claimIsLive(operation)) continue;
+        const wasRunning = operation.status === "running";
+        const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
+        if (wasRunning && operation.phase === "qa") {
+          const result = run?.candidateResults.find((item) => item.id === operation.resultId);
+          if (result?.status === "running") {
+            result.status = "queued";
+            result.startedAt = null;
+            result.completedAt = null;
+            this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, "running", "queued", operation.referenceId);
+          }
+          if (run) {
+            run.status = "queued";
+            run.completedAt = null;
+          }
+        } else if (wasRunning && operation.phase === "repair" && operation.repairAttemptId) {
+          const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
+          if (repair?.status === "running") {
+            repair.status = "queued";
+            repair.startedAt = null;
+            repair.completedAt = null;
+            this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, "running", "queued", operation.referenceId);
+          }
+        } else if (wasRunning && operation.phase === "re_qa" && operation.repairAttemptId) {
+          const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
+          const result = state.s2ReQaResults.find((item) => item.id === operation.resultId);
+          if (result?.status === "running") {
+            result.status = "queued";
+            result.startedAt = null;
+            result.completedAt = null;
+            this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, "running", "queued", operation.referenceId);
+          }
+          if (repair?.status === "re_qa_running") repair.status = "derived_ready";
+        }
         operation.status = "queued";
         this.clearClaim(operation);
         operation.startedAt = null;
+        operation.completedAt = null;
         ids.push(operation.id);
       }
       return ids;
