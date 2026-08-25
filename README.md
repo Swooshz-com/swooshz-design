@@ -8,4 +8,4 @@ The first MVP focuses on turning a structured booth brief into buildability-awar
 
 Canonical MVP scope and governance are tracked in GitHub issue #1.
 
-> Status: G1 architecture/authority in progress. Product implementation has not started.
+> Status: S1 reset implementation in progress under Decision Lock DL-SD-MVP-G3-001. Provider smoke is intentionally not required for S1 merge.
