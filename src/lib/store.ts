@@ -15,11 +15,13 @@ import {
 } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
+import { flockSync } from "fs-ext-extra-prebuilt";
 import { AppError, type StoreState } from "./types";
 
 const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
 
+const MUTEX_FLAGS = "exnb" as const;
 export type RepositoryLockRecord = {
   protocol?: typeof LOCK_PROTOCOL;
   ownerToken: string;
@@ -36,11 +38,19 @@ export type RepositoryLockPhase =
   | "before-canonical-claim"
   | "canonical-claiming"
   | "canonical-claimed"
-  | "before-acquisition-return";
+  | "before-acquisition-return"
+  | "before-malformed-recovery"
+  | "before-dead-owner-recovery"
+  | "before-canonical-release";
 
+
+type FileMutexLease = {
+  release: () => void;
+};
 type RepositoryLock = {
   candidatePath: string;
   record: RepositoryLockRecord;
+  mutex: FileMutexLease;
 };
 
 type ProcessLiveness = (processId: number) => boolean;
@@ -60,13 +70,13 @@ class LockHookError extends Error {
 }
 
 function processIsAlive(processId: number): boolean {
-  if (!Number.isInteger(processId) || processId <= 0) return false;
+  if (!Number.isInteger(processId) || processId <= 0) return true;
   try {
     process.kill(processId, 0);
     return true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    return code === "EPERM" || code === "EACCES";
+    return code !== "ESRCH";
   }
 }
 
@@ -201,6 +211,7 @@ export class JsonRepository {
   readonly statePath: string;
   readonly lockPath: string;
   private current: StoreState;
+  readonly mutexPath: string;
   private readonly beforeCommit: (() => void) | undefined;
   private readonly lockWaitMs: number;
   private readonly processId: number;
@@ -220,6 +231,7 @@ export class JsonRepository {
     this.root = resolve(root);
     this.statePath = join(this.root, "state.json");
     this.lockPath = join(this.root, "state.json.lock");
+    this.mutexPath = join(this.root, "state.json.mutex");
     this.beforeCommit = options.beforeCommit;
     this.lockWaitMs = options.lockWaitMs ?? LOCK_WAIT_MS;
     this.processId = options.processId ?? process.pid;
@@ -328,6 +340,51 @@ export class JsonRepository {
       left.acquiredAt === right.acquiredAt &&
       (left.protocol ?? null) === (right.protocol ?? null)
     );
+  }
+  private acquireMutex(deadline: number): FileMutexLease {
+    let descriptor: number;
+    try {
+      descriptor = openSync(this.mutexPath, "a+");
+    } catch {
+      throw new AppError(503, "PERSISTENCE_BUSY");
+    }
+
+    try {
+      while (true) {
+        try {
+          flockSync(descriptor, MUTEX_FLAGS);
+          let released = false;
+          return {
+            release: () => {
+              if (released) return;
+              released = true;
+              try {
+                flockSync(descriptor, "un");
+              } catch {
+                // Closing the descriptor still releases the OS lock after a
+                // best-effort explicit unlock failure.
+              }
+              try {
+                closeSync(descriptor);
+              } catch {
+                // The descriptor is already closed or the process is exiting.
+              }
+            },
+          };
+        } catch {
+          if (Date.now() >= deadline) throw new AppError(503, "PERSISTENCE_BUSY");
+          sleepSync(5);
+        }
+      }
+    } catch (error) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // Preserve the bounded busy result without exposing filesystem data.
+      }
+      if (error instanceof AppError) throw error;
+      throw new AppError(503, "PERSISTENCE_BUSY");
+    }
   }
 
   private removeLockIfOwned(record: RepositoryLockRecord): boolean {
@@ -448,47 +505,59 @@ export class JsonRepository {
       acquiredAt: Date.now(),
     };
     let candidate: string | null = null;
+    let mutex: FileMutexLease | null = null;
     try {
-      this.recoverCandidateArtifacts();
-      candidate = this.prepareCandidate(record);
+      mutex = this.acquireMutex(deadline);
 
       while (true) {
+        this.recoverCandidateArtifacts();
         const inspection = this.inspectCanonicalLock();
-        if (inspection.kind === "missing") {
-          this.emitLockPhase("before-canonical-claim", record, this.lockPath);
-          this.emitLockPhase("canonical-claiming", record, this.lockPath);
-          try {
-            // The owner record is complete and fsynced before linkSync. A hard
-            // link is atomic and cannot overwrite an existing canonical path.
-            linkSync(candidate, this.lockPath);
-          } catch (error) {
-            const code = (error as NodeJS.ErrnoException).code;
-            if (code === "EEXIST") continue;
-            throw new AppError(500, "PERSISTENCE_FAILED");
-          }
-          this.emitLockPhase("canonical-claimed", record, this.lockPath);
-          this.removeCandidate(candidate);
-          this.emitLockPhase("before-acquisition-return", record, this.lockPath);
-          return { candidatePath: candidate, record };
-        }
-
         if (inspection.kind === "malformed") {
+          this.emitLockPhase("before-malformed-recovery", record, this.lockPath);
           this.recoverMalformedCanonical();
           continue;
         }
 
-        if (!this.ownerIsLive(inspection.record)) {
+        if (inspection.kind === "valid") {
+          if (this.ownerIsLive(inspection.record)) {
+            mutex.release();
+            mutex = null;
+            if (Date.now() >= deadline) throw new AppError(503, "PERSISTENCE_BUSY");
+            sleepSync(5);
+            mutex = this.acquireMutex(deadline);
+            continue;
+          }
+          this.emitLockPhase("before-dead-owner-recovery", inspection.record, this.lockPath);
           this.removeLockIfOwned(inspection.record);
           continue;
         }
 
-        if (Date.now() >= deadline) throw new AppError(503, "PERSISTENCE_BUSY");
-        sleepSync(5);
+        candidate = this.prepareCandidate(record);
+        this.emitLockPhase("before-canonical-claim", record, this.lockPath);
+        this.emitLockPhase("canonical-claiming", record, this.lockPath);
+        try {
+          // The owner record is complete and fsynced before linkSync. A hard
+          // link is atomic and cannot overwrite an existing canonical path.
+          linkSync(candidate, this.lockPath);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "EEXIST") {
+            this.removeCandidate(candidate);
+            candidate = null;
+            continue;
+          }
+          throw new AppError(500, "PERSISTENCE_FAILED");
+        }
+        this.emitLockPhase("canonical-claimed", record, this.lockPath);
+        this.removeCandidate(candidate);
+        this.emitLockPhase("before-acquisition-return", record, this.lockPath);
+        return { candidatePath: candidate, mutex, record };
       }
     } catch (error) {
       if (!(error instanceof LockHookError) && candidate !== null) {
         this.removeCandidate(candidate);
       }
+      mutex?.release();
       if (error instanceof LockHookError) throw error.original;
       if (error instanceof AppError) throw error;
       throw new AppError(500, "PERSISTENCE_FAILED");
@@ -496,10 +565,15 @@ export class JsonRepository {
   }
 
   private releaseLock(lock: RepositoryLock): void {
-    // The canonical record is checked again immediately before removal. A
-    // late release from an old owner therefore cannot delete a successor.
-    this.removeLockIfOwned(lock.record);
-    this.removeCandidate(lock.candidatePath);
+    try {
+      // The OS-backed mutex is held from canonical inspection through release.
+      // A successor cannot publish between this observation and the removal.
+      this.emitLockPhase("before-canonical-release", lock.record, this.lockPath);
+      this.removeLockIfOwned(lock.record);
+      this.removeCandidate(lock.candidatePath);
+    } finally {
+      lock.mutex.release();
+    }
   }
 
   private commit(state: StoreState): void {

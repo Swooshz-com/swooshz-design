@@ -11,6 +11,7 @@
     "test": "tsx --test tests/g3.test.ts"
   },
   "dependencies": {
+    "fs-ext-extra-prebuilt": "2.2.13",
     "next": "16.3.2",
     "pdfjs-dist": "6.1.200",
     "react": "19.2.8",

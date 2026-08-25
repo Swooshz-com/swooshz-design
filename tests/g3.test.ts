@@ -739,6 +739,265 @@ test("repository locks use owner identity, do not steal live owners, and reclaim
   }
 });
 
+test("malformed canonical recovery is serialized against successor publication", () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-malformed-race-"));
+  const lockPath = join(root, "state.json.lock");
+  const malformed = '{"ownerToken":"malformed-x"';
+  writeFileSync(lockPath, malformed);
+  let contenderBlocked = false;
+  let contenderRan = false;
+  let successorObserved = false;
+  const successor = new JsonRepository(root, {
+    processId: 8402,
+    lockWaitMs: 0,
+    isProcessAlive: () => false,
+    onLockPhase: (phase, record) => {
+      if (phase !== "before-canonical-release") return;
+      const canonical = lockText(lockPath);
+      assert.ok(canonical);
+      assert.equal(JSON.parse(canonical).ownerToken, record.ownerToken);
+      successorObserved = true;
+    },
+  });
+  const observer = new JsonRepository(root, {
+    processId: 8401,
+    isProcessAlive: () => false,
+    onLockPhase: (phase) => {
+      if (phase !== "before-malformed-recovery") return;
+      assert.equal(lockText(lockPath), malformed);
+      assertBusy(() => successor.transact((state) => {
+        contenderRan = true;
+        return state.projects.length;
+      }));
+      contenderBlocked = true;
+      assert.equal(contenderRan, false);
+      assert.equal(lockText(lockPath), malformed);
+    },
+  });
+  try {
+    observer.transact((state) => {
+      addLockTestProject(state, "malformed observer winner");
+      return state.projects.length;
+    });
+    assert.equal(contenderBlocked, true);
+    successor.transact((state) => {
+      addLockTestProject(state, "malformed observer successor");
+      return state.projects.length;
+    });
+    assert.equal(successorObserved, true);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("dead-owner stale recovery cannot interleave with successor publication", () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-dead-race-"));
+  const lockPath = join(root, "state.json.lock");
+  const deadRecord = {
+    protocol: "swooshz-repository-lock-v2",
+    ownerToken: "dead-observed-x",
+    processId: 8501,
+    acquiredAt: 0,
+  };
+  const encoded = JSON.stringify(deadRecord);
+  writeFileSync(lockPath, encoded);
+  let contenderBlocked = false;
+  let contenderRan = false;
+  const successor = new JsonRepository(root, {
+    processId: 8503,
+    lockWaitMs: 0,
+    isProcessAlive: () => false,
+  });
+  const observer = new JsonRepository(root, {
+    processId: 8502,
+    isProcessAlive: () => false,
+    onLockPhase: (phase, record) => {
+      if (phase !== "before-dead-owner-recovery") return;
+      assert.equal(record.ownerToken, deadRecord.ownerToken);
+      assert.equal(lockText(lockPath), encoded);
+      assertBusy(() => successor.transact((state) => {
+        contenderRan = true;
+        return state.projects.length;
+      }));
+      contenderBlocked = true;
+      assert.equal(contenderRan, false);
+      assert.equal(lockText(lockPath), encoded);
+    },
+  });
+  try {
+    observer.transact((state) => {
+      addLockTestProject(state, "dead observer winner");
+      return state.projects.length;
+    });
+    assert.equal(contenderBlocked, true);
+    successor.transact((state) => {
+      addLockTestProject(state, "dead observer successor");
+      return state.projects.length;
+    });
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("release holds the serialization lease until canonical removal", () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-release-race-"));
+  const lockPath = join(root, "state.json.lock");
+  let successorBlocked = false;
+  let successorRan = false;
+  let successorObserved = false;
+  const successor = new JsonRepository(root, {
+    processId: 8602,
+    lockWaitMs: 0,
+    isProcessAlive: () => false,
+    onLockPhase: (phase, record) => {
+      if (phase !== "before-canonical-release") return;
+      const canonical = lockText(lockPath);
+      assert.ok(canonical);
+      assert.equal(JSON.parse(canonical).ownerToken, record.ownerToken);
+      successorObserved = true;
+    },
+  });
+  const owner = new JsonRepository(root, {
+    processId: 8601,
+    onLockPhase: (phase) => {
+      if (phase !== "before-canonical-release") return;
+      assertBusy(() => successor.transact((state) => {
+        successorRan = true;
+        return state.projects.length;
+      }));
+      successorBlocked = true;
+      assert.equal(successorRan, false);
+    },
+  });
+  try {
+    owner.transact((state) => {
+      addLockTestProject(state, "release owner");
+      return state.projects.length;
+    });
+    assert.equal(successorBlocked, true);
+    successor.transact((state) => {
+      addLockTestProject(state, "release successor");
+      return state.projects.length;
+    });
+    assert.equal(successorObserved, true);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("unknown repository-lock liveness remains bounded busy and does not reclaim", () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-unknown-liveness-"));
+  const lockPath = join(root, "state.json.lock");
+  const encoded = JSON.stringify({
+    protocol: "swooshz-repository-lock-v2",
+    ownerToken: "unknown-owner",
+    processId: 8701,
+    acquiredAt: 0,
+  });
+  writeFileSync(lockPath, encoded);
+  const uncertain = new JsonRepository(root, {
+    processId: 8702,
+    lockWaitMs: 25,
+    isProcessAlive: () => {
+      throw new Error("unexpected liveness probe failure");
+    },
+  });
+  try {
+    assertBusy(() => uncertain.transact(() => "must hold"));
+    assert.equal(lockText(lockPath), encoded);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("live partial candidate is not swept while its writer holds the serialization lease", () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-partial-race-"));
+  let candidatePath: string | null = null;
+  let sweeperBlocked = false;
+  let sweeperRan = false;
+  const sweeper = new JsonRepository(root, {
+    processId: 8802,
+    lockWaitMs: 0,
+    isProcessAlive: () => true,
+  });
+  const writer = new JsonRepository(root, {
+    processId: 8801,
+    onLockPhase: (phase, _record, path) => {
+      if (phase !== "owner-data-partial") return;
+      candidatePath = path;
+      assert.ok(lockText(path));
+      assertBusy(() => sweeper.transact((state) => {
+        sweeperRan = true;
+        return state.projects.length;
+      }));
+      sweeperBlocked = true;
+      assert.equal(sweeperRan, false);
+      assert.ok(lockText(path));
+      throw new Error("simulated live writer pause");
+    },
+  });
+  try {
+    assert.throws(() => writer.transact(() => "not reached"), /simulated live writer pause/);
+    assert.equal(sweeperBlocked, true);
+    assert.ok(candidatePath);
+    assert.ok(lockText(candidatePath));
+    sweeper.transact((state) => {
+      addLockTestProject(state, "partial candidate recovery");
+      return state.projects.length;
+    });
+    assert.equal(lockText(candidatePath), null);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("two recovery actors have one serialized recovery owner", () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-two-recovery-"));
+  const lockPath = join(root, "state.json.lock");
+  const encoded = JSON.stringify({
+    protocol: "swooshz-repository-lock-v2",
+    ownerToken: "dead-shared-owner",
+    processId: 8901,
+    acquiredAt: 0,
+  });
+  writeFileSync(lockPath, encoded);
+  let loserBlocked = false;
+  let loserRan = false;
+  const loser = new JsonRepository(root, {
+    processId: 8903,
+    lockWaitMs: 0,
+    isProcessAlive: () => false,
+  });
+  const winner = new JsonRepository(root, {
+    processId: 8902,
+    isProcessAlive: () => false,
+    onLockPhase: (phase, record) => {
+      if (phase !== "before-dead-owner-recovery") return;
+      assert.equal(record.ownerToken, "dead-shared-owner");
+      assertBusy(() => loser.transact((state) => {
+        loserRan = true;
+        return state.projects.length;
+      }));
+      loserBlocked = true;
+      assert.equal(loserRan, false);
+      assert.equal(lockText(lockPath), encoded);
+    },
+  });
+  try {
+    winner.transact((state) => {
+      addLockTestProject(state, "recovery winner");
+      return state.projects.length;
+    });
+    assert.equal(loserBlocked, true);
+    loser.transact((state) => {
+      addLockTestProject(state, "recovery successor after winner release");
+      return state.projects.length;
+    });
+    assert.equal(new JsonRepository(root).state().projects.length, 2);
+  } finally {
+    cleanup(root);
+  }
+});
 test("a stale owner cannot release a replacement lock", () => {
   const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-owner-"));
   const lockPath = join(root, "state.json.lock");
@@ -942,6 +1201,86 @@ test("dead generation owner is reclaimed and its late completion cannot duplicat
   }
 });
 
+test("unknown extraction-owner liveness holds the provider claim", async () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-design-extraction-unknown-liveness-"));
+  const blocked = new ExtractionGateProvider({ briefData: completeBrief() });
+  const serviceA = createWorkflowService({
+    dataRoot: root,
+    provider: blocked,
+    workerId: "worker-a",
+    processId: 9001,
+    isProcessAlive: (processId) => processId === 9001,
+  });
+  try {
+    const project = serviceA.createProject("Extraction unknown liveness");
+    serviceA.saveGeometry(project.projectId, { widthMm: 6000, depthMm: 3000, openSides: ["north"], maxHeightMm: null });
+    await serviceA.uploadBrief(project.projectId, uuid(), { fileName: "brief.pdf", mimeType: "application/pdf", bytes: pdfFixture() }, uuid());
+    await waitUntil(() => serviceA.repository.state().extractionOperations.some((operation) => operation.status === "running") && blocked.startedExtractions === 1);
+
+    let unknownProbes = 0;
+    const replacement = new MockOpenAIProvider({ briefData: completeBrief() });
+    const serviceB = createWorkflowService({
+      dataRoot: root,
+      provider: replacement,
+      workerId: "worker-b",
+      processId: 9002,
+      isProcessAlive: () => {
+        unknownProbes += 1;
+        throw new Error("unexpected provider-owner liveness error");
+      },
+    });
+    assert.ok(unknownProbes > 0);
+    assert.equal(serviceB.repository.state().extractionOperations[0].status, "running");
+    blocked.release.resolve(undefined);
+    const draft = await serviceB.waitForDraft(project.projectId);
+    assert.equal(draft.revision, 1);
+    assert.equal(blocked.extractionCalls, 1);
+    assert.equal(replacement.extractionCalls, 0);
+  } finally {
+    blocked.release.resolve(undefined);
+    cleanup(root);
+  }
+});
+
+test("unknown generation-owner liveness holds the four-image provider claim", async () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-generation-unknown-liveness-"));
+  const blocked = new ImageGateProvider({ briefData: completeBrief() });
+  const serviceA = createWorkflowService({
+    dataRoot: root,
+    provider: blocked,
+    workerId: "worker-a",
+    processId: 9101,
+    isProcessAlive: (processId) => processId === 9101,
+  });
+  try {
+    const seeded = await seedConfirmed(serviceA);
+    const generation = serviceA.createGeneration(seeded.project.projectId, uuid(), uuid());
+    await waitUntil(() => serviceA.repository.state().generationOperations.some((operation) => operation.status === "running") && blocked.startedImages === 4);
+
+    let unknownProbes = 0;
+    const replacement = new MockOpenAIProvider({ briefData: completeBrief() });
+    const serviceB = createWorkflowService({
+      dataRoot: root,
+      provider: replacement,
+      workerId: "worker-b",
+      processId: 9102,
+      isProcessAlive: () => {
+        unknownProbes += 1;
+        throw new Error("unexpected provider-owner liveness error");
+      },
+    });
+    assert.ok(unknownProbes > 0);
+    assert.equal(serviceB.repository.state().generationOperations[0].status, "running");
+    blocked.release.resolve(undefined);
+    const ready = await serviceB.waitForGeneration(seeded.project.projectId, generation.generationSet.generationSetId);
+    assert.equal(ready.candidates.length, 4);
+    assert.equal(blocked.imageCalls, 4);
+    assert.equal(replacement.imageCalls, 0);
+  } finally {
+    blocked.release.resolve(undefined);
+    cleanup(root);
+  }
+});
 test("server-persisted route state covers direct S1 re-entry and stale generation routes", () => {
   const project: Project = {
     projectId: uuid(),
@@ -1054,6 +1393,10 @@ function lockText(lockPath: string): string | null {
   } catch {
     return null;
   }
+}
+
+function assertBusy(action: () => unknown): void {
+  assert.throws(action, (error: any) => error?.code === "PERSISTENCE_BUSY");
 }
 
 function addLockTestProject(state: { projects: Project[] }, name: string): void {

@@ -2,6 +2,7 @@
 const nextConfig = {
   poweredByHeader: false,
   reactStrictMode: true,
+  serverExternalPackages: ["fs-ext-extra-prebuilt"],
 };
 
 export default nextConfig;

@@ -89,13 +89,13 @@ function pendingOperation(status: string): boolean {
 }
 
 function processIsAlive(processId: number): boolean {
-  if (!Number.isInteger(processId) || processId <= 0) return false;
+  if (!Number.isInteger(processId) || processId <= 0) return true;
   try {
     process.kill(processId, 0);
     return true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    return code === "EPERM" || code === "EACCES";
+    return code !== "ESRCH";
   }
 }
 
