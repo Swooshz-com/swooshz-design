@@ -1,6 +1,6 @@
 # S2 G2 Implementation Contract
 
-Decision Lock: DL-SD-S2-G2-002
+Decision Lock: DL-SD-S2-G2-003
 
 Status: normative contract for G3 implementation upon Web acceptance and canonical merge
 
@@ -12,16 +12,19 @@ Accepted predecessor lock: DL-SD-S2-G1-001
 
 Accepted predecessor record: issue #7 comment 5412018969
 
-Revision scope: MEDIA-012 evidence feasibility clarification only.
-Revision canonical base: ae256e6bef8d4af1546320a8869c3c9d98132da8
+Revision scope: MEDIA-014 / BIND-009 aggregate-RGBA evidence feasibility clarification only.
+Revision canonical base: 3d5aca89a698f05fbb51c5f980d2578b5f44b007
 
-Revision branch: web/run-008-s2-g2-media012-clarification
+Revision branch: web/run-009-s2-g2-rgba-aggregate-clarification
 
-This revision supersedes DL-SD-S2-G2-001 as the current canonical G2
+This revision supersedes DL-SD-S2-G2-002 as the current canonical G2
 contract revision once Web accepts and merges it. All non-conflicting
-DL-SD-S2-G2-001 decisions are incorporated unchanged. The previous accepted
-G2 history remains traceable through its lock, canonical base
-eff3ae3a49791052741c571c3322ca53520fb9f2, and prepared branch
+DL-SD-S2-G2-002 decisions are incorporated unchanged. The previous accepted
+G2 history remains traceable through the immediately previous G2-002 revision
+at accepted head d6e9cd1198e423db8fbc796327ffffe36846135b, canonical merge
+3d5aca89a698f05fbb51c5f980d2578b5f44b007, and clarification branch
+web/run-008-s2-g2-media012-clarification, together with the G2-001 lock,
+canonical base eff3ae3a49791052741c571c3322ca53520fb9f2, and prepared branch
 web/run-005-s2-g2-contract.
 
 This document is the complete S2 G2 implementation contract. The words MUST,
@@ -267,6 +270,19 @@ Accordingly, an otherwise in-policy 16,777,217-pixel raster is not
 representable under these v0.1 limits. This clarification does not change the
 enforcement order or error precedence; MEDIA-011 provides the behavioural
 evidence for the first representable over-dimension raster.
+
+The per-asset 64 MiB RGBA-equivalent boundary remains reachable because
+16,777,216 pixels x 4 = 67,108,864 bytes. The aggregate RGBA-equivalent guard
+remains exactly 134,217,728 bytes (128 MiB) as a mandatory independent
+defence-in-depth invariant and MUST NOT be weakened or removed. Under the
+separate 32,000,000-pixel aggregate cap, the largest otherwise in-policy
+RGBA-equivalent aggregate is exactly 128,000,000 bytes (32,000,000 pixels x
+4). No otherwise in-policy bound input can reach 134,217,728 decoded
+RGBA-equivalent bytes because doing so requires 33,554,432 pixels. This
+clarification does not change enforcement order, error precedence, aggregate
+calculation, or any numeric limit. Behavioral evidence MUST NOT manufacture
+the unreachable aggregate with synthetic metadata, fake pixel counts,
+weakened limits, or impossible rasters.
 
 The provider-bound encoded aggregate includes the exact persisted PNG bytes for
 all four S1 source candidates and every selected reference and logo asset.
@@ -1956,7 +1972,7 @@ limits to make a fixture pass.
 | MEDIA-011 | Width or height exactly 4,096 is accepted where other bounds pass; 4,097 is rejected. |
 | MEDIA-012 | Exactly 16,777,216 pixels (4,096 x 4,096) is accepted where all other bounds pass, and the per-asset pixel guard remains fixed at 16,777,216. Because each dimension is independently capped at 4,096, no otherwise in-policy 16,777,217-pixel single-frame raster is representable; MEDIA-011 covers the first representable over-dimension rejection. |
 | MEDIA-013 | Decoded total of 32,000,000 pixels is accepted; one additional decoded pixel is rejected at bind. |
-| MEDIA-014 | RGBA-equivalent per-asset and aggregate 64 MiB/128 MiB bounds are enforced. |
+| MEDIA-014 | The reachable per-asset 64 MiB RGBA-equivalent boundary is enforced. Aggregate RGBA accounting remains pixelCount x 4 with the mandatory 134,217,728-byte defence-in-depth guard; because the 32,000,000-pixel aggregate cap limits otherwise in-policy input to 128,000,000 RGBA-equivalent bytes, evidence uses that maximum representable aggregate and independently verifies the exact 134,217,728-byte guard. |
 | MEDIA-015 | Normalized PNG exactly 16 MiB is accepted and the next byte is rejected. |
 | MEDIA-016 | EXIF orientations are applied before final dimensions and output orientation is correct. |
 | MEDIA-017 | ICC, EXIF, XMP, IPTC, PNG text, comments and filename metadata are absent from normalized output. |
@@ -1982,7 +1998,7 @@ limits to make a fixture pass.
 | BIND-006 | Concurrent bind requests produce one input/run and one frozen draft. |
 | BIND-007 | Same idempotency key and same input replays; same key with changed input rejects. |
 | BIND-008 | Second bind for the same source generation set returns S2_QA_RUN_EXISTS or S2_ALREADY_BOUND. |
-| BIND-009 | The 32 MiB provider-bound encoded and 128 MiB decoded aggregates include exact S1 source bytes and selected normalized assets. |
+| BIND-009 | The 32 MiB provider-bound encoded aggregate includes exact persisted S1 source bytes and selected normalized assets. Decoded aggregate accounting includes the exact decoder-derived S1 and selected-asset pixel/RGBA measures, enforces the 32,000,000-pixel cap and the fixed 134,217,728-byte RGBA defence-in-depth guard, with 128,000,000 bytes as the maximum representable otherwise in-policy RGBA aggregate. |
 | BIND-010 | Bind reads the immutable S1 ConceptAsset private PNG, verifies exact byte identity, derives S2 metadata safely, and never mutates or renormalizes the S1 object. |
 | QA-001 | One QA request is made per candidate, using only the source candidate image. |
 | QA-002 | The QA request uses the pinned model, store false, high image detail and strict s2_qa_v1 schema. |
