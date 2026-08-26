@@ -2,7 +2,7 @@
 
 Decision Lock: DL-SD-S2-G2-002
 
-Status: proposed bounded G2 revision; not yet accepted
+Status: normative contract for G3 implementation upon Web acceptance and canonical merge
 
 Programme parent: #1 - Swooshz Design v0.1 Rolling Work Queue
 
