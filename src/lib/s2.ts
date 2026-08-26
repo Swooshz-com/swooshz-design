@@ -77,8 +77,10 @@ export type S2WorkflowServiceOptions = {
   workerId?: string;
   processId?: number;
   isProcessAlive?: (processId: number) => boolean;
-  onPublicationPhase?: (phase: "after-final-promotion", publication: S2Publication) => "interrupt" | void;
+  onPublicationPhase?: (phase: S2PublicationPhase, publication: S2Publication) => "interrupt" | void | Promise<"interrupt" | void>;
 };
+
+export type S2PublicationPhase = "after-publication-staged" | "after-final-promotion";
 
 export type S2PublicAsset = {
   id: UUID;
@@ -733,8 +735,8 @@ export class S2WorkflowService {
     });
   }
 
-  private notifyPublicationPromoted(publication: S2Publication): void {
-    if (this.onPublicationPhase?.("after-final-promotion", cloneJson(publication)) === "interrupt") {
+  private async notifyPublicationPhase(phase: S2PublicationPhase, publication: S2Publication): Promise<void> {
+    if (await this.onPublicationPhase?.(phase, cloneJson(publication)) === "interrupt") {
       throw new SimulatedProcessInterruption();
     }
   }
@@ -766,7 +768,17 @@ export class S2WorkflowService {
     }
   }
 
-  private reconcileUploadPublication(state: StoreState, publication: S2UploadPublication): { cleanupFinal: boolean; startOperationId: UUID | null } {
+  private uploadOwnerIsDefinitelyDead(publication: S2UploadPublication): boolean {
+    if (!Number.isInteger(publication.ownerProcessId) || publication.ownerProcessId <= 0) return false;
+    try {
+      return this.isProcessAlive(publication.ownerProcessId) === false;
+    } catch {
+      return false;
+    }
+  }
+
+  private reconcileUploadPublication(state: StoreState, publication: S2UploadPublication): { cleanupFinal: boolean; startOperationId: UUID | null } | null {
+    if (!this.uploadOwnerIsDefinitelyDead(publication)) return null;
     const finalMatches = this.publicationFinalsMatch(publication);
     const existingAsset = state.s2Assets.find((asset) => asset.id === publication.assetId);
     const existingIdempotency = state.idempotency.find((item) => item.key === publication.idempotencyKey);
@@ -954,6 +966,7 @@ export class S2WorkflowService {
       assetId,
       idempotencyKey: key,
       inputHash,
+      ownerProcessId: this.processId,
       stagingObjects: [
         { key: stagingOriginal, sha256: normalized.originalSha256, byteSize: normalized.originalBytes.byteLength },
         { key: stagingNormalized, sha256: normalized.normalizedSha256, byteSize: normalized.normalizedBytes.byteLength },
@@ -979,10 +992,11 @@ export class S2WorkflowService {
         const replay = this.idempotencyIn(state, key, "s2_asset_upload", projectId, inputHash);
         if (!replay) state.s2Publications.push(cloneJson(publication));
       });
+      await this.notifyPublicationPhase("after-publication-staged", publication);
       this.objects.promote(stagingOriginal, finalOriginal);
       this.objects.promote(stagingNormalized, finalNormalized);
       this.markPublicationState(publication.id, "promoted");
-      this.notifyPublicationPromoted(publication);
+      await this.notifyPublicationPhase("after-final-promotion", publication);
       const result = this.repository.transact((state) => {
         this.s2Project(state, projectId);
         const draft = this.draftIn(state, projectId, true);
@@ -2037,10 +2051,11 @@ export class S2WorkflowService {
         if (!stored || !this.claimMatches(stored, claim.token)) throw appError(409, "STATE_CONFLICT");
         current.s2Publications.push(cloneJson(repairPublication));
       });
+      await this.notifyPublicationPhase("after-publication-staged", repairPublication);
       this.objects.promote(stageKey, finalKey);
       this.verifyObject(finalKey, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
       this.markPublicationState(repairPublication.id, "promoted");
-      this.notifyPublicationPromoted(repairPublication);
+      await this.notifyPublicationPhase("after-final-promotion", repairPublication);
       const committed = this.repository.transact((current) => {
         const stored = current.s2Operations.find((item) => item.id === operationId);
         if (!stored || !this.claimMatches(stored, claim.token)) {

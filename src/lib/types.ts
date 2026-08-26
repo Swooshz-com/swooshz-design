@@ -612,6 +612,7 @@ export type S2UploadPublication = {
   assetId: UUID;
   idempotencyKey: UUID;
   inputHash: Sha256;
+  ownerProcessId: number;
   stagingObjects: S2PublicationObject[];
   finalObjects: S2PublicationObject[];
   intendedAsset: S2AssetRecord;

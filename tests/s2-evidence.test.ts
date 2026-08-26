@@ -11,6 +11,7 @@ import { createIdempotencyKeyRetainer, UnknownNetworkOutcome, withRetainedIdempo
 import { MockOpenAIProvider, ProviderFailure } from "../src/lib/openai";
 import { buildS2QaRequest, buildS2RepairRequest } from "../src/lib/s2-provider";
 import { JsonRepository, PrivateObjectStore } from "../src/lib/store";
+import type { S2PublicationPhase } from "../src/lib/s2";
 import {
   enforceS2AggregateLimits,
   normalizeS2Media,
@@ -79,7 +80,7 @@ type SeedOptions = {
   data?: StructuredBriefData;
   processId?: number;
   isProcessAlive?: (processId: number) => boolean;
-  onPublicationPhase?: (phase: "after-final-promotion", publication: S2Publication) => "interrupt" | void;
+  onPublicationPhase?: (phase: S2PublicationPhase, publication: S2Publication) => "interrupt" | void | Promise<"interrupt" | void>;
 };
 
 function seed(options: SeedOptions = {}): Fixture {
@@ -291,7 +292,7 @@ test("section-24 media evidence", async () => {
     mark("MEDIA-021", "Pinned decoder safety options", true, ["failOn: \"warning\"", "limitInputPixels", "pages: 1", "animated: false", "autoOrient: true", "sequentialRead: true"].every((value) => mediaSource.includes(value)) && !mediaSource.includes("unlimited: true"));
     const failing = seed(); try { (failing.objects as any).promote = () => { throw new AppError(500, "PERSISTENCE_FAILED"); }; await expectCode(() => upload(failing, "reference", PNG), "PERSISTENCE_FAILED"); mark("MEDIA-022", "Owned staging cleanup after promotion failure", true, listObjects(failing.root).every((path) => !path.includes("/staging/") && !path.includes("\\staging\\"))); } finally { cleanup(failing); }
     const hardUploadKey = randomUUID();
-    const hardUpload = seed({ processId: 99130, onPublicationPhase: () => "interrupt" });
+    const hardUpload = seed({ processId: 99130, onPublicationPhase: (phase) => phase === "after-final-promotion" ? "interrupt" : undefined });
     try {
       let interrupted = false;
       try { await hardUpload.service.s2.uploadAsset(hardUpload.projectId, "reference", "hard-crash.png", "image/png", PNG, hardUploadKey); }
@@ -301,9 +302,15 @@ test("section-24 media evidence", async () => {
       const restarted = createWorkflowService({ repository: hardUpload.repository, objects: hardUpload.objects, provider: hardUpload.provider, processId: 99131, isProcessAlive: (processId) => processId !== 99130 });
       const afterRestart = restarted.repository.state();
       const recoveredAsset = afterRestart.s2Assets[0];
+      const recoveredPublication = afterRestart.s2Publications.find((publication) => publication.kind === "asset_upload");
       const replay = await restarted.s2.uploadAsset(hardUpload.projectId, "reference", "different-name.png", "image/png", PNG, hardUploadKey);
       markVariant("MEDIA-022", "hard-interruption-restart", "Promoted upload publication is reconciled after process loss before lineage commit", true,
-        interrupted && promotedBeforeRestart && beforeRestart.s2Assets.length === 0 && beforeRestart.s2Publications.some((publication) => publication.state === "promoted") && afterRestart.s2Assets.length === 1 && recoveredAsset.status === "ready" && afterRestart.s2Publications.every((publication) => publication.state === "committed") && listObjects(hardUpload.root).filter((name) => /s2[\\/]references[\\/]/.test(name)).length === 2 && listObjects(hardUpload.root).every((name) => !/s2[\\/]staging[\\/]/.test(name)) && replay.replayed && replay.asset.id === recoveredAsset.id);
+        interrupted && promotedBeforeRestart && beforeRestart.s2Assets.length === 0 && beforeRestart.s2Publications.some((publication) => publication.state === "promoted" && publication.kind === "asset_upload" && publication.ownerProcessId === 99130) && afterRestart.s2Assets.length === 1 && recoveredAsset.status === "ready" && afterRestart.s2Publications.every((publication) => publication.state === "committed") && listObjects(hardUpload.root).filter((name) => /s2[\\/]references[\\/]/.test(name)).length === 2 && listObjects(hardUpload.root).every((name) => !/s2[\\/]staging[\\/]/.test(name)) && replay.replayed && replay.asset.id === recoveredAsset.id);
+      markVariant("CONC-003", "upload-dead-promoted", "Definitely dead promoted upload recovers one exact asset and same-key replay identity", true,
+        interrupted && recoveredPublication?.ownerProcessId === 99130 && recoveredPublication.state === "committed" && afterRestart.s2Assets.length === 1 &&
+        afterRestart.idempotency.filter((item) => item.key === hardUploadKey).length === 1 && replay.replayed && replay.asset.id === recoveredAsset.id &&
+        listObjects(hardUpload.root).filter((name) => /s2[\\/]references[\\/]/.test(name)).length === 2 &&
+        listObjects(hardUpload.root).every((name) => !/s2[\\/]staging[\\/]/.test(name)));
     } finally { cleanup(hardUpload); }
   } finally { cleanup(fixture); }
 });
@@ -698,7 +705,7 @@ test("section-24 repair output, aggregate and rollback evidence", async () => {
   } finally { cleanup(publication); }
 
   const hardRepairProvider = new MockOpenAIProvider({ briefData: brief() });
-  const hardRepair = seed({ provider: hardRepairProvider, processId: 99140, onPublicationPhase: () => "interrupt" });
+  const hardRepair = seed({ provider: hardRepairProvider, processId: 99140, onPublicationPhase: (phase) => phase === "after-final-promotion" ? "interrupt" : undefined });
   try {
     const bound = await bind(hardRepair); await waitForRun(hardRepair, bound.qaRun.id);
     const sourceBefore = Buffer.from(hardRepair.objects.read(hardRepair.repository.state().s2Inputs[0].sourceCandidates[0].sourceStorageKey));
@@ -849,7 +856,7 @@ test("section-24 concurrency and recovery evidence", async () => {
   } finally { cleanup(activeQa); }
 
   const hardRepairProvider = new MockOpenAIProvider({ briefData: brief() });
-  const activeRepair = seed({ provider: hardRepairProvider, processId: 99140, onPublicationPhase: () => "interrupt" });
+  const activeRepair = seed({ provider: hardRepairProvider, processId: 99140, onPublicationPhase: (phase) => phase === "after-final-promotion" ? "interrupt" : undefined });
   try {
     const bound = await bind(activeRepair); await waitForRun(activeRepair, bound.qaRun.id);
     const candidate = materializeResult(activeRepair, bound.qaRun.id, 1, { status: "material_fail", verdict: "MATERIAL_FAIL", materialFindingIds: ["scale.human"], warningFindingIds: [], uncertainFindingIds: [] });
@@ -900,6 +907,183 @@ test("section-24 concurrency and recovery evidence", async () => {
     const s2Objects = listObjects(uploads.root).filter((name) => /s2[\\/]+references[\\/]+/.test(name));
     mark("CONC-006", "Concurrent object publication cannot overwrite or duplicate a ready asset", true, fulfilled === 1 && rejected === 1 && uploads.repository.state().s2Assets.length === 1 && s2Objects.length === 2 && listObjects(uploads.root).every((name) => !/s2[\\/]+staging/.test(name)));
   } finally { cleanup(uploads); }
+
+  let releaseLiveStaged!: () => void;
+  const liveStagedGate = new Promise<void>((resolve) => { releaseLiveStaged = resolve; });
+  const liveStaged = seed({
+    processId: 99201,
+    isProcessAlive: (processId) => processId === 99201,
+    onPublicationPhase: async (phase) => {
+      if (phase === "after-publication-staged") {
+        await liveStagedGate;
+      }
+    },
+  });
+  let liveStagedUpload: Promise<any> | undefined;
+  try {
+    const key = randomUUID();
+    liveStagedUpload = liveStaged.service.s2.uploadAsset(liveStaged.projectId, "reference", "live-staged.png", "image/png", PNG, key);
+    const staged = await waitUntil(() => liveStaged.repository.state().s2Publications.some((publication) => publication.kind === "asset_upload" && publication.state === "staged"));
+    const before = liveStaged.repository.state();
+    const beforeStaging = listObjects(liveStaged.root).filter((name) => /s2[\\/]staging[\\/]/.test(name));
+    const beforeFinals = listObjects(liveStaged.root).filter((name) => /s2[\\/]references[\\/]/.test(name));
+    const liveService = createWorkflowService({
+      repository: liveStaged.repository,
+      objects: liveStaged.objects,
+      provider: new MockOpenAIProvider({ briefData: brief() }),
+      processId: 99202,
+      isProcessAlive: (processId) => processId === 99201,
+    });
+    const afterRecovery = liveStaged.repository.state();
+    const publication = afterRecovery.s2Publications.find((item) => item.kind === "asset_upload");
+    const unchanged = jcs(before.s2Publications) === jcs(afterRecovery.s2Publications) &&
+      jcs(beforeStaging) === jcs(listObjects(liveStaged.root).filter((name) => /s2[\\/]staging[\\/]/.test(name))) &&
+      jcs(beforeFinals) === jcs(listObjects(liveStaged.root).filter((name) => /s2[\\/]references[\\/]/.test(name)));
+    releaseLiveStaged();
+    const result = await liveStagedUpload;
+    const completed = liveStaged.repository.state();
+    const asset = completed.s2Assets.find((item) => item.id === result.asset.id);
+    const finalObjects = listObjects(liveStaged.root).filter((name) => /s2[\\/]references[\\/]/.test(name));
+    markVariant("CONC-003", "upload-live-staged", "Live staged upload owner remains untouched across a fresh service recovery and completes once", true,
+      staged && publication?.ownerProcessId === 99201 && publication.state === "staged" && unchanged && before.s2Assets.length === 0 &&
+      afterRecovery.s2Assets.length === 0 && afterRecovery.idempotency.filter((item) => item.operation === "s2_asset_upload").length === 0 &&
+      beforeFinals.length === 0 && finalObjects.length === 2 && completed.s2Assets.length === 1 &&
+      completed.idempotency.filter((item) => item.key === key).length === 1 && completed.s2Publications.find((item) => item.kind === "asset_upload")?.state === "committed" &&
+      asset?.storageKeyOriginal !== undefined && finalObjects.some((name) => name.replaceAll(String.fromCharCode(92), "/") === asset.storageKeyOriginal) &&
+      finalObjects.some((name) => name.replaceAll(String.fromCharCode(92), "/") === asset.storageKeyNormalized) && result.asset.id === asset.id);
+    void liveService;
+  } finally {
+    releaseLiveStaged();
+    if (liveStagedUpload) await liveStagedUpload.catch(() => undefined);
+    cleanup(liveStaged);
+  }
+
+  let releaseUnknownOwner!: () => void;
+  const unknownOwnerGate = new Promise<void>((resolve) => { releaseUnknownOwner = resolve; });
+  const unknownOwner = seed({
+    processId: 99211,
+    isProcessAlive: (processId) => processId === 99211,
+    onPublicationPhase: async (phase) => {
+      if (phase === "after-publication-staged") {
+        await unknownOwnerGate;
+      }
+    },
+  });
+  let unknownOwnerUpload: Promise<any> | undefined;
+  try {
+    const key = randomUUID();
+    unknownOwnerUpload = unknownOwner.service.s2.uploadAsset(unknownOwner.projectId, "reference", "unknown-owner.png", "image/png", PNG, key);
+    const staged = await waitUntil(() => unknownOwner.repository.state().s2Publications.some((publication) => publication.kind === "asset_upload" && publication.state === "staged"));
+    const before = unknownOwner.repository.state();
+    const beforeStaging = listObjects(unknownOwner.root).filter((name) => /s2[\\/]staging[\\/]/.test(name));
+    const unknownService = createWorkflowService({
+      repository: unknownOwner.repository,
+      objects: unknownOwner.objects,
+      provider: new MockOpenAIProvider({ briefData: brief() }),
+      processId: 99212,
+      isProcessAlive: () => { throw new Error("unknown owner liveness"); },
+    });
+    const afterRecovery = unknownOwner.repository.state();
+    const unchanged = jcs(before.s2Publications) === jcs(afterRecovery.s2Publications) &&
+      jcs(beforeStaging) === jcs(listObjects(unknownOwner.root).filter((name) => /s2[\\/]staging[\\/]/.test(name)));
+    releaseUnknownOwner();
+    const result = await unknownOwnerUpload;
+    const completed = unknownOwner.repository.state();
+    markVariant("CONC-003", "upload-unknown-owner", "Unknown upload-owner liveness leaves staged publication and owned staging untouched", true,
+      staged && unchanged && afterRecovery.s2Assets.length === 0 &&
+      afterRecovery.idempotency.filter((item) => item.operation === "s2_asset_upload").length === 0 &&
+      afterRecovery.s2Publications.find((item) => item.kind === "asset_upload")?.state === "staged" &&
+      completed.s2Assets.length === 1 && completed.idempotency.filter((item) => item.key === key).length === 1 &&
+      completed.s2Publications.find((item) => item.kind === "asset_upload")?.state === "committed" && result.asset.id === completed.s2Assets[0].id);
+    void unknownService;
+  } finally {
+    releaseUnknownOwner();
+    if (unknownOwnerUpload) await unknownOwnerUpload.catch(() => undefined);
+    cleanup(unknownOwner);
+  }
+
+  let releaseLivePromoted!: () => void;
+  const livePromotedGate = new Promise<void>((resolve) => { releaseLivePromoted = resolve; });
+  const livePromoted = seed({
+    processId: 99221,
+    isProcessAlive: (processId) => processId === 99221,
+    onPublicationPhase: async (phase) => {
+      if (phase === "after-final-promotion") {
+        await livePromotedGate;
+      }
+    },
+  });
+  let livePromotedUpload: Promise<any> | undefined;
+  try {
+    const key = randomUUID();
+    livePromotedUpload = livePromoted.service.s2.uploadAsset(livePromoted.projectId, "reference", "live-promoted.png", "image/png", PNG, key);
+    const promoted = await waitUntil(() => livePromoted.repository.state().s2Publications.some((publication) => publication.kind === "asset_upload" && publication.state === "promoted"));
+    const before = livePromoted.repository.state();
+    const beforeFinals = listObjects(livePromoted.root).filter((name) => /s2[\\/]references[\\/]/.test(name));
+    const liveService = createWorkflowService({
+      repository: livePromoted.repository,
+      objects: livePromoted.objects,
+      provider: new MockOpenAIProvider({ briefData: brief() }),
+      processId: 99222,
+      isProcessAlive: (processId) => processId === 99221,
+    });
+    const afterRecovery = livePromoted.repository.state();
+    const unchanged = jcs(before.s2Publications) === jcs(afterRecovery.s2Publications) &&
+      jcs(beforeFinals) === jcs(listObjects(livePromoted.root).filter((name) => /s2[\\/]references[\\/]/.test(name)));
+    releaseLivePromoted();
+    const result = await livePromotedUpload;
+    const completed = livePromoted.repository.state();
+    const asset = completed.s2Assets.find((item) => item.id === result.asset.id);
+    const finalObjects = listObjects(livePromoted.root).filter((name) => /s2[\\/]references[\\/]/.test(name));
+    const finalSet = new Set(finalObjects.map((name) => name.replaceAll(String.fromCharCode(92), "/")));
+    markVariant("CONC-003", "upload-live-promoted", "Live promoted upload owner remains authoritative until its asset transaction commits", true,
+      promoted && before.s2Publications.find((item) => item.kind === "asset_upload")?.ownerProcessId === 99221 &&
+      before.s2Assets.length === 0 && before.idempotency.filter((item) => item.operation === "s2_asset_upload").length === 0 &&
+      beforeFinals.length === 2 && unchanged && afterRecovery.s2Assets.length === 0 &&
+      afterRecovery.idempotency.filter((item) => item.operation === "s2_asset_upload").length === 0 &&
+      afterRecovery.s2Publications.find((item) => item.kind === "asset_upload")?.state === "promoted" &&
+      completed.s2Assets.length === 1 && completed.idempotency.filter((item) => item.key === key).length === 1 &&
+      completed.s2Publications.find((item) => item.kind === "asset_upload")?.state === "committed" &&
+      asset !== undefined && finalSet.has(asset.storageKeyOriginal) && finalSet.has(asset.storageKeyNormalized) && result.asset.id === asset.id);
+    void liveService;
+  } finally {
+    releaseLivePromoted();
+    if (livePromotedUpload) await livePromotedUpload.catch(() => undefined);
+    cleanup(livePromoted);
+  }
+
+  const deadStaged = seed({
+    processId: 99231,
+    onPublicationPhase: (phase) => phase === "after-publication-staged" ? "interrupt" : undefined,
+  });
+  try {
+    const key = randomUUID();
+    let interrupted = false;
+    const deadUpload = deadStaged.service.s2.uploadAsset(deadStaged.projectId, "reference", "dead-staged.png", "image/png", PNG, key).catch(() => {
+      interrupted = true;
+      return null;
+    });
+    const staged = await waitUntil(() => deadStaged.repository.state().s2Publications.some((publication) => publication.kind === "asset_upload" && publication.state === "staged"));
+    await deadUpload;
+    const beforeRecovery = deadStaged.repository.state();
+    const beforeStaging = listObjects(deadStaged.root).filter((name) => /s2[\\/]staging[\\/]/.test(name));
+    const recovered = createWorkflowService({
+      repository: deadStaged.repository,
+      objects: deadStaged.objects,
+      provider: new MockOpenAIProvider({ briefData: brief() }),
+      processId: 99232,
+      isProcessAlive: (processId) => processId !== 99231,
+    });
+    const afterRecovery = deadStaged.repository.state();
+    markVariant("CONC-003", "upload-dead-staged", "Definitely dead staged upload is aborted without a ready asset or unrelated deletion", true,
+      staged && interrupted && beforeRecovery.s2Publications.find((item) => item.kind === "asset_upload")?.ownerProcessId === 99231 &&
+      beforeStaging.length === 2 && beforeRecovery.s2Assets.length === 0 &&
+      afterRecovery.s2Assets.length === 0 && afterRecovery.idempotency.filter((item) => item.key === key).length === 0 &&
+      afterRecovery.s2Publications.find((item) => item.kind === "asset_upload")?.state === "aborted" &&
+      deadStaged.sourceKeys.every((sourceKey) => deadStaged.objects.exists(sourceKey)) &&
+      listObjects(deadStaged.root).every((name) => !/s2[\\/]staging[\\/]/.test(name) && !/s2[\\/]references[\\/]/.test(name)));
+    void recovered;
+  } finally { cleanup(deadStaged); }
 });
 
 test("section-24 exact route and refresh evidence", async () => {
