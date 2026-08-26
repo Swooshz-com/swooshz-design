@@ -36,7 +36,7 @@ import {
 } from "./openai";
 import { JsonRepository, PrivateObjectStore, defaultDataRoot } from "./store";
 import { assertUuid, cloneJson, jcs, newUuid, nowUtc, privateStorageKey, sha256 } from "./utils";
-import { S2WorkflowService } from "./s2";
+import { S2WorkflowService, type S2WorkflowServiceOptions } from "./s2";
 
 
 export type WorkflowServiceOptions = {
@@ -49,6 +49,7 @@ export type WorkflowServiceOptions = {
   workerId?: string;
   processId?: number;
   isProcessAlive?: (processId: number) => boolean;
+  onPublicationPhase?: S2WorkflowServiceOptions["onPublicationPhase"];
 };
 
 export type PublicGeneration = {
@@ -183,6 +184,7 @@ export class WorkflowService {
       workerId: this.workerId,
       processId: this.processId,
       isProcessAlive: this.isProcessAlive,
+      onPublicationPhase: options.onPublicationPhase,
     });
   }
 

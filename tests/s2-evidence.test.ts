@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import sharp from "sharp";
 import { test } from "node:test";
 import { handleApiRequest } from "../src/lib/api";
+import { createS2QaClient, createS2ReferencesClient } from "../app/components/S2Client";
 import { createIdempotencyKeyRetainer, UnknownNetworkOutcome, withRetainedIdempotencyKey } from "../src/lib/client-idempotency";
 import { MockOpenAIProvider, ProviderFailure } from "../src/lib/openai";
 import { buildS2QaRequest, buildS2RepairRequest } from "../src/lib/s2-provider";
@@ -25,7 +26,7 @@ import {
   S2_MAX_REPAIR_IMAGES,
 } from "../src/lib/s2-media";
 import { createWorkflowService, type WorkflowService } from "../src/lib/workflow";
-import { AppError, type BoothGeometry, type ConceptAsset, type ConceptCandidate, type GenerationSet, type Project, type ProviderMetadata, type StructuredBriefData, type StructuredBriefVersion, type S2QaCandidateResult, type S2AssetRecord } from "../src/lib/types";
+import { AppError, type BoothGeometry, type ConceptAsset, type ConceptCandidate, type GenerationSet, type Project, type ProviderMetadata, type StructuredBriefData, type StructuredBriefVersion, type S2QaCandidateResult, type S2AssetRecord, type S2Publication } from "../src/lib/types";
 import { jcs, privateStorageKey, sha256 } from "../src/lib/utils";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
@@ -76,6 +77,9 @@ type SeedOptions = {
   exactCount?: boolean;
   geometry?: BoothGeometry;
   data?: StructuredBriefData;
+  processId?: number;
+  isProcessAlive?: (processId: number) => boolean;
+  onPublicationPhase?: (phase: "after-final-promotion", publication: S2Publication) => "interrupt" | void;
 };
 
 function seed(options: SeedOptions = {}): Fixture {
@@ -103,7 +107,7 @@ function seed(options: SeedOptions = {}): Fixture {
     }
   });
   const provider = options.provider ?? new MockOpenAIProvider({ briefData: data });
-  const service = createWorkflowService({ repository, objects, provider });
+  const service = createWorkflowService({ repository, objects, provider, processId: options.processId, isProcessAlive: options.isProcessAlive, onPublicationPhase: options.onPublicationPhase });
   service.s2.getReferenceDraft(projectId);
   return { root, repository, objects, service, provider, projectId, generationSetId, versionId, sourceKeys, sourceBytes };
 }
@@ -132,6 +136,10 @@ async function waitForRun(fixture: Fixture, qaRunId: string, predicate: (value: 
 async function expectCode(action: () => unknown, code: string): Promise<boolean> {
   try { await action(); return false; }
   catch (error) { return error instanceof AppError && error.code === code; }
+}
+function succeeds(action: () => unknown): boolean {
+  try { action(); return true; }
+  catch { return false; }
 }
 async function upload(fixture: Fixture, kind: "reference" | "logo", bytes: Uint8Array, name = "asset.png"): Promise<any> {
   return fixture.service.s2.uploadAsset(fixture.projectId, kind, name, "image/png", bytes, randomUUID());
@@ -172,10 +180,13 @@ function measure(overrides: Partial<{ encodedBytes: number; width: number; heigh
 function qaPayload(input: any, mode: string, badRule?: string): any {
   const requirements = input.requirements.map((item: any) => {
     const exactUncertain = mode === "uncertain" && item.expected === "exact_count";
+    const exactBoundary = mode === "threshold" && item.expected === "exact_count";
+    const belowBoundary = mode === "below_threshold" && item.expected === "exact_count";
     const requirementViolation = mode === "requirement_violation" && item.requirementId === "brief.functional.001";
-    const observed = exactUncertain ? "uncertain" : requirementViolation ? "absent" : item.expected === "absent" ? "absent" : "present";
-    const observedCount = exactUncertain ? null : mode === "exact_count_fail" && item.expected === "exact_count" ? (item.expectedCount ?? 0) + 1 : item.expected === "exact_count" ? item.expectedCount : null;
-    return { requirementId: item.requirementId, expected: item.expected, expectedCount: item.expectedCount, observed, observedCount, confidence: mode === "uncertain" && exactUncertain ? 0.5 : 0.99, evidence: mode === "evidence_long" ? "x".repeat(401) : "synthetic observation" };
+    const observed = exactUncertain || belowBoundary ? "uncertain" : requirementViolation ? "absent" : item.expected === "absent" ? "absent" : "present";
+    const observedCount = exactUncertain || belowBoundary ? null : (exactBoundary || mode === "exact_count_fail") && item.expected === "exact_count" ? (item.expectedCount ?? 0) + 1 : item.expected === "exact_count" ? item.expectedCount : null;
+    const confidence = exactBoundary ? 0.75 : belowBoundary ? 0.7499 : mode === "uncertain" && exactUncertain ? 0.5 : 0.99;
+    return { requirementId: item.requirementId, expected: item.expected, expectedCount: item.expectedCount, observed, observedCount, confidence, evidence: mode === "evidence_long" ? "x".repeat(401) : "synthetic observation" };
   });
   const designRules = input.designRules.filter((item: any) => item.applicability === "applicable").map((item: any) => ({ ruleId: item.ruleId, observed: item.ruleId === badRule ? "non_compliant" : mode === "not_verifiable" && item.ruleId === "branding.style" ? "not_verifiable" : mode === "warning" && item.ruleId === "branding.style" ? "non_compliant" : "compliant", confidence: 0.99, evidence: "synthetic observation" }));
   if (mode === "missing") requirements.pop();
@@ -243,22 +254,28 @@ test("section-24 media evidence", async () => {
     mark("MEDIA-008", "Truncated/corrupt and multi-frame rejection", true, await expectCode(() => normalizeS2Media({ kind: "reference", fileName: "truncated.png", mimeType: "image/png", bytes: PNG.subarray(0, PNG.length - 4) }), "MEDIA_CORRUPT") && await expectCode(() => normalizeS2Media({ kind: "reference", fileName: "multi.webp", mimeType: "image/webp", bytes: webpWithChunk(webp, "VP8L", Buffer.alloc(2)) }), "MEDIA_ANIMATED_NOT_ALLOWED"));
     const exactSource = exactSizePng(S2_MAX_SOURCE_BYTES);
     const exactAccepted = await normalizeS2Media({ kind: "reference", fileName: "exact.png", mimeType: "image/png", bytes: exactSource, maxInputBytes: S2_MAX_SOURCE_BYTES });
-    mark("MEDIA-009", "Exact 8 MiB source boundary", S2_MAX_SOURCE_BYTES, exactAccepted.originalBytes.byteLength);
+    const overSource = exactSizePng(S2_MAX_SOURCE_BYTES + 1);
+    const overRejected = await expectCode(() => normalizeS2Media({ kind: "reference", fileName: "over.png", mimeType: "image/png", bytes: overSource, maxInputBytes: S2_MAX_SOURCE_BYTES }), "MEDIA_TOO_LARGE");
+    mark("MEDIA-009", "Exact 8 MiB accepted and 8 MiB plus one rejected during intake", { acceptedBytes: S2_MAX_SOURCE_BYTES, rejectedCode: "MEDIA_TOO_LARGE" }, { acceptedBytes: exactAccepted.originalBytes.byteLength, rejectedCode: overRejected ? "MEDIA_TOO_LARGE" : "unexpected" });
     const boundary = "s2-evidence"; const oversizedBody = Buffer.alloc(S2_MAX_MULTIPART_BODY_BYTES + 1, 0x20);
     const oversizedResponse = await handleApiRequest(new Request(`http://localhost/api/projects/${fixture.projectId}/s2/reference-assets`, { method: "POST", headers: { "content-type": `multipart/form-data; boundary=${boundary}`, "content-length": String(oversizedBody.length), "Idempotency-Key": randomUUID() }, body: oversizedBody }), ["projects", fixture.projectId, "s2", "reference-assets"], fixture.service);
     mark("MEDIA-010", "Multipart framing 9 MiB boundary", 413, oversizedResponse.status);
-    enforceS2AggregateLimits([measure({ width: S2_MAX_DIMENSION, height: 1 })]);
-    mark("MEDIA-011", "Dimension exact/over boundary", true, await expectCode(() => enforceS2AggregateLimits([measure({ width: S2_MAX_DIMENSION + 1 })]), "MEDIA_DIMENSIONS_EXCEEDED"));
-    enforceS2AggregateLimits([measure({ width: 4096, height: 4096, pixelCount: S2_MAX_PIXELS_PER_ASSET, decodedRgbaBytes: S2_MAX_RGBA_BYTES_PER_ASSET })]);
-    mark("MEDIA-012", "Per-asset pixel exact/over boundary", true, await expectCode(() => enforceS2AggregateLimits([measure({ width: 4096, height: 4097, pixelCount: S2_MAX_PIXELS_PER_ASSET + 4096 })]), "MEDIA_DIMENSIONS_EXCEEDED"));
-    enforceS2AggregateLimits([measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2 }), measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2 })]);
-    mark("MEDIA-013", "Aggregate decoded pixel exact/over boundary", true, await expectCode(() => enforceS2AggregateLimits([measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2 }), measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2 }), measure()]), "MEDIA_AGGREGATE_LIMIT_EXCEEDED"));
+    const exactDimensions = succeeds(() => enforceS2AggregateLimits([measure({ width: S2_MAX_DIMENSION, height: 1 })]));
+    const overDimensions = await expectCode(() => enforceS2AggregateLimits([measure({ width: S2_MAX_DIMENSION + 1 })]), "MEDIA_DIMENSIONS_EXCEEDED");
+    mark("MEDIA-011", "Dimension exact/over boundary", true, exactDimensions && overDimensions);
+    const exactPixels = succeeds(() => enforceS2AggregateLimits([measure({ width: 4096, height: 4096, pixelCount: S2_MAX_PIXELS_PER_ASSET, decodedRgbaBytes: S2_MAX_RGBA_BYTES_PER_ASSET })]));
+    const overPixels = await expectCode(() => enforceS2AggregateLimits([measure({ width: 4096, height: 4097, pixelCount: S2_MAX_PIXELS_PER_ASSET + 4096 })]), "MEDIA_DIMENSIONS_EXCEEDED");
+    mark("MEDIA-012", "Per-asset pixel exact/over boundary", true, exactPixels && overPixels);
+    const exactAggregatePixels = succeeds(() => enforceS2AggregateLimits([measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2 }), measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2 })]));
+    const overAggregatePixels = await expectCode(() => enforceS2AggregateLimits([measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2 }), measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2 }), measure()]), "MEDIA_AGGREGATE_LIMIT_EXCEEDED");
+    mark("MEDIA-013", "Aggregate decoded pixel exact/over boundary", true, exactAggregatePixels && overAggregatePixels);
     enforceS2AggregateLimits([measure({ width: 4000, height: 4000, pixelCount: 16_000_000, decodedRgbaBytes: S2_MAX_RGBA_BYTES_PER_ASSET }), measure({ width: 4000, height: 4000, pixelCount: 16_000_000, decodedRgbaBytes: S2_MAX_RGBA_BYTES_PER_ASSET })]);
     const perAssetRgba = await expectCode(() => enforceS2AggregateLimits([measure({ decodedRgbaBytes: S2_MAX_RGBA_BYTES_PER_ASSET + 1 })]), "MEDIA_PIXEL_LIMIT_EXCEEDED");
     const aggregateRgba = await expectCode(() => enforceS2AggregateLimits([measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2, decodedRgbaBytes: S2_MAX_TOTAL_RGBA_BYTES / 2 }), measure({ pixelCount: S2_MAX_TOTAL_PIXELS / 2, decodedRgbaBytes: S2_MAX_TOTAL_RGBA_BYTES / 2 }), measure({ pixelCount: 0, decodedRgbaBytes: 1 })]), "MEDIA_AGGREGATE_LIMIT_EXCEEDED");
     mark("MEDIA-014", "Per-asset and aggregate RGBA limits", true, perAssetRgba && aggregateRgba);
-    enforceS2AggregateLimits([measure({ normalizedBytes: S2_MAX_NORMALIZED_BYTES })]);
-    mark("MEDIA-015", "Normalized byte exact/over boundary", true, await expectCode(() => enforceS2AggregateLimits([measure({ normalizedBytes: S2_MAX_NORMALIZED_BYTES + 1 })]), "MEDIA_NORMALIZATION_FAILED"));
+    const exactNormalized = succeeds(() => enforceS2AggregateLimits([measure({ normalizedBytes: S2_MAX_NORMALIZED_BYTES })]));
+    const overNormalized = await expectCode(() => enforceS2AggregateLimits([measure({ normalizedBytes: S2_MAX_NORMALIZED_BYTES + 1 })]), "MEDIA_NORMALIZATION_FAILED");
+    mark("MEDIA-015", "Normalized byte exact/over boundary", true, exactNormalized && overNormalized);
     const oriented = await sharp({ create: { width: 2, height: 1, channels: 3, background: { r: 200, g: 20, b: 20 } } }).withMetadata({ orientation: 6 }).jpeg().toBuffer();
     const orientedMedia = await normalizeS2Media({ kind: "reference", fileName: "oriented.jpg", mimeType: "image/jpeg", bytes: oriented });
     mark("MEDIA-016", "EXIF orientation before dimensions", { width: 1, height: 2 }, { width: orientedMedia.width, height: orientedMedia.height });
@@ -273,6 +290,21 @@ test("section-24 media evidence", async () => {
     const mediaSource = readFileSync(join(process.cwd(), "src/lib/s2-media.ts"), "utf8");
     mark("MEDIA-021", "Pinned decoder safety options", true, ["failOn: \"warning\"", "limitInputPixels", "pages: 1", "animated: false", "autoOrient: true", "sequentialRead: true"].every((value) => mediaSource.includes(value)) && !mediaSource.includes("unlimited: true"));
     const failing = seed(); try { (failing.objects as any).promote = () => { throw new AppError(500, "PERSISTENCE_FAILED"); }; await expectCode(() => upload(failing, "reference", PNG), "PERSISTENCE_FAILED"); mark("MEDIA-022", "Owned staging cleanup after promotion failure", true, listObjects(failing.root).every((path) => !path.includes("/staging/") && !path.includes("\\staging\\"))); } finally { cleanup(failing); }
+    const hardUploadKey = randomUUID();
+    const hardUpload = seed({ processId: 99130, onPublicationPhase: () => "interrupt" });
+    try {
+      let interrupted = false;
+      try { await hardUpload.service.s2.uploadAsset(hardUpload.projectId, "reference", "hard-crash.png", "image/png", PNG, hardUploadKey); }
+      catch { interrupted = true; }
+      const promotedBeforeRestart = listObjects(hardUpload.root).filter((name) => /s2[\\/]references[\\/]/.test(name)).length === 2;
+      const beforeRestart = hardUpload.repository.state();
+      const restarted = createWorkflowService({ repository: hardUpload.repository, objects: hardUpload.objects, provider: hardUpload.provider, processId: 99131, isProcessAlive: (processId) => processId !== 99130 });
+      const afterRestart = restarted.repository.state();
+      const recoveredAsset = afterRestart.s2Assets[0];
+      const replay = await restarted.s2.uploadAsset(hardUpload.projectId, "reference", "different-name.png", "image/png", PNG, hardUploadKey);
+      markVariant("MEDIA-022", "hard-interruption-restart", "Promoted upload publication is reconciled after process loss before lineage commit", true,
+        interrupted && promotedBeforeRestart && beforeRestart.s2Assets.length === 0 && beforeRestart.s2Publications.some((publication) => publication.state === "promoted") && afterRestart.s2Assets.length === 1 && recoveredAsset.status === "ready" && afterRestart.s2Publications.every((publication) => publication.state === "committed") && listObjects(hardUpload.root).filter((name) => /s2[\\/]references[\\/]/.test(name)).length === 2 && listObjects(hardUpload.root).every((name) => !/s2[\\/]staging[\\/]/.test(name)) && replay.replayed && replay.asset.id === recoveredAsset.id);
+    } finally { cleanup(hardUpload); }
   } finally { cleanup(fixture); }
 });
 
@@ -352,9 +384,31 @@ test("section-24 bind/hash/concurrency evidence", async () => {
     const key = randomUUID(); const first = await bind(replayFixture, key); const replay = await bind(replayFixture, key); const changed = await expectCode(() => bind(replayFixture, key, 2), "IDEMPOTENCY_KEY_REUSE");
     mark("BIND-007", "Exact bind replay/conflicting key reuse", true, replay.replayed && first.inputVersionId === replay.inputVersionId && changed);
     mark("BIND-008", "Second bind uses existing-run conflict", "S2_QA_RUN_EXISTS", (await (async () => { try { await bind(replayFixture, randomUUID()); return "none"; } catch (error) { return error instanceof AppError ? error.code : "unknown"; } })()));
-    mark("BIND-006", "Concurrent bind serialization", 1, replayFixture.repository.state().s2Inputs.length);
     await waitForRun(replayFixture, first.qaRun.id);
   } finally { cleanup(replayFixture); }
+
+  const concurrent = seed();
+  let releaseConcurrent!: () => void;
+  try {
+    let arrivals = 0;
+    const gate = new Promise<void>((resolve) => { releaseConcurrent = resolve; });
+    const originalPreparation = (concurrent.service.s2 as any).sourcePreparation.bind(concurrent.service.s2);
+    (concurrent.service.s2 as any).sourcePreparation = (projectId: string, generationSetId: string) => {
+      arrivals += 1;
+      return gate.then(() => originalPreparation(projectId, generationSetId));
+    };
+    const first = bind(concurrent, randomUUID());
+    const second = bind(concurrent, randomUUID());
+    const overlapped = await waitUntil(() => arrivals === 2);
+    releaseConcurrent();
+    const outcomes = await Promise.allSettled([first, second]);
+    const winner = outcomes.find((outcome): outcome is PromiseFulfilledResult<any> => outcome.status === "fulfilled")?.value;
+    const loserConflict = outcomes.some((outcome) => outcome.status === "rejected" && outcome.reason instanceof AppError && outcome.reason.code === "S2_QA_RUN_EXISTS");
+    if (winner) await waitForRun(concurrent, winner.qaRun.id);
+    const state = concurrent.repository.state();
+    const initialQaOperations = state.s2Operations.filter((operation) => operation.phase === "qa" && operation.attempt === 1);
+    mark("BIND-006", "Overlapping bind requests serialize at the transaction uniqueness boundary", true, overlapped && outcomes.length === 2 && Boolean(winner) && loserConflict && state.s2Inputs.length === 1 && state.s2QaRuns.length === 1 && initialQaOperations.length === 4 && concurrent.provider.s2QaCalls === 4 && state.s2Drafts[0].status === "frozen" && state.s2Drafts[0].frozenByQaRunId === state.s2QaRuns[0].id);
+  } finally { releaseConcurrent?.(); cleanup(concurrent); }
 
   const requestFixture = seed(); try {
     const captured: any[] = []; const provider = new MockOpenAIProvider({ briefData: brief(), onS2QaRequest: (input) => captured.push(input) });
@@ -386,15 +440,23 @@ test("section-24 QA schema/verdict evidence", async () => {
   } finally { cleanup(pass.fixture); }
 
   const invalidModes: Array<[string, string]> = [["missing", "missing"], ["duplicate", "duplicate"], ["unknown", "unknown"], ["non_applicable", "non-applicable"], ["extra_property", "extra-property"], ["wrong_type", "wrong-type"], ["out_of_range", "out-of-range"]];
+  const invalidOutcomes: boolean[] = [];
   for (const [mode] of invalidModes) {
     const value = await runQaFixture(mode);
     try {
       const first = value.value.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1);
-      markVariant("QA-004", mode, `Strict schema ${mode}`, true, first.status === "qa_unavailable_terminal" && value.fixture.repository.state().s2Operations.some((operation) => operation.failureCode === "QA_SCHEMA_INVALID"));
+      const rejected = first.status === "qa_unavailable_terminal" && value.fixture.repository.state().s2Operations.some((operation) => operation.failureCode === "QA_SCHEMA_INVALID");
+      invalidOutcomes.push(rejected);
+      markVariant("QA-004", mode, `Strict schema ${mode}`, true, rejected);
+      if (mode === "non_applicable") markVariant("QA-005", "applicability-mismatch", "Provider adds a non-applicable design rule and the server rejects the echo", true, rejected);
     } finally { cleanup(value.fixture); }
   }
-  mark("QA-004", "All strict-schema variants reject invalid provider output", true, invalidModes.length === 7);
-  mark("QA-005", "Server-owned expected/applicability echo", true, invalidModes.length === 7);
+  mark("QA-004", "All strict-schema variants reject invalid provider output", true, invalidOutcomes.length === invalidModes.length && invalidOutcomes.every(Boolean));
+  const expectedMismatch = await runQaFixture("expected_mismatch");
+  try {
+    const first = expectedMismatch.value.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1);
+    mark("QA-005", "Provider expected-value echo mismatch is rejected by the server-owned schema", true, first.status === "qa_unavailable_terminal" && expectedMismatch.fixture.repository.state().s2Operations.some((operation) => operation.failureCode === "QA_SCHEMA_INVALID"));
+  } finally { cleanup(expectedMismatch.fixture); }
 
   const low = await runQaFixture("uncertain", { exactCount: true });
   try {
@@ -402,8 +464,10 @@ test("section-24 QA schema/verdict evidence", async () => {
     mark("QA-006", "0.5 and null count remain uncertainty", true, first.status === "warning" && first.verdict === "WARNING" && first.requirementObservations.some((item: any) => item.observed === "uncertain" && item.observedCount === null));
     mark("QA-010", "Uncertainty contributes WARNING not schema invalid", true, low.value.qaRun.warningCount === 1 && !low.fixture.repository.state().s2Operations.some((operation) => operation.failureCode === "QA_SCHEMA_INVALID"));
   } finally { cleanup(low.fixture); }
-  const threshold = await runQaFixture("exact_count_fail", { exactCount: true });
-  try { markVariant("QA-006", "variant-2", "0.75 high-confidence count is judged", true, threshold.value.qaRun.candidateResults[0].status === "material_fail" && threshold.value.qaRun.candidateResults[0].materialFindingIds.includes("brief.functional.001")); } finally { cleanup(threshold.fixture); }
+  const threshold = await runQaFixture("threshold", { exactCount: true });
+  try { markVariant("QA-006", "variant-2", "Exact 0.75 high-confidence count is judged", true, threshold.value.qaRun.candidateResults[0].status === "material_fail" && threshold.value.qaRun.candidateResults[0].materialFindingIds.includes("brief.functional.001") && threshold.value.input.canonicalRequirements.some((item: any) => item.expected === "exact_count")); } finally { cleanup(threshold.fixture); }
+  const belowThreshold = await runQaFixture("below_threshold", { exactCount: true });
+  try { markVariant("QA-006", "variant-3", "Confidence immediately below 0.75 remains uncertainty with null exact count", true, belowThreshold.value.qaRun.candidateResults[0].status === "warning" && belowThreshold.value.qaRun.candidateResults[0].verdict === "WARNING" && belowThreshold.value.qaRun.candidateResults[0].requirementObservations.some((item: any) => item.confidence === 0.7499 && item.observed === "uncertain" && item.observedCount === null)); } finally { cleanup(belowThreshold.fixture); }
   const requirementFail = await runQaFixture("requirement_violation");
   try { markVariant("QA-007", "variant-2", "Server classifies a present requirement violation", true, requirementFail.value.qaRun.candidateResults[0].verdict === "MATERIAL_FAIL"); mark("QA-011", "Material verdict requires complete high-confidence violation", true, requirementFail.value.qaRun.materialFailCount === 1); } finally { cleanup(requirementFail.fixture); }
   const overhead = await runQaFixture("pass", {}, "structure.overhead-support");
@@ -523,7 +587,10 @@ test("section-24 repair eligibility, compiler, request and publication evidence"
   } finally { cleanup(prepared.fixture); }
 
   const scale = await repairBatch([["scale.human"]]);
-  try { mark("REPAIR-016", "Scale repair is bounded and does not change hard geometry", true, scale.captured.length === 1 && scale.captured[0].promptText.includes("plausible visual scale correction") && scale.captured[0].promptText.includes("Do not change width") && scale.captured[0].promptText.includes("Do not add engineering")); } finally { cleanup(scale.fixture); }
+  try {
+    mark("REPAIR-016", "Scale repair is bounded and does not change hard geometry", true, scale.captured.length === 1 && scale.captured[0].promptText.includes("plausible visual scale correction") && scale.captured[0].promptText.includes("Do not change width") && scale.captured[0].promptText.includes("Do not add engineering"));
+    markVariant("REPAIR-012", "immutable-input-change", "Changing the immutable finding/manifest inputs changes the repair prompt hash", true, sha256(Buffer.from(scale.captured[0].promptText)) !== sha256(Buffer.from(captured[0].promptText)));
+  } finally { cleanup(scale.fixture); }
 });
 
 test("section-24 repair allowlist and compatibility evidence", async () => {
@@ -611,7 +678,10 @@ test("section-24 repair output, aggregate and rollback evidence", async () => {
     await maxCount.service.s2.repairCandidate(maxCount.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
     const value = await waitForRun(maxCount, bound.qaRun.id, (current) => ["re_qa_pass", "re_qa_warning", "re_qa_material_fail", "re_qa_unavailable", "failed"].includes(current.qaRun.repairs?.[0]?.status));
     const state = maxCount.repository.state();
-    markVariant("BIND-009", "max-user-assets", "Eight selected user assets bind with four source candidates under the aggregate limits", true, state.s2Inputs[0].referenceAssetIds.length === 6 && state.s2Inputs[0].logoAssetIds.length === 2);
+    const selectedAssets = state.s2Assets.filter((asset) => state.s2Inputs[0].referenceAssetIds.includes(asset.id) || state.s2Inputs[0].logoAssetIds.includes(asset.id));
+    const encodedAggregate = state.s2Inputs[0].sourceCandidates.reduce((total, source) => total + source.sourceByteSize, 0) + selectedAssets.reduce((total, asset) => total + asset.normalizedBytes, 0);
+    const decodedAggregate = state.s2Inputs[0].sourceCandidates.reduce((total, source) => total + source.sourceDecodedRgbaBytes, 0) + selectedAssets.reduce((total, asset) => total + asset.width * asset.height * 4, 0);
+    markVariant("BIND-009", "max-user-assets", "Eight selected user assets bind with four source candidates under the aggregate limits", true, state.s2Inputs[0].referenceAssetIds.length === 6 && state.s2Inputs[0].logoAssetIds.length === 2 && selectedAssets.length === 8 && encodedAggregate <= S2_MAX_PROVIDER_BYTES && decodedAggregate <= S2_MAX_TOTAL_RGBA_BYTES && state.s2Operations.filter((operation) => operation.phase === "qa" && operation.attempt === 1).length === 4 && maxCountProvider.s2QaCalls === 5);
     markVariant("REPAIR-009", "max-repair-images", "Nine-image repair manifest boundary is accepted before provider call", true, maxCountProvider.s2RepairCalls === 1 && maxCountCaptured[0]?.images.length === 9 && value.qaRun.repairs?.[0]?.status === "re_qa_pass");
   } finally { cleanup(maxCount); }
   const publicationProvider = new MockOpenAIProvider({ briefData: brief() });
@@ -624,8 +694,26 @@ test("section-24 repair output, aggregate and rollback evidence", async () => {
     await publication.service.s2.repairCandidate(publication.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
     const value = await waitForRun(publication, bound.qaRun.id, (current) => current.qaRun.repairs?.[0]?.status === "failed");
     (publication.objects as any).promote = originalPromote;
-    mark("REPAIR-014", "Publication failure rolls back staging and leaves no derived success", true, value.qaRun.repairs[0].status === "failed" && publication.repository.state().s2DerivedCandidates.length === 0 && listObjects(publication.root).every((name) => !name.includes("s2/repairs")));
+    mark("REPAIR-014", "Publication failure rolls back staging and leaves no derived success", true, value.qaRun.repairs[0].status === "failed" && publication.repository.state().s2DerivedCandidates.length === 0 && listObjects(publication.root).every((name) => !/s2[\\/]repairs[\\/]/.test(name)));
   } finally { cleanup(publication); }
+
+  const hardRepairProvider = new MockOpenAIProvider({ briefData: brief() });
+  const hardRepair = seed({ provider: hardRepairProvider, processId: 99140, onPublicationPhase: () => "interrupt" });
+  try {
+    const bound = await bind(hardRepair); await waitForRun(hardRepair, bound.qaRun.id);
+    const sourceBefore = Buffer.from(hardRepair.objects.read(hardRepair.repository.state().s2Inputs[0].sourceCandidates[0].sourceStorageKey));
+    const candidate = materializeResult(hardRepair, bound.qaRun.id, 1, { status: "material_fail", verdict: "MATERIAL_FAIL", materialFindingIds: ["scale.human"], warningFindingIds: [], uncertainFindingIds: [] });
+    await hardRepair.service.s2.repairCandidate(hardRepair.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    const promoted = await waitUntil(() => hardRepair.repository.state().s2Publications.some((publication) => publication.kind === "repair_output" && publication.state === "promoted"));
+    const beforeRestart = hardRepair.repository.state();
+    const recoveryProvider = new MockOpenAIProvider({ briefData: brief() });
+    const restarted = createWorkflowService({ repository: hardRepair.repository, objects: hardRepair.objects, provider: recoveryProvider, processId: 99141, isProcessAlive: (processId) => processId !== 99140 });
+    const value = await waitForRun(hardRepair, bound.qaRun.id, (current) => ["re_qa_pass", "re_qa_warning", "re_qa_material_fail", "re_qa_unavailable", "failed"].includes(current.qaRun.repairs?.[0]?.status));
+    const afterRestart = restarted.repository.state();
+    const derived = afterRestart.s2DerivedCandidates[0];
+    markVariant("REPAIR-014", "hard-interruption-restart", "Promoted repair output is reconciled without a second repair/provider success", true,
+      promoted && beforeRestart.s2DerivedCandidates.length === 0 && hardRepairProvider.s2RepairCalls === 1 && recoveryProvider.s2RepairCalls === 0 && afterRestart.s2DerivedCandidates.length === 1 && afterRestart.s2ReQaResults.length === 1 && afterRestart.s2Publications.every((publication) => publication.state === "committed") && value.qaRun?.repairs?.[0]?.status === "re_qa_pass" && Boolean(derived) && hardRepair.objects.exists(derived.storageKeyNormalized) && sourceBefore.equals(hardRepair.objects.read(afterRestart.s2Inputs[0].sourceCandidates[0].sourceStorageKey)) && listObjects(hardRepair.root).every((name) => !/s2[\\/]repairs[\\/]\S+[\\/]staged/.test(name)));
+  } finally { cleanup(hardRepair); }
 });
 
 test("section-24 re-QA outcome evidence", async () => {
@@ -661,6 +749,19 @@ async function apiCall(fixture: Fixture, method: string, path: string[], body?: 
   const init: RequestInit = { method, headers };
   if (body !== undefined) (init as any).body = body;
   return handleApiRequest(new Request("http://localhost/" + path.join("/"), init), path, fixture.service);
+}
+
+async function clientFetch(fixture: Fixture, input: string, init: RequestInit = {}): Promise<Response> {
+  const url = new URL(input, "http://localhost");
+  const headers = Object.fromEntries(new Headers(init.headers).entries());
+  const route = url.pathname.split("/").filter(Boolean);
+  if (route[0] === "api") route.shift();
+  return apiCall(fixture, init.method ?? "GET", route, init.body === null ? undefined : init.body, headers);
+}
+
+async function expectUnknown(action: () => unknown): Promise<boolean> {
+  try { await action(); return false; }
+  catch (error) { return error instanceof UnknownNetworkOutcome; }
 }
 
 async function responseJson(response: Response): Promise<any> {
@@ -728,17 +829,58 @@ test("section-24 concurrency and recovery evidence", async () => {
     void bound;
   } finally { release(); cleanup(stale); }
 
-  const persisted = seed();
+  let releaseActiveQa!: () => void;
+  const activeQaGate = new Promise<void>((resolve) => { releaseActiveQa = resolve; });
+  const activeQaProvider = new MockOpenAIProvider({ briefData: brief() });
+  const activeQaOriginal = activeQaProvider.runS2Qa.bind(activeQaProvider);
+  (activeQaProvider as any).runS2Qa = async (input: any) => { if (input.candidateIndex === 1) await activeQaGate; return activeQaOriginal(input); };
+  const activeQa = seed({ provider: activeQaProvider, processId: 99130 });
   try {
-    const bound = await bind(persisted); await waitForRun(persisted, bound.qaRun.id);
-    const candidate = materializeResult(persisted, bound.qaRun.id, 1, { status: "material_fail", verdict: "MATERIAL_FAIL", materialFindingIds: ["scale.human"], warningFindingIds: [], uncertainFindingIds: [] });
-    await persisted.service.s2.repairCandidate(persisted.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
-    await waitForRun(persisted, bound.qaRun.id, (current) => current.qaRun.repairs?.[0]?.status === "re_qa_pass");
-    const before = { inputs: persisted.repository.state().s2Inputs.length, runs: persisted.repository.state().s2QaRuns.length, derived: persisted.repository.state().s2DerivedCandidates.length, reQa: persisted.repository.state().s2ReQaResults.length };
-    const restarted = createWorkflowService({ repository: persisted.repository, objects: persisted.objects, provider: persisted.provider });
-    const after = restarted.s2.getQaRun(persisted.projectId, bound.qaRun.id) as any;
-    mark("CONC-003", "Restart preserves bind, repair and re-QA lineage without duplication", true, before.inputs === persisted.repository.state().s2Inputs.length && before.runs === persisted.repository.state().s2QaRuns.length && before.derived === persisted.repository.state().s2DerivedCandidates.length && before.reQa === persisted.repository.state().s2ReQaResults.length && after.qaRun.repairs.length === 1 && after.qaRun.reQa.length === 1);
-  } finally { cleanup(persisted); }
+    const bound = await bind(activeQa);
+    const running = await waitUntil(() => activeQa.repository.state().s2Operations.some((operation) => operation.phase === "qa" && operation.status === "running" && operation.candidateId === activeQa.repository.state().candidates[0].candidateId));
+    const unknownRestart = createWorkflowService({ repository: activeQa.repository, objects: activeQa.objects, provider: activeQaProvider, processId: 99131, isProcessAlive: () => { throw new Error("unknown"); } });
+    const remainsBusy = activeQa.repository.state().s2Operations.find((operation) => operation.candidateId === activeQa.repository.state().candidates[0].candidateId)?.status === "running";
+    const recoveredProvider = new MockOpenAIProvider({ briefData: brief() });
+    const recovered = createWorkflowService({ repository: activeQa.repository, objects: activeQa.objects, provider: recoveredProvider, processId: 99132, isProcessAlive: (processId) => processId !== 99130 });
+    const recoveredRun = await waitForRun(activeQa, bound.qaRun.id);
+    const qaState = activeQa.repository.state();
+    const qaCandidate = qaState.s2QaRuns[0].candidateResults.find((result) => result.candidateIndex === 1)!;
+    mark("CONC-003", "QA-running interruption is conservatively fenced and dead-owner recovery reuses the same logical operation", true, running && remainsBusy && unknownRestart.s2.getQaRun(activeQa.projectId, bound.qaRun.id) !== undefined && recoveredRun.qaRun.status === "completed" && recoveredProvider.s2QaCalls === 1 && activeQaProvider.s2QaCalls === 3 && qaState.s2Operations.filter((operation) => operation.phase === "qa").length === 4 && qaState.s2QaRuns[0].candidateResults.filter((result) => result.candidateId === qaCandidate.candidateId).length === 1 && qaCandidate.status === "pass" && recovered.s2.getQaRun(activeQa.projectId, bound.qaRun.id) !== undefined);
+  } finally { cleanup(activeQa); }
+
+  const hardRepairProvider = new MockOpenAIProvider({ briefData: brief() });
+  const activeRepair = seed({ provider: hardRepairProvider, processId: 99140, onPublicationPhase: () => "interrupt" });
+  try {
+    const bound = await bind(activeRepair); await waitForRun(activeRepair, bound.qaRun.id);
+    const candidate = materializeResult(activeRepair, bound.qaRun.id, 1, { status: "material_fail", verdict: "MATERIAL_FAIL", materialFindingIds: ["scale.human"], warningFindingIds: [], uncertainFindingIds: [] });
+    await activeRepair.service.s2.repairCandidate(activeRepair.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    const publicationRunning = await waitUntil(() => activeRepair.repository.state().s2Publications.some((publication) => publication.kind === "repair_output" && publication.state === "promoted"));
+    const before = activeRepair.repository.state();
+    const recoveredProvider = new MockOpenAIProvider({ briefData: brief() });
+    const recovered = createWorkflowService({ repository: activeRepair.repository, objects: activeRepair.objects, provider: recoveredProvider, processId: 99141, isProcessAlive: (processId) => processId !== 99140 });
+    const value = await waitForRun(activeRepair, bound.qaRun.id, (current) => ["re_qa_pass", "re_qa_warning", "re_qa_material_fail", "re_qa_unavailable", "failed"].includes(current.qaRun.repairs?.[0]?.status));
+    const after = recovered.repository.state();
+    markVariant("CONC-003", "repair-publication-boundary", "Repair-running final promotion boundary recovers intended lineage without re-dispatching repair", true, publicationRunning && before.s2DerivedCandidates.length === 0 && hardRepairProvider.s2RepairCalls === 1 && recoveredProvider.s2RepairCalls === 0 && after.s2DerivedCandidates.length === 1 && after.s2ReQaResults.length === 1 && value.qaRun.repairs?.[0]?.status === "re_qa_pass" && after.s2Operations.filter((operation) => operation.phase === "repair").length === 1 && recovered.s2.getQaRun(activeRepair.projectId, bound.qaRun.id) !== undefined);
+  } finally { cleanup(activeRepair); }
+
+  let releaseActiveReQa!: () => void;
+  const activeReQaGate = new Promise<void>((resolve) => { releaseActiveReQa = resolve; });
+  const activeReQaProvider = new MockOpenAIProvider({ briefData: brief() });
+  const activeReQaOriginal = activeReQaProvider.runS2Qa.bind(activeReQaProvider);
+  let activeReQaCalls = 0;
+  (activeReQaProvider as any).runS2Qa = async (input: any) => { activeReQaCalls += 1; if (activeReQaCalls === 5) await activeReQaGate; return activeReQaOriginal(input); };
+  const activeReQa = seed({ provider: activeReQaProvider, processId: 99150 });
+  try {
+    const bound = await bind(activeReQa); await waitForRun(activeReQa, bound.qaRun.id);
+    const candidate = materializeResult(activeReQa, bound.qaRun.id, 1, { status: "material_fail", verdict: "MATERIAL_FAIL", materialFindingIds: ["scale.human"], warningFindingIds: [], uncertainFindingIds: [] });
+    await activeReQa.service.s2.repairCandidate(activeReQa.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    const reQaRunning = await waitUntil(() => activeReQa.repository.state().s2Operations.some((operation) => operation.phase === "re_qa" && operation.status === "running"));
+    const reQaOperation = activeReQa.repository.state().s2Operations.find((operation) => operation.phase === "re_qa")!;
+    const recovered = createWorkflowService({ repository: activeReQa.repository, objects: activeReQa.objects, provider: activeReQaProvider, processId: 99151, isProcessAlive: (processId) => processId !== 99150 });
+    const value = await waitForRun(activeReQa, bound.qaRun.id, (current) => ["re_qa_pass", "re_qa_warning", "re_qa_material_fail", "re_qa_unavailable", "failed"].includes(current.qaRun.repairs?.[0]?.status));
+    const state = recovered.repository.state();
+    markVariant("CONC-003", "re-qa-running", "Re-QA-running interruption reuses one result and does not create a second repair", true, reQaRunning && reQaOperation.claimedProcessId === 99150 && activeReQaCalls === 6 && activeReQaProvider.s2QaCalls === 5 && state.s2ReQaResults.length === 1 && state.s2Operations.filter((operation) => operation.phase === "re_qa").length === 1 && state.s2Repairs.length === 1 && value.qaRun.repairs?.[0]?.status === "re_qa_pass");
+  } finally { cleanup(activeReQa); }
 
   const persistence = seed();
   try {
@@ -780,6 +922,9 @@ test("section-24 exact route and refresh evidence", async () => {
     const status = await apiCall(fixture, "GET", ["projects", fixture.projectId, "s2", "qa-runs", qaBody.qaRun.id]);
     await waitForRun(fixture, qaBody.qaRun.id);
     const refreshed = await apiCall(fixture, "GET", ["projects", fixture.projectId, "s2", "qa-runs", qaBody.qaRun.id]);
+    const providerCallsBeforeRestart = fixture.provider.s2QaCalls;
+    const restartedRoute = createWorkflowService({ repository: fixture.repository, objects: fixture.objects, provider: fixture.provider, processId: 99170, isProcessAlive: () => true });
+    const restartedProjection = restartedRoute.s2.getQaRun(fixture.projectId, qaBody.qaRun.id) as any;
     const frozen = await apiCall(fixture, "GET", ["projects", fixture.projectId, "s2", "reference-draft"]);
     const frozenBody = await responseJson(frozen);
     const frozenWrite = await apiCall(fixture, "PATCH", ["projects", fixture.projectId, "s2", "reference-draft"], JSON.stringify({ expectedRevision: frozenBody.draft.revision, referenceAssetIds: frozenBody.draft.referenceAssetIds, logoAssetIds: frozenBody.draft.logoAssetIds }), { "content-type": "application/json", "Idempotency-Key": randomUUID() });
@@ -788,7 +933,7 @@ test("section-24 exact route and refresh evidence", async () => {
     const frozenWriteBody = await responseJson(frozenWrite);
     mark("ROUTE-002", "Exact S2 methods bodies statuses and error envelope route correctly", true, initial.status === 200 && uploaded.status === 201 && replay.status === 200 && patch.status === 200 && preview.status === 200 && preview.headers.get("content-type")?.startsWith("image/png") === true && qa.status === 202 && status.status === 200 && refreshed.status === 200 && frozen.status === 200 && frozenWriteBody.error?.code === "DRAFT_FROZEN");
     mark("ROUTE-003", "Duplicate upload replays by idempotency key", true, replayBody.asset.id === uploadBody.asset.id && fixture.repository.state().s2Assets.length === 1);
-    mark("ROUTE-004", "Refresh after queue and restart returns persisted truth", true, qaBody.qaRun.id === refreshedBody.qaRun.id && refreshedBody.qaRun.status === "completed");
+    mark("ROUTE-004", "Refresh after queue and restart returns persisted truth", true, qaBody.qaRun.id === refreshedBody.qaRun.id && refreshedBody.qaRun.status === "completed" && restartedProjection.qaRun.id === qaBody.qaRun.id && restartedProjection.qaRun.status === "completed" && fixture.provider.s2QaCalls === providerCallsBeforeRestart);
     mark("ROUTE-005", "Empty draft is valid and frozen screen is read-only", true, initialBody.draft.referenceAssetIds.length === 0 && frozenBody.draft.status === "frozen" && frozenWrite.status === 409);
     const freshControls = await runQaFixture("pass", {}, "structure.overhead-support");
     const warningControls = await runQaFixture("warning");
@@ -798,36 +943,69 @@ test("section-24 exact route and refresh evidence", async () => {
       const warning = (warningControls.value.qaRun.candidateResults as any).find((result: any) => result.candidateIndex === 1);
       const unavailable = (unavailableControls.value.qaRun.candidateResults as any).find((result: any) => result.candidateIndex === 1);
       mark("ROUTE-006", "Retry and repair controls are derived only from exact persisted states", true, eligible.repairEligible === true && warning.repairEligible === false && unavailable.status === "qa_unavailable_retryable" && unavailable.repairEligible === false);
+      const behavioral = seed();
+      try {
+        const bound = await bind(behavioral); await waitForRun(behavioral, bound.qaRun.id);
+        const candidate = materializeResult(behavioral, bound.qaRun.id, 1, { status: "material_fail", verdict: "MATERIAL_FAIL", materialFindingIds: ["scale.human"], warningFindingIds: [], uncertainFindingIds: [] });
+        const repairPosts: Array<{ body: any; key: string }> = [];
+        const qaClient = createS2QaClient({
+          projectId: behavioral.projectId,
+          qaRunId: bound.qaRun.id,
+          fetcher: async (input, init) => {
+            if ((init.method ?? "GET") === "POST" && input.endsWith("/repair")) repairPosts.push({ body: JSON.parse(String(init.body)), key: new Headers(init.headers).get("Idempotency-Key") ?? "" });
+            return clientFetch(behavioral, input, init);
+          },
+        });
+        const projection = await qaClient.refresh();
+        await qaClient.repair(candidate.candidateId);
+        await waitForRun(behavioral, bound.qaRun.id, (value) => ["re_qa_pass", "re_qa_warning", "re_qa_material_fail", "re_qa_unavailable", "failed"].includes(value.qaRun.repairs?.[0]?.status));
+        const persisted = await qaClient.refresh();
+        const unavailableFixture = seed();
+        try {
+          const unavailableBound = await bind(unavailableFixture); await waitForRun(unavailableFixture, unavailableBound.qaRun.id);
+          const unavailableCandidate = materializeResult(unavailableFixture, unavailableBound.qaRun.id, 1, { status: "qa_unavailable_retryable", verdict: "QA_UNAVAILABLE", materialFindingIds: [], warningFindingIds: [], uncertainFindingIds: [] });
+          let unavailablePosts = 0;
+          const unavailableClient = createS2QaClient({ projectId: unavailableFixture.projectId, qaRunId: unavailableBound.qaRun.id, fetcher: async (input, init) => { if ((init.method ?? "GET") === "POST" && input.endsWith("/repair")) unavailablePosts += 1; return clientFetch(unavailableFixture, input, init); } });
+          await unavailableClient.refresh();
+          const blocked = await (async () => { try { await unavailableClient.repair(unavailableCandidate.candidateId); return false; } catch { return true; } })();
+          markVariant("ROUTE-006", "behavioral-client-path", "GET sibling input projection drives the real repair POST and persisted re-QA refresh; unavailable state is guarded", true,
+            projection.input.id === bound.inputVersionId && repairPosts.length === 1 && repairPosts[0].body.expectedInputVersionId === projection.input.id && repairPosts[0].key.length > 0 && persisted.input.id === bound.inputVersionId && persisted.qaRun.repairs?.[0]?.status === "re_qa_pass" && blocked && unavailablePosts === 0);
+        } finally { cleanup(unavailableFixture); }
+      } finally { cleanup(behavioral); }
     } finally { cleanup(freshControls.fixture); cleanup(warningControls.fixture); cleanup(unavailableControls.fixture); }
   } finally { cleanup(fixture); }
 
   const lostBind = seed();
   try {
     const retainer = createIdempotencyKeyRetainer(() => randomUUID());
-    const bindInput = JSON.stringify({ projectId: lostBind.projectId, sourceGenerationSetId: lostBind.generationSetId, expectedDraftRevision: 1 });
-    const keys: string[] = [];
-    const bodies: string[] = [];
-    const statuses: number[] = [];
-    let calls = 0;
-    const recovered = await withRetainedIdempotencyKey(retainer, "s2_bind", bindInput, async (key) => {
-      calls += 1;
-      keys.push(key);
-      const body = JSON.stringify({ sourceGenerationSetId: lostBind.generationSetId, expectedDraftRevision: 1 });
-      bodies.push(body);
-      const response = await apiCall(lostBind, "POST", ["projects", lostBind.projectId, "s2", "qa-runs"], body, { "content-type": "application/json", "Idempotency-Key": key });
-      statuses.push(response.status);
-      if (calls === 1) throw new UnknownNetworkOutcome();
-      return response;
+    const bindKeys: string[] = [];
+    const navigations: string[] = [];
+    let bindCalls = 0;
+    const client = createS2ReferencesClient({
+      projectId: lostBind.projectId,
+      sourceGenerationSetId: lostBind.generationSetId,
+      operationKeys: retainer,
+      navigate: (url) => navigations.push(url),
+      fetcher: async (input, init) => {
+        const response = await clientFetch(lostBind, input, init);
+        if ((init.method ?? "GET") === "POST" && input.endsWith("/s2/qa-runs")) {
+          bindCalls += 1;
+          bindKeys.push(new Headers(init.headers).get("Idempotency-Key") ?? "");
+          if (bindCalls <= 2) throw new Error("response lost after durable bind");
+        }
+        return response;
+      },
     });
-    const recoveredBody = await responseJson(recovered);
-    const recoveredRunId = recoveredBody.qaRun.id;
-    await waitForRun(lostBind, recoveredRunId);
-    const refreshed = await apiCall(lostBind, "GET", ["projects", lostBind.projectId, "s2", "qa-runs", recoveredRunId]);
-    const refreshedBody = await responseJson(refreshed);
+    const initialDraft = await client.refresh();
+    const lost = await expectUnknown(() => client.bind(initialDraft.revision));
+    const unrelated = await (async () => { try { await client.update([], [], initialDraft.revision); return false; } catch { return true; } })();
+    const recoveredDraft = await client.refresh();
+    const replay = await client.bind(initialDraft.revision);
+    await waitForRun(lostBind, replay.qaRun.id);
     const state = lostBind.repository.state();
     const initialQaOperations = state.s2Operations.filter((operation) => operation.phase === "qa" && operation.attempt === 1);
-    markVariant("ROUTE-004", "lost-bind-response", "First bind response is lost after durable acceptance; retained-key replay recovers original truth", true,
-      calls === 2 && keys.length === 2 && keys[0] === keys[1] && bodies.length === 2 && bodies[0] === bodies[1] && statuses[0] === 202 && recovered.status === 200 && state.s2Inputs.length === 1 && state.s2QaRuns.length === 1 && initialQaOperations.length === 4 && lostBind.provider.s2QaCalls === 4 && recoveredBody.inputVersionId === state.s2Inputs[0].id && recoveredRunId === state.s2QaRuns[0].id && refreshed.status === 200 && refreshedBody.qaRun.id === recoveredRunId && refreshedBody.qaRun.status === "completed");
+    markVariant("ROUTE-004", "lost-bind-response", "Production references client retains an ambiguous bind across an unrelated update and refresh, then follows persisted frozen truth", true,
+      lost && bindCalls === 3 && bindKeys.length === 3 && bindKeys.every((key) => key === bindKeys[0]) && unrelated && recoveredDraft.status === "frozen" && navigations.includes("/projects/" + lostBind.projectId + "/s2/qa/" + state.s2QaRuns[0].id) && replay.qaRun.id === state.s2QaRuns[0].id && state.s2Inputs.length === 1 && state.s2QaRuns.length === 1 && initialQaOperations.length === 4 && lostBind.provider.s2QaCalls === 4 && state.s2Drafts[0].frozenByQaRunId === state.s2QaRuns[0].id);
   } finally { cleanup(lostBind); }
 
   const retained = createIdempotencyKeyRetainer(() => randomUUID());
@@ -894,7 +1072,7 @@ test("section-24 privacy, security and UI evidence", async () => {
     const storedPath = fixture.repository.state().s2Assets.find((item) => item.id === pathAsset.asset.id)!;
     mark("PRIV-004", "Storage keys are server-generated and path traversal is rejected", true, !storedPath.storageKeyOriginal.includes("private") && !storedPath.storageKeyOriginal.includes("..") && !storedPath.storageKeyNormalized.includes("customer") && fixture.objects.exists(storedPath.storageKeyNormalized));
 
-    const changedFiles = ["src/lib/s2.ts", "src/lib/s2-media.ts", "src/lib/s2-provider.ts", "src/lib/openai.ts", "src/lib/api.ts", "app/components/S2Client.tsx", "package.json", "pnpm-lock.yaml"];
+    const changedFiles = ["src/lib/s2.ts", "src/lib/s2-media.ts", "src/lib/s2-provider.ts", "src/lib/openai.ts", "src/lib/api.ts", "src/lib/client-idempotency.ts", "src/lib/store.ts", "src/lib/types.ts", "src/lib/workflow.ts", "app/components/S2Client.tsx", "tests/s2-evidence.test.ts", "package.json", "pnpm-lock.yaml"];
     const changedText = changedFiles.map((name) => readFileSync(join(process.cwd(), name), "utf8")).join("\n");
     const literalSecret = /(?:sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,})/.test(changedText);
     mark("PRIV-002", "No literal credential-like values enter the changed files", false, literalSecret);
@@ -927,5 +1105,6 @@ test("section-24 evidence matrix completeness", () => {
   const actual = new Set(Array.from(evidenceRows.keys()).map((key) => key.split("/")[0]));
   const missing = required.filter((id) => !actual.has(id));
   assert.equal(required.length, 103);
+  console.log(`Section 24 evidence: ${actual.size}/103 base rows; ${evidenceRows.size} records; 0 skipped`);
   assert.deepEqual(missing, []);
 });

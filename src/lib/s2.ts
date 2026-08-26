@@ -19,6 +19,10 @@ import {
   type S2ReQaResult,
   type S2DerivedCandidate,
   type S2Operation,
+  type S2Publication,
+  type S2PublicationObject,
+  type S2RepairPublication,
+  type S2UploadPublication,
   type S2StateTransition,
   type StoreState,
   type StructuredBriefData,
@@ -73,6 +77,7 @@ export type S2WorkflowServiceOptions = {
   workerId?: string;
   processId?: number;
   isProcessAlive?: (processId: number) => boolean;
+  onPublicationPhase?: (phase: "after-final-promotion", publication: S2Publication) => "interrupt" | void;
 };
 
 export type S2PublicAsset = {
@@ -113,6 +118,13 @@ const SOURCE_PROVIDER_BYTES = 16 * 1024 * 1024;
 const CONFIDENCE_THRESHOLD = 0.75;
 const DESIGN_RULES_VERSION = "s2-design-rules-v1" as const;
 const DECODER_PROFILE = "s2-media-v1" as const;
+
+class SimulatedProcessInterruption extends Error {
+  constructor() {
+    super("simulated process interruption");
+    this.name = "SimulatedProcessInterruption";
+  }
+}
 
 const RULE_CATALOGUE: readonly {
   ruleId: string;
@@ -587,6 +599,7 @@ export class S2WorkflowService {
   private readonly workerId: string;
   private readonly processId: number;
   private readonly isProcessAlive: (processId: number) => boolean;
+  private readonly onPublicationPhase: S2WorkflowServiceOptions["onPublicationPhase"];
   private readonly inFlight = new Set<string>();
 
   constructor(options: S2WorkflowServiceOptions) {
@@ -605,6 +618,8 @@ export class S2WorkflowService {
         return (error as NodeJS.ErrnoException).code !== "ESRCH";
       }
     });
+    this.onPublicationPhase = options.onPublicationPhase;
+    this.recoverPublications();
     this.recoverPendingOperations();
   }
 
@@ -685,6 +700,184 @@ export class S2WorkflowService {
     }
   }
 
+  private publicationObjectMatches(object: S2PublicationObject): boolean {
+    try {
+      const bytes = this.objects.read(object.key);
+      return bytes.byteLength === object.byteSize && sha256(bytes) === object.sha256;
+    } catch {
+      return false;
+    }
+  }
+
+  private publicationFinalsMatch(publication: S2Publication): boolean {
+    return publication.finalObjects.every((object) => this.publicationObjectMatches(object));
+  }
+
+  private referencedPrivateObjectKeys(state: StoreState): Set<string> {
+    const keys = new Set<string>();
+    state.conceptAssets.forEach((asset) => keys.add(asset.storageKey));
+    state.s2Assets.forEach((asset) => {
+      keys.add(asset.storageKeyOriginal);
+      keys.add(asset.storageKeyNormalized);
+    });
+    state.s2DerivedCandidates.forEach((candidate) => keys.add(candidate.storageKeyNormalized));
+    return keys;
+  }
+
+  private cleanupPublicationObjects(publication: S2Publication, removeFinal: boolean): void {
+    publication.stagingObjects.forEach((object) => this.objects.remove(object.key));
+    if (!removeFinal) return;
+    const referenced = this.referencedPrivateObjectKeys(this.state());
+    publication.finalObjects.forEach((object) => {
+      if (!referenced.has(object.key)) this.objects.remove(object.key);
+    });
+  }
+
+  private notifyPublicationPromoted(publication: S2Publication): void {
+    if (this.onPublicationPhase?.("after-final-promotion", cloneJson(publication)) === "interrupt") {
+      throw new SimulatedProcessInterruption();
+    }
+  }
+
+  private markPublicationState(publicationId: UUID, stateValue: "promoted" | "aborted"): void {
+    this.repository.transact((state) => {
+      const publication = state.s2Publications.find((item) => item.id === publicationId);
+      if (!publication || publication.state === "committed") throw appError(500, "PERSISTENCE_FAILED");
+      publication.state = stateValue;
+      publication.updatedAt = this.clock();
+    });
+  }
+
+  private recoverPublications(): void {
+    const pending = this.state().s2Publications
+      .filter((publication) => publication.state === "staged" || publication.state === "promoted")
+      .map((publication) => cloneJson(publication));
+    for (const snapshot of pending) {
+      const outcome = this.repository.transact((state) => {
+        const publication = state.s2Publications.find((item) => item.id === snapshot.id);
+        if (!publication || (publication.state !== "staged" && publication.state !== "promoted")) return null;
+        if (publication.kind === "asset_upload") return this.reconcileUploadPublication(state, publication);
+        return this.reconcileRepairPublication(state, publication);
+      });
+      if (!outcome) continue;
+      if (outcome.cleanupFinal) this.cleanupPublicationObjects(snapshot, true);
+      else this.cleanupPublicationObjects(snapshot, false);
+      if (outcome.startOperationId) this.startOperation(outcome.startOperationId);
+    }
+  }
+
+  private reconcileUploadPublication(state: StoreState, publication: S2UploadPublication): { cleanupFinal: boolean; startOperationId: UUID | null } {
+    const finalMatches = this.publicationFinalsMatch(publication);
+    const existingAsset = state.s2Assets.find((asset) => asset.id === publication.assetId);
+    const existingIdempotency = state.idempotency.find((item) => item.key === publication.idempotencyKey);
+    const assetMatches = existingAsset?.status === "ready" && existingAsset.projectId === publication.projectId &&
+      existingAsset.storageKeyOriginal === publication.intendedAsset.storageKeyOriginal &&
+      existingAsset.storageKeyNormalized === publication.intendedAsset.storageKeyNormalized &&
+      existingAsset.originalSha256 === publication.intendedAsset.originalSha256 &&
+      existingAsset.normalizedSha256 === publication.intendedAsset.normalizedSha256 &&
+      existingAsset.originalBytes === publication.intendedAsset.originalBytes &&
+      existingAsset.normalizedBytes === publication.intendedAsset.normalizedBytes;
+    if (finalMatches && assetMatches && existingIdempotency?.result.assetId === publication.assetId) {
+      publication.state = "committed";
+      publication.updatedAt = this.clock();
+      return { cleanupFinal: false, startOperationId: null };
+    }
+    if (!finalMatches || !state.projects.some((project) => project.projectId === publication.projectId)) {
+      publication.state = "aborted";
+      publication.updatedAt = this.clock();
+      return { cleanupFinal: true, startOperationId: null };
+    }
+    const project = state.projects.find((item) => item.projectId === publication.projectId);
+    const draft = state.s2Drafts.find((item) => item.projectId === publication.projectId);
+    if (!project || project.status !== "concepts_ready" || draft?.status === "frozen") {
+      publication.state = "aborted";
+      publication.updatedAt = this.clock();
+      return { cleanupFinal: true, startOperationId: null };
+    }
+    if (existingIdempotency && (existingIdempotency.operation !== "s2_asset_upload" ||
+        existingIdempotency.projectId !== publication.projectId || existingIdempotency.inputHash !== publication.inputHash ||
+        existingIdempotency.result.assetId !== publication.assetId)) {
+      publication.state = "aborted";
+      publication.updatedAt = this.clock();
+      return { cleanupFinal: true, startOperationId: null };
+    }
+    if (state.s2Assets.some((asset) => asset.projectId === publication.projectId &&
+        asset.originalSha256 === publication.intendedAsset.originalSha256 && asset.status === "ready" && asset.id !== publication.assetId)) {
+      publication.state = "aborted";
+      publication.updatedAt = this.clock();
+      return { cleanupFinal: true, startOperationId: null };
+    }
+    if (!existingAsset) state.s2Assets.push(cloneJson(publication.intendedAsset));
+    if (!existingIdempotency) {
+      this.rememberIdempotency(state, publication.idempotencyKey, "s2_asset_upload", publication.projectId, publication.inputHash, { assetId: publication.assetId });
+    }
+    publication.state = "committed";
+    publication.updatedAt = this.clock();
+    return { cleanupFinal: false, startOperationId: null };
+  }
+
+  private reconcileRepairPublication(state: StoreState, publication: S2RepairPublication): { cleanupFinal: boolean; startOperationId: UUID | null } | null {
+    const operation = state.s2Operations.find((item) => item.id === publication.operationId);
+    const repair = state.s2Repairs.find((item) => item.id === publication.repairAttemptId);
+    const run = state.s2QaRuns.find((item) => item.id === publication.qaRunId);
+    if (!operation || !repair || !run) {
+      publication.state = "aborted";
+      publication.updatedAt = this.clock();
+      return { cleanupFinal: true, startOperationId: null };
+    }
+    if (operation.status === "running" && this.claimIsLive(operation)) return null;
+    const finalMatches = this.publicationFinalsMatch(publication);
+    const existingDerived = state.s2DerivedCandidates.find((item) => item.id === publication.intendedDerived.id);
+    const existingReQa = state.s2ReQaResults.find((item) => item.id === publication.intendedReQa.id);
+    const existingReQaOperation = state.s2Operations.find((item) => item.id === publication.intendedReQaOperation.id);
+    if (existingDerived || existingReQa || existingReQaOperation) {
+      if (!finalMatches || existingDerived?.storageKeyNormalized !== publication.intendedDerived.storageKeyNormalized ||
+          existingReQa?.derivedCandidateId !== publication.intendedDerived.id ||
+          existingReQaOperation?.resultId !== publication.intendedReQa.id) {
+        publication.state = "aborted";
+        publication.updatedAt = this.clock();
+        return { cleanupFinal: true, startOperationId: null };
+      }
+      publication.state = "committed";
+      publication.updatedAt = this.clock();
+      return { cleanupFinal: false, startOperationId: existingReQaOperation?.status === "queued" ? existingReQaOperation.id : null };
+    }
+    if (!finalMatches || operation.status === "failed") {
+      repair.status = "failed";
+      repair.completedAt = this.clock();
+      operation.status = "failed";
+      operation.failureCode = "PERSISTENCE_FAILED";
+      operation.completedAt = this.clock();
+      this.clearClaim(operation);
+      publication.state = "aborted";
+      publication.updatedAt = this.clock();
+      return { cleanupFinal: true, startOperationId: null };
+    }
+    if (operation.status !== "queued" && operation.status !== "running") {
+      publication.state = "aborted";
+      publication.updatedAt = this.clock();
+      return { cleanupFinal: true, startOperationId: null };
+    }
+    state.s2DerivedCandidates.push(cloneJson(publication.intendedDerived));
+    state.s2ReQaResults.push(cloneJson(publication.intendedReQa));
+    state.s2Operations.push(cloneJson(publication.intendedReQaOperation));
+    repair.status = "derived_ready";
+    repair.outputSha256 = publication.intendedDerived.outputSha256;
+    repair.derivedCandidateId = publication.intendedDerived.id;
+    repair.reQaCandidateResultId = publication.intendedReQa.id;
+    repair.providerRequestId = publication.providerRequestId;
+    repair.completedAt = this.clock();
+    const wasRunning = operation.status === "running";
+    operation.status = "succeeded";
+    operation.completedAt = this.clock();
+    this.clearClaim(operation);
+    this.transition(state, operation.projectId, operation.id, "repair", 1, wasRunning ? "running" : "queued", "derived_ready", operation.referenceId);
+    this.transition(state, operation.projectId, publication.intendedReQaOperation.id, "re_qa", 1, "derived_ready", "queued", operation.referenceId);
+    publication.state = "committed";
+    publication.updatedAt = this.clock();
+    return { cleanupFinal: false, startOperationId: publication.intendedReQaOperation.id };
+  }
+
   authorizeProject(projectId: UUID): void {
     this.s2Project(this.state(), projectId);
   }
@@ -717,64 +910,116 @@ export class S2WorkflowService {
       originalSha256: normalized.originalSha256,
       originalBytes: normalized.originalBytes.byteLength,
     });
+    const knownReplay = this.repository.transact((state) => {
+      this.s2Project(state, projectId);
+      const draft = this.draftIn(state, projectId, true);
+      if (draft.status === "frozen") throw appError(409, "DRAFT_FROZEN");
+      const replay = this.idempotencyIn(state, key, "s2_asset_upload", projectId, inputHash);
+      return replay ? String(replay.result.assetId) : null;
+    });
+    if (knownReplay) {
+      const current = this.state();
+      const asset = current.s2Assets.find((item) => item.id === knownReplay);
+      if (!asset) throw appError(500, "PERSISTENCE_FAILED");
+      return { asset: publicAsset(asset), draft: publicDraft(current, this.draftIn(current, projectId, true)), replayed: true };
+    }
     const assetId = this.uuid();
     const stagingOriginal = privateStorageKey("projects", projectId, "s2", "staging", "reference-assets", assetId, "original");
     const stagingNormalized = privateStorageKey("projects", projectId, "s2", "staging", "reference-assets", assetId, "normalized.png");
     const finalOriginal = privateStorageKey("projects", projectId, "s2", "references", assetId, "original");
     const finalNormalized = privateStorageKey("projects", projectId, "s2", "references", assetId, "normalized.png");
+    const intendedAsset: S2AssetRecord = {
+      id: assetId,
+      projectId,
+      kind,
+      status: "ready",
+      originalSha256: normalized.originalSha256,
+      originalBytes: normalized.originalBytes.byteLength,
+      normalizedSha256: normalized.normalizedSha256,
+      normalizedBytes: normalized.normalizedBytes.byteLength,
+      detectedMime: normalized.detectedMime,
+      width: normalized.width,
+      height: normalized.height,
+      pixelCount: normalized.pixelCount,
+      hasAlpha: normalized.hasAlpha,
+      storageKeyOriginal: finalOriginal,
+      storageKeyNormalized: finalNormalized,
+      createdAt: this.clock(),
+      deletedAt: null,
+    };
+    const publication: S2UploadPublication = {
+      kind: "asset_upload",
+      id: this.uuid(),
+      projectId,
+      assetId,
+      idempotencyKey: key,
+      inputHash,
+      stagingObjects: [
+        { key: stagingOriginal, sha256: normalized.originalSha256, byteSize: normalized.originalBytes.byteLength },
+        { key: stagingNormalized, sha256: normalized.normalizedSha256, byteSize: normalized.normalizedBytes.byteLength },
+      ],
+      finalObjects: [
+        { key: finalOriginal, sha256: normalized.originalSha256, byteSize: normalized.originalBytes.byteLength },
+        { key: finalNormalized, sha256: normalized.normalizedSha256, byteSize: normalized.normalizedBytes.byteLength },
+      ],
+      intendedAsset,
+      state: "staged",
+      createdAt: this.clock(),
+      updatedAt: this.clock(),
+    };
     try {
       this.objects.put(stagingOriginal, normalized.originalBytes);
       this.verifyObject(stagingOriginal, normalized.originalBytes.byteLength, normalized.originalSha256);
       this.objects.put(stagingNormalized, normalized.normalizedBytes);
       this.verifyObject(stagingNormalized, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
+      this.repository.transact((state) => {
+        this.s2Project(state, projectId);
+        const draft = this.draftIn(state, projectId, true);
+        if (draft.status === "frozen") throw appError(409, "DRAFT_FROZEN");
+        const replay = this.idempotencyIn(state, key, "s2_asset_upload", projectId, inputHash);
+        if (!replay) state.s2Publications.push(cloneJson(publication));
+      });
       this.objects.promote(stagingOriginal, finalOriginal);
       this.objects.promote(stagingNormalized, finalNormalized);
+      this.markPublicationState(publication.id, "promoted");
+      this.notifyPublicationPromoted(publication);
       const result = this.repository.transact((state) => {
         this.s2Project(state, projectId);
         const draft = this.draftIn(state, projectId, true);
         if (draft.status === "frozen") throw appError(409, "DRAFT_FROZEN");
         const replay = this.idempotencyIn(state, key, "s2_asset_upload", projectId, inputHash);
-        if (replay) return { assetId: String(replay.result.assetId), replayed: true };
+        const storedPublication = state.s2Publications.find((item) => item.id === publication.id);
+        if (replay) {
+          if (storedPublication) {
+            storedPublication.state = "aborted";
+            storedPublication.updatedAt = this.clock();
+          }
+          return { assetId: String(replay.result.assetId), replayed: true };
+        }
+        if (!storedPublication || storedPublication.state !== "promoted") throw appError(500, "PERSISTENCE_FAILED");
         if (state.s2Assets.some((asset) => asset.projectId === projectId &&
             asset.originalSha256 === normalized.originalSha256 && asset.status === "ready")) {
           throw appError(409, "MEDIA_DUPLICATE");
         }
-        const asset: S2AssetRecord = {
-          id: assetId,
-          projectId,
-          kind,
-          status: "ready",
-          originalSha256: normalized.originalSha256,
-          originalBytes: normalized.originalBytes.byteLength,
-          normalizedSha256: normalized.normalizedSha256,
-          normalizedBytes: normalized.normalizedBytes.byteLength,
-          detectedMime: normalized.detectedMime,
-          width: normalized.width,
-          height: normalized.height,
-          pixelCount: normalized.pixelCount,
-          hasAlpha: normalized.hasAlpha,
-          storageKeyOriginal: finalOriginal,
-          storageKeyNormalized: finalNormalized,
-          createdAt: this.clock(),
-          deletedAt: null,
-        };
-        state.s2Assets.push(asset);
+        state.s2Assets.push(cloneJson(intendedAsset));
         this.rememberIdempotency(state, key, "s2_asset_upload", projectId, inputHash, { assetId });
+        storedPublication.state = "committed";
+        storedPublication.updatedAt = this.clock();
         return { assetId, replayed: false };
       });
-      if (result.replayed) {
-        this.objects.remove(finalOriginal);
-        this.objects.remove(finalNormalized);
-      }
+      this.cleanupPublicationObjects(publication, result.replayed);
       const current = this.state();
       const asset = current.s2Assets.find((item) => item.id === result.assetId);
       if (!asset) throw appError(500, "PERSISTENCE_FAILED");
       return { asset: publicAsset(asset), draft: publicDraft(current, this.draftIn(current, projectId, true)), replayed: result.replayed };
     } catch (error) {
-      this.objects.remove(finalOriginal);
-      this.objects.remove(finalNormalized);
-      this.objects.remove(stagingOriginal);
-      this.objects.remove(stagingNormalized);
+      if (error instanceof SimulatedProcessInterruption) throw error;
+      this.cleanupPublicationObjects(publication, true);
+      try {
+        this.markPublicationState(publication.id, "aborted");
+      } catch {
+        // Recovery will reconcile a durable publication record if the abort write fails.
+      }
       throw error;
     }
   }
@@ -1662,6 +1907,7 @@ export class S2WorkflowService {
     const operation = claim.operation;
     let stageKey: string | null = null;
     let finalKey: string | null = null;
+    let publication: S2RepairPublication | null = null;
     try {
       const state = this.state();
       const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
@@ -1699,104 +1945,147 @@ export class S2WorkflowService {
       this.objects.remove(stageKey);
       this.objects.put(stageKey, normalized.normalizedBytes);
       this.verifyObject(stageKey, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
-      this.objects.promote(stageKey, finalKey);
-      this.verifyObject(finalKey, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
       const derivedId = this.uuid();
       const reQaResultId = this.uuid();
       const reQaOperationId = this.uuid();
+      const sourceCandidate = source;
+      const derived: S2DerivedCandidate = {
+        id: derivedId,
+        projectId: operation.projectId,
+        sourceGenerationSetId: input.sourceGenerationSetId,
+        inputVersionId: input.id,
+        qaRunId: run.id,
+        sourceCandidateId: operation.candidateId,
+        repairAttemptId: repair.id,
+        sourceAssetId: sourceCandidate.sourceAssetId,
+        sourceByteSize: sourceCandidate.sourceByteSize,
+        sourceSha256: sourceCandidate.sourceSha256,
+        outputSha256: normalized.normalizedSha256,
+        normalizedBytes: normalized.normalizedBytes.byteLength,
+        width: normalized.width,
+        height: normalized.height,
+        storageKeyNormalized: finalKey,
+        createdAt: this.clock(),
+      };
+      const reQa: S2ReQaResult = {
+        id: reQaResultId,
+        qaRunId: run.id,
+        inputVersionId: input.id,
+        candidateId: operation.candidateId,
+        candidateIndex: sourceCandidate.candidateIndex,
+        attempt: 1,
+        sourceAssetId: sourceCandidate.sourceAssetId,
+        sourceByteSize: sourceCandidate.sourceByteSize,
+        sourceSha256: sourceCandidate.sourceSha256,
+        status: "queued",
+        verdict: "QA_UNAVAILABLE",
+        requirementObservations: [],
+        designObservations: [],
+        materialFindingIds: [],
+        warningFindingIds: [],
+        uncertainFindingIds: [],
+        providerRequestId: null,
+        repairAttemptId: repair.id,
+        startedAt: null,
+        completedAt: null,
+        phase: "re_qa",
+        derivedCandidateId: derivedId,
+      };
+      const reQaOperation: S2Operation = {
+        id: reQaOperationId,
+        projectId: operation.projectId,
+        phase: "re_qa",
+        attempt: 1,
+        qaRunId: run.id,
+        candidateId: operation.candidateId,
+        repairAttemptId: repair.id,
+        inputHash: input.inputHash,
+        referenceId: operation.referenceId,
+        status: "queued",
+        claimedBy: null,
+        claimedProcessId: null,
+        claimToken: null,
+        claimedAt: null,
+        startedAt: null,
+        completedAt: null,
+        failureCode: null,
+        resultId: reQaResultId,
+      };
+      publication = {
+        kind: "repair_output",
+        id: this.uuid(),
+        projectId: operation.projectId,
+        operationId,
+        repairAttemptId: repair.id,
+        qaRunId: run.id,
+        candidateId: operation.candidateId,
+        inputVersionId: input.id,
+        inputHash: input.inputHash,
+        stagingObjects: [{ key: stageKey, sha256: normalized.normalizedSha256, byteSize: normalized.normalizedBytes.byteLength }],
+        finalObjects: [{ key: finalKey, sha256: normalized.normalizedSha256, byteSize: normalized.normalizedBytes.byteLength }],
+        intendedDerived: derived,
+        intendedReQa: reQa,
+        intendedReQaOperation: reQaOperation,
+        providerRequestId: safeProviderRequestId(response.providerRequestId),
+        state: "staged",
+        createdAt: this.clock(),
+        updatedAt: this.clock(),
+      };
+      const repairPublication = publication;
       this.repository.transact((current) => {
         const stored = current.s2Operations.find((item) => item.id === operationId);
+        if (!stored || !this.claimMatches(stored, claim.token)) throw appError(409, "STATE_CONFLICT");
+        current.s2Publications.push(cloneJson(repairPublication));
+      });
+      this.objects.promote(stageKey, finalKey);
+      this.verifyObject(finalKey, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
+      this.markPublicationState(repairPublication.id, "promoted");
+      this.notifyPublicationPromoted(repairPublication);
+      const committed = this.repository.transact((current) => {
+        const stored = current.s2Operations.find((item) => item.id === operationId);
         if (!stored || !this.claimMatches(stored, claim.token)) {
-          if (finalKey) this.objects.remove(finalKey);
-          return;
+          return false;
         }
+        const storedPublication = current.s2Publications.find((item) => item.id === repairPublication.id);
+        if (!storedPublication || storedPublication.kind !== "repair_output" || storedPublication.state !== "promoted") throw appError(500, "PERSISTENCE_FAILED");
         const storedRepair = current.s2Repairs.find((item) => item.id === repair.id);
-        const storedRun = current.s2QaRuns.find((item) => item.id === operation.qaRunId);
-        const storedInput = storedRun ? this.inputForRun(current, storedRun) : null;
-        if (!storedRepair || !storedRun || !storedInput) throw appError(500, "PERSISTENCE_FAILED");
-        const source = storedInput.sourceCandidates.find((item) => item.candidateId === operation.candidateId);
-        if (!source) throw appError(500, "PERSISTENCE_FAILED");
-        const derived: S2DerivedCandidate = {
-          id: derivedId,
-          projectId: operation.projectId,
-          sourceGenerationSetId: storedInput.sourceGenerationSetId,
-          inputVersionId: storedInput.id,
-          qaRunId: storedRun.id,
-          sourceCandidateId: operation.candidateId,
-          repairAttemptId: storedRepair.id,
-          sourceAssetId: source.sourceAssetId,
-          sourceByteSize: source.sourceByteSize,
-          sourceSha256: source.sourceSha256,
-          outputSha256: normalized.normalizedSha256,
-          normalizedBytes: normalized.normalizedBytes.byteLength,
-          width: normalized.width,
-          height: normalized.height,
-          storageKeyNormalized: finalKey!,
-          createdAt: this.clock(),
-        };
-        const reQa: S2ReQaResult = {
-          id: reQaResultId,
-          qaRunId: storedRun.id,
-          inputVersionId: storedInput.id,
-          candidateId: operation.candidateId,
-          candidateIndex: source.candidateIndex,
-          attempt: 1,
-          sourceAssetId: source.sourceAssetId,
-          sourceByteSize: source.sourceByteSize,
-          sourceSha256: source.sourceSha256,
-          status: "queued",
-          verdict: "QA_UNAVAILABLE",
-          requirementObservations: [],
-          designObservations: [],
-          materialFindingIds: [],
-          warningFindingIds: [],
-          uncertainFindingIds: [],
-          providerRequestId: null,
-          repairAttemptId: storedRepair.id,
-          startedAt: null,
-          completedAt: null,
-          phase: "re_qa",
-          derivedCandidateId: derivedId,
-        };
-        current.s2DerivedCandidates.push(derived);
-        current.s2ReQaResults.push(reQa);
+        if (!storedRepair) throw appError(500, "PERSISTENCE_FAILED");
+        current.s2DerivedCandidates.push(cloneJson(storedPublication.intendedDerived));
+        current.s2ReQaResults.push(cloneJson(storedPublication.intendedReQa));
         storedRepair.status = "derived_ready";
-        storedRepair.outputSha256 = normalized.normalizedSha256;
-        storedRepair.derivedCandidateId = derivedId;
-        storedRepair.reQaCandidateResultId = reQaResultId;
-        storedRepair.providerRequestId = safeProviderRequestId(response.providerRequestId);
+        storedRepair.outputSha256 = storedPublication.intendedDerived.outputSha256;
+        storedRepair.derivedCandidateId = storedPublication.intendedDerived.id;
+        storedRepair.reQaCandidateResultId = storedPublication.intendedReQa.id;
+        storedRepair.providerRequestId = storedPublication.providerRequestId;
         storedRepair.completedAt = this.clock();
         stored.status = "succeeded";
         stored.completedAt = this.clock();
         this.clearClaim(stored);
         this.transition(current, stored.projectId, stored.id, stored.phase, 1, "running", "derived_ready", stored.referenceId);
-        current.s2Operations.push({
-          id: reQaOperationId,
-          projectId: operation.projectId,
-          phase: "re_qa",
-          attempt: 1,
-          qaRunId: storedRun.id,
-          candidateId: operation.candidateId,
-          repairAttemptId: storedRepair.id,
-          inputHash: storedInput.inputHash,
-          referenceId: stored.referenceId,
-          status: "queued",
-          claimedBy: null,
-          claimedProcessId: null,
-          claimToken: null,
-          claimedAt: null,
-          startedAt: null,
-          completedAt: null,
-          failureCode: null,
-          resultId: reQaResultId,
-        });
-        this.transition(current, stored.projectId, reQaOperationId, "re_qa", 1, "derived_ready", "queued", stored.referenceId);
+        current.s2Operations.push(cloneJson(storedPublication.intendedReQaOperation));
+        this.transition(current, stored.projectId, storedPublication.intendedReQaOperation.id, "re_qa", 1, "derived_ready", "queued", stored.referenceId);
+        storedPublication.state = "committed";
+        storedPublication.updatedAt = this.clock();
+        return true;
       });
-      const reQaOperation = this.state().s2Operations.find((item) => item.id === reQaOperationId);
-      if (reQaOperation) this.startOperation(reQaOperation.id);
+      if (!committed) {
+        this.cleanupPublicationObjects(repairPublication, true);
+        return;
+      }
+      this.cleanupPublicationObjects(repairPublication, false);
+      const storedReQaOperation = this.state().s2Operations.find((item) => item.id === reQaOperationId);
+      if (storedReQaOperation) this.startOperation(storedReQaOperation.id);
     } catch (error) {
+      if (error instanceof SimulatedProcessInterruption) throw error;
       if (stageKey) this.objects.remove(stageKey);
-      if (finalKey) this.objects.remove(finalKey);
+      if (publication) {
+        this.cleanupPublicationObjects(publication, true);
+        try {
+          this.markPublicationState(publication.id, "aborted");
+        } catch {
+          // Recovery will reconcile a durable publication record if the abort write fails.
+        }
+      } else if (finalKey) this.objects.remove(finalKey);
       this.failRepairOperation(operationId, claim.token, error);
     }
   }

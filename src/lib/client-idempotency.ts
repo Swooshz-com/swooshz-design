@@ -1,4 +1,4 @@
-type ActiveOperation = {
+type RetainedOperation = {
   operation: string;
   input: unknown;
   key: string;
@@ -6,7 +6,7 @@ type ActiveOperation = {
 
 export type IdempotencyKeyRetainer = {
   keyFor(operation: string, input: unknown): string;
-  clear(): void;
+  clear(operation?: string, input?: unknown): void;
 };
 export class UnknownNetworkOutcome extends Error {
   constructor() {
@@ -18,17 +18,24 @@ export class UnknownNetworkOutcome extends Error {
 export function createIdempotencyKeyRetainer(
   generateKey: () => string = () => globalThis.crypto.randomUUID(),
 ): IdempotencyKeyRetainer {
-  let active: ActiveOperation | null = null;
+  const retained: RetainedOperation[] = [];
 
   return {
     keyFor(operation, input) {
-      if (!active || active.operation !== operation || !Object.is(active.input, input)) {
-        active = { operation, input, key: generateKey() };
-      }
-      return active.key;
+      const existing = retained.find((item) => item.operation === operation && Object.is(item.input, input));
+      if (existing) return existing.key;
+      const next = { operation, input, key: generateKey() };
+      retained.push(next);
+      return next.key;
     },
-    clear() {
-      active = null;
+    clear(operation, input) {
+      if (operation === undefined) {
+        retained.length = 0;
+        return;
+      }
+      for (let index = retained.length - 1; index >= 0; index -= 1) {
+        if (retained[index].operation === operation && Object.is(retained[index].input, input)) retained.splice(index, 1);
+      }
     },
   };
 }
@@ -42,19 +49,19 @@ export async function withRetainedIdempotencyKey<T>(
   const key = retainer.keyFor(operation, input);
   try {
     const result = await request(key);
-    retainer.clear();
+    retainer.clear(operation, input);
     return result;
   } catch (error) {
     if (!(error instanceof UnknownNetworkOutcome)) {
-      retainer.clear();
+      retainer.clear(operation, input);
       throw error;
     }
     try {
       const replay = await request(key);
-      retainer.clear();
+      retainer.clear(operation, input);
       return replay;
     } catch (replayError) {
-      if (!(replayError instanceof UnknownNetworkOutcome)) retainer.clear();
+      if (!(replayError instanceof UnknownNetworkOutcome)) retainer.clear(operation, input);
       throw replayError;
     }
   }

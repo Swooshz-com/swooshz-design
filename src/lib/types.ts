@@ -292,6 +292,7 @@ export type StoreState = {
   s2DerivedCandidates: S2DerivedCandidate[];
   s2ReQaResults: S2ReQaResult[];
   s2Transitions: S2StateTransition[];
+  s2Publications: S2Publication[];
 };
 
 export type FieldError = {
@@ -597,6 +598,50 @@ export type S2Operation = {
   failureCode: string | null;
   resultId: UUID | null;
 };
+
+export type S2PublicationObject = {
+  key: string;
+  sha256: Sha256;
+  byteSize: number;
+};
+
+export type S2UploadPublication = {
+  kind: "asset_upload";
+  id: UUID;
+  projectId: UUID;
+  assetId: UUID;
+  idempotencyKey: UUID;
+  inputHash: Sha256;
+  stagingObjects: S2PublicationObject[];
+  finalObjects: S2PublicationObject[];
+  intendedAsset: S2AssetRecord;
+  state: "staged" | "promoted" | "committed" | "aborted";
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type S2RepairPublication = {
+  kind: "repair_output";
+  id: UUID;
+  projectId: UUID;
+  operationId: UUID;
+  repairAttemptId: UUID;
+  qaRunId: UUID;
+  candidateId: UUID;
+  inputVersionId: UUID;
+  inputHash: Sha256;
+  stagingObjects: S2PublicationObject[];
+  finalObjects: S2PublicationObject[];
+  intendedDerived: S2DerivedCandidate;
+  intendedReQa: S2ReQaResult;
+  intendedReQaOperation: S2Operation;
+  providerRequestId: string | null;
+  state: "staged" | "promoted" | "committed" | "aborted";
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type S2Publication = S2UploadPublication | S2RepairPublication;
 
 export type S2StateTransition = {
   id: UUID;

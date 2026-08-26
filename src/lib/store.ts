@@ -108,6 +108,7 @@ export function emptyStoreState(): StoreState {
     s2DerivedCandidates: [],
     s2ReQaResults: [],
     s2Transitions: [],
+    s2Publications: [],
   };
 }
 
@@ -273,6 +274,7 @@ export class JsonRepository {
       if (!Array.isArray(merged.s2DerivedCandidates)) merged.s2DerivedCandidates = [];
       if (!Array.isArray(merged.s2ReQaResults)) merged.s2ReQaResults = [];
       if (!Array.isArray(merged.s2Transitions)) merged.s2Transitions = [];
+      if (!Array.isArray(merged.s2Publications)) merged.s2Publications = [];
       return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
