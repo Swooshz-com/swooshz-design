@@ -1,8 +1,8 @@
 # S2 G2 Implementation Contract
 
-Decision Lock: DL-SD-S2-G2-001
+Decision Lock: DL-SD-S2-G2-002
 
-Status: normative contract for G3 implementation
+Status: proposed bounded G2 revision; not yet accepted
 
 Programme parent: #1 - Swooshz Design v0.1 Rolling Work Queue
 
@@ -12,11 +12,17 @@ Accepted predecessor lock: DL-SD-S2-G1-001
 
 Accepted predecessor record: issue #7 comment 5412018969
 
-Canonical base: eff3ae3a49791052741c571c3322ca53520fb9f2
+Revision scope: MEDIA-012 evidence feasibility clarification only.
+Revision canonical base: ae256e6bef8d4af1546320a8869c3c9d98132da8
 
-Prepared branch: web/run-005-s2-g2-contract
+Revision branch: web/run-008-s2-g2-media012-clarification
 
-Prepared on: 2026-08-25
+This revision supersedes DL-SD-S2-G2-001 as the current canonical G2
+contract revision once Web accepts and merges it. All non-conflicting
+DL-SD-S2-G2-001 decisions are incorporated unchanged. The previous accepted
+G2 history remains traceable through its lock, canonical base
+eff3ae3a49791052741c571c3322ca53520fb9f2, and prepared branch
+web/run-005-s2-g2-contract.
 
 This document is the complete S2 G2 implementation contract. The words MUST,
 MUST NOT, SHOULD, and MAY are normative. G3 MUST implement this document
@@ -251,6 +257,16 @@ table says otherwise. A value above it is rejected before the next stage.
 | Repair provider input count | 9 | One source candidate, up to six references, up to two logos |
 | Repair provider output | 16,777,216 bytes (16 MiB) | Provider PNG before final normalization |
 | Provider QA input count | 1 | The source candidate only |
+
+The width/height and per-asset pixel limits coincide at the maximum 4096 x
+4096 raster. With both dimensions independently constrained to at most 4,096,
+no valid single-frame S2 input can exceed 16,777,216 pixels without also
+exceeding a dimension limit. The 16,777,216 pixel-count guard remains a
+mandatory defence-in-depth invariant and MUST NOT be weakened or removed.
+Accordingly, an otherwise in-policy 16,777,217-pixel raster is not
+representable under these v0.1 limits. This clarification does not change the
+enforcement order or error precedence; MEDIA-011 provides the behavioural
+evidence for the first representable over-dimension raster.
 
 The provider-bound encoded aggregate includes the exact persisted PNG bytes for
 all four S1 source candidates and every selected reference and logo asset.
@@ -1938,7 +1954,7 @@ limits to make a fixture pass.
 | MEDIA-009 | Exactly 8,388,608 source bytes are accepted and 8,388,609 is rejected during intake. |
 | MEDIA-010 | Multipart body framing above 9,437,184 bytes is rejected without unbounded buffering. |
 | MEDIA-011 | Width or height exactly 4,096 is accepted where other bounds pass; 4,097 is rejected. |
-| MEDIA-012 | Exactly 16,777,216 pixels is accepted; one additional pixel is rejected. |
+| MEDIA-012 | Exactly 16,777,216 pixels (4,096 x 4,096) is accepted where all other bounds pass, and the per-asset pixel guard remains fixed at 16,777,216. Because each dimension is independently capped at 4,096, no otherwise in-policy 16,777,217-pixel single-frame raster is representable; MEDIA-011 covers the first representable over-dimension rejection. |
 | MEDIA-013 | Decoded total of 32,000,000 pixels is accepted; one additional decoded pixel is rejected at bind. |
 | MEDIA-014 | RGBA-equivalent per-asset and aggregate 64 MiB/128 MiB bounds are enforced. |
 | MEDIA-015 | Normalized PNG exactly 16 MiB is accepted and the next byte is rejected. |
@@ -2039,7 +2055,7 @@ Provider request/response fixtures MUST be redacted and synthetic.
 
 ### 25.1 Authorized next work after Web acceptance
 
-After Web explicitly accepts DL-SD-S2-G2-001 in the programme record, G3 may:
+After Web explicitly accepts DL-SD-S2-G2-002 in the programme record, G3 may:
 
 1. add sharp 0.35.3 and the generated dependency/lockfile entries;
 2. implement the S2 types, repository records, private media adapter,
@@ -2066,7 +2082,7 @@ implementation blocker; it does not authorize a decoder substitution.
 
 Web may accept this lock only when:
 
-- the branch is based exactly on eff3ae3a49791052741c571c3322ca53520fb9f2;
+- this revision branch is based exactly on ae256e6bef8d4af1546320a8869c3c9d98132da8;
 - this is the only product file changed by the G2 authoring task;
 - the lock contains exact media, data, API, provider, verdict, repair,
   concurrency, privacy and evidence behavior;
