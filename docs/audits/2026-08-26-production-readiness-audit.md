@@ -1,6 +1,7 @@
 # S2 G3 fresh-lineage completion audit
 
 Date: 2026-08-26
+Final repair validation update: 2026-08-27
 
 Repository: `Swooshz-com/swooshz-design`
 
@@ -27,7 +28,7 @@ credential, customer-data, or provider action was in scope.
 | Check | Result | Evidence |
 | --- | --- | --- |
 | Claim-aware Section-24 suite | PASS, 17/17 tests | 103 base rows, 329 derived claims; missing 0, unknown 0, duplicate 0, skipped 0 |
-| Evidence validator negative self-tests | PASS, 8/8 required failure modes | Missing, unknown, duplicate, absent variant, sequential concurrency, boundary mismatch, missing provenance, and impossible MEDIA-014 aggregate all failed for the intended reason |
+| Evidence validator negative self-tests | PASS, 13/13 intentional failure cases | Missing, unknown, duplicate, absent variant, sequential concurrency, boundary mismatch, missing/unlinked provenance, unbound assertion, impossible MEDIA-014 aggregate, grouped partial success, missing claim-specific assertion, and false-fact-not-proof all failed for the intended reason |
 | Complete S1 regression | PASS, 41/41 tests | `tests/g3.test.ts` |
 | Typecheck | PASS | `pnpm run typecheck` |
 | Configured lint | PASS | `pnpm run lint` (repository-configured TypeScript lint) |
@@ -40,6 +41,7 @@ credential, customer-data, or provider action was in scope.
 | Changed-content secret scan | PASS | zero private-key/token/API-key/credential-pattern matches |
 | Client credential/bundle boundary | PASS | zero provider URL, authorization, env, private-path, prompt, or payload matches in S2 client files |
 | Privacy/logging review | PASS in scope | one server log site emits only reference ID, operation, status, and safe code; zero sensitive-log matches |
+| Standard manual/static security review | PASS in scope | S2 API, upload/media, private-object, provider-adapter, client-bundle, persistence/fencing, and error/logging paths reviewed; no known unresolved P0/P1 blocker |
 | Live provider calls | PASS | zero; tests use local mock providers/fake fetch only |
 
 ## Evidence architecture
@@ -50,11 +52,22 @@ G2-003 removes the impossible MEDIA-014 aggregate variants and the impossible
 BIND-009 exact-128-MiB decoded variant. Every record carries the
 contract-required test ID, claim/variant ID, fixture/setup, expected result,
 actual result, safe local reference ID, and artifact/test-output provenance.
-`ExecutionEvidenceRegistry` emits a record only after the proving assertion
-succeeds, and final completeness compares those emitted records with the
-manifest. There is no manifest-wide behavioral record synthesis and no
-`actualForClaim()` fallback. Completeness rejects missing, unknown, duplicate,
-empty, weak source-token, wrong-boundary, and non-concurrent evidence.
+
+The final evidence-integrity repair changes the collector from the unsafe
+grouped `proveMany(claimIds, proof, oneCallback)` shape to
+`proveClaim(claimId, proof, assertion)` plus
+`proveMany([{ claimId, proof, assertion }, ...])`. The matrix wrapper requires
+a distinct assertion callback for every claim in a grouped emission and calls
+each callback before that claim is emitted. If one grouped assertion fails,
+only claims whose own preceding assertions succeeded can exist in the
+registry. The emitted actual text and observation facts remain bound to the
+proving fixture, and final completeness compares emitted claim IDs with the
+canonical manifest. There is no manifest-wide behavioral record synthesis and
+no `actualForClaim()` fallback. A source audit enumerated 112 proof calls: 22
+single-claim calls and 90 multi-claim calls; all 90 multi-claim calls supplied
+explicit per-claim assertion maps, with zero grouped calls missing a map.
+Completeness rejects missing, unknown, duplicate, empty, weak source-token,
+wrong-boundary, unbound-assertion, and non-concurrent evidence.
 
 The fresh suite includes genuine local behavioral fixtures for the known weak
 rows: distinct MEDIA-008 truncated, corrupt, warning-only, and multi-frame
@@ -66,16 +79,35 @@ classes; RETRY-005 late-attempt races; production repair-adapter bad-output
 classes; publication owner recovery; active-phase restart; and stale
 repair/re-QA fencing.
 
+BIND-002 re-read all four persisted private S1 source objects and independently
+matched candidate IDs, indexes `[1,2,3,4]`, ConceptAsset IDs, byte lengths,
+SHA-256 identities, decoder-derived dimensions, pixel counts, and
+pixel-count-times-four RGBA values to the bound snapshots. BIND-004 rebuilt
+the canonical input, requirement, and binding objects from persisted immutable
+inputs, then independently recomputed `inputHash`, `requirementHash`, and
+`bindingHash` with `jcs()` and `sha256()`; all three matched the persisted
+hashes. BIND-009 summed actual persisted source and selected-normalized bytes
+and measured the real bind at exactly 33,554,432 encoded bytes, 32,000,000
+decoded pixels, and 128,000,000 decoded RGBA-equivalent bytes while retaining
+the independently configured 134,217,728-byte defence-in-depth guard; no
+impossible 134,217,728-byte decoded fixture was used.
+
 ## Browser/UI verification
 
-The local Next.js app was started on loopback only with a temporary synthetic
-data root. Playwright CLI snapshots verified:
+The production-built Next.js app was started on loopback only with
+`pnpm exec next start --hostname 127.0.0.1 --port 3101`; readiness and the
+startup log were verified for the run-owned server. Playwright CLI snapshots
+verified:
 
 - `/projects/new` renders the local project creation surface.
-- Creating a synthetic local project reaches the geometry screen, which renders
-  the required dimensions and open-side controls.
-- A valid S2 references navigation before confirmation redirects to geometry;
-  an unknown synthetic S2 QA route returns the expected 404.
+- The production-built `/projects/new` response is HTTP 200 and renders the
+  project-name field and Create project control.
+- An unknown synthetic S2 QA route returns the expected 404.
+- The browser request inventory contains loopback-only URLs; no provider or
+  external URL was contacted.
+
+Fresh snapshot artifacts: `.playwright-cli/page-2026-08-26T17-20-32-870Z.yml`
+and `.playwright-cli/page-2026-08-26T17-20-55-369Z.yml`.
 
 The repository Playwright wrapper could not run because WSL has no
 `/bin/bash`; the wrapper's documented direct `npx --package @playwright/cli`
