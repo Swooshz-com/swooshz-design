@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import sharp from "sharp";
 import { test } from "node:test";
 import { handleApiRequest } from "../src/lib/api";
+import { createIdempotencyKeyRetainer, UnknownNetworkOutcome, withRetainedIdempotencyKey } from "../src/lib/client-idempotency";
 import { MockOpenAIProvider, ProviderFailure } from "../src/lib/openai";
 import { buildS2QaRequest, buildS2RepairRequest } from "../src/lib/s2-provider";
 import { JsonRepository, PrivateObjectStore } from "../src/lib/store";
@@ -800,6 +801,55 @@ test("section-24 exact route and refresh evidence", async () => {
     } finally { cleanup(freshControls.fixture); cleanup(warningControls.fixture); cleanup(unavailableControls.fixture); }
   } finally { cleanup(fixture); }
 
+  const lostBind = seed();
+  try {
+    const retainer = createIdempotencyKeyRetainer(() => randomUUID());
+    const bindInput = JSON.stringify({ projectId: lostBind.projectId, sourceGenerationSetId: lostBind.generationSetId, expectedDraftRevision: 1 });
+    const keys: string[] = [];
+    const bodies: string[] = [];
+    const statuses: number[] = [];
+    let calls = 0;
+    const recovered = await withRetainedIdempotencyKey(retainer, "s2_bind", bindInput, async (key) => {
+      calls += 1;
+      keys.push(key);
+      const body = JSON.stringify({ sourceGenerationSetId: lostBind.generationSetId, expectedDraftRevision: 1 });
+      bodies.push(body);
+      const response = await apiCall(lostBind, "POST", ["projects", lostBind.projectId, "s2", "qa-runs"], body, { "content-type": "application/json", "Idempotency-Key": key });
+      statuses.push(response.status);
+      if (calls === 1) throw new UnknownNetworkOutcome();
+      return response;
+    });
+    const recoveredBody = await responseJson(recovered);
+    const recoveredRunId = recoveredBody.qaRun.id;
+    await waitForRun(lostBind, recoveredRunId);
+    const refreshed = await apiCall(lostBind, "GET", ["projects", lostBind.projectId, "s2", "qa-runs", recoveredRunId]);
+    const refreshedBody = await responseJson(refreshed);
+    const state = lostBind.repository.state();
+    const initialQaOperations = state.s2Operations.filter((operation) => operation.phase === "qa" && operation.attempt === 1);
+    markVariant("ROUTE-004", "lost-bind-response", "First bind response is lost after durable acceptance; retained-key replay recovers original truth", true,
+      calls === 2 && keys.length === 2 && keys[0] === keys[1] && bodies.length === 2 && bodies[0] === bodies[1] && statuses[0] === 202 && recovered.status === 200 && state.s2Inputs.length === 1 && state.s2QaRuns.length === 1 && initialQaOperations.length === 4 && lostBind.provider.s2QaCalls === 4 && recoveredBody.inputVersionId === state.s2Inputs[0].id && recoveredRunId === state.s2QaRuns[0].id && refreshed.status === 200 && refreshedBody.qaRun.id === recoveredRunId && refreshedBody.qaRun.status === "completed");
+  } finally { cleanup(lostBind); }
+
+  const retained = createIdempotencyKeyRetainer(() => randomUUID());
+  const retainedKeys: string[][] = [];
+  for (const [operation, input] of [
+    ["s2_reference_upload", "upload-input"],
+    ["s2_reference_draft_update", "draft-input"],
+    ["s2_bind", "bind-input"],
+    ["s2_qa_retry", "retry-input"],
+    ["s2_repair", "repair-input"],
+  ] as const) {
+    const keys: string[] = [];
+    await withRetainedIdempotencyKey(retained, operation, input, async (key) => {
+      keys.push(key);
+      if (keys.length === 1) throw new UnknownNetworkOutcome();
+      return true;
+    });
+    retainedKeys.push(keys);
+  }
+  const changedInputKey = retained.keyFor("s2_repair", "repair-input-changed");
+  markVariant("ROUTE-006", "same-key-mutation-recovery", "Upload, draft, bind, retry and repair retain one key across unknown response replay and replace it for changed input", true,
+    retainedKeys.every((keys) => keys.length === 2 && keys[0] === keys[1]) && retainedKeys[0][0] !== retainedKeys[1][0] && changedInputKey !== retainedKeys[4][0]);
   const unauthorized = seed();
   try {
     const projectId = randomUUID();

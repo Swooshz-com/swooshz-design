@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  createIdempotencyKeyRetainer,
+  type IdempotencyKeyRetainer,
+  UnknownNetworkOutcome,
+  withRetainedIdempotencyKey,
+} from "../../src/lib/client-idempotency";
 
 type Asset = {
   id: string;
@@ -53,11 +59,39 @@ type QaRun = {
   reQa?: Array<{ candidateId: string; status: string; verdict: string }>;
 };
 
-function key(): string { return crypto.randomUUID(); }
+function useOperationKeys(): IdempotencyKeyRetainer {
+  const retainer = useRef<IdempotencyKeyRetainer | null>(null);
+  if (!retainer.current) retainer.current = createIdempotencyKeyRetainer();
+  return retainer.current;
+}
+
 async function json(response: Response): Promise<any> {
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(`${body.error?.message ?? "The request could not be completed."} Reference: ${body.error?.referenceId ?? "unavailable"}`);
+  let body: any;
+  try {
+    body = await response.json();
+  } catch {
+    if (response.ok) throw new UnknownNetworkOutcome();
+    throw new Error("The request could not be completed. Reference: unavailable");
+  }
+  if (!response.ok) throw new Error((body.error?.message ?? "The request could not be completed.") + " Reference: " + (body.error?.referenceId ?? "unavailable"));
   return body;
+}
+
+async function requestJsonWithKey(
+  retainer: IdempotencyKeyRetainer,
+  operation: string,
+  input: unknown,
+  request: (key: string) => Promise<Response>,
+): Promise<any> {
+  return withRetainedIdempotencyKey(retainer, operation, input, async (key) => {
+    let response: Response;
+    try {
+      response = await request(key);
+    } catch {
+      throw new UnknownNetworkOutcome();
+    }
+    return json(response);
+  });
 }
 function path(projectId: string, suffix: string): string { return "/api/projects/" + projectId + suffix; }
 
@@ -66,7 +100,8 @@ export function S2ReferencesScreen({ projectId, sourceGenerationSetId }: { proje
   const [kind, setKind] = useState<"reference" | "logo">("reference");
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(false);  const operationKeys = useOperationKeys();
+  const uploadInput = useMemo(() => file ? { projectId, file, kind } : null, [file, kind, projectId]);
   async function refresh() {
     try { setDraft((await json(await fetch(path(projectId, "/s2/reference-draft"), { cache: "no-store" }))).draft); }
     catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); }
@@ -78,9 +113,11 @@ export function S2ReferencesScreen({ projectId, sourceGenerationSetId }: { proje
     if (!file || !draft) return;
     setBusy(true); setError("");
     try {
-      const form = new FormData();
-      form.append("file", file, file.name); form.append("kind", kind);
-      const body = await json(await fetch(path(projectId, "/s2/reference-assets"), { method: "POST", headers: { "Idempotency-Key": key() }, body: form }));
+      const body = await requestJsonWithKey(operationKeys, "s2_reference_upload", uploadInput, (key) => {
+        const form = new FormData();
+        form.append("file", file, file.name); form.append("kind", kind);
+        return fetch(path(projectId, "/s2/reference-assets"), { method: "POST", headers: { "Idempotency-Key": key }, body: form });
+      });
       setDraft(body.draft); setFile(null);
     } catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); }
     finally { setBusy(false); }
@@ -89,8 +126,9 @@ export function S2ReferencesScreen({ projectId, sourceGenerationSetId }: { proje
     if (!draft) return;
     setBusy(true); setError("");
     try {
-      const body = await json(await fetch(path(projectId, "/s2/reference-draft"), {
-        method: "PATCH", headers: { "content-type": "application/json", "Idempotency-Key": key() },
+      const input = JSON.stringify({ projectId, expectedRevision: draft.revision, referenceAssetIds, logoAssetIds });
+      const body = await requestJsonWithKey(operationKeys, "s2_reference_draft_update", input, (key) => fetch(path(projectId, "/s2/reference-draft"), {
+        method: "PATCH", headers: { "content-type": "application/json", "Idempotency-Key": key },
         body: JSON.stringify({ expectedRevision: draft.revision, referenceAssetIds, logoAssetIds }),
       }));
       setDraft(body.draft);
@@ -128,8 +166,9 @@ export function S2ReferencesScreen({ projectId, sourceGenerationSetId }: { proje
     if (!sourceGenerationSetId) { setError("The completed S1 generation set is unavailable. Refresh the page and try again."); return; }
     setBusy(true); setError("");
     try {
-      const body = await json(await fetch(path(projectId, "/s2/qa-runs"), {
-        method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": key() },
+      const input = JSON.stringify({ projectId, sourceGenerationSetId, expectedDraftRevision: draft.revision });
+      const body = await requestJsonWithKey(operationKeys, "s2_bind", input, (key) => fetch(path(projectId, "/s2/qa-runs"), {
+        method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": key },
         body: JSON.stringify({ sourceGenerationSetId, expectedDraftRevision: draft.revision }),
       }));
       window.location.assign("/projects/" + projectId + "/s2/qa/" + body.qaRun.id);
@@ -141,6 +180,7 @@ export function S2ReferencesScreen({ projectId, sourceGenerationSetId }: { proje
 
 export function S2QaScreen({ projectId, qaRunId }: { projectId: string; qaRunId: string }) {
   const [run, setRun] = useState<QaRun | null>(null); const [error, setError] = useState(""); const [busy, setBusy] = useState(false);
+  const operationKeys = useOperationKeys();
   async function refresh() {
     try { setRun((await json(await fetch(path(projectId, "/s2/qa-runs/" + qaRunId), { cache: "no-store" }))).qaRun); }
     catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); }
@@ -148,14 +188,23 @@ export function S2QaScreen({ projectId, qaRunId }: { projectId: string; qaRunId:
   useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh(), 1200); return () => window.clearInterval(timer); }, [projectId, qaRunId]);
   async function retry(candidateId: string) {
     setBusy(true); setError("");
-    try { await json(await fetch(path(projectId, "/s2/qa-runs/" + qaRunId + "/candidates/" + candidateId + "/retry"), { method: "POST", headers: { "Idempotency-Key": key() } })); await refresh(); }
+    try {
+      const input = JSON.stringify({ projectId, qaRunId, candidateId });
+      await requestJsonWithKey(operationKeys, "s2_qa_retry", input, (key) => fetch(path(projectId, "/s2/qa-runs/" + qaRunId + "/candidates/" + candidateId + "/retry"), { method: "POST", headers: { "Idempotency-Key": key } }));
+      await refresh();
+    }
     catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); }
     finally { setBusy(false); }
   }
   async function repair(candidateId: string) {
     if (!run?.input?.id) { setError("The immutable S2 input is unavailable. Refresh the page and try again."); return; }
     setBusy(true); setError("");
-    try { await json(await fetch(path(projectId, "/s2/qa-runs/" + qaRunId + "/candidates/" + candidateId + "/repair"), { method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": key() }, body: JSON.stringify({ expectedInputVersionId: run.input.id }) })); await refresh(); }
+    try {
+      const inputVersionId = run.input.id;
+      const input = JSON.stringify({ projectId, qaRunId, candidateId, expectedInputVersionId: inputVersionId });
+      await requestJsonWithKey(operationKeys, "s2_repair", input, (key) => fetch(path(projectId, "/s2/qa-runs/" + qaRunId + "/candidates/" + candidateId + "/repair"), { method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": key }, body: JSON.stringify({ expectedInputVersionId: inputVersionId }) }));
+      await refresh();
+    }
     catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); }
     finally { setBusy(false); }
   }
