@@ -25,7 +25,7 @@ const VARIANTS: Record<string, string[]> = {
   "MEDIA-011": ["exact-4096", "over-4096"],
   "MEDIA-012": ["exact-max-square", "pixel-guard-fixed", "unrepresentable-plus-one"],
   "MEDIA-013": ["aggregate-exact", "aggregate-plus-one-bind"],
-  "MEDIA-014": ["per-asset-exact", "per-asset-over", "aggregate-exact", "aggregate-over"],
+  "MEDIA-014": ["per-asset-exact", "aggregate-max-representable", "guards-configured"],
   "MEDIA-015": ["exact-normalized", "next-byte"],
   "MEDIA-016": ["exif-orientation"],
   "MEDIA-017": ["icc", "exif", "xmp", "iptc", "png-text", "comments", "filename"],
@@ -51,7 +51,7 @@ const VARIANTS: Record<string, string[]> = {
   "BIND-006": ["concurrent-one"],
   "BIND-007": ["same-replay", "changed-reject"],
   "BIND-008": ["second-bind-conflict"],
-  "BIND-009": ["encoded-aggregate", "decoded-aggregate", "exact-32MiB", "exact-128MiB"],
+  "BIND-009": ["encoded-aggregate", "decoded-aggregate", "exact-32MiB", "max-representable-rgba"],
   "BIND-010": ["read-private", "verify-identity", "no-mutate-renorm"],
   "QA-001": ["one-per-candidate", "source-only"],
   "QA-002": ["model", "store-false", "high-detail", "strict-schema"],
@@ -123,10 +123,11 @@ function rowMap(contractText: string): Map<string, string> {
   return rows;
 }
 
-function typeFor(testId: string): EvidenceType {
+function typeFor(testId: string, variantId: string): EvidenceType {
+  if (testId === "CONC-002" || testId === "CONC-003" || testId === "CONC-005") return "persistence/restart";
   if (testId.startsWith("CONC-")) return "concurrency";
   if (testId.startsWith("RETRY-005")) return "concurrency";
-  if (testId.startsWith("CONC-003")) return "persistence/restart";
+  if (testId === "MEDIA-014" && variantId === "guards-configured") return "static";
   if (testId.startsWith("MEDIA-") || testId.startsWith("DRAFT-") || testId.startsWith("BIND-") || testId.startsWith("QA-") ||
       testId.startsWith("REPAIR-") || testId.startsWith("REQA-")) return "behavioral";
   if (testId.startsWith("ROUTE-")) return "client/API";
@@ -166,7 +167,7 @@ export function deriveClaimManifest(contractText: string): ClaimDefinition[] {
         claimId: testId + "/" + variantId,
         variantId,
         normativeRowText,
-        evidenceType: testId === "MEDIA-012" && variantId === "unrepresentable-plus-one" ? "boundary" : typeFor(testId),
+        evidenceType: testId === "MEDIA-012" && variantId === "unrepresentable-plus-one" ? "boundary" : typeFor(testId, variantId),
         fixtureSetup: fixtureFor(testId, variantId),
       });
     }
