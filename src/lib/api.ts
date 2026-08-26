@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { AppError, type UUID } from "./types";
 import { assertUuid, uuidV4Pattern } from "./utils";
 import { MAX_BRIEF_BYTES } from "./media";
+import { S2_MAX_MULTIPART_BODY_BYTES, S2_MAX_SOURCE_BYTES } from "./s2-media";
 import { createWorkflowService, type WorkflowService } from "./workflow";
 
 const MAX_MULTIPART_BODY_BYTES = MAX_BRIEF_BYTES + 1024 * 1024;
@@ -53,6 +54,25 @@ function exactKeys(body: Record<string, unknown>, keys: readonly string[]): void
     if (!expected.has(key)) fieldErrors.push({ field: key, code: "UNKNOWN_FIELD" });
   }
   if (fieldErrors.length) throw new AppError(400, "INVALID_REQUEST", fieldErrors);
+}
+
+async function requireEmptyBody(request: Request): Promise<void> {
+  if (!request.body) return;
+  const reader = request.body.getReader();
+  try {
+    for (let count = 0; count < 8; count += 1) {
+      const next = await reader.read();
+      if (next.done) return;
+      if (next.value.byteLength > 0) {
+        await reader.cancel().catch(() => undefined);
+        throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "EMPTY_BODY_REQUIRED" }]);
+      }
+    }
+    await reader.cancel().catch(() => undefined);
+    throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "EMPTY_BODY_REQUIRED" }]);
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function uploadTooLarge(): AppError {
@@ -162,6 +182,66 @@ async function multipartFile(request: Request): Promise<{ fileName: string; mime
   };
 }
 
+async function multipartS2File(request: Request): Promise<{ fileName: string; mimeType: string; kind: "reference" | "logo"; bytes: Uint8Array }> {
+  const contentType = request.headers.get("content-type") ?? "";
+  const match = contentType.match(/^multipart\/form-data\s*;\s*boundary=(?:"([^"]+)"|([^;\s]+))\s*$/i);
+  if (!match) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_REQUIRED" }]);
+  const boundary = match[1] ?? match[2];
+  if (!boundary || boundary.length > 70) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
+  const contentLength = request.headers.get("content-length");
+  if (contentLength && Number.isSafeInteger(Number(contentLength)) && Number(contentLength) > S2_MAX_MULTIPART_BODY_BYTES) {
+    throw new AppError(413, "MEDIA_TOO_LARGE", [{ field: "file", code: "MEDIA_TOO_LARGE" }]);
+  }
+  if (!request.body) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
+  const reader = request.body.getReader(); const chunks: Buffer[] = []; let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read(); if (next.done) break;
+      const chunk = Buffer.from(next.value); total += chunk.byteLength;
+      if (total > S2_MAX_MULTIPART_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new AppError(413, "MEDIA_TOO_LARGE", [{ field: "file", code: "MEDIA_TOO_LARGE" }]);
+      }
+      chunks.push(chunk);
+    }
+  } finally { reader.releaseLock(); }
+  const body = Buffer.concat(chunks, total); const marker = Buffer.from("--" + boundary, "latin1");
+  const delimiter = Buffer.from("\r\n" + marker.toString("latin1"), "latin1");
+  if (!body.subarray(0, marker.length).equals(marker)) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
+  const parts: { headers: Map<string, string>; bytes: Buffer }[] = []; let cursor = marker.length;
+  while (true) {
+    if (body.subarray(cursor, cursor + 2).toString("latin1") === "--") { cursor += 2; break; }
+    if (body.subarray(cursor, cursor + 2).toString("latin1") !== "\r\n") throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
+    cursor += 2; const headerEnd = body.indexOf(Buffer.from("\r\n\r\n", "latin1"), cursor);
+    if (headerEnd < 0) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
+    const headers = new Map<string, string>();
+    for (const line of body.subarray(cursor, headerEnd).toString("latin1").split("\r\n")) {
+      const separator = line.indexOf(":"); if (separator > 0) headers.set(line.slice(0, separator).trim().toLowerCase(), line.slice(separator + 1).trim());
+    }
+    const start = headerEnd + 4; const nextBoundary = body.indexOf(delimiter, start);
+    if (nextBoundary < 0) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
+    parts.push({ headers, bytes: body.subarray(start, nextBoundary) }); cursor = nextBoundary + delimiter.length;
+    if (body.subarray(cursor, cursor + 2).toString("latin1") === "--") { cursor += 2; break; }
+  }
+  if (cursor < body.length && body.subarray(cursor).toString("latin1").trim() !== "") throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
+  const fields = new Map<string, { headers: Map<string, string>; bytes: Buffer }>();
+  for (const part of parts) {
+    const disposition = headerValue(part.headers, "content-disposition");
+    const name = disposition.match(/(?:^|;)\s*name="([^"]*)"/i)?.[1] ?? "";
+    if (!name || fields.has(name) || !["file", "kind", "filename"].includes(name)) throw new AppError(400, "INVALID_REQUEST", [{ field: name || "body", code: "INVALID_FIELD" }]);
+    fields.set(name, part);
+  }
+  const file = fields.get("file"); const kindPart = fields.get("kind");
+  if (!file || !kindPart || fields.size > 3) throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "S2_FIELDS_REQUIRED" }]);
+  if (file.bytes.byteLength > S2_MAX_SOURCE_BYTES) throw new AppError(413, "MEDIA_TOO_LARGE", [{ field: "file", code: "MEDIA_TOO_LARGE" }]);
+  const kind = kindPart.bytes.toString("utf8").trim();
+  if (kind !== "reference" && kind !== "logo") throw new AppError(400, "INVALID_ASSET_KIND", [{ field: "kind", code: "INVALID_ASSET_KIND" }]);
+  const fileDisposition = headerValue(file.headers, "content-disposition");
+  const fileName = fields.get("filename")?.bytes.toString("utf8").trim() ||
+    fileDisposition.match(/(?:^|;)\s*filename="([^"]*)"/i)?.[1] || "asset";
+  return { fileName, mimeType: headerValue(file.headers, "content-type"), kind, bytes: file.bytes };
+}
+
 function serviceForRequest(): WorkflowService {
   return createWorkflowService();
 }
@@ -173,6 +253,49 @@ async function handle(
   service: WorkflowService,
   referenceId: UUID,
 ): Promise<NextResponse> {
+  if (segments.length === 4 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "reference-assets" && method === "POST") {
+    assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]);
+    const file = await multipartS2File(request); const key = keyFromHeader(request, "Idempotency-Key");
+    const result = await service.s2.uploadAsset(segments[1], file.kind, file.fileName, file.mimeType, file.bytes, key);
+    return NextResponse.json({ asset: result.asset, draft: result.draft }, { status: result.replayed ? 200 : 201 });
+  }
+  if (segments.length === 4 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "reference-draft" && method === "GET") {
+    assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]);
+    return NextResponse.json({ draft: service.s2.getReferenceDraft(segments[1]) }, { status: 200 });
+  }
+  if (segments.length === 4 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "reference-draft" && method === "PATCH") {
+    assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]);
+    const body = await jsonBody(request); exactKeys(body, ["expectedRevision", "referenceAssetIds", "logoAssetIds"]);
+    const result = service.s2.updateDraft(segments[1], body.expectedRevision, body.referenceAssetIds, body.logoAssetIds, keyFromHeader(request, "Idempotency-Key"));
+    return NextResponse.json({ draft: result.draft }, { status: 200 });
+  }
+  if (segments.length === 5 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "reference-assets" && method === "GET") {
+    assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]); assertUuid(segments[4], "assetId");
+    const result = service.s2.getAsset(segments[1], segments[4]);
+    return new NextResponse(new Uint8Array(result.bytes), { status: 200, headers: { "content-type": result.contentType, "cache-control": "private, no-store" } });
+  }
+  if (segments.length === 4 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "qa-runs" && method === "POST") {
+    assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]);
+    const body = await jsonBody(request); exactKeys(body, ["sourceGenerationSetId", "expectedDraftRevision"]); assertUuid(body.sourceGenerationSetId, "sourceGenerationSetId");
+    const result = await service.s2.bindQa(segments[1], body.sourceGenerationSetId, body.expectedDraftRevision, keyFromHeader(request, "Idempotency-Key"), referenceId);
+    return NextResponse.json({ qaRun: result.qaRun, inputVersionId: result.inputVersionId }, { status: result.replayed ? 200 : 202 });
+  }
+  if (segments.length === 5 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "qa-runs" && method === "GET") {
+    assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]); assertUuid(segments[4], "qaRunId");
+    return NextResponse.json(service.s2.getQaRun(segments[1], segments[4]), { status: 200 });
+  }
+  if (segments.length === 8 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "qa-runs" && segments[5] === "candidates" && segments[7] === "retry" && method === "POST") {
+    assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]); assertUuid(segments[4], "qaRunId"); assertUuid(segments[6], "candidateId");
+    await requireEmptyBody(request);
+    const result = await service.s2.retryQa(segments[1], segments[4], segments[6], keyFromHeader(request, "Idempotency-Key"), referenceId);
+    const { replayed, ...body } = result; return NextResponse.json(body, { status: replayed ? 200 : 202 });
+  }
+  if (segments.length === 8 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "qa-runs" && segments[5] === "candidates" && segments[7] === "repair" && method === "POST") {
+    assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]); assertUuid(segments[4], "qaRunId"); assertUuid(segments[6], "candidateId");
+    const body = await jsonBody(request); exactKeys(body, ["expectedInputVersionId"]); assertUuid(body.expectedInputVersionId, "expectedInputVersionId");
+    const result = await service.s2.repairCandidate(segments[1], segments[4], segments[6], body.expectedInputVersionId, keyFromHeader(request, "Idempotency-Key"), referenceId);
+    const { replayed, ...responseBody } = result; return NextResponse.json(responseBody, { status: replayed ? 200 : 202 });
+  }
   if (segments.length === 1 && segments[0] === "projects" && method === "POST") {
     const body = await jsonBody(request);
     exactKeys(body, ["name"]);

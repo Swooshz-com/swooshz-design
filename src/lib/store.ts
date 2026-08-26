@@ -99,6 +99,16 @@ export function emptyStoreState(): StoreState {
     extractionAttempts: {},
     extractionOperations: [],
     generationOperations: [],
+    s2Assets: [],
+    s2Drafts: [],
+    s2Inputs: [],
+    s2QaRuns: [],
+    s2Repairs: [],
+    s2DerivedCandidates: [],
+    s2ReQaResults: [],
+    s2Operations: [],
+    s2Publications: [],
+    s2Transitions: [],
   };
 }
 
@@ -255,6 +265,16 @@ export class JsonRepository {
       if (!Array.isArray(merged.generationOperations)) {
         merged.generationOperations = [];
       }
+      if (!Array.isArray(merged.s2Assets)) merged.s2Assets = [];
+      if (!Array.isArray(merged.s2Drafts)) merged.s2Drafts = [];
+      if (!Array.isArray(merged.s2Inputs)) merged.s2Inputs = [];
+      if (!Array.isArray(merged.s2QaRuns)) merged.s2QaRuns = [];
+      if (!Array.isArray(merged.s2Repairs)) merged.s2Repairs = [];
+      if (!Array.isArray(merged.s2DerivedCandidates)) merged.s2DerivedCandidates = [];
+      if (!Array.isArray(merged.s2ReQaResults)) merged.s2ReQaResults = [];
+      if (!Array.isArray(merged.s2Operations)) merged.s2Operations = [];
+      if (!Array.isArray(merged.s2Publications)) merged.s2Publications = [];
+      if (!Array.isArray(merged.s2Transitions)) merged.s2Transitions = [];
       return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
