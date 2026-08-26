@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { handleApiRequest } from "../src/lib/api";
 import { createS2QaClient, createS2ReferencesClient } from "../app/components/S2Client";
 import { createIdempotencyKeyRetainer, UnknownNetworkOutcome, withRetainedIdempotencyKey } from "../src/lib/client-idempotency";
-import { MockOpenAIProvider, ProviderFailure } from "../src/lib/openai";
+import { MockOpenAIProvider, OpenAIProvider, ProviderFailure } from "../src/lib/openai";
 import { buildS2QaRequest, buildS2RepairRequest } from "../src/lib/s2-provider";
 import { JsonRepository, PrivateObjectStore } from "../src/lib/store";
 import type { S2PublicationPhase } from "../src/lib/s2";
@@ -20,6 +20,7 @@ import {
   S2_MAX_NORMALIZED_BYTES,
   S2_MAX_PIXELS_PER_ASSET,
   S2_MAX_PROVIDER_BYTES,
+  S2_MAX_REPAIR_OUTPUT_BYTES,
   S2_MAX_RGBA_BYTES_PER_ASSET,
   S2_MAX_TOTAL_PIXELS,
   S2_MAX_TOTAL_RGBA_BYTES,
@@ -132,11 +133,31 @@ async function waitForRun(fixture: Fixture, qaRunId: string, predicate: (value: 
     if (predicate(value)) return value;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  return fixture.service.s2.getQaRun(fixture.projectId, qaRunId) as any;
+  const value = fixture.service.s2.getQaRun(fixture.projectId, qaRunId) as any;
+  throw new Error("Timed out waiting for S2 QA evidence predicate: status=" + String(value.qaRun?.status ?? "unknown") + "; completedCandidateCount=" + String(value.qaRun?.completedCandidateCount ?? "unknown") + "; unavailableCount=" + String(value.qaRun?.unavailableCount ?? "unknown"));
 }
 async function expectCode(action: () => unknown, code: string): Promise<boolean> {
   try { await action(); return false; }
   catch (error) { return error instanceof AppError && error.code === code; }
+}
+function controlledOpenAiRepairProvider(responseBody: Record<string, unknown>, requestCount: { value: number }): OpenAIProvider {
+  return new OpenAIProvider({
+    apiKey: "dummy-test-api-key",
+    fetchImpl: async (input: RequestInfo | URL): Promise<Response> => {
+      requestCount.value += 1;
+      assert.equal(String(input), "https://api.openai.com/v1/images/edits");
+      return new Response(JSON.stringify(responseBody), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+}
+function productionRepairFixture(decodedOutput: Uint8Array): { fixture: Fixture; requestCount: { value: number } } {
+  const requestCount = { value: 0 };
+  const productionRepairProvider = controlledOpenAiRepairProvider({
+    data: [{ b64_json: Buffer.from(decodedOutput).toString("base64") }],
+  }, requestCount);
+  const provider = new MockOpenAIProvider({ briefData: brief() });
+  provider.runS2Repair = productionRepairProvider.runS2Repair.bind(productionRepairProvider);
+  return { fixture: seed({ provider }), requestCount };
 }
 function succeeds(action: () => unknown): boolean {
   try { action(); return true; }
@@ -493,19 +514,134 @@ test("section-24 QA schema/verdict evidence", async () => {
 
 test("section-24 retry evidence", async () => {
   const provider = new MockOpenAIProvider({ briefData: brief(), s2QaResponses: [new ProviderFailure("PROVIDER_TIMEOUT")] });
+  let releaseRetry!: () => void;
+  const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve; });
+  const originalQa = provider.runS2Qa.bind(provider);
+  (provider as any).runS2Qa = async (input: any) => {
+    if (input.candidateIndex === 1 && provider.s2QaCalls >= 4) await retryGate;
+    return originalQa(input);
+  };
   const fixture = seed({ provider });
   try {
-    const bound = await bind(fixture); const first = await waitForRun(fixture, bound.qaRun.id); const candidate = first.qaRun.candidateResults.find((result: any) => result.status === "qa_unavailable_retryable");
+    const bound = await bind(fixture);
+    const first = await waitForRun(fixture, bound.qaRun.id);
+    const beforeRetryState = fixture.repository.state();
+    const attemptOneOperations = beforeRetryState.s2Operations.filter((operation) => operation.phase === "qa" && operation.attempt === 1);
+    const candidate = first.qaRun.candidateResults.find((result: any) => result.status === "qa_unavailable_retryable");
+    markVariant("RETRY-002", "pre-retry-completed", "All four attempt-1 QA operations terminate before explicit retry, including one retryable unavailable result", true,
+      first.qaRun.status === "completed" &&
+      first.qaRun.completedCandidateCount === 4 &&
+      first.qaRun.unavailableCount === 1 &&
+      first.qaRun.candidateResults.filter((result: any) => result.status === "qa_unavailable_retryable").length === 1 &&
+      new Set(attemptOneOperations.map((operation) => operation.candidateId)).size === 4 &&
+      attemptOneOperations.length === 4 &&
+      attemptOneOperations.every((operation) => operation.status === "succeeded" || operation.status === "failed") &&
+      attemptOneOperations.filter((operation) => operation.status === "queued" || operation.status === "running").length === 0 &&
+      beforeRetryState.s2Inputs.length === 1 &&
+      beforeRetryState.s2QaRuns.length === 1);
     mark("RETRY-001", "Only retryable unavailable is retryable", true, Boolean(candidate) && !first.qaRun.candidateResults.some((result: any) => result.status === "pass" && result.candidateIndex === candidate.candidateIndex && result.repairEligible === true));
-    const beforeInputs = fixture.repository.state().s2Inputs.length; const beforeRuns = fixture.repository.state().s2QaRuns.length; const retry = await fixture.service.s2.retryQa(fixture.projectId, bound.qaRun.id, candidate.candidateId, randomUUID(), randomUUID()); const after = await waitForRun(fixture, bound.qaRun.id);
+    const beforeInputs = beforeRetryState.s2Inputs.length;
+    const beforeRuns = beforeRetryState.s2QaRuns.length;
+    const retry: any = await fixture.service.s2.retryQa(fixture.projectId, bound.qaRun.id, candidate.candidateId, randomUUID(), randomUUID());
+    const reopenedState = fixture.repository.state();
+    const reopenedOperation = reopenedState.s2Operations.find((operation) => operation.phase === "qa" && operation.attempt === 2);
+    const reopenedResult = reopenedState.s2QaRuns[0].candidateResults.find((result) => result.attempt === 2);
+    markVariant("RETRY-002", "reopen-same-run", "Explicit retry reopens the same run/input while attempt 2 is active", true,
+      retry.replayed === false &&
+      retry.qaRun.id === bound.qaRun.id &&
+      retry.input.id === bound.inputVersionId &&
+      (retry.qaRun.status === "queued" || retry.qaRun.status === "running") &&
+      retry.qaRun.completedAt === null &&
+      Boolean(reopenedOperation) &&
+      (reopenedOperation!.status === "queued" || reopenedOperation!.status === "running") &&
+      Boolean(reopenedResult) &&
+      (reopenedResult!.status === "queued" || reopenedResult!.status === "running") &&
+      reopenedState.s2Inputs.length === beforeInputs &&
+      reopenedState.s2QaRuns.length === beforeRuns);
+    releaseRetry();
+    const after = await waitForRun(fixture, bound.qaRun.id);
+    const afterState = fixture.repository.state();
+    const latestStatuses = after.qaRun.candidateResults.map((result: any) => result.status);
+    const attemptTwoOperation = afterState.s2Operations.find((operation) => operation.phase === "qa" && operation.attempt === 2);
+    markVariant("RETRY-002", "post-retry-success", "Attempt 2 succeeds and recomputes latest counters without a new run/input", true,
+      after.qaRun.id === bound.qaRun.id &&
+      after.input.id === bound.inputVersionId &&
+      after.qaRun.status === "completed" &&
+      after.qaRun.completedAt !== null &&
+      after.qaRun.completedCandidateCount === 4 &&
+      after.qaRun.unavailableCount === 0 &&
+      after.qaRun.passCount === 4 &&
+      latestStatuses.length === 4 &&
+      latestStatuses.every((status: string) => status === "pass") &&
+      after.qaRun.candidateAttempts.filter((result: any) => result.candidateId === candidate.candidateId && result.attempt === 1).length === 1 &&
+      after.qaRun.candidateAttempts.filter((result: any) => result.candidateId === candidate.candidateId && result.attempt === 2).length === 1 &&
+      attemptTwoOperation?.status === "succeeded" &&
+      afterState.s2Inputs.length === beforeInputs &&
+      afterState.s2QaRuns.length === beforeRuns);
     mark("RETRY-002", "Explicit retry reuses input/run and appends attempt two", true, retry.replayed === false && after.qaRun.candidateAttempts.some((result: any) => result.candidateId === candidate.candidateId && result.attempt === 2) && fixture.repository.state().s2Inputs.length === beforeInputs && fixture.repository.state().s2QaRuns.length === beforeRuns);
     mark("RETRY-004", "No hidden SDK retry", 5, provider.s2QaCalls);
     const terminal = seed({ provider: new MockOpenAIProvider({ briefData: brief(), s2QaResponses: [new ProviderFailure("QA_SCHEMA_INVALID")] }) });
-    try { const b = await bind(terminal); const v = await waitForRun(terminal, b.qaRun.id); markVariant("RETRY-001", "variant-2", "Terminal unavailable is not retryable", true, v.qaRun.candidateResults[0].status === "qa_unavailable_terminal" && await expectCode(() => terminal.service.s2.retryQa(terminal.projectId, b.qaRun.id, v.qaRun.candidateResults[0].candidateId, randomUUID(), randomUUID()), "QA_NOT_RETRYABLE")); } finally { cleanup(terminal); }
-  } finally { cleanup(fixture); }
+    try {
+      const b = await bind(terminal);
+      const v = await waitForRun(terminal, b.qaRun.id);
+      markVariant("RETRY-001", "variant-2", "Terminal unavailable is not retryable", true, v.qaRun.candidateResults[0].status === "qa_unavailable_terminal" && await expectCode(() => terminal.service.s2.retryQa(terminal.projectId, b.qaRun.id, v.qaRun.candidateResults[0].candidateId, randomUUID(), randomUUID()), "QA_NOT_RETRYABLE"));
+    } finally { cleanup(terminal); }
+  } finally {
+    releaseRetry();
+    cleanup(fixture);
+  }
   const exhaustedProvider = new MockOpenAIProvider({ briefData: brief(), s2QaResponses: [new ProviderFailure("PROVIDER_TIMEOUT"), undefined, undefined, undefined, new ProviderFailure("PROVIDER_TIMEOUT")] });
+  let releaseExhaustedRetry!: () => void;
+  const exhaustedRetryGate = new Promise<void>((resolve) => { releaseExhaustedRetry = resolve; });
+  const originalExhaustedQa = exhaustedProvider.runS2Qa.bind(exhaustedProvider);
+  (exhaustedProvider as any).runS2Qa = async (input: any) => {
+    if (input.candidateIndex === 1 && exhaustedProvider.s2QaCalls >= 4) await exhaustedRetryGate;
+    return originalExhaustedQa(input);
+  };
   const exhausted = seed({ provider: exhaustedProvider });
-  try { const b = await bind(exhausted); const first = await waitForRun(exhausted, b.qaRun.id); const candidate = first.qaRun.candidateResults.find((result: any) => result.status === "qa_unavailable_retryable"); await exhausted.service.s2.retryQa(exhausted.projectId, b.qaRun.id, candidate.candidateId, randomUUID(), randomUUID()); const second = await waitForRun(exhausted, b.qaRun.id); mark("RETRY-003", "Retry exhaustion is terminal", true, second.qaRun.candidateResults.find((result: any) => result.candidateId === candidate.candidateId).status === "qa_unavailable_terminal" && await expectCode(() => exhausted.service.s2.retryQa(exhausted.projectId, b.qaRun.id, candidate.candidateId, randomUUID(), randomUUID()), "QA_RETRY_EXHAUSTED")); mark("RETRY-005", "Attempt history remains fenced", true, second.qaRun.candidateAttempts.filter((result: any) => result.candidateId === candidate.candidateId).length === 2 && second.qaRun.candidateResults.filter((result: any) => result.candidateId === candidate.candidateId).length === 1); } finally { cleanup(exhausted); }
+  try {
+    const b = await bind(exhausted);
+    const first = await waitForRun(exhausted, b.qaRun.id);
+    const beforeRetryState = exhausted.repository.state();
+    const candidate = first.qaRun.candidateResults.find((result: any) => result.status === "qa_unavailable_retryable");
+    const retry: any = await exhausted.service.s2.retryQa(exhausted.projectId, b.qaRun.id, candidate.candidateId, randomUUID(), randomUUID());
+    const reopenedState = exhausted.repository.state();
+    const reopenedOperation = reopenedState.s2Operations.find((operation) => operation.phase === "qa" && operation.attempt === 2);
+    const reopenedResult = reopenedState.s2QaRuns[0].candidateResults.find((result) => result.attempt === 2);
+    markVariant("RETRY-003", "reopen-before-terminal", "Retry-exhaustion attempt 2 reopens the same run before becoming terminal unavailable", true,
+      first.qaRun.status === "completed" &&
+      first.qaRun.completedCandidateCount === 4 &&
+      first.qaRun.unavailableCount === 1 &&
+      retry.qaRun.id === b.qaRun.id &&
+      retry.input.id === b.inputVersionId &&
+      (retry.qaRun.status === "queued" || retry.qaRun.status === "running") &&
+      retry.qaRun.completedAt === null &&
+      (reopenedOperation?.status === "queued" || reopenedOperation?.status === "running") &&
+      (reopenedResult?.status === "queued" || reopenedResult?.status === "running") &&
+      reopenedState.s2Inputs.length === 1 &&
+      reopenedState.s2QaRuns.length === 1);
+    releaseExhaustedRetry();
+    const second = await waitForRun(exhausted, b.qaRun.id);
+    const afterRetryState = exhausted.repository.state();
+    const latest = second.qaRun.candidateResults.find((result: any) => result.candidateId === candidate.candidateId);
+    markVariant("RETRY-003", "post-retry-terminal", "Retry exhaustion becomes terminal unavailable with latest-only counters and retained attempts", true,
+      second.qaRun.id === b.qaRun.id &&
+      second.input.id === b.inputVersionId &&
+      second.qaRun.status === "completed" &&
+      second.qaRun.completedCandidateCount === 4 &&
+      second.qaRun.unavailableCount === 1 &&
+      latest?.status === "qa_unavailable_terminal" &&
+      second.qaRun.candidateAttempts.filter((result: any) => result.candidateId === candidate.candidateId).length === 2 &&
+      second.qaRun.candidateResults.filter((result: any) => result.candidateId === candidate.candidateId).length === 1 &&
+      afterRetryState.s2Inputs.length === beforeRetryState.s2Inputs.length &&
+      afterRetryState.s2QaRuns.length === beforeRetryState.s2QaRuns.length &&
+      exhaustedProvider.s2QaCalls === 5);
+    mark("RETRY-003", "Retry exhaustion is terminal", true, latest?.status === "qa_unavailable_terminal" && await expectCode(() => exhausted.service.s2.retryQa(exhausted.projectId, b.qaRun.id, candidate.candidateId, randomUUID(), randomUUID()), "QA_RETRY_EXHAUSTED"));
+    mark("RETRY-005", "Attempt history remains fenced", true, second.qaRun.candidateAttempts.filter((result: any) => result.candidateId === candidate.candidateId).length === 2 && second.qaRun.candidateResults.filter((result: any) => result.candidateId === candidate.candidateId).length === 1);
+  } finally {
+    releaseExhaustedRetry();
+    cleanup(exhausted);
+  }
 });
 
 
@@ -644,16 +780,72 @@ test("section-24 repair allowlist and compatibility evidence", async () => {
 });
 
 test("section-24 repair output, aggregate and rollback evidence", async () => {
-  const invalidProvider = new MockOpenAIProvider({ briefData: brief(), s2RepairResponses: [Buffer.from("not-a-png")] });
-  const invalid = seed({ provider: invalidProvider });
-  try {
-    const bound = await bind(invalid); await waitForRun(invalid, bound.qaRun.id);
-    const candidate = materializeResult(invalid, bound.qaRun.id, 1, { status: "material_fail", verdict: "MATERIAL_FAIL", materialFindingIds: ["scale.human"], warningFindingIds: [], uncertainFindingIds: [] });
-    await invalid.service.s2.repairCandidate(invalid.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
-    const value = await waitForRun(invalid, bound.qaRun.id, (current) => current.qaRun.repairs?.[0]?.status === "failed");
-    const adapterSource = readFileSync(join(process.cwd(), "src/lib/openai.ts"), "utf8");
-    mark("REPAIR-011", "Invalid, empty, multiple, non-PNG, base64 and oversized output guards reject", true, invalidProvider.s2RepairCalls === 1 && value.qaRun.repairs[0].status === "failed" && invalid.repository.state().s2DerivedCandidates.length === 0 && invalid.repository.state().s2Operations.some((operation) => operation.failureCode === "REPAIR_OUTPUT_INVALID") && adapterSource.includes("data.length !== 1") && adapterSource.includes("REPAIR_OUTPUT_INVALID") && adapterSource.includes("b64_json"));
-  } finally { cleanup(invalid); }
+  const adapterCases = [
+    { id: "empty", fixture: "Production adapter rejects empty data", responseBody: { data: [] } },
+    { id: "multiple", fixture: "Production adapter rejects multiple image results", responseBody: { data: [{ b64_json: PNG.toString("base64") }, { b64_json: PNG.toString("base64") }] } },
+    { id: "missing", fixture: "Production adapter rejects missing or URL-only output", responseBody: { data: [{ url: "https://example.invalid/provider-output.png" }] } },
+    { id: "invalid-base64", fixture: "Production adapter rejects malformed Base64", responseBody: { data: [{ b64_json: "%%%%" }] } },
+  ];
+  const adapterResults: boolean[] = [];
+  for (const testCase of adapterCases) {
+    const requestCount = { value: 0 };
+    const provider = controlledOpenAiRepairProvider(testCase.responseBody, requestCount);
+    let safeCode = "NO_FAILURE";
+    try {
+      await provider.runS2Repair({ promptText: "synthetic repair test", images: [PNG] });
+    } catch (error) {
+      safeCode = error instanceof ProviderFailure ? error.safeCode : "UNEXPECTED_FAILURE";
+    }
+    const passed = safeCode === "REPAIR_OUTPUT_INVALID" && requestCount.value === 1;
+    adapterResults.push(passed);
+    markVariant("REPAIR-011", testCase.id, testCase.fixture, true, passed);
+  }
+
+  const workflowCases = [
+    { id: "non-png", fixture: "Workflow rejects non-PNG decoded provider bytes", bytes: Buffer.from("not-a-png") },
+    { id: "corrupt-truncated-png", fixture: "Workflow rejects corrupt or truncated PNG bytes", bytes: PNG.subarray(0, PNG.length - 4) },
+    { id: "oversized", fixture: "Workflow rejects decoded provider output above the 16 MiB limit", bytes: Buffer.alloc(S2_MAX_REPAIR_OUTPUT_BYTES + 1, 0x61) },
+  ];
+  const workflowResults: boolean[] = [];
+  for (const testCase of workflowCases) {
+    const { fixture, requestCount } = productionRepairFixture(testCase.bytes);
+    try {
+      const bound = await bind(fixture);
+      await waitForRun(fixture, bound.qaRun.id);
+      const before = fixture.repository.state();
+      const lineageBefore = jcs({
+        candidates: before.candidates,
+        conceptAssets: before.conceptAssets,
+        sourceCandidates: before.s2Inputs[0].sourceCandidates,
+      });
+      const candidate = materializeResult(fixture, bound.qaRun.id, 1, { status: "material_fail", verdict: "MATERIAL_FAIL", materialFindingIds: ["scale.human"], warningFindingIds: [], uncertainFindingIds: [] });
+      await fixture.service.s2.repairCandidate(fixture.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+      const value = await waitForRun(fixture, bound.qaRun.id, (current) => current.qaRun.repairs?.[0]?.status === "failed");
+      const after = fixture.repository.state();
+      const repair = after.s2Repairs[0];
+      const repairOperation = after.s2Operations.find((operation) => operation.phase === "repair");
+      const lineageAfter = jcs({
+        candidates: after.candidates,
+        conceptAssets: after.conceptAssets,
+        sourceCandidates: after.s2Inputs[0].sourceCandidates,
+      });
+      const passed =
+        requestCount.value === 1 &&
+        value.qaRun.repairs[0].status === "failed" &&
+        repair?.status === "failed" &&
+        repairOperation?.failureCode === "REPAIR_OUTPUT_INVALID" &&
+        after.s2DerivedCandidates.length === 0 &&
+        after.s2Operations.filter((operation) => operation.phase === "re_qa").length === 0 &&
+        after.s2Publications.length === 0 &&
+        lineageBefore === lineageAfter &&
+        !after.s2Repairs.some((item) => item.status === "derived_ready") &&
+        listObjects(fixture.root).every((name) => !/s2[\\/]repairs[\\/]/.test(name)) &&
+        fixture.provider.s2QaCalls === 4;
+      workflowResults.push(passed);
+      markVariant("REPAIR-011", testCase.id, testCase.fixture + "; one local fake request; no derived or re-QA state", true, passed);
+    } finally { cleanup(fixture); }
+  }
+  mark("REPAIR-011", "Real OpenAIProvider adapter and S2 workflow reject every locked provider-output class", true, adapterResults.every(Boolean) && workflowResults.every(Boolean));
 
   const aggregateProvider = new MockOpenAIProvider({ briefData: brief() });
   const aggregate = await bindWithAssets(aggregateProvider);

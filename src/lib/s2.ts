@@ -200,7 +200,7 @@ function isPending(status: string): boolean {
 
 function isTerminalCandidate(status: string): boolean {
   return status === "pass" || status === "warning" || status === "material_fail" ||
-    status === "qa_unavailable_terminal";
+    status === "qa_unavailable_retryable" || status === "qa_unavailable_terminal";
 }
 
 function safeProviderRequestId(value: string | null): string | null {

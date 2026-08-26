@@ -42,6 +42,24 @@ export class ProviderFailure extends Error {
   }
 }
 
+function isStrictBase64(value: string): boolean {
+  if (!value || value.length % 4 !== 0) return false;
+  let padding = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0x3d) {
+      if (index < value.length - 2) return false;
+      padding += 1;
+      if (padding > 2) return false;
+      continue;
+    }
+    if (padding > 0 ||
+        !((code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a) ||
+          (code >= 0x30 && code <= 0x39) || code === 0x2b || code === 0x2f)) return false;
+  }
+  return true;
+}
+
 function usageMetadata(
   api: "responses" | "images",
   model: "gpt-5.4-mini" | "gpt-image-2",
@@ -292,7 +310,7 @@ export class OpenAIProvider implements OpenAIProviderContract {
     const data = Array.isArray(json.data) ? json.data : [];
     if (data.length !== 1 || typeof data[0] !== "object" || data[0] === null) throw new ProviderFailure("REPAIR_OUTPUT_INVALID");
     const encoded = (data[0] as Record<string, unknown>).b64_json;
-    if (typeof encoded !== "string" || !encoded || encoded.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    if (typeof encoded !== "string" || !isStrictBase64(encoded)) {
       throw new ProviderFailure("REPAIR_OUTPUT_INVALID");
     }
     const pngBytes = Buffer.from(encoded, "base64");
