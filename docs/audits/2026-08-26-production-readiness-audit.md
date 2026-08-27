@@ -2,6 +2,98 @@
 
 Current audit update: 2026-08-27
 
+## Current exact-head G3 audit: bounded S2 persistence graph and locked workflow repair
+
+Repository: Swooshz-com/swooshz-design
+
+Branch: web/run-007-s2-g3-nonconvergence-reset
+
+Previous exact head: e0e65470d4411dad1295212a2948cee8ff2883df
+
+Implementation commit: 825d67aeb2e73b85a6e1656893bd096216b9d52c
+
+Authority: existing S2 G3 child #7, parent #1, locks
+DL-SD-S2-G1-001, DL-SD-S2-G2-003, and DL-SD-S2-G3-001; controlling
+substantive Web review 5037920110, child comment 5435332269, and parent
+transition 5435333895. This is the final ordinary persistence-validation
+correction opportunity. The repair is limited to the fresh G4 AMEND findings:
+whole-state S2 graph validation and the two locked S2 workflow capabilities.
+docs/G2_S2_CONTRACT.md, PR #15/run-006, PR #18/G2, G1/G2 implementation
+surfaces, later-slice code, and unrelated S1 behavior were not modified.
+
+### Bounded repair evidence
+
+- src/lib/s2-persistence.ts adds a deterministic whole-state pass after
+  strict S2 record validation. It rejects invalid project and foreign-key
+  ownership, draft freeze tuples, bound input/source identity, canonical
+  four-candidate topology, retry attempt/lifecycle states, one-repair and
+  re-QA lineage, deterministic publication identities, operation
+  claim/phase/provider-dispatch/error/result combinations, idempotency
+  ownership/hash relationships, and impossible transition records. It accepts
+  active queued, terminal, frozen/bound, conservative
+  may_have_started, and legal repair/re-QA recovery states.
+- The repository invokes the graph pass on load and before commit. Any
+  malformed present graph fails closed as PERSISTENCE_FAILED; no malformed
+  stored state is repaired silently. The retry and dead-owner requeue paths
+  retain running when another candidate or repair lineage is active.
+- The new persisted-state matrix writes syntactically valid state JSON to
+  isolated roots and attempts real JsonRepository loads. Eighteen materially
+  distinct negative fixtures were rejected with PERSISTENCE_FAILED, including
+  missing projects, cross-project ownership, frozen-field errors, invalid
+  input/candidate/repair/publication lineage, extra retry/repair topology,
+  impossible operation metadata, duplicate active claims, idempotency mismatch,
+  and impossible transition status. Three positive fixtures actually loaded:
+  frozen/bound terminal repair plus re-QA, active queued state, and
+  conservative may_have_started recovery.
+- app/components/S2Client.tsx, src/lib/api.ts, and src/lib/s2.ts close only
+  the locked workflow gaps. The references screen truthfully displays
+  PNG/JPEG/WebP, 8 MiB per file, six-reference, and two-logo limits. Logo
+  ordering uses the existing full-array expectedRevision update path and keeps
+  frozen/stale-revision/server-truth behavior. QA renders four source previews
+  sorted by canonical candidate index.
+- Preview access is authenticated through the project-authorized API path,
+  checks the run/input/candidate/source identity and source hash/byte size,
+  reads the private object-store key only on the server, returns
+  private, no-store PNG content, and never projects a private storage key.
+  Same-project valid previews, source identity bytes, unknown candidates, and
+  cross-project denial are covered by the real route/client evidence.
+- pdfjs-dist remains the owner-authorized 6.2.108 S1 security exception; no
+  S1 PDF behavior or unrelated S1 surface was changed. The real S1 PDF
+  extraction regression remains green.
+
+### Current follow-up validation
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Full S2 evidence and runtime suite | PASS, 23/23 | Section 24: 103 rows, 329 claims; missing 0, unknown 0, duplicate 0, skipped 0 |
+| Persistence graph negative/positive matrix | PASS | 18 real persisted JSON negative loads rejected; 3 legal lifecycle loads accepted |
+| Locked UI workflow evidence | PASS | Guidance, full-array logo reorder/revision/frozen behavior, canonical four-preview route, identity and privacy denial cases |
+| Existing evidence-negative self-tests | PASS | Execution-bound negative validator self-tests passed |
+| Complete S1 regression and PDF extraction | PASS, 41/41 | pnpm test / tests/g3.test.ts; real PDF acceptance/extraction fixtures |
+| Typecheck and configured lint | PASS | pnpm run typecheck; pnpm run lint |
+| Production build | PASS | pnpm run build; Next.js 16.3.2/Turbopack |
+| Frozen dependency/security validation | PASS | pnpm install --frozen-lockfile --offline --ignore-scripts; pdfjs-dist@6.2.108 only; sharp@0.35.3, libvips 8.18.3; pnpm audit --offline found no known vulnerabilities |
+| Diff/conflict/hygiene checks | PASS | git diff --check; no unmerged paths or conflict markers; no generated contract change |
+| Secret/client/privacy/storage review | PASS in scope | No exposed credential; client has no environment, bearer, authorization, private-key, provider-credential, or private-storage-key match; private preview path is server-owned |
+| Browser smoke | PASS, loopback only | Built app rendered /projects/new and a seeded synthetic S2 references screen at 127.0.0.1:3101; exact guidance and editable controls were visible; server stopped and synthetic root removed |
+| GitHub CI/check inventory | Not claimed green | Starting required head had zero statuses, zero check runs, and zero workflow runs; final exact-head inventory is checked in the publication packet |
+| External-safety boundary | PASS | No live provider call, provider credential, customer/private data, deployment, or destructive live mutation |
+
+### Disposition and documentation closure
+
+G2 re-entry is not required: the owner-authorized pdfjs-dist retention was
+limited to dependency/security maintenance and required no S1 behavioral
+change. G4 was not launched, Ready was not marked, PR #17 remains Draft and
+unmerged, S3 was not advanced, and parent #1 was not mutated. MEMORY.md is
+not present and was not applicable. The canonical audit was updated here; the
+implementation commit contains only the six bounded source/test files, and
+the pre-existing .playwright-cli/, .tmp/, and _agent-toolkit-backups/
+untracked material remains unstaged.
+
+ELI5: bad saved-data combinations now stop at the repository boundary, the
+missing logo-order and source-picture workflow pieces are present, and the
+patched PDF library stayed in place while the old PDF path still passes.
+
 ## Current exact-head G3 audit: S2 idempotency-key route/error correction
 
 Repository: `Swooshz-com/swooshz-design`
