@@ -2,7 +2,75 @@
 
 Current audit update: 2026-08-27
 
-## Current exact-head G3 audit: bounded non-convergence simplification
+## Current exact-head G3 audit: S2 idempotency-key route/error correction
+
+Repository: `Swooshz-com/swooshz-design`
+
+Branch: `web/run-007-s2-g3-nonconvergence-reset`
+
+Scope: the authorized smallest S2 G3 follow-up from previous exact head
+`b29432370ddc8d772730369cc8cb91796ae8b405`, under controlling Web review
+`5037182396`, child authority `5434304578`, and parent transition
+`5434306068`. The correction preserves `DL-SD-S2-G1-001`,
+`DL-SD-S2-G2-003`, and `DL-SD-S2-G3-001`; `docs/G2_S2_CONTRACT.md`, PR
+#15/run-006, and PR #18 were not modified. No G2 re-entry, G4, Ready, merge,
+or S3 action is authorized or performed.
+
+### Bounded correction evidence
+
+- `src/lib/api.ts` adds only `s2IdempotencyKeyFromHeader`. Missing or empty
+  S2 `Idempotency-Key` returns HTTP 400 with top-level
+  `IDEMPOTENCY_KEY_REQUIRED`, a safe `Idempotency-Key` field error, and the
+  existing generic reference-bearing response. A present malformed non-empty
+  key remains `INVALID_REQUEST` / `UUID_REQUIRED`. The original
+  `keyFromHeader` behavior and S1 call sites are unchanged.
+- The helper is used by exactly the five S2 idempotent route families:
+  reference upload, reference-draft PATCH, QA bind/start, explicit retry, and
+  bounded repair. Upload admission remains project authorization, key
+  validation, then multipart body access.
+- Real `handleApiRequest()` tests prove missing-key HTTP 400, exact top-level
+  code, safe reference ID, no S2 state mutation, and no provider calls for all
+  five families. Upload missing and empty keys return the required-key error;
+  missing and malformed keys pull zero body chunks. Valid surrounding
+  state/body/path data makes the key the failing condition.
+- ROUTE-002/key is execution-bound to the real missing-key bind request with a
+  valid body, HTTP 400, exact `IDEMPOTENCY_KEY_REQUIRED`, safe reference ID,
+  field error, and no mutation. The existing per-claim `prove` architecture
+  and all other route claims remain intact.
+- Previously accepted provider-dispatch, persistence/recovery, multipart,
+  canonical-order/hash, repair-eligibility, unavailable-UI, BIND, MEDIA, and
+  evidence-collector corrections remain covered by the full S2 suite.
+
+### Current follow-up validation
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Focused route/multipart correction tests | PASS, 3/3 | Missing-key five-route matrix, upload zero-pull cases, malformed-key behavior, and existing route flow |
+| Full S2 evidence and runtime suite | PASS, 22/22 | Section 24: 103 base rows, 329 derived claims; missing 0, unknown 0, duplicate 0, skipped 0 |
+| Complete S1 regression | PASS, 41/41 | `pnpm test` / `tests/g3.test.ts` |
+| Typecheck and configured lint | PASS | `pnpm run typecheck`; `pnpm run lint` |
+| Production build | PASS | `pnpm run build`; Next.js 16.3.2/Turbopack |
+| Native sharp/runtime and normalization | PASS | sharp 0.35.3, libvips 8.18.3, native load and deterministic normalization |
+| Frozen dependency validation and audit | PASS | offline frozen install; no known vulnerabilities |
+| Hygiene and changed-content secret scan | PASS | diff check, no conflicts, balanced Markdown, zero secret/temp-marker matches |
+| Client/provider boundary | PASS | client has zero environment, bearer, authorization, private-key, or provider-URL matches; provider auth remains server-side |
+| Privacy/logging/storage/recovery review | PASS in scope | safe reference/status/code logs; existing private-object and ownership-safe recovery tests pass |
+| Browser smoke | PASS, loopback only | production build at `127.0.0.1:3101`; `/projects/new` rendered, field interaction retained input, 10 local requests returned 200; server stopped |
+
+### Follow-up limitations
+
+Codex Security was not available in the installed capabilities. Standard
+manual/static security, changed-content scanning, dependency, privacy/logging,
+storage/recovery, and targeted failure-path review were completed instead.
+No known unresolved P0/P1 blocker was found in the declared scope. CI is not
+claimed: the exact-head GitHub status remains pending with zero contexts and
+zero check runs, and the branch has no workflow runs. No provider credentials,
+live provider calls, deployment, live-system mutation, customer/private data,
+or destructive action was used.
+
+---
+
+## Previous exact-head G3 audit: bounded non-convergence simplification
 
 Repository: `Swooshz-com/swooshz-design`
 

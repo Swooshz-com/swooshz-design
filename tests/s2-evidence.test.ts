@@ -367,6 +367,52 @@ function requestWithStream(headers: HeadersInit, body: ReadableStream<Uint8Array
   return { method: "POST", headers: new Headers(headers), body } as unknown as Request;
 }
 
+function s2StateCounts(value: Fixture): Record<string, number> {
+  const state = value.repository.state();
+  return {
+    idempotency: state.idempotency.length,
+    s2Assets: state.s2Assets.length,
+    s2Drafts: state.s2Drafts.length,
+    s2Inputs: state.s2Inputs.length,
+    s2QaRuns: state.s2QaRuns.length,
+    s2Repairs: state.s2Repairs.length,
+    s2DerivedCandidates: state.s2DerivedCandidates.length,
+    s2ReQaResults: state.s2ReQaResults.length,
+    s2Operations: state.s2Operations.length,
+    s2Publications: state.s2Publications.length,
+    s2Transitions: state.s2Transitions.length,
+  };
+}
+
+function providerCallCounts(value: Fixture): Record<string, number> {
+  return {
+    extraction: value.provider.extractionCalls,
+    image: value.provider.imageCalls,
+    s2Qa: value.provider.s2QaCalls,
+    s2Repair: value.provider.s2RepairCalls,
+  };
+}
+
+function assertMissingS2IdempotencyKeyError(body: any): void {
+  assert.equal(body.error.code, "IDEMPOTENCY_KEY_REQUIRED");
+  assert.equal(typeof body.error.referenceId, "string");
+  assert.notEqual(body.error.referenceId, "");
+  assert.equal(body.error.message, "The request could not be completed. Try again or contact support with the reference ID.");
+  assert.deepEqual(body.error.fieldErrors, [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]);
+}
+
+async function assertMissingS2IdempotencyKeyRoute(value: Fixture, request: Request, path: string[]): Promise<any> {
+  const stateBefore = s2StateCounts(value);
+  const providerCallsBefore = providerCallCounts(value);
+  const response = await handleApiRequest(request, path, value.service);
+  const body = await response.json() as any;
+  assert.equal(response.status, 400);
+  assertMissingS2IdempotencyKeyError(body);
+  assert.deepEqual(s2StateCounts(value), stateBefore);
+  assert.deepEqual(providerCallCounts(value), providerCallsBefore);
+  return body;
+}
+
 function hashCanonicalOperationInput(operation: string, projectId: string, input: unknown): string {
   return sha256(jcs({ operation, projectId, input }));
 }
@@ -473,7 +519,7 @@ test("fresh S2 multipart route streams arbitrary chunks and rejects an oversized
     const missingKeyResponse = await handleApiRequest(missingKeyRequest, ["projects", value.projectId, "s2", "reference-assets"], value.service);
     const missingKeyError = await missingKeyResponse.json() as any;
     assert.equal(missingKeyResponse.status, 400);
-    assert.equal(missingKeyError.error.fieldErrors[0].code, "UUID_REQUIRED");
+    assertMissingS2IdempotencyKeyError(missingKeyError);
     assert.equal(missingKeyBody.stats().pulls, 0);
 
     const invalidKeyBody = lazyTrackedChunks([body]);
@@ -484,6 +530,7 @@ test("fresh S2 multipart route streams arbitrary chunks and rejects an oversized
     const invalidKeyResponse = await handleApiRequest(invalidKeyRequest, ["projects", value.projectId, "s2", "reference-assets"], value.service);
     const invalidKeyError = await invalidKeyResponse.json() as any;
     assert.equal(invalidKeyResponse.status, 400);
+    assert.equal(invalidKeyError.error.code, "INVALID_REQUEST");
     assert.equal(invalidKeyError.error.fieldErrors[0].code, "UUID_REQUIRED");
     assert.equal(invalidKeyBody.stats().pulls, 0);
 
@@ -530,6 +577,93 @@ test("fresh S2 multipart route streams arbitrary chunks and rejects an oversized
     assert.equal(value.repository.state().s2Assets.length, 1);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("fresh S2 idempotent routes reject a missing key before mutation or provider work", async () => {
+  const uploadValue = fixture();
+  try {
+    const boundary = "s2-stream-boundary";
+    const missingBody = lazyTrackedChunks([s2MultipartBody(ONE_PIXEL_PNG)]);
+    await assertMissingS2IdempotencyKeyRoute(uploadValue, requestWithStream(
+      { "content-type": "multipart/form-data; boundary=" + boundary },
+      missingBody.body,
+    ), ["projects", uploadValue.projectId, "s2", "reference-assets"]);
+    assert.equal(missingBody.stats().pulls, 0);
+
+    const emptyBody = lazyTrackedChunks([s2MultipartBody(ONE_PIXEL_PNG)]);
+    await assertMissingS2IdempotencyKeyRoute(uploadValue, requestWithStream(
+      { "content-type": "multipart/form-data; boundary=" + boundary, "Idempotency-Key": "" },
+      emptyBody.body,
+    ), ["projects", uploadValue.projectId, "s2", "reference-assets"]);
+    assert.equal(emptyBody.stats().pulls, 0);
+
+    const malformedBody = lazyTrackedChunks([s2MultipartBody(ONE_PIXEL_PNG)]);
+    const stateBeforeMalformed = s2StateCounts(uploadValue);
+    const providerCallsBeforeMalformed = providerCallCounts(uploadValue);
+    const malformedResponse = await handleApiRequest(requestWithStream(
+      { "content-type": "multipart/form-data; boundary=" + boundary, "Idempotency-Key": "not-a-uuid" },
+      malformedBody.body,
+    ), ["projects", uploadValue.projectId, "s2", "reference-assets"], uploadValue.service);
+    const malformedBodyJson = await malformedResponse.json() as any;
+    assert.equal(malformedResponse.status, 400);
+    assert.equal(malformedBodyJson.error.code, "INVALID_REQUEST");
+    assert.deepEqual(malformedBodyJson.error.fieldErrors, [{ field: "Idempotency-Key", code: "UUID_REQUIRED" }]);
+    assert.equal(malformedBody.stats().pulls, 0);
+    assert.deepEqual(s2StateCounts(uploadValue), stateBeforeMalformed);
+    assert.deepEqual(providerCallCounts(uploadValue), providerCallsBeforeMalformed);
+  } finally {
+    rmSync(uploadValue.root, { recursive: true, force: true });
+  }
+
+  const draftValue = fixture();
+  try {
+    await assertMissingS2IdempotencyKeyRoute(draftValue, new Request("http://localhost", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 1, referenceAssetIds: [], logoAssetIds: [] }),
+    }), ["projects", draftValue.projectId, "s2", "reference-draft"]);
+  } finally {
+    rmSync(draftValue.root, { recursive: true, force: true });
+  }
+
+  const bindValue = fixture();
+  try {
+    await assertMissingS2IdempotencyKeyRoute(bindValue, new Request("http://localhost", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sourceGenerationSetId: bindValue.generationSetId, expectedDraftRevision: 1 }),
+    }), ["projects", bindValue.projectId, "s2", "qa-runs"]);
+  } finally {
+    rmSync(bindValue.root, { recursive: true, force: true });
+  }
+
+  const retryValue = fixture();
+  try {
+    const bound = await bindAndWait(retryValue);
+    const retryCandidate = bound.result.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 2)!;
+    assert.equal(retryCandidate.status, "qa_unavailable_retryable");
+    await assertMissingS2IdempotencyKeyRoute(retryValue, new Request("http://localhost", { method: "POST" }), [
+      "projects", retryValue.projectId, "s2", "qa-runs", bound.bound.qaRun.id, "candidates", retryCandidate.candidateId, "retry",
+    ]);
+  } finally {
+    rmSync(retryValue.root, { recursive: true, force: true });
+  }
+
+  const repairValue = fixture();
+  try {
+    const bound = await bindAndWait(repairValue);
+    const repairCandidate = bound.result.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)!;
+    assert.equal(repairCandidate.status, "material_fail");
+    await assertMissingS2IdempotencyKeyRoute(repairValue, new Request("http://localhost", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedInputVersionId: bound.bound.inputVersionId }),
+    }), [
+      "projects", repairValue.projectId, "s2", "qa-runs", bound.bound.qaRun.id, "candidates", repairCandidate.candidateId, "repair",
+    ]);
+  } finally {
+    rmSync(repairValue.root, { recursive: true, force: true });
   }
 });
 
@@ -3457,28 +3591,31 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     });
     const frozenWriteBody = await frozenWriteResponse.json();
     const frozenWriteCode = frozenWriteBody.error?.code ?? "";
-    const malformedBindBody = JSON.stringify({});
-    const malformedBindKey = randomUUID();
-    const apiError = await routeApi("/api/projects/" + routeValue.projectId + "/s2/qa-runs", { method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": malformedBindKey }, body: malformedBindBody });
+    const missingBindBody = JSON.stringify({ sourceGenerationSetId: routeValue.generationSetId, expectedDraftRevision: updated.draft.revision });
+    const routeStateBeforeMissingKey = s2StateCounts(routeValue);
+    const providerCallsBeforeMissingKey = providerCallCounts(routeValue);
+    const apiError = await routeApi("/api/projects/" + routeValue.projectId + "/s2/qa-runs", { method: "POST", headers: { "content-type": "application/json" }, body: missingBindBody });
     const apiErrorBody = await apiError.json();
-    const malformedBindRequest = lastRouteRequest!;
-    const malformedBindBodyObserved = await malformedBindRequest.text();
+    const missingBindRequest = lastRouteRequest!;
+    const missingBindBodyObserved = await missingBindRequest.text();
     const unknownProjectStatus = await routeApi("/api/projects/" + randomUUID() + "/s2/reference-draft", { method: "GET" }).then((response) => response.status);
     const routeState = routeValue.repository.state();
+    const missingKeyNoMutation = JSON.stringify(s2StateCounts(routeValue)) === JSON.stringify(routeStateBeforeMissingKey)
+      && JSON.stringify(providerCallCounts(routeValue)) === JSON.stringify(providerCallsBeforeMissingKey);
     const routeClientSource = readFileSync("app/components/S2Client.tsx", "utf8");
     await prove(claimIds("ROUTE-001", ["auth-all"]), "route project authorization", "Real API requests for a random project and the authorized local project through every S2 route family.",
       { authorizedProject: routeValue.projectId.length > 0, unknownProjectStatus, unauthorizedRoutes: 1, result: "guarded" },
       "The real API rejected an unknown project without exposing a project record while allowing the authorized local project flow.",
       () => { assert.equal(unknownProjectStatus, 404); assert.equal(routeValue.projectId.length > 0, true); });
-    await prove(claimIds("ROUTE-002", ["method", "body", "key", "status", "envelope"]), "route method body key envelope", "Real malformed bind request with method/body/idempotency validation and safe JSON error envelope.",
-      { method: malformedBindRequest.method, body: malformedBindBodyObserved, status: apiError.status, hasError: Boolean(apiErrorBody.error), hasReferenceId: typeof apiErrorBody.error?.referenceId === "string", keyHeaderProvided: malformedBindRequest.headers.has("Idempotency-Key"), result: "safe-error" },
-      "The real route returned a safe status and reference-bearing error envelope for an invalid request.",
-      () => { assert.equal(apiError.status, 400); assert.equal(Boolean(apiErrorBody.error), true); assert.equal(typeof apiErrorBody.error.referenceId, "string"); }, undefined, {
-        "ROUTE-002/method": () => assert.equal(malformedBindRequest.method, "POST"),
-        "ROUTE-002/body": () => assert.equal(malformedBindBodyObserved, malformedBindBody),
-        "ROUTE-002/key": () => assert.equal(malformedBindRequest.headers.get("Idempotency-Key"), malformedBindKey),
+    await prove(claimIds("ROUTE-002", ["method", "body", "key", "status", "envelope"]), "route method body required-key envelope", "Real bind request with a valid body and missing S2 Idempotency-Key through the production API dispatcher.",
+      { method: missingBindRequest.method, body: missingBindBodyObserved, status: apiError.status, topLevelCode: apiErrorBody.error?.code ?? "", hasError: Boolean(apiErrorBody.error), hasReferenceId: typeof apiErrorBody.error?.referenceId === "string", keyHeaderProvided: missingBindRequest.headers.has("Idempotency-Key"), noMutation: missingKeyNoMutation, result: "required-key-safe-error" },
+      "The real route rejected a missing required S2 Idempotency-Key with HTTP 400, the locked top-level code, a safe reference-bearing envelope, and no mutation.",
+      () => { assert.equal(apiError.status, 400); assert.equal(apiErrorBody.error?.code, "IDEMPOTENCY_KEY_REQUIRED"); assert.equal(Boolean(apiErrorBody.error), true); assert.equal(typeof apiErrorBody.error.referenceId, "string"); assert.equal(missingKeyNoMutation, true); }, undefined, {
+        "ROUTE-002/method": () => assert.equal(missingBindRequest.method, "POST"),
+        "ROUTE-002/body": () => assert.equal(missingBindBodyObserved, missingBindBody),
+        "ROUTE-002/key": () => { assert.equal(missingBindRequest.headers.has("Idempotency-Key"), false); assert.equal(apiErrorBody.error?.code, "IDEMPOTENCY_KEY_REQUIRED"); assert.deepEqual(apiErrorBody.error?.fieldErrors, [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]); },
         "ROUTE-002/status": () => assert.equal(apiError.status, 400),
-        "ROUTE-002/envelope": () => { assert.equal(Boolean(apiErrorBody.error), true); assert.equal(typeof apiErrorBody.error.referenceId, "string"); },
+        "ROUTE-002/envelope": () => { assert.equal(Boolean(apiErrorBody.error), true); assert.equal(typeof apiErrorBody.error.referenceId, "string"); assert.equal(missingKeyNoMutation, true); },
       });
     await prove(["ROUTE-003/idempotent-replay"], "route client idempotent bind", "Real S2 client bind with an injected uncertain first response and a retained second request key.",
       { bindCalls: routeBindCalls, sameKey: routeBindKeys[0] === routeBindKeys[1], inputCount: routeState.s2Inputs.length, runCount: routeState.s2QaRuns.length, result: "replayed-safe" },

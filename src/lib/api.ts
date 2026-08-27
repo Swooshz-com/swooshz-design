@@ -44,6 +44,15 @@ function keyFromHeader(request: Request, header: string): UUID {
   return key;
 }
 
+function s2IdempotencyKeyFromHeader(request: Request): UUID {
+  const key = request.headers.get("Idempotency-Key");
+  if (key === null || key.trim() === "") {
+    throw new AppError(400, "IDEMPOTENCY_KEY_REQUIRED", [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]);
+  }
+  assertUuid(key, "Idempotency-Key");
+  return key;
+}
+
 function exactKeys(body: Record<string, unknown>, keys: readonly string[]): void {
   const expected = new Set(keys);
   const fieldErrors = [] as { field: string; code: string }[];
@@ -372,7 +381,7 @@ async function handle(
 ): Promise<NextResponse> {
   if (segments.length === 4 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "reference-assets" && method === "POST") {
     assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]);
-    const key = keyFromHeader(request, "Idempotency-Key"); const file = await multipartS2File(request);
+    const key = s2IdempotencyKeyFromHeader(request); const file = await multipartS2File(request);
     const result = await service.s2.uploadAsset(segments[1], file.kind, file.fileName, file.mimeType, file.bytes, key);
     return NextResponse.json({ asset: result.asset, draft: result.draft }, { status: result.replayed ? 200 : 201 });
   }
@@ -383,7 +392,7 @@ async function handle(
   if (segments.length === 4 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "reference-draft" && method === "PATCH") {
     assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]);
     const body = await jsonBody(request); exactKeys(body, ["expectedRevision", "referenceAssetIds", "logoAssetIds"]);
-    const result = service.s2.updateDraft(segments[1], body.expectedRevision, body.referenceAssetIds, body.logoAssetIds, keyFromHeader(request, "Idempotency-Key"));
+    const result = service.s2.updateDraft(segments[1], body.expectedRevision, body.referenceAssetIds, body.logoAssetIds, s2IdempotencyKeyFromHeader(request));
     return NextResponse.json({ draft: result.draft }, { status: 200 });
   }
   if (segments.length === 5 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "reference-assets" && method === "GET") {
@@ -394,7 +403,7 @@ async function handle(
   if (segments.length === 4 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "qa-runs" && method === "POST") {
     assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]);
     const body = await jsonBody(request); exactKeys(body, ["sourceGenerationSetId", "expectedDraftRevision"]); assertUuid(body.sourceGenerationSetId, "sourceGenerationSetId");
-    const result = await service.s2.bindQa(segments[1], body.sourceGenerationSetId, body.expectedDraftRevision, keyFromHeader(request, "Idempotency-Key"), referenceId);
+    const result = await service.s2.bindQa(segments[1], body.sourceGenerationSetId, body.expectedDraftRevision, s2IdempotencyKeyFromHeader(request), referenceId);
     return NextResponse.json({ qaRun: result.qaRun, inputVersionId: result.inputVersionId }, { status: result.replayed ? 200 : 202 });
   }
   if (segments.length === 5 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "qa-runs" && method === "GET") {
@@ -404,13 +413,13 @@ async function handle(
   if (segments.length === 8 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "qa-runs" && segments[5] === "candidates" && segments[7] === "retry" && method === "POST") {
     assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]); assertUuid(segments[4], "qaRunId"); assertUuid(segments[6], "candidateId");
     await requireEmptyBody(request);
-    const result = await service.s2.retryQa(segments[1], segments[4], segments[6], keyFromHeader(request, "Idempotency-Key"), referenceId);
+    const result = await service.s2.retryQa(segments[1], segments[4], segments[6], s2IdempotencyKeyFromHeader(request), referenceId);
     const { replayed, ...body } = result; return NextResponse.json(body, { status: replayed ? 200 : 202 });
   }
   if (segments.length === 8 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "qa-runs" && segments[5] === "candidates" && segments[7] === "repair" && method === "POST") {
     assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]); assertUuid(segments[4], "qaRunId"); assertUuid(segments[6], "candidateId");
     const body = await jsonBody(request); exactKeys(body, ["expectedInputVersionId"]); assertUuid(body.expectedInputVersionId, "expectedInputVersionId");
-    const result = await service.s2.repairCandidate(segments[1], segments[4], segments[6], body.expectedInputVersionId, keyFromHeader(request, "Idempotency-Key"), referenceId);
+    const result = await service.s2.repairCandidate(segments[1], segments[4], segments[6], body.expectedInputVersionId, s2IdempotencyKeyFromHeader(request), referenceId);
     const { replayed, ...responseBody } = result; return NextResponse.json(responseBody, { status: replayed ? 200 : 202 });
   }
   if (segments.length === 1 && segments[0] === "projects" && method === "POST") {
