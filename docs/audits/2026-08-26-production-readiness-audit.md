@@ -8,15 +8,16 @@ Repository: `Swooshz-com/swooshz-design`
 
 Branch: `web/run-007-s2-g3-nonconvergence-reset`
 
-Scope: the authorized bounded simplification for the current fresh S2 G3
-non-convergence review. The implementation preserves
-`DL-SD-S2-G2-003`; `docs/G2_S2_CONTRACT.md` was not modified. Historical
-PR #15/run-006 remains untouched. No G2 re-entry, G4 advancement, Ready state,
-merge, deployment, live provider call, credential use, customer/private data,
-or destructive action was performed.
-
-The final commit SHA and attached GitHub status are returned in the exact-head
-G3 packet and controlling Draft PR #17 comment.
+Scope: the authorized bounded non-convergence follow-up on
+`web/run-007-s2-g3-nonconvergence-reset`, from previous exact head
+`3cdeee0fdd7ef26b3c2ab8812734f3cdd2e6c451`. The implementation preserves
+`DL-SD-S2-G1-001`, `DL-SD-S2-G2-003`, and `DL-SD-S2-G3-001`;
+`docs/G2_S2_CONTRACT.md` was not modified. Historical PR #15/run-006 remains
+untouched. No G2 re-entry, G2-004, G4 advancement, Ready state, merge,
+deployment, live provider call, credential use, customer/private data, or
+destructive action was performed. The final exact head and attached GitHub
+status are returned in the exact-head G3 packet and the single controlling
+child #7 submission comment for Draft PR #17.
 
 ### Root-cause and bounded-simplification evidence
 
@@ -27,9 +28,18 @@ G3 packet and controlling Draft PR #17 comment.
   restart fixtures prove no duplicate provider call and no late completion
   overwrite.
 - S2 operation idempotency uses the locked
-  `sha256(UTF8 jcs({operation, projectId, input}))` projection. Repair
-  provenance independently uses the locked canonical repair-input projection;
-  the evidence asserts the two hashes are distinct and reproducible.
+  `sha256(UTF8 jcs({operation, projectId, input}))` projection. The fresh
+  evidence independently reconstructs and matches persisted idempotency
+  records for asset upload, draft update, bind, QA retry, and repair, with
+  changed-field negatives. Repair provenance independently uses the exact
+  locked repair-input projection, exact reference/logo projections, changed
+  source/binding/finding/projection negatives, and an explicit inequality
+  assertion between operationInputHash and repairInputHash.
+- Repair eligibility, result arrays, idempotency input, repair input, and
+  repair prompt objectives now share the exact section-16 canonical finding
+  order: the ten fixed families followed by numeric `brief.functional.NNN`
+  and `brief.mandatory.NNN` order. Deliberately scrambled provider fixtures
+  exercise lexical-order differences.
 - Present S2 persisted collections are schema-validated on load for exact
   record keys, bounded values, UUID/SHA/timestamp shapes, nested records,
   relationships, and lifecycle/claim invariants. Unknown or malformed
@@ -47,45 +57,61 @@ G3 packet and controlling Draft PR #17 comment.
   `projects/{projectId}/s2/references/{assetId}/...`.
 - Server-owned repair eligibility and truthful QA summaries distinguish
   processing, usable results, results containing unavailable candidates, and
-  all-results-unavailable states. The client does not infer repairability or
-  render an unavailable result as success.
-- The S2 multipart parser consumes a bounded stream, rejects oversized
-  bodies/files before normalization, enforces bounded headers/fields/trailer,
-  handles arbitrary chunk boundaries, rejects unknown/duplicate fields, and
-  cancels the reader on failure.
+  all-results-unavailable states. The client projects those summaries into
+  user-facing processing/results/unavailable text, does not infer repairability,
+  and does not render an unavailable result as success.
+- The upload route validates project authorization and `Idempotency-Key` before
+  beginning multipart intake. The S2 multipart parser consumes a bounded
+  stream, rejects oversized bodies/files before normalization, enforces bounded
+  headers/fields/trailer, handles arbitrary chunk boundaries, rejects
+  unknown/duplicate fields, and cancels the reader on failure.
+- MEDIA-009 now uses the real multipart route with a valid deterministic
+  exactly-8,388,608-byte padded PNG and a boundary-crossing stream; the
+  8,388,609-byte route is rejected before persistence/normalization. MEDIA-010
+  retains the exact 9,437,184-byte guard, rejects declared 9,437,185-byte
+  bodies before body pull, and rejects a no-Content-Length stream at the real
+  counter before retaining the offending chunk. The locked structural maximum
+  is `8,439,354`, the gap is `997,830`, and exact-valid 9 MiB equality is
+  recorded as structurally unreachable/non-applicable rather than manufactured.
 
 ### Current validation
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| S2 evidence and runtime suite | PASS, 19/19 tests | 103 base rows, 329 derived claims; missing 0, unknown 0, duplicate 0, skipped 0 |
+| S2 evidence and runtime suite | PASS, 21/21 tests | 103 base rows, 329 derived claims; missing 0, unknown 0, duplicate 0, skipped 0 |
 | Complete S1 regression | PASS, 41/41 tests | `tests/g3.test.ts` |
 | Typecheck | PASS | `pnpm run typecheck` |
 | Configured lint | PASS | `pnpm run lint` (repository script maps to TypeScript check) |
 | Production build | PASS | `pnpm run build`; Next.js 16.3.2/Turbopack routes generated |
-| Dependency audit | PASS | `pdfjs-dist` updated from 6.1.200 to patched 6.2.108; `pnpm audit --offline`: no known vulnerabilities |
-| Diff hygiene | PASS | `git diff --check` |
-| Browser smoke | PASS, loopback only | Production build served at 127.0.0.1:3101; `/projects/new` 200; synthetic S2 QA route 404; request inventory contained only loopback URLs |
-| Provider/live-system boundary | PASS | Zero live provider calls, deployment, credential use, or external-system mutation |
+| Native sharp/runtime | PASS | sharp 0.35.3, libvips 8.18.3, native binding loaded; deterministic normalization assertions passed |
+| Frozen dependency validation | PASS | `pnpm install --frozen-lockfile --offline --ignore-scripts`; `pnpm list --depth=0` |
+| Dependency audit | PASS | `pnpm audit --offline`: no known vulnerabilities found |
+| Diff/conflict/Markdown hygiene | PASS | `git diff --check`; no unmerged paths; 26 tracked Markdown files with zero unbalanced fences |
+| Changed additions scan | PASS | 522 added lines; zero credential/token pattern matches and zero unintentional TODO/FIXME/WIP markers |
+| Client/provider credential boundary | PASS | Client has zero `process.env`, bearer, authorization, private-key, or provider-URL matches; provider auth remains server-side |
+| Privacy/logging/storage review | PASS in scope | Safe error logs contain references/status/codes only; private project-scoped storage and ownership-safe recovery are covered by S2 persistence/restart tests |
+| Browser smoke | PASS, loopback only | Production build served at 127.0.0.1:3101; `/projects/new` 200; textbox interaction retained input; 10 requests were loopback-only and successful |
+| Provider/live-system boundary | PASS | Zero live provider calls, deployment, credential use, customer/private data, or external-system mutation |
 
 ### Evidence and audit limitations
 
 The full completed QA browser flow was not clicked because doing so would
 invoke the real provider adapter; the authorized scope requires zero live
 provider calls. Deterministic local workflow/client tests cover the persisted
-QA, unavailable, repair, and re-QA states. Codex Security was not available in
-the installed capabilities; standard manual/static security, privacy,
-storage-path, secret-pattern, dependency, persistence, and failure-injection
-checks were completed. No known unresolved P0/P1 blocker was found in scope.
-GitHub CI/check status is reported from the actual PR after push and is not
-claimed by this local audit.
+QA, unavailable, repair, re-QA, ROUTE-006 matrix, and UI-003 projection.
+Codex Security was not available in the installed capabilities; standard
+manual/static security, privacy, storage-path, secret-pattern, dependency,
+persistence, failure-injection, and changed-content checks were completed.
+No known unresolved P0/P1 blocker was found in scope. GitHub CI/check status is
+reported from the actual PR after push and is not claimed by this local audit.
 
 ### Generated and local artifacts
 
-No generated tracked output was intentionally edited. The dependency lockfile
-change is intentional. Existing `.playwright-cli/` and
-`_agent-toolkit-backups/` untracked material was preserved; local browser
-startup logs under `.tmp/localhost/` are not part of the commit.
+No generated tracked output was intentionally edited in this follow-up. The
+existing `.playwright-cli/`, `.tmp/`, and `_agent-toolkit-backups/` untracked
+material was preserved; the local browser startup log is not part of the
+commit. The exact Section-24 artifact was temporary test output and was not
+copied into the repository; the test derives and validates it on each run.
 
 ---
 
