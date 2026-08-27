@@ -436,6 +436,9 @@ test("persisted lifecycle validation rejects reverse tuples and accepts pristine
       operation.providerDispatchState = "not_started";
       operation.failureCode = null;
     }
+    pristine.s2Transitions = pristine.s2Transitions.filter((transition: any) =>
+      transition.phase === "qa" && transition.attempt === 1 && transition.from === "none" && transition.to === "queued",
+    );
     writeFileSync(fixture.repository.statePath, JSON.stringify(pristine));
     const pristineReload = new JsonRepository(fixture.root);
     assert.equal(pristineReload.state().s2QaRuns[0].status, "queued");

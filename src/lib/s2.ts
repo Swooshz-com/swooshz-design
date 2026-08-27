@@ -473,8 +473,14 @@ export class S2WorkflowService {
       if (stored.kind === "repair_output") {
         const operation = state.s2Operations.find((item) => item.id === stored.operationId);
         const repair = state.s2Repairs.find((item) => item.id === stored.repairAttemptId);
-        if (repair && repair.derivedCandidateId === null) { repair.status = "failed"; repair.completedAt = this.clock(); }
-        if (operation && operation.status !== "succeeded") {
+        if (repair && repair.derivedCandidateId === null && repair.status !== "failed") {
+          const previousStatus = repair.status;
+          repair.status = "failed"; repair.completedAt = this.clock();
+          if (operation && operation.status === "running") {
+            this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, previousStatus, "failed", operation.referenceId);
+          }
+        }
+        if (operation && operation.status === "running") {
           operation.status = "failed"; operation.providerDispatchState = "consumed";
           operation.failureCode = "PERSISTENCE_FAILED"; operation.completedAt = this.clock(); this.clearClaim(operation);
         }
@@ -534,18 +540,26 @@ export class S2WorkflowService {
     });
   }
   private requeueUnstartedOperation(state: StoreState, operation: S2Operation): void {
+    const wasRunning = operation.status === "running";
+    const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
+    const result = operation.phase === "qa"
+      ? run?.candidateResults.find((item) => item.id === operation.resultId)
+      : operation.phase === "re_qa" ? state.s2ReQaResults.find((item) => item.id === operation.resultId) : undefined;
+    const repair = operation.phase !== "qa" && operation.repairAttemptId
+      ? state.s2Repairs.find((item) => item.id === operation.repairAttemptId)
+      : undefined;
+    const previousStatus = operation.phase === "qa" ? result?.status : operation.phase === "repair" ? repair?.status : result?.status;
     operation.status = "queued";
     operation.startedAt = null;
     operation.completedAt = null;
     this.clearClaim(operation);
-    const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
     if (run && operation.phase === "qa") {
-      const result = run.candidateResults.find((item) => item.id === operation.resultId);
-      if (result) {
-        result.status = "queued";
-        result.startedAt = null;
-        result.completedAt = null;
-        result.providerRequestId = null;
+      const sourceResult = run.candidateResults.find((item) => item.id === operation.resultId);
+      if (sourceResult) {
+        sourceResult.status = "queued";
+        sourceResult.startedAt = null;
+        sourceResult.completedAt = null;
+        sourceResult.providerRequestId = null;
       }
       this.recompute(run);
     }
@@ -569,12 +583,18 @@ export class S2WorkflowService {
         result.providerRequestId = null;
       }
     }
+    if (wasRunning && previousStatus !== undefined) {
+      this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, previousStatus, "queued", operation.referenceId);
+    }
   }
   private resolveAmbiguousOperation(state: StoreState, operation: S2Operation): void {
     const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
+    let previousStatus: string | undefined;
+    let nextStatus: string;
     if (operation.phase === "qa") {
       const result = run?.candidateResults.find((item) => item.id === operation.resultId);
       if (result) {
+        previousStatus = result.status;
         result.status = operation.attempt === 1 ? "qa_unavailable_retryable" : "qa_unavailable_terminal";
         result.verdict = "QA_UNAVAILABLE";
         result.requirementObservations = [];
@@ -584,6 +604,7 @@ export class S2WorkflowService {
         result.uncertainFindingIds = [];
         result.providerRequestId = null;
         result.completedAt = this.clock();
+        nextStatus = result.status;
       }
       if (run) this.recompute(run);
       operation.failureCode = "PROVIDER_UNAVAILABLE";
@@ -592,10 +613,12 @@ export class S2WorkflowService {
         ? state.s2Repairs.find((item) => item.id === operation.repairAttemptId)
         : undefined;
       if (repair) {
+        previousStatus = repair.status;
         repair.status = "failed";
         repair.providerRequestId = null;
         repair.completedAt = this.clock();
       }
+      nextStatus = "failed";
       operation.failureCode = "REPAIR_PROVIDER_FAILED";
     } else {
       const result = state.s2ReQaResults.find((item) => item.id === operation.resultId);
@@ -603,6 +626,7 @@ export class S2WorkflowService {
         ? state.s2Repairs.find((item) => item.id === operation.repairAttemptId)
         : undefined;
       if (result) {
+        previousStatus = result.status;
         result.status = "re_qa_unavailable";
         result.verdict = "QA_UNAVAILABLE";
         result.requirementObservations = [];
@@ -617,7 +641,11 @@ export class S2WorkflowService {
         repair.status = "re_qa_unavailable";
         repair.completedAt = this.clock();
       }
+      nextStatus = "re_qa_unavailable";
       operation.failureCode = "RE_QA_UNAVAILABLE";
+    }
+    if (previousStatus !== undefined) {
+      this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, previousStatus, nextStatus!, operation.referenceId);
     }
     operation.providerDispatchState = "consumed";
     operation.status = "failed";
@@ -625,13 +653,15 @@ export class S2WorkflowService {
     this.clearClaim(operation);
   }
   private commitRepairPublication(state: StoreState, publication: S2RepairPublication): void {
+    const operation = state.s2Operations.find((item) => item.id === publication.operationId);
+    const reQaCreated = !state.s2Operations.some((item) => item.id === publication.intendedReQaOperation.id);
     if (!state.s2DerivedCandidates.some((item) => item.id === publication.intendedDerived.id)) {
       state.s2DerivedCandidates.push(cloneJson(publication.intendedDerived));
     }
     if (!state.s2ReQaResults.some((item) => item.id === publication.intendedReQa.id)) {
       state.s2ReQaResults.push(cloneJson(publication.intendedReQa));
     }
-    if (!state.s2Operations.some((item) => item.id === publication.intendedReQaOperation.id)) {
+    if (reQaCreated) {
       state.s2Operations.push(cloneJson(publication.intendedReQaOperation));
     }
     const repair = state.s2Repairs.find((item) => item.id === publication.repairAttemptId);
@@ -640,10 +670,11 @@ export class S2WorkflowService {
       repair.derivedCandidateId = publication.intendedDerived.id; repair.reQaCandidateResultId = publication.intendedReQa.id;
       repair.providerRequestId = publication.providerRequestId; repair.completedAt = this.clock();
     }
-    const operation = state.s2Operations.find((item) => item.id === publication.operationId);
-    if (operation) {
+    if (operation && operation.status === "running") {
       operation.status = "succeeded"; operation.providerDispatchState = "consumed"; operation.completedAt = this.clock(); this.clearClaim(operation);
       this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, "running", "derived_ready", operation.referenceId);
+    }
+    if (operation && reQaCreated) {
       this.transition(state, operation.projectId, publication.intendedReQaOperation.id, "re_qa", 1, "derived_ready", "queued", operation.referenceId);
     }
   }
@@ -1021,26 +1052,35 @@ export class S2WorkflowService {
       const operation = state.s2Operations.find((item) => item.id === operationId);
       if (!operation || operation.status !== "queued") return null;
       const token = this.uuid();
+      const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
+      const sourceResult = operation.phase === "qa"
+        ? run?.candidateResults.find((item) => item.id === operation.resultId)
+        : undefined;
+      const reQaResult = operation.phase === "re_qa"
+        ? state.s2ReQaResults.find((item) => item.id === operation.resultId)
+        : undefined;
+      const repair = operation.phase !== "qa" && operation.repairAttemptId
+        ? state.s2Repairs.find((item) => item.id === operation.repairAttemptId)
+        : undefined;
+      const previousStatus = operation.phase === "qa" ? sourceResult?.status : operation.phase === "repair" ? repair?.status : reQaResult?.status;
       operation.status = "running"; operation.claimedBy = this.workerId; operation.claimedProcessId = this.processId;
       operation.claimToken = token; operation.claimedAt = this.clock(); operation.startedAt = this.clock();
-      const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
       if (run && operation.phase === "qa") {
-        const result = run.candidateResults.find((item) => item.id === operation.resultId);
-        if (result) {
-          result.status = "running";
-          result.startedAt = this.clock();
+        if (sourceResult) {
+          sourceResult.status = "running";
+          sourceResult.startedAt = this.clock();
         }
         this.recompute(run);
       }
       if (operation.phase === "repair" && operation.repairAttemptId) {
-        const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
         if (repair) { repair.status = "running"; repair.startedAt = this.clock(); }
       }
       if (operation.phase === "re_qa" && operation.repairAttemptId) {
-        const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
-        const result = state.s2ReQaResults.find((item) => item.id === operation.resultId);
         if (repair) repair.status = "re_qa_running";
-        if (result) { result.status = "running"; result.startedAt = this.clock(); }
+        if (reQaResult) { reQaResult.status = "running"; reQaResult.startedAt = this.clock(); }
+      }
+      if (previousStatus !== undefined) {
+        this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, previousStatus, "running", operation.referenceId);
       }
       return { operation: cloneJson(operation), token };
     });
@@ -1094,6 +1134,7 @@ export class S2WorkflowService {
         result.verdict = value.verdict; result.requirementObservations = value.requirements; result.designObservations = value.designRules;
         result.materialFindingIds = value.material; result.warningFindingIds = value.warning; result.uncertainFindingIds = value.uncertain;
         result.providerRequestId = safeRequestId(response.providerRequestId); result.completedAt = this.clock();
+        this.transition(current, operation.projectId, operation.id, operation.phase, operation.attempt, "running", result.status, operation.referenceId);
         operation.status = "succeeded"; operation.providerDispatchState = "consumed"; operation.completedAt = this.clock(); this.clearClaim(operation); this.recompute(currentRun);
       });
     } catch (error) {
@@ -1111,6 +1152,7 @@ export class S2WorkflowService {
         const canRetry = retryable(error) && operation.attempt === 1;
         result.status = canRetry ? "qa_unavailable_retryable" : "qa_unavailable_terminal";
         result.verdict = "QA_UNAVAILABLE"; result.completedAt = this.clock();
+        this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, "running", result.status, operation.referenceId);
         operation.status = "failed"; operation.providerDispatchState = "consumed"; operation.failureCode = error instanceof ProviderFailure ? error.safeCode : error instanceof AppError ? error.code : "QA_PROVIDER_FAILED";
         operation.completedAt = this.clock(); this.clearClaim(operation); this.recompute(run);
       });
@@ -1134,6 +1176,7 @@ export class S2WorkflowService {
       state.s2Operations.push({ id: operationId, projectId, phase: "qa", attempt: 2, qaRunId, candidateId, repairAttemptId: null,
         inputHash: input.inputHash, referenceId, status: "queued", claimedBy: null, claimedProcessId: null, claimToken: null,
         claimedAt: null, startedAt: null, completedAt: null, providerDispatchState: "not_started", failureCode: null, resultId: retryResult.id });
+      this.transition(state, projectId, operationId, "qa", 2, current.status, "queued", referenceId);
       this.remember(state, key, "s2_qa_retry", projectId, inputHash, { qaRunId, candidateId, operationId, resultId: retryResult.id });
       return { replayed: false };
     });
@@ -1242,6 +1285,7 @@ export class S2WorkflowService {
       state.s2Operations.push({ id: operationId, projectId, phase: "repair", attempt: 1, qaRunId, candidateId,
         repairAttemptId: repairId, inputHash: operationHash, referenceId, status: "queued", claimedBy: null, claimedProcessId: null,
         claimToken: null, claimedAt: null, startedAt: null, completedAt: null, providerDispatchState: "not_started", failureCode: null, resultId: null });
+      this.transition(state, projectId, operationId, "repair", 1, "eligible", "queued", referenceId);
       this.remember(state, key, "s2_repair", projectId, operationHash, { repairAttemptId: repairId, operationId });
       return { replayed: false };
     });
@@ -1345,6 +1389,7 @@ export class S2WorkflowService {
         const repair = operation?.repairAttemptId ? state.s2Repairs.find((item) => item.id === operation.repairAttemptId) : null;
         if (!operation || !repair || !this.claimMatches(operation, token)) return;
         repair.status = "failed"; repair.completedAt = this.clock();
+        this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, "running", "failed", operation.referenceId);
         operation.status = "failed"; operation.providerDispatchState = "consumed"; operation.failureCode = error instanceof AppError ? error.code :
           error instanceof ProviderFailure ? error.safeCode : "REPAIR_PROVIDER_FAILED";
         operation.completedAt = this.clock(); this.clearClaim(operation);
@@ -1381,6 +1426,7 @@ export class S2WorkflowService {
         storedResult.providerRequestId = safeRequestId(response.providerRequestId); storedResult.completedAt = this.clock();
         storedRepair.status = value.verdict === "PASS" ? "re_qa_pass" : value.verdict === "WARNING" ? "re_qa_warning" : "re_qa_material_fail";
         storedRepair.completedAt = this.clock(); stored.status = "succeeded"; stored.providerDispatchState = "consumed";
+        this.transition(current, stored.projectId, stored.id, stored.phase, stored.attempt, "running", storedRepair.status, stored.referenceId);
         stored.completedAt = this.clock(); this.clearClaim(stored);
       });
     } catch (error) {
@@ -1393,6 +1439,7 @@ export class S2WorkflowService {
           if (!operation || !result || !repair || !this.claimMatches(operation, claim.token)) return;
           result.status = "re_qa_unavailable"; result.verdict = "QA_UNAVAILABLE"; result.completedAt = this.clock();
           repair.status = "re_qa_unavailable"; repair.completedAt = this.clock();
+          this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, "running", "re_qa_unavailable", operation.referenceId);
           operation.status = "failed"; operation.providerDispatchState = "consumed";
           operation.failureCode = error instanceof AppError ? error.code :
             error instanceof ProviderFailure ? error.safeCode : "RE_QA_UNAVAILABLE";

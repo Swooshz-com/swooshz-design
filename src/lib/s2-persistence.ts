@@ -43,6 +43,7 @@ const RETRYABLE_QA_FAILURE_CODES = new Set([
 ]);
 
 type AnyRecord = Record<string, unknown>;
+type S2TransitionRecord = StoreState["s2Transitions"][number];
 
 function invalid(reason: string): never {
   throw new Error("invalid S2 persisted graph: " + reason);
@@ -586,6 +587,65 @@ function validateOperationTarget(operation: S2Operation, result: S2QaCandidateRe
   }
 }
 
+function expectedTransitionStart(operation: S2Operation): string {
+  if (operation.phase === "qa") return operation.attempt === 1 ? "none" : "qa_unavailable_retryable";
+  return operation.phase === "repair" ? "eligible" : "derived_ready";
+}
+
+function expectedTransitionEnd(operation: S2Operation, result: S2QaCandidateResult | S2ReQaResult | null, repair: S2RepairAttempt | null): string {
+  if (operation.phase === "qa") {
+    ensure(result !== null, "transition.qa-result");
+    return result.status;
+  }
+  if (operation.phase === "repair") {
+    ensure(repair !== null, "transition.repair-record");
+    return operation.status === "succeeded" ? "derived_ready" : repair.status;
+  }
+  ensure(result !== null, "transition.re-qa-result");
+  if (operation.status === "succeeded") {
+    if (result.status === "pass") return "re_qa_pass";
+    if (result.status === "warning") return "re_qa_warning";
+    if (result.status === "material_fail") return "re_qa_material_fail";
+  }
+  return operation.status === "failed" ? "re_qa_unavailable" : result.status;
+}
+
+function validateOperationTransitionHistory(
+  operation: S2Operation,
+  result: S2QaCandidateResult | S2ReQaResult | null,
+  repair: S2RepairAttempt | null,
+  transitions: readonly S2TransitionRecord[],
+): void {
+  const history = transitions.filter((transition) => transition.operationId === operation.id);
+  ensure(history.length > 0, "transition.history-required");
+  ensure(history[0].from === expectedTransitionStart(operation) && history[0].to === "queued", "transition.initial-state");
+
+  const seenPairs = new Set<string>();
+  for (let index = 0; index < history.length; index += 1) {
+    const transition = history[index];
+    const pair = transition.from + ":" + transition.to;
+    if (index > 0) {
+      const previous = history[index - 1];
+      ensure(previous.to === transition.from, "transition.history-gap");
+      ensure(Date.parse(previous.at) <= Date.parse(transition.at), "transition.timestamp-order");
+    }
+    ensure(!seenPairs.has(pair) || pair === "queued:running" || pair === "running:queued", "transition.impossible-duplicate");
+    seenPairs.add(pair);
+    if (pair === "running:queued") {
+      ensure(index > 0 && history[index - 1].from === "queued" && history[index - 1].to === "running", "transition.recovery-topology");
+    }
+  }
+
+  const final = history[history.length - 1].to;
+  const expected = expectedTransitionEnd(operation, result, repair);
+  ensure(final === expected, "transition.final-state");
+  if (operation.status === "running") {
+    ensure(final === "running" && history[history.length - 1].from === "queued", "transition.running-state");
+  } else if (operation.status === "succeeded" || operation.status === "failed") {
+    ensure(history.length >= 3 && history[history.length - 1].from === "running", "transition.terminal-state");
+  }
+}
+
 function expectedAssetKeys(publication: S2UploadPublication): { staging: S2PublicationObject[]; final: S2PublicationObject[] } {
   const asset = publication.intendedAsset;
   return {
@@ -872,11 +932,19 @@ export function validateS2Graph(state: StoreState): void {
     ensure(transition.referenceId === operation.referenceId, "transition.reference-lineage");
     const pair = transition.from + ":" + transition.to;
     const allowed = transition.phase === "qa"
-      ? ["none:queued", "queued:running", "running:pass", "running:warning", "running:material_fail", "running:qa_unavailable_retryable", "running:qa_unavailable_terminal", "qa_unavailable_retryable:queued", "qa_unavailable_retryable:running"]
+      ? ["none:queued", "queued:running", "running:queued", "running:pass", "running:warning", "running:material_fail", "running:qa_unavailable_retryable", "running:qa_unavailable_terminal", "qa_unavailable_retryable:queued", "qa_unavailable_retryable:running"]
       : transition.phase === "repair"
-        ? ["eligible:queued", "queued:running", "running:failed", "running:derived_ready"]
-        : ["derived_ready:queued", "queued:running", "running:re_qa_pass", "running:re_qa_warning", "running:re_qa_material_fail", "running:re_qa_unavailable"];
+        ? ["eligible:queued", "queued:running", "running:queued", "running:failed", "running:derived_ready"]
+        : ["derived_ready:queued", "queued:running", "running:queued", "running:re_qa_pass", "running:re_qa_warning", "running:re_qa_material_fail", "running:re_qa_unavailable"];
     ensure(allowed.includes(pair), "transition.status-pair");
+  }
+  for (const operation of operations.values()) {
+    const run = runs.get(operation.qaRunId);
+    const result = operation.phase === "qa"
+      ? run?.candidateResults.find((item) => item.id === operation.resultId) ?? null
+      : operation.phase === "re_qa" ? reQa.get(operation.resultId ?? "") ?? null : null;
+    const repair = operation.phase === "qa" ? null : repairs.get(operation.repairAttemptId ?? "") ?? null;
+    validateOperationTransitionHistory(operation, result, repair, state.s2Transitions);
   }
   for (const draft of drafts.values()) {
     if (draft.status === "frozen") {
