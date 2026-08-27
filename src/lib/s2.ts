@@ -41,6 +41,7 @@ import {
 } from "./s2-media";
 import { S2_QA_MODEL, S2_QA_SCHEMA, type S2ProviderContract, type S2QaProviderInput } from "./s2-provider";
 import { ProviderFailure } from "./openai";
+import { deriveSourceQaLifecycle, isSourceQaTerminalStatus, latestSourceQaResults } from "./s2-lifecycle";
 
 export type S2PublicationPhase =
   | "before-publication-intent"
@@ -117,7 +118,7 @@ export function operationInputHash(operation: string, projectId: UUID, input: un
   return sha256(jcs({ operation, projectId, input }));
 }
 function terminal(status: string): boolean {
-  return ["pass", "warning", "material_fail", "qa_unavailable_retryable", "qa_unavailable_terminal"].includes(status);
+  return isSourceQaTerminalStatus(status);
 }
 function safeRequestId(value: string | null): string | null {
   return value && value.length <= 200 ? value : null;
@@ -538,20 +539,15 @@ export class S2WorkflowService {
     operation.completedAt = null;
     this.clearClaim(operation);
     const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
-    if (run) {
-      run.completedAt = null;
-      if (operation.phase === "qa") {
-        const result = run.candidateResults.find((item) => item.id === operation.resultId);
-        if (result) {
-          result.status = "queued";
-          result.startedAt = null;
-          result.completedAt = null;
-          result.providerRequestId = null;
-        }
-        run.status = run.candidateResults.some((item) => item.status === "running") ? "running" : "queued";
-      } else {
-        run.status = "running";
+    if (run && operation.phase === "qa") {
+      const result = run.candidateResults.find((item) => item.id === operation.resultId);
+      if (result) {
+        result.status = "queued";
+        result.startedAt = null;
+        result.completedAt = null;
+        result.providerRequestId = null;
       }
+      this.recompute(run);
     }
     if (operation.phase === "repair" && operation.repairAttemptId) {
       const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
@@ -967,14 +963,13 @@ export class S2WorkflowService {
     return input;
   }
   private latest(run: S2QaRun, candidateId: UUID): S2QaCandidateResult {
-    const value = run.candidateResults.filter((item) => item.candidateId === candidateId).sort((a, b) => b.attempt - a.attempt)[0];
+    const value = latestSourceQaResults(run.candidateResults.filter((item) => item.candidateId === candidateId))[0];
     if (!value) throw fail(404, "QA_NOT_FOUND");
     return value;
   }
   private publicRun(state: StoreState, run: S2QaRun): Record<string, unknown> {
     const input = this.inputFor(state, run);
-    const latest = Array.from(new Set(run.candidateResults.map((item) => item.candidateId))).map((id) => this.latest(run, id))
-      .sort((a, b) => a.candidateIndex - b.candidateIndex);
+    const latest = latestSourceQaResults(run.candidateResults);
     const repairs = state.s2Repairs.filter((item) => item.qaRunId === run.id);
     const candidates = latest.map((candidate) => {
       const eligibleFindingIds = this.eligibleFindings(candidate, input);
@@ -1029,12 +1024,13 @@ export class S2WorkflowService {
       operation.status = "running"; operation.claimedBy = this.workerId; operation.claimedProcessId = this.processId;
       operation.claimToken = token; operation.claimedAt = this.clock(); operation.startedAt = this.clock();
       const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
-      if (run) {
-        run.status = "running"; run.startedAt ??= this.clock();
-        if (operation.phase === "qa") {
-          const result = run.candidateResults.find((item) => item.id === operation.resultId);
-          if (result) { result.status = "running"; result.startedAt = this.clock(); }
+      if (run && operation.phase === "qa") {
+        const result = run.candidateResults.find((item) => item.id === operation.resultId);
+        if (result) {
+          result.status = "running";
+          result.startedAt = this.clock();
         }
+        this.recompute(run);
       }
       if (operation.phase === "repair" && operation.repairAttemptId) {
         const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
@@ -1063,14 +1059,18 @@ export class S2WorkflowService {
       requirements: input.canonicalRequirements, designRules: input.designRuleSnapshot.filter((item) => item.applicability === "applicable") };
   }
   private recompute(run: S2QaRun): void {
-    const latest = Array.from(new Set(run.candidateResults.map((item) => item.candidateId))).map((id) => this.latest(run, id));
-    run.completedCandidateCount = latest.filter((item) => terminal(item.status)).length;
-    run.passCount = latest.filter((item) => item.status === "pass").length;
-    run.warningCount = latest.filter((item) => item.status === "warning").length;
-    run.materialFailCount = latest.filter((item) => item.status === "material_fail").length;
-    run.unavailableCount = latest.filter((item) => item.status === "qa_unavailable_retryable" || item.status === "qa_unavailable_terminal").length;
-    if (latest.length === 4 && latest.every((item) => terminal(item.status))) { run.status = "completed"; run.completedAt = this.clock(); }
-    else { run.status = "running"; run.completedAt = null; }
+    const lifecycle = deriveSourceQaLifecycle(run.candidateResults, {
+      startedAt: run.startedAt,
+      completedAt: run.completedAt,
+    }, this.clock());
+    run.status = lifecycle.status;
+    run.startedAt = lifecycle.startedAt;
+    run.completedAt = lifecycle.completedAt;
+    run.completedCandidateCount = lifecycle.completedCandidateCount;
+    run.passCount = lifecycle.passCount;
+    run.warningCount = lifecycle.warningCount;
+    run.materialFailCount = lifecycle.materialFailCount;
+    run.unavailableCount = lifecycle.unavailableCount;
   }
   private async runQa(operationId: UUID): Promise<void> {
     const claim = this.claim(operationId); if (!claim) return;
@@ -1130,15 +1130,7 @@ export class S2WorkflowService {
         requirementObservations: [], designObservations: [], materialFindingIds: [], warningFindingIds: [], uncertainFindingIds: [],
         providerRequestId: null, repairAttemptId: null, startedAt: null, completedAt: null };
       const operationId = this.uuid(); run.candidateResults.push(retryResult);
-      run.status = run.candidateResults.some((item) => item.status === "running") ? "running" : "queued";
-      run.completedAt = null;
-      const latest = Array.from(new Set(run.candidateResults.map((item) => item.candidateId)))
-        .map((id) => this.latest(run, id));
-      run.completedCandidateCount = latest.filter((item) => terminal(item.status)).length;
-      run.passCount = latest.filter((item) => item.status === "pass").length;
-      run.warningCount = latest.filter((item) => item.status === "warning").length;
-      run.materialFailCount = latest.filter((item) => item.status === "material_fail").length;
-      run.unavailableCount = latest.filter((item) => item.status === "qa_unavailable_retryable" || item.status === "qa_unavailable_terminal").length;
+      this.recompute(run);
       state.s2Operations.push({ id: operationId, projectId, phase: "qa", attempt: 2, qaRunId, candidateId, repairAttemptId: null,
         inputHash: input.inputHash, referenceId, status: "queued", claimedBy: null, claimedProcessId: null, claimToken: null,
         claimedAt: null, startedAt: null, completedAt: null, providerDispatchState: "not_started", failureCode: null, resultId: retryResult.id });

@@ -146,7 +146,9 @@ function fixtureFor(testId: string, variantId: string): string {
   if (testId === "BIND-009") return "Persisted S1 source PNGs plus selected normalized assets through the actual S2 bind boundary.";
   if (testId === "QA-012") return "Six named local provider failure fixtures mapped through the production QA aggregation boundary.";
   if (testId === "RETRY-005") return "Deferred attempt-1 provider response racing explicit attempt 2 and terminal state.";
-  if (testId === "CONC-003") return "Local restart fixtures for upload, bind, QA, repair and re-QA with definite, live and uncertain liveness.";
+  if (testId === "CONC-003") return "Local restart fixtures for upload, bind, QA, repair and re-QA with definite, live and uncertain liveness; repair/re-QA recovery preserves the completed source-QA run.";
+  if (testId === "REPAIR-007") return "Real two-candidate repair workflow proving one repair per (qaRunId, candidateId), independent candidate repair, and same-candidate rejection.";
+  if (testId === "REQA-003") return "Four real repair/re-QA workflows proving pass, warning, material-fail, and unavailable outcomes without changing source-QA completion.";
   if (testId === "REPAIR-011") return "Production OpenAIProvider.runS2Repair adapter with one controlled local response per locked output class.";
   if (testId === "PRIV-001") return "Changed-content and captured-log review with redacted local provider fixtures and private object keys.";
   if (testId === "PRIV-002" || testId === "PRIV-005") return "Changed-content credential scan, client-boundary review and offline dependency inspection.";

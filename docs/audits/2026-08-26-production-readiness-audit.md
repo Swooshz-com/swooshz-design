@@ -2,6 +2,133 @@
 
 Current audit update: 2026-08-27
 
+## Current exact-head G3 audit: authorised non-convergence subsystem reset
+
+Repository: Swooshz-com/swooshz-design
+
+Canonical main: 68fbbb8653733554730d90316ce6e91719f1ffce
+
+Branch: web/run-007-s2-g3-nonconvergence-reset
+
+Previous exact head: 0a507dae616c9a7737650d68e2844ef65c7c9939
+
+Implementation commit: this exact-head publication commit; the final packet
+records its exact hash.
+
+Admission verified before mutation: PR #17 is OPEN, Draft, unmerged, based on
+main, and points to the required previous head. The current controlling Web
+disposition is review 5039746994; the current child #7 authority is comment
+5437711987; the current parent #1 authority is comment 5437716139. Locks
+DL-SD-S2-G1-001, DL-SD-S2-G2-003, and DL-SD-S2-G3-001 remain active. No newer
+conflicting User/Web authority was found. PR #15 remains historical
+closed/unmerged/noncanonical and PR #18 remains merged/canonical G2. Parent
+#1 was not modified. This is the authorised S2 subsystem reset after repeated
+same-root failure, not repair 3/3, G1 re-entry, or G2 re-entry.
+
+### Reset model and bounded scope
+
+- src/lib/s2-lifecycle.ts adds one pure, deterministic source-QA lifecycle
+  projection. It selects the latest result for each canonical candidate index
+  1..4, derives all source counters from those four results, and derives
+  queued/running/completed source-run status and timestamps only from source-QA
+  work.
+- src/lib/s2.ts uses that projection for bind, claim, completion, failure,
+  retry, requeue, and ambiguous-operation recovery. Repair and re-QA claims,
+  recovery, publication, completion, and failure update only their own
+  records, operations, and publication state.
+- src/lib/s2-persistence.ts enforces one repair per (qaRunId, candidateId),
+  resolves repair eligibility from the canonical latest source-QA result,
+  requires the latest result to link the repair, and rejects stale or
+  cross-candidate/project/run/input lineage.
+- tests/s2-evidence.test.ts adds real two-candidate repair and attempt-two
+  repair workflows, independent source-run lifecycle/recovery coverage, and a
+  persisted graph matrix. tests/s2-evidence-manifest.ts rebinds affected
+  Section-24 claims to those real proving paths.
+- docs/G2_S2_CONTRACT.md, src/lib/types.ts, package.json, pnpm-lock.yaml, UI,
+  provider adapters, and unrelated S1 behavior were not modified.
+
+### Audited S2QaRun mutation sites
+
+The audit covered every production path that can write S2QaRun status,
+startedAt, completedAt, or source counters:
+
+| Site | Source-QA behavior | Repair/re-QA behavior |
+| --- | --- | --- |
+| bindQa() constructor path | Initializes the queued four-candidate source run and zero counters | None |
+| claim() | Marks a source result running and recomputes the source projection | Claims only S2RepairAttempt or S2ReQaResult state |
+| runQa() and failQa() | Persist terminal source result facts and recompute | Not used |
+| retryQa() | Appends the explicit candidate attempt two and recomputes source state | Not used |
+| requeueUnstartedOperation() | Requeues and recomputes only phase=qa | Requeues only repair or re-QA records |
+| resolveAmbiguousOperation() | Resolves only phase=qa as candidate unavailable and recomputes | Resolves only repair/re-QA state and operation failure |
+| recoverOperations() and constructor recovery | Routes source operations through the source projection | Routes repair/re-QA recovery without touching source-run fields |
+| repair claim/run/fail/publication commit/recovery | No S2QaRun status, counter, or timestamp write | Own operation, repair, derived, publication, and re-QA lineage only |
+| re-QA claim/completion/failure/recovery | No S2QaRun status, counter, or timestamp write | Own result, repair, and operation lifecycle only |
+
+Consequently, repair queued/running/failed/derived_ready and re-QA
+queued/running/pass/warning/material-fail/unavailable states cannot reopen a
+completed source run or clear its completedAt. The real tests assert the
+original completedAt value remains byte-for-byte unchanged.
+
+### Reset proving results
+
+- Two-candidate repair workflow: PASS. Two different candidates in one QA run
+  each received one legal repair, each linked to its own latest source result,
+  and each persisted an independent repair operation, idempotency record,
+  publication, derived candidate, and re-QA operation/result lineage after a
+  fresh JsonRepository reload. Repair provider calls were 2 and re-QA calls
+  were 2; no operation identity dispatched twice. Candidate B was not blocked
+  by candidate A. A second request for candidate A returned
+  REPAIR_ALREADY_EXISTS with no extra provider call or mutation.
+- Attempt-two repair workflow: PASS. Candidate attempt one was
+  qa_unavailable_retryable, the explicit retry produced attempt-two
+  MATERIAL_FAIL, and exactly one repair and one successful re-QA persisted
+  after reload. Attempt one retained repairAttemptId=null; attempt two linked
+  the repair; eligibility and immutable source identity came from attempt two;
+  no PERSISTENCE_FAILED occurred and a second repair was rejected.
+- Source-run lifecycle matrix: PASS. Completed source QA remained completed
+  with its original completedAt through queued/running/failed repair,
+  derived_ready, queued/running re-QA, all four terminal re-QA outcomes, dead
+  owner recovery, ambiguous may-have-started recovery, and repair concurrent
+  with active source QA. The source projection remained latest-result-only.
+- Persisted graph matrix: PASS. 44 impossible persisted graphs were rejected
+  with PERSISTENCE_FAILED and 15 legal positive roots, including no repair,
+  attempt-one repair, attempt-two repair, two candidate repairs, active repair
+  and re-QA states, and recovery states, were accepted.
+- Section-24 evidence: PASS. The base matrix remains 103 rows and the exact
+  head has 329 claims with missing 0, unknown 0, duplicate 0, and skipped 0.
+  Evidence-negative self-tests pass.
+
+### Validation closure
+
+| Check | Result |
+| --- | --- |
+| Full S2 suite | PASS, 26/26 |
+| Full S1 suite and PDF extraction regression | PASS, 41/41 |
+| pdfjs-dist | 6.2.108 |
+| Frozen dependency install | PASS, offline and frozen |
+| Supported dependency audit | PASS, no known vulnerabilities found |
+| sharp native load | PASS, sharp 0.35.3, libvips 8.18.3 |
+| Typecheck and lint | PASS |
+| Production build | PASS, Next.js 16.3.2/Turbopack |
+| Diff/conflict/temporary/debug/secret checks | PASS in changed scope |
+| Client credential/provider boundary and privacy/log review | PASS in scope |
+| Loopback browser smoke | PASS, production app returned HTTP 200 at 127.0.0.1:3101/projects/new and rendered Create project, Project name, and Create project controls; browser and server were stopped |
+
+No live provider calls, provider credentials, customer/private data,
+deployment, or destructive live action was used. No additional dependency was
+introduced. The only external mutations are the explicitly authorised push to
+the same GitHub Draft branch and one child #7 submission. The final GitHub
+status/check/workflow inventory is reported from the pushed exact head; missing
+checks are not treated as green. PR #17 remains Draft and no G4, Ready, merge,
+or S3 action is taken. Exactly one fresh exact-head G3 submission is sent to
+child #7 after comment 5437711987; no worker packet is posted to the PR
+conversation.
+
+ELI5: replace many special-case database exceptions with one rulebook. The
+four latest original QA results decide whether source QA is finished, every
+design gets its own one repair, and a repair belongs to that design's latest
+real QA result. The real workflows and persisted graph prove the combinations.
+
 ## Current exact-head G3 audit: bounded non-convergence simplification
 
 Repository: Swooshz-com/swooshz-design

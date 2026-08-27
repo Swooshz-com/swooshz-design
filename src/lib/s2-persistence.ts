@@ -20,6 +20,12 @@ import type {
   StructuredBriefData,
 } from "./types";
 import { jcs, sha256, uuidV4Pattern } from "./utils";
+import {
+  deriveSourceQaLifecycle,
+  latestSourceQaResults,
+  SOURCE_QA_CANDIDATE_INDEXES,
+  SOURCE_QA_TERMINAL_STATUSES,
+} from "./s2-lifecycle";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_REFERENCES = 6;
@@ -30,10 +36,8 @@ const QA_SCHEMA = "s2-qa-v1";
 const DESIGN_RULES_VERSION = "s2-design-rules-v1";
 const DECODER_PROFILE = "s2-media-v1";
 
-const SOURCE_INDEXES = [1, 2, 3, 4] as const;
-const TERMINAL_CANDIDATE_STATUSES = [
-  "pass", "warning", "material_fail", "qa_unavailable_retryable", "qa_unavailable_terminal",
-] as const;
+const SOURCE_INDEXES = SOURCE_QA_CANDIDATE_INDEXES;
+const TERMINAL_CANDIDATE_STATUSES = SOURCE_QA_TERMINAL_STATUSES;
 const UNAVAILABLE_STATUSES = ["qa_unavailable_retryable", "qa_unavailable_terminal", "re_qa_unavailable"] as const;
 const RETRYABLE_QA_FAILURE_CODES = new Set([
   "PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE", "PROVIDER_RATE_LIMIT", "PROVIDER_SERVER_ERROR", "QA_PROVIDER_INCOMPLETE",
@@ -417,18 +421,22 @@ function validateRunRetryTopology(
   }
 }
 
-function validateRunLifecycle(run: S2QaRun, latest: readonly S2QaCandidateResult[], hasRepairLineage: boolean): void {
+function validateRunLifecycle(run: S2QaRun, latest: readonly S2QaCandidateResult[]): void {
+  const projection = deriveSourceQaLifecycle(latest, {
+    startedAt: run.startedAt,
+    completedAt: run.completedAt,
+  }, run.completedAt ?? run.startedAt ?? run.createdAt);
   const hasQueued = latest.some((item) => item.status === "queued");
   const hasRunning = latest.some((item) => item.status === "running");
-  const allTerminal = latest.length === 4 && latest.every((item) => (TERMINAL_CANDIDATE_STATUSES as readonly string[]).includes(item.status));
-  ensure(run.completedCandidateCount === latest.filter((item) => (TERMINAL_CANDIDATE_STATUSES as readonly string[]).includes(item.status)).length, "qa-run.completed-count");
+  const allTerminal = latest.length === SOURCE_INDEXES.length && latest.every((item) => (TERMINAL_CANDIDATE_STATUSES as readonly string[]).includes(item.status));
+  ensure(run.completedCandidateCount === projection.completedCandidateCount, "qa-run.completed-count");
   ensure(run.passCount === latest.filter((item) => item.status === "pass").length &&
     run.warningCount === latest.filter((item) => item.status === "warning").length &&
     run.materialFailCount === latest.filter((item) => item.status === "material_fail").length &&
     run.unavailableCount === latest.filter((item) => item.status === "qa_unavailable_retryable" || item.status === "qa_unavailable_terminal").length, "qa-run.counters");
-  if (run.status === "queued") ensure(hasQueued && !hasRunning && run.completedAt === null, "qa-run.queued-tuple");
-  if (run.status === "running") ensure(run.startedAt !== null && (hasRunning || hasRepairLineage) && (hasRepairLineage || run.completedAt === null), "qa-run.running-tuple");
-  if (run.status === "completed") ensure(allTerminal && run.completedAt !== null, "qa-run.completed-tuple");
+  if (run.status === "queued") ensure(projection.status === "queued" && hasQueued && !hasRunning && run.completedAt === null, "qa-run.queued-tuple");
+  if (run.status === "running") ensure(projection.status === "running" && run.startedAt !== null && hasRunning && run.completedAt === null, "qa-run.running-tuple");
+  if (run.status === "completed") ensure(projection.status === "completed" && allTerminal && run.completedAt !== null, "qa-run.completed-tuple");
   if (run.status === "failed") ensure(!hasQueued && !hasRunning && allTerminal && run.completedAt !== null, "qa-run.failed-tuple");
 }
 
@@ -441,9 +449,14 @@ function validateRepairSource(repair: S2RepairAttempt, input: S2InputVersion): S
 
 function validateRepairState(repair: S2RepairAttempt, run: S2QaRun, input: S2InputVersion, state: StoreState, operations: Map<string, S2Operation>, derived: Map<string, S2DerivedCandidate>, reQa: Map<string, S2ReQaResult>): void {
   const source = validateRepairSource(repair, input);
-  const original = run.candidateResults.filter((item) => item.candidateId === repair.candidateId && item.attempt === 1)[0];
-  ensure(original !== undefined && original.repairAttemptId === repair.id, "repair.original-link");
-  const eligible = candidateEligibility(original, input);
+  const history = run.candidateResults
+    .filter((item) => item.candidateId === repair.candidateId)
+    .slice()
+    .sort((left, right) => left.attempt - right.attempt);
+  const latest = latestSourceQaResults(history)[0];
+  ensure(latest !== undefined && latest.repairAttemptId === repair.id, "repair.latest-link");
+  ensure(history.filter((item) => item.id !== latest.id).every((item) => item.repairAttemptId === null), "repair.earlier-link");
+  const eligible = candidateEligibility(latest, input);
   ensure(eligible !== null && equalIds(repair.eligibleFindingIds, eligible), "repair.eligible-findings");
   const referenceAssets = selectedAssetProjection(state, input.referenceAssetIds, "reference", input.projectId);
   const logoAssets = selectedAssetProjection(state, input.logoAssetIds, "logo", input.projectId);
@@ -724,10 +737,6 @@ export function validateS2Graph(state: StoreState): void {
     runByInput.add(input.id);
     for (const result of run.candidateResults) {
       validateRunResultLineage(result, run, input, resultIds);
-      if (result.repairAttemptId !== null) {
-        const repair = repairs.get(result.repairAttemptId);
-        ensure(result.attempt === 1 && repair !== undefined && repair.qaRunId === run.id && repair.candidateId === result.candidateId, "qa-result.repair-lineage");
-      }
     }
     validateRunRetryTopology(run, input, operations, idempotency);
     const latest = SOURCE_INDEXES.map((index) => {
@@ -735,8 +744,14 @@ export function validateS2Graph(state: StoreState): void {
       ensure(values.length > 0, "qa-run.candidate-cardinality");
       return values.sort((left, right) => right.attempt - left.attempt)[0];
     });
-    const hasRepairLineage = state.s2Repairs.some((item) => item.qaRunId === run.id) || state.s2ReQaResults.some((item) => item.qaRunId === run.id);
-    validateRunLifecycle(run, latest, hasRepairLineage);
+    for (const result of run.candidateResults) {
+      if (result.repairAttemptId !== null) {
+        const repair = repairs.get(result.repairAttemptId);
+        const canonical = latest.find((item) => item.candidateId === result.candidateId);
+        ensure(canonical?.id === result.id && repair !== undefined && repair.qaRunId === run.id && repair.candidateId === result.candidateId, "qa-result.repair-lineage");
+      }
+    }
+    validateRunLifecycle(run, latest);
   }
   for (const run of runs.values()) for (const result of run.candidateResults) {
     const matches = Array.from(operations.values()).filter((item) => item.phase === "qa" && item.qaRunId === run.id && item.candidateId === result.candidateId && item.attempt === result.attempt && item.resultId === result.id);
@@ -757,10 +772,11 @@ export function validateS2Graph(state: StoreState): void {
     ensure(input !== undefined && run !== undefined && input.qaRunId === run.id, "repair.run-input");
     ensure(repair.projectId === input.projectId && run.projectId === input.projectId, "repair.project-lineage");
   }
-  const repairByRun = new Set<string>();
+  const repairByCandidate = new Set<string>();
   for (const repair of repairs.values()) {
-    ensure(!repairByRun.has(repair.qaRunId), "repair.one-bounded-attempt");
-    repairByRun.add(repair.qaRunId);
+    const repairKey = repair.qaRunId + ":" + repair.candidateId;
+    ensure(!repairByCandidate.has(repairKey), "repair.one-per-candidate");
+    repairByCandidate.add(repairKey);
     validateRepairState(repair, runs.get(repair.qaRunId)!, inputs.get(repair.inputVersionId)!, state, operations, derived, reQa);
   }
   for (const record of derived.values()) {

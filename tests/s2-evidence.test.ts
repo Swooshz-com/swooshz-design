@@ -593,8 +593,182 @@ test("fresh S2 persistence rejects present malformed or unknown records and keep
   }
 });
 
+test("fresh S2 real workflow permits one independent repair per candidate and preserves source lifecycle", async () => {
+  const qaCallsByCandidate = new Map<number, number>();
+  const dispatches: Array<{ id: string; phase: string; candidateId: string }> = [];
+  const provider = new MockOpenAIProvider({
+    briefData: briefData(),
+    s2RepairResponses: [ONE_PIXEL_PNG, ONE_PIXEL_PNG],
+    s2QaResponseFactory: (input) => {
+      const call = qaCallsByCandidate.get(input.candidateIndex) ?? 0;
+      qaCallsByCandidate.set(input.candidateIndex, call + 1);
+      return call === 0 && (input.candidateIndex === 1 || input.candidateIndex === 2)
+        ? qaPayload(input, "pass", "structure.overhead-support")
+        : qaPayload(input, "pass");
+    },
+  });
+  const value = fixture([ONE_PIXEL_PNG], {
+    provider,
+    onProviderDispatchPhase: (phase, operation) => {
+      if (phase === "after-dispatch-marked" && (operation.phase === "repair" || operation.phase === "re_qa")) {
+        dispatches.push({ id: operation.id, phase: operation.phase, candidateId: operation.candidateId });
+      }
+    },
+  });
+  try {
+    const { bound, result: initial } = await bindAndWait(value);
+    const initialState = new JsonRepository(value.root).state();
+    const sourceRunId = bound.qaRun.id;
+    const initialRun = initialState.s2QaRuns.find((run) => run.id === sourceRunId)!;
+    assert.equal(initialRun.status, "completed");
+    assert.notEqual(initialRun.completedAt, null);
+    const completedAt = initialRun.completedAt;
+    const candidateA = initial.qaRun.candidateResults.find((item: any) => item.candidateIndex === 1)!;
+    const candidateB = initial.qaRun.candidateResults.find((item: any) => item.candidateIndex === 2)!;
+
+    await value.service.s2.repairCandidate(value.projectId, sourceRunId, candidateA.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    await waitFor(() => value.service.s2.getQaRun(value.projectId, sourceRunId) as any,
+      (current) => current.qaRun.reQa.some((item: any) => item.candidateId === candidateA.candidateId && item.status === "pass"));
+    const afterA = new JsonRepository(value.root).state().s2QaRuns.find((run) => run.id === sourceRunId)!;
+    assert.equal(afterA.status, "completed");
+    assert.equal(afterA.completedAt, completedAt);
+
+    await value.service.s2.repairCandidate(value.projectId, sourceRunId, candidateB.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    await waitFor(() => value.service.s2.getQaRun(value.projectId, sourceRunId) as any,
+      (current) => current.qaRun.reQa.filter((item: any) => item.status === "pass").length === 2);
+
+    const reloaded = new JsonRepository(value.root).state();
+    const run = reloaded.s2QaRuns.find((item) => item.id === sourceRunId)!;
+    assert.equal(run.status, "completed");
+    assert.equal(run.completedAt, completedAt);
+    assert.equal(reloaded.s2Repairs.length, 2);
+    assert.equal(new Set(reloaded.s2Repairs.map((repair) => repair.candidateId)).size, 2);
+    assert.equal(reloaded.s2Operations.filter((operation) => operation.phase === "repair" && operation.qaRunId === sourceRunId).length, 2);
+    assert.equal(reloaded.s2Operations.filter((operation) => operation.phase === "re_qa" && operation.qaRunId === sourceRunId).length, 2);
+    assert.equal(reloaded.s2DerivedCandidates.length, 2);
+    assert.equal(reloaded.s2ReQaResults.length, 2);
+    assert.equal(reloaded.s2Publications.filter((publication) => publication.kind === "repair_output" && publication.state === "committed").length, 2);
+
+    for (const repair of reloaded.s2Repairs) {
+      const history = run.candidateResults.filter((result) => result.candidateId === repair.candidateId).sort((left, right) => left.attempt - right.attempt);
+      const latest = history[history.length - 1];
+      assert.ok(latest);
+      assert.equal(latest.repairAttemptId, repair.id);
+      assert.equal(history.filter((result) => result.repairAttemptId === repair.id).length, 1);
+      assert.equal(repair.qaRunId, run.id);
+      assert.equal(repair.inputVersionId, run.inputVersionId);
+      assert.equal(repair.projectId, value.projectId);
+      assert.equal(repair.sourceAssetId, latest.sourceAssetId);
+      assert.equal(repair.sourceSha256, latest.sourceSha256);
+      assert.deepEqual(repair.eligibleFindingIds, latest.materialFindingIds);
+      assert.equal(repair.derivedCandidateId !== null, true);
+      assert.equal(repair.reQaCandidateResultId !== null, true);
+      assert.equal(reloaded.s2DerivedCandidates.find((record) => record.id === repair.derivedCandidateId)?.sourceCandidateId, repair.candidateId);
+      assert.equal(reloaded.s2ReQaResults.find((record) => record.id === repair.reQaCandidateResultId)?.candidateId, repair.candidateId);
+      const repairOperation = reloaded.s2Operations.find((operation) => operation.phase === "repair" && operation.repairAttemptId === repair.id)!;
+      const reQaOperation = reloaded.s2Operations.find((operation) => operation.phase === "re_qa" && operation.repairAttemptId === repair.id)!;
+      assert.equal(repairOperation.candidateId, repair.candidateId);
+      assert.equal(reQaOperation.candidateId, repair.candidateId);
+      assert.equal(repairOperation.status, "succeeded");
+      assert.equal(reQaOperation.status, "succeeded");
+      const idempotency = reloaded.idempotency.find((record) => record.operation === "s2_repair" && (record.result as any).repairAttemptId === repair.id)!;
+      assert.equal((idempotency.result as any).operationId, repairOperation.id);
+    }
+    assert.equal(provider.s2RepairCalls, 2);
+    assert.equal(dispatches.filter((dispatch) => dispatch.phase === "repair").length, 2);
+    assert.equal(dispatches.filter((dispatch) => dispatch.phase === "re_qa").length, 2);
+    assert.equal(new Set(dispatches.map((dispatch) => dispatch.id)).size, dispatches.length);
+
+    const beforeSecondRepair = new JsonRepository(value.root).state();
+    const repairCallsBefore = provider.s2RepairCalls;
+    assert.equal(await expectCode(
+      () => value.service.s2.repairCandidate(value.projectId, sourceRunId, candidateA.candidateId, bound.inputVersionId, randomUUID(), randomUUID()),
+      "REPAIR_ALREADY_EXISTS",
+    ), true);
+    assert.equal(provider.s2RepairCalls, repairCallsBefore);
+    const afterSecondRepair = new JsonRepository(value.root).state();
+    assert.deepEqual(afterSecondRepair.s2Repairs, beforeSecondRepair.s2Repairs);
+    assert.deepEqual(afterSecondRepair.s2Operations, beforeSecondRepair.s2Operations);
+    assert.equal(afterSecondRepair.s2Repairs.some((repair) => repair.candidateId === candidateB.candidateId), true);
+  } finally { rmSync(value.root, { recursive: true, force: true }); }
+});
+
+test("fresh S2 real workflow repairs an eligible attempt-two material failure and keeps attempt-one unlinked", async () => {
+  const qaCallsByCandidate = new Map<number, number>();
+  const provider = new MockOpenAIProvider({
+    briefData: briefData(),
+    s2RepairResponses: [ONE_PIXEL_PNG],
+    s2QaResponseFactory: (input) => {
+      const call = qaCallsByCandidate.get(input.candidateIndex) ?? 0;
+      qaCallsByCandidate.set(input.candidateIndex, call + 1);
+      if (input.candidateIndex === 2 && call === 0) throw new ProviderFailure("PROVIDER_TIMEOUT");
+      if (input.candidateIndex === 2 && call === 1) return qaPayload(input, "pass", "structure.overhead-support");
+      return qaPayload(input, "pass");
+    },
+  });
+  const value = fixture([ONE_PIXEL_PNG], { provider });
+  try {
+    const { bound, result: initial } = await bindAndWait(value);
+    const candidate = initial.qaRun.candidateResults.find((item: any) => item.candidateIndex === 2)!;
+    assert.equal(candidate.status, "qa_unavailable_retryable");
+    await value.service.s2.retryQa(value.projectId, bound.qaRun.id, candidate.candidateId, randomUUID(), randomUUID());
+    const retried = await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any,
+      (current) => current.qaRun.candidateResults.some((item: any) => item.candidateId === candidate.candidateId && item.attempt === 2 && item.status === "material_fail"));
+    const sourceCompletedAt = retried.qaRun.completedAt;
+    assert.equal(retried.qaRun.status, "completed");
+    assert.notEqual(sourceCompletedAt, null);
+    await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    const final = await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any,
+      (current) => current.qaRun.reQa.some((item: any) => item.candidateId === candidate.candidateId && item.status === "pass"));
+    assert.equal(final.qaRun.status, "completed");
+    assert.equal(final.qaRun.completedAt, sourceCompletedAt);
+
+    const reloaded = new JsonRepository(value.root).state();
+    const run = reloaded.s2QaRuns.find((item) => item.id === bound.qaRun.id)!;
+    const attempts = run.candidateResults.filter((item) => item.candidateId === candidate.candidateId).sort((left, right) => left.attempt - right.attempt);
+    const repair = reloaded.s2Repairs.find((item) => item.candidateId === candidate.candidateId)!;
+    assert.deepEqual(attempts.map((item) => item.attempt), [1, 2]);
+    assert.equal(attempts[0].status, "qa_unavailable_retryable");
+    assert.equal(attempts[0].repairAttemptId, null);
+    assert.equal(attempts[1].status, "material_fail");
+    assert.equal(attempts[1].repairAttemptId, repair.id);
+    assert.deepEqual(repair.eligibleFindingIds, attempts[1].materialFindingIds);
+    assert.equal(repair.projectId, value.projectId);
+    assert.equal(repair.qaRunId, run.id);
+    assert.equal(repair.inputVersionId, run.inputVersionId);
+    assert.equal(repair.candidateId, candidate.candidateId);
+    assert.equal(repair.sourceAssetId, attempts[1].sourceAssetId);
+    assert.equal(repair.sourceSha256, attempts[1].sourceSha256);
+    assert.equal(repair.status, "re_qa_pass");
+    assert.equal(reloaded.s2ReQaResults.find((item) => item.id === repair.reQaCandidateResultId)?.candidateId, candidate.candidateId);
+    assert.equal(reloaded.s2Operations.some((operation) => operation.failureCode === "PERSISTENCE_FAILED"), false);
+    assert.equal(provider.s2RepairCalls, 1);
+    assert.equal(provider.s2QaCalls, 6);
+    assert.equal(await expectCode(
+      () => value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID()),
+      "REPAIR_ALREADY_EXISTS",
+    ), true);
+    assert.equal(provider.s2RepairCalls, 1);
+    assert.equal(new JsonRepository(value.root).state().s2QaRuns.find((item) => item.id === run.id)?.completedAt, sourceCompletedAt);
+  } finally { rmSync(value.root, { recursive: true, force: true }); }
+});
+
 test("fresh S2 persistence graph fixtures reject impossible relationships and load legal lifecycle states", async () => {
-  const value = fixture();
+  const graphQaCalls = new Map<number, number>();
+  const graphProvider = new MockOpenAIProvider({
+    briefData: briefData(),
+    s2RepairResponses: [ONE_PIXEL_PNG, ONE_PIXEL_PNG],
+    s2QaResponseFactory: (input) => {
+      const call = graphQaCalls.get(input.candidateIndex) ?? 0;
+      graphQaCalls.set(input.candidateIndex, call + 1);
+      if (input.candidateIndex === 2 && call === 0) throw new ProviderFailure("PROVIDER_TIMEOUT");
+      if ((input.candidateIndex === 1 && call === 0) || (input.candidateIndex === 2 && call === 1)) {
+        return qaPayload(input, "pass", "structure.overhead-support");
+      }
+      return qaPayload(input, "pass");
+    },
+  });
+  const value = fixture([ONE_PIXEL_PNG], { provider: graphProvider });
   try {
     const draft = value.service.s2.getReferenceDraft(value.projectId);
     const reference = await value.service.s2.uploadAsset(value.projectId, "reference", "graph-reference.png", "image/png", await solidPng(2, 2, { r: 121, g: 1, b: 1 }), randomUUID());
@@ -605,10 +779,14 @@ test("fresh S2 persistence graph fixtures reject impossible relationships and lo
     await value.service.s2.retryQa(value.projectId, bound.qaRun.id, retryCandidate.candidateId, randomUUID(), randomUUID());
     const completed = await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any,
       (current) => current.qaRun.candidateResults.every((item: any) => item.status === "pass" || item.status === "material_fail"));
-    const materialCandidate = completed.qaRun.candidateResults.find((item: any) => item.status === "material_fail")!;
-    await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, materialCandidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    const materialCandidates = completed.qaRun.candidateResults.filter((item: any) => item.status === "material_fail");
+    assert.equal(materialCandidates.length, 2);
+    await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, materialCandidates[0].candidateId, bound.inputVersionId, randomUUID(), randomUUID());
     await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any,
-      (current) => current.qaRun.reQa.some((item: any) => item.status === "pass"));
+      (current) => current.qaRun.reQa.some((item: any) => item.candidateId === materialCandidates[0].candidateId && item.status === "pass"));
+    await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, materialCandidates[1].candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any,
+      (current) => current.qaRun.reQa.filter((item: any) => item.status === "pass").length === 2);
     const base = cloneJson(value.repository.state()) as any;
     const rejected: Array<{ invariant: string; code: string }> = [];
     const rejectedRoot = (invariant: string, mutate: (state: any) => void): void => {
@@ -636,6 +814,136 @@ test("fresh S2 persistence graph fixtures reject impossible relationships and lo
       const projectId = randomUUID();
       state.projects.push({ ...state.projects[0], projectId, boothGeometry: null, confirmedBriefVersionId: null, activeGenerationSetId: null, briefAssetId: null, briefDraftId: null });
       return projectId;
+    };
+    const sourceResult = (state: any, candidateIndex: number, attempt?: number): any => state.s2QaRuns[0].candidateResults.find((item: any) =>
+      item.candidateIndex === candidateIndex && (attempt === undefined || item.attempt === attempt));
+    const repairFor = (state: any, candidateIndex: number): any => {
+      const candidateId = sourceResult(state, candidateIndex, candidateIndex === 2 ? 2 : 1).candidateId;
+      return state.s2Repairs.find((item: any) => item.candidateId === candidateId);
+    };
+    const setSourceCounters = (state: any): void => {
+      const run = state.s2QaRuns[0];
+      const latest = [1, 2, 3, 4].map((index) => {
+        const results = run.candidateResults.filter((item: any) => item.candidateIndex === index);
+        return results.sort((left: any, right: any) => right.attempt - left.attempt)[0];
+      });
+      run.completedCandidateCount = latest.filter((item: any) => ["pass", "warning", "material_fail", "qa_unavailable_retryable", "qa_unavailable_terminal"].includes(item.status)).length;
+      run.passCount = latest.filter((item: any) => item.status === "pass").length;
+      run.warningCount = latest.filter((item: any) => item.status === "warning").length;
+      run.materialFailCount = latest.filter((item: any) => item.status === "material_fail").length;
+      run.unavailableCount = latest.filter((item: any) => item.status === "qa_unavailable_retryable" || item.status === "qa_unavailable_terminal").length;
+    };
+    const setOutcome = (target: any, template: any, status: "pass" | "warning" | "material_fail" | "qa_unavailable_terminal"): void => {
+      target.status = status;
+      target.verdict = status === "pass" ? "PASS" : status === "warning" ? "WARNING" : status === "material_fail" ? "MATERIAL_FAIL" : "QA_UNAVAILABLE";
+      target.requirementObservations = cloneJson(template.requirementObservations);
+      target.designObservations = cloneJson(template.designObservations);
+      target.materialFindingIds = [];
+      target.warningFindingIds = [];
+      target.uncertainFindingIds = [];
+      target.providerRequestId = status === "qa_unavailable_terminal" ? null : target.providerRequestId;
+      if (status === "warning") {
+        const branding = target.designObservations.find((item: any) => item.ruleId === "branding.style");
+        branding.observed = "non_compliant";
+        target.warningFindingIds = ["branding.style"];
+      }
+      if (status === "material_fail") {
+        const overhead = target.designObservations.find((item: any) => item.ruleId === "structure.overhead-support");
+        overhead.observed = "non_compliant";
+        target.materialFindingIds = ["structure.overhead-support"];
+      }
+      if (status === "qa_unavailable_terminal") {
+        target.requirementObservations = [];
+        target.designObservations = [];
+      }
+    };
+    const resetRepairToPreDerived = (state: any, candidateIndex: number, status: "queued" | "running" | "failed"): void => {
+      const repair = repairFor(state, candidateIndex);
+      const repairOperation = state.s2Operations.find((item: any) => item.phase === "repair" && item.repairAttemptId === repair.id);
+      const reQaOperation = state.s2Operations.find((item: any) => item.phase === "re_qa" && item.repairAttemptId === repair.id);
+      const reQaId = repair.reQaCandidateResultId;
+      state.s2DerivedCandidates = state.s2DerivedCandidates.filter((item: any) => item.id !== repair.derivedCandidateId);
+      state.s2ReQaResults = state.s2ReQaResults.filter((item: any) => item.id !== reQaId);
+      state.s2Publications = state.s2Publications.filter((item: any) => !(item.kind === "repair_output" && item.repairAttemptId === repair.id));
+      state.s2Operations = state.s2Operations.filter((item: any) => item.id !== reQaOperation.id);
+      state.s2Transitions = state.s2Transitions.filter((item: any) => item.operationId !== repairOperation.id && item.operationId !== reQaOperation.id);
+      repair.status = status;
+      repair.outputSha256 = null;
+      repair.derivedCandidateId = null;
+      repair.reQaCandidateResultId = null;
+      repair.providerRequestId = null;
+      repair.startedAt = status === "running" ? new Date().toISOString() : null;
+      repair.completedAt = status === "failed" ? new Date().toISOString() : null;
+      repairOperation.status = status === "failed" ? "failed" : status;
+      repairOperation.claimedBy = status === "running" ? "graph-fixture" : null;
+      repairOperation.claimedProcessId = status === "running" ? 9003 : null;
+      repairOperation.claimToken = status === "running" ? randomUUID() : null;
+      repairOperation.claimedAt = status === "running" ? new Date().toISOString() : null;
+      repairOperation.startedAt = status === "running" ? repair.startedAt : null;
+      repairOperation.completedAt = status === "failed" ? repair.completedAt : null;
+      repairOperation.providerDispatchState = status === "running" ? "may_have_started" : status === "failed" ? "consumed" : "not_started";
+      repairOperation.failureCode = status === "failed" ? "REPAIR_PROVIDER_FAILED" : null;
+      state.s2Transitions.push({ id: randomUUID(), projectId: repair.projectId, operationId: repairOperation.id, phase: "repair", attempt: 1,
+        from: "eligible", to: "queued", referenceId: repairOperation.referenceId, at: new Date().toISOString() });
+      if (status === "running") state.s2Transitions.push({ id: randomUUID(), projectId: repair.projectId, operationId: repairOperation.id, phase: "repair", attempt: 1,
+        from: "queued", to: "running", referenceId: repairOperation.referenceId, at: new Date().toISOString() });
+      if (status === "failed") state.s2Transitions.push({ id: randomUUID(), projectId: repair.projectId, operationId: repairOperation.id, phase: "repair", attempt: 1,
+        from: "running", to: "failed", referenceId: repairOperation.referenceId, at: new Date().toISOString() });
+    };
+    const resetReQa = (state: any, candidateIndex: number, status: "queued" | "running" | "pass" | "warning" | "material_fail" | "re_qa_unavailable"): void => {
+      const repair = repairFor(state, candidateIndex);
+      const result = state.s2ReQaResults.find((item: any) => item.id === repair.reQaCandidateResultId);
+      const operation = state.s2Operations.find((item: any) => item.phase === "re_qa" && item.repairAttemptId === repair.id);
+      const template = state.s2QaRuns[0].candidateResults.find((item: any) => item.candidateIndex === 3);
+      state.s2Transitions = state.s2Transitions.filter((item: any) => item.operationId !== operation.id);
+      const addTransition = (from: string, to: string): void => {
+        state.s2Transitions.push({ id: randomUUID(), projectId: repair.projectId, operationId: operation.id, phase: "re_qa", attempt: 1,
+          from, to, referenceId: operation.referenceId, at: new Date().toISOString() });
+      };
+      if (status === "queued" || status === "running") {
+        result.status = status; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
+        result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null;
+        result.startedAt = status === "running" ? new Date().toISOString() : null; result.completedAt = null;
+        repair.status = status === "queued" ? "derived_ready" : "re_qa_running";
+        operation.status = status; operation.claimedBy = status === "running" ? "graph-fixture" : null;
+        operation.claimedProcessId = status === "running" ? 9004 : null; operation.claimToken = status === "running" ? randomUUID() : null;
+        operation.claimedAt = status === "running" ? result.startedAt : null; operation.startedAt = status === "running" ? result.startedAt : null;
+        operation.completedAt = null; operation.providerDispatchState = status === "running" ? "may_have_started" : "not_started"; operation.failureCode = null;
+        addTransition("derived_ready", "queued");
+        if (status === "running") addTransition("queued", "running");
+        return;
+      }
+      setOutcome(result, template, status === "re_qa_unavailable" ? "qa_unavailable_terminal" : status);
+      if (status === "re_qa_unavailable") {
+        result.status = "re_qa_unavailable"; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
+        result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null;
+        repair.status = "re_qa_unavailable"; operation.status = "failed"; operation.failureCode = "RE_QA_UNAVAILABLE"; operation.providerDispatchState = "consumed";
+      } else {
+        repair.status = status === "pass" ? "re_qa_pass" : status === "warning" ? "re_qa_warning" : "re_qa_material_fail";
+        operation.status = "succeeded"; operation.failureCode = null; operation.providerDispatchState = "consumed";
+      }
+      result.startedAt = result.startedAt ?? new Date(0).toISOString();
+      result.completedAt = new Date(0).toISOString();
+      operation.claimedBy = null; operation.claimedProcessId = null; operation.claimToken = null; operation.claimedAt = null;
+      operation.startedAt = result.startedAt; operation.completedAt = result.completedAt;
+      repair.completedAt = result.completedAt;
+      addTransition("derived_ready", "queued");
+      addTransition("queued", "running");
+      addTransition("running", status === "re_qa_unavailable" ? "re_qa_unavailable" : status === "pass" ? "re_qa_pass" : status === "warning" ? "re_qa_warning" : "re_qa_material_fail");
+    };
+    const removeRepair = (state: any, candidateIndex: number): void => {
+      const repair = repairFor(state, candidateIndex);
+      const operationIds = state.s2Operations.filter((item: any) => item.repairAttemptId === repair.id).map((item: any) => item.id);
+      state.s2Repairs = state.s2Repairs.filter((item: any) => item.id !== repair.id);
+      state.s2DerivedCandidates = state.s2DerivedCandidates.filter((item: any) => item.repairAttemptId !== repair.id);
+      state.s2ReQaResults = state.s2ReQaResults.filter((item: any) => item.repairAttemptId !== repair.id);
+      state.s2Operations = state.s2Operations.filter((item: any) => item.repairAttemptId !== repair.id);
+      state.s2Publications = state.s2Publications.filter((item: any) => item.kind !== "repair_output" || item.repairAttemptId !== repair.id);
+      state.s2Transitions = state.s2Transitions.filter((item: any) => !operationIds.includes(item.operationId));
+      state.idempotency = state.idempotency.filter((item: any) => item.operation !== "s2_repair" || item.result?.repairAttemptId !== repair.id);
+      state.s2QaRuns[0].candidateResults.forEach((result: any) => {
+        if (result.repairAttemptId === repair.id) result.repairAttemptId = null;
+      });
     };
     rejectedRoot("draft ownership: nonexistent project", (state) => { state.s2Drafts[0].projectId = randomUUID(); });
     rejectedRoot("cross-project S2 foreign key: input/source generation", (state) => {
@@ -686,11 +994,72 @@ test("fresh S2 persistence graph fixtures reject impossible relationships and lo
       const projectId = addForeignProject(state);
       state.idempotency.find((item: any) => item.operation === "s2_qa_retry").projectId = projectId;
     });
-    rejectedRoot("candidate: repair link must be the original attempt", (state) => {
+    rejectedRoot("candidate: repair link must be the canonical latest source result", (state) => {
       state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 1 && item.repairAttemptId !== null).repairAttemptId = randomUUID();
     });
     rejectedRoot("repair: unrelated candidate/input/run", (state) => { state.s2Repairs[0].candidateId = state.s2Inputs[0].sourceCandidates[1].candidateId; });
-    rejectedRoot("repair/re-QA: prohibited second bounded lineage", (state) => { state.s2Repairs.push({ ...state.s2Repairs[0], id: randomUUID() }); });
+    rejectedRoot("repair: project mismatch", (state) => { state.s2Repairs[0].projectId = randomUUID(); });
+    rejectedRoot("repair: run mismatch", (state) => { state.s2Repairs[0].qaRunId = randomUUID(); });
+    rejectedRoot("repair: input mismatch", (state) => { state.s2Repairs[0].inputVersionId = randomUUID(); });
+    rejectedRoot("repair: attached to non-latest source-QA attempt", (state) => {
+      const repair = repairFor(state, 2);
+      sourceResult(state, 2, 1).repairAttemptId = repair.id;
+    });
+    rejectedRoot("repair: attempt-one link when attempt two exists", (state) => {
+      const repair = repairFor(state, 2);
+      sourceResult(state, 2, 1).repairAttemptId = repair.id;
+      sourceResult(state, 2, 2).repairAttemptId = null;
+    });
+    rejectedRoot("repair: earlier and latest source results share one repair link", (state) => {
+      const repair = repairFor(state, 2);
+      sourceResult(state, 2, 1).repairAttemptId = repair.id;
+    });
+    rejectedRoot("repair: latest PASS cannot retain repair", (state) => {
+      setOutcome(sourceResult(state, 2, 2), sourceResult(state, 3), "pass");
+      setSourceCounters(state);
+    });
+    rejectedRoot("repair: latest WARNING cannot retain repair", (state) => {
+      setOutcome(sourceResult(state, 2, 2), sourceResult(state, 3), "warning");
+      setSourceCounters(state);
+    });
+    rejectedRoot("repair: latest unavailable cannot retain repair", (state) => {
+      setOutcome(sourceResult(state, 2, 2), sourceResult(state, 3), "qa_unavailable_terminal");
+      setSourceCounters(state);
+    });
+    rejectedRoot("repair: eligible findings do not match latest material failure", (state) => {
+      state.s2Repairs[0].eligibleFindingIds = ["structure.screen-support"];
+    });
+    rejectedRoot("repair operation: belongs to another candidate", (state) => {
+      const operation = state.s2Operations.find((item: any) => item.phase === "repair" && item.repairAttemptId === state.s2Repairs[0].id);
+      operation.candidateId = sourceResult(state, 3).candidateId;
+    });
+    rejectedRoot("repair idempotency: belongs to another candidate", (state) => {
+      const record = state.idempotency.find((item: any) => item.operation === "s2_repair");
+      record.result.operationId = state.s2Operations.find((item: any) => item.phase === "repair" && item.repairAttemptId === state.s2Repairs[1].id).id;
+    });
+    rejectedRoot("repair idempotency: belongs to another project", (state) => {
+      const projectId = addForeignProject(state);
+      state.idempotency.find((item: any) => item.operation === "s2_repair").projectId = projectId;
+    });
+    rejectedRoot("derived candidate: belongs to another candidate", (state) => {
+      const derived = state.s2DerivedCandidates.find((item: any) => item.repairAttemptId === state.s2Repairs[0].id);
+      derived.sourceCandidateId = sourceResult(state, 3).candidateId;
+    });
+    rejectedRoot("re-QA: belongs to another candidate", (state) => {
+      const result = state.s2ReQaResults.find((item: any) => item.repairAttemptId === state.s2Repairs[0].id);
+      result.candidateId = sourceResult(state, 3).candidateId;
+    });
+    rejectedRoot("QA run: running with terminal source QA and only repair/re-QA work", (state) => {
+      state.s2QaRuns[0].status = "running";
+    });
+    rejectedRoot("QA run: completed with null completedAt", (state) => {
+      state.s2QaRuns[0].completedAt = null;
+    });
+    rejectedRoot("QA run: counters use an earlier attempt instead of latest", (state) => {
+      const run = state.s2QaRuns[0];
+      run.completedCandidateCount = 4; run.passCount = 2; run.warningCount = 0; run.materialFailCount = 1; run.unavailableCount = 1;
+    });
+    rejectedRoot("repair/re-QA: prohibited second repair for one candidate", (state) => { state.s2Repairs.push({ ...state.s2Repairs[0], id: randomUUID() }); });
     rejectedRoot("publication: unrelated repair operation", (state) => {
       const publication = state.s2Publications.find((item: any) => item.kind === "repair_output");
       publication.operationId = state.s2Operations.find((item: any) => item.phase === "qa").id;
@@ -710,7 +1079,7 @@ test("fresh S2 persistence graph fixtures reject impossible relationships and lo
         result.status = "running"; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
         result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null; result.startedAt = now; result.completedAt = null;
       }
-      run.status = "running"; run.startedAt = now; run.completedAt = null; run.completedCandidateCount = 2; run.passCount = 1; run.warningCount = 0; run.materialFailCount = 1; run.unavailableCount = 0;
+      run.status = "running"; run.startedAt = now; run.completedAt = null; run.completedCandidateCount = 2; run.passCount = 0; run.warningCount = 0; run.materialFailCount = 2; run.unavailableCount = 0;
     });
     rejectedRoot("input: binding hash does not match persisted graph", (state) => { state.s2Inputs[0].bindingHash = "0".repeat(64); });
     rejectedRoot("idempotency: bind result belongs to another project", (state) => {
@@ -721,15 +1090,115 @@ test("fresh S2 persistence graph fixtures reject impossible relationships and lo
       const transition = state.s2Transitions.find((item: any) => item.phase === "qa");
       transition.from = "pass"; transition.to = "running"; transition.referenceId = randomUUID();
     });
-    assert.equal(rejected.length, 26);
+    assert.equal(rejected.length, 44);
     assert.equal(rejected.every((item) => item.code === "PERSISTENCE_FAILED"), true);
 
     const terminal = positiveRoot("legal frozen/bound terminal repair and re-QA state", () => undefined);
     assert.equal(terminal.s2Drafts[0].status, "frozen");
     assert.equal(terminal.s2Inputs.length, 1);
-    assert.equal(terminal.s2QaRuns[0].status, "running");
+    assert.equal(terminal.s2QaRuns[0].status, "completed");
     assert.equal(terminal.s2Repairs[0].status, "re_qa_pass");
     assert.equal(terminal.s2ReQaResults[0].status, "pass");
+    assert.equal(terminal.s2Repairs.length, 2);
+    assert.equal(terminal.s2QaRuns[0].completedAt !== null, true);
+
+    positiveRoot("legal completed source QA with no repair", (state) => {
+      const run = state.s2QaRuns[0];
+      run.candidateResults.forEach((result: any) => { result.repairAttemptId = null; });
+      state.s2Repairs = []; state.s2DerivedCandidates = []; state.s2ReQaResults = [];
+      state.s2Operations = state.s2Operations.filter((item: any) => item.phase === "qa");
+      state.s2Publications = state.s2Publications.filter((item: any) => item.kind === "asset_upload");
+      state.idempotency = state.idempotency.filter((item: any) => item.operation !== "s2_repair");
+      state.s2Transitions = state.s2Transitions.filter((item: any) => item.phase === "qa");
+      setSourceCounters(state);
+      run.status = "completed";
+    });
+
+    positiveRoot("legal one repair from attempt one", (state) => {
+      removeRepair(state, 2);
+      assert.equal(state.s2Repairs.length, 1);
+      assert.equal(state.s2Repairs[0].candidateId, sourceResult(state, 1).candidateId);
+    });
+
+    positiveRoot("legal one repair from attempt two", (state) => {
+      removeRepair(state, 1);
+      assert.equal(state.s2Repairs.length, 1);
+      assert.equal(state.s2Repairs[0].candidateId, sourceResult(state, 2, 2).candidateId);
+      assert.equal(sourceResult(state, 2, 2).repairAttemptId, state.s2Repairs[0].id);
+      assert.equal(sourceResult(state, 2, 1).repairAttemptId, null);
+    });
+
+    positiveRoot("legal completed source QA plus queued repair", (state) => {
+      resetRepairToPreDerived(state, 1, "queued");
+      assert.equal(state.s2QaRuns[0].status, "completed");
+      assert.equal(state.s2QaRuns[0].completedAt !== null, true);
+      assert.equal(state.s2Repairs.find((item: any) => item.candidateId === sourceResult(state, 1).candidateId).status, "queued");
+    });
+
+    positiveRoot("legal completed source QA plus running repair", (state) => {
+      resetRepairToPreDerived(state, 1, "running");
+      assert.equal(state.s2QaRuns[0].status, "completed");
+      assert.equal(state.s2QaRuns[0].completedAt !== null, true);
+      assert.equal(state.s2Repairs.find((item: any) => item.candidateId === sourceResult(state, 1).candidateId).status, "running");
+    });
+
+    positiveRoot("legal completed source QA plus failed repair", (state) => {
+      resetRepairToPreDerived(state, 1, "failed");
+      assert.equal(state.s2QaRuns[0].status, "completed");
+      assert.equal(state.s2QaRuns[0].completedAt !== null, true);
+      assert.equal(state.s2Repairs.find((item: any) => item.candidateId === sourceResult(state, 1).candidateId).status, "failed");
+    });
+
+    positiveRoot("legal completed source QA plus derived-ready repair", (state) => {
+      resetReQa(state, 1, "queued");
+      assert.equal(state.s2QaRuns[0].status, "completed");
+      assert.equal(state.s2QaRuns[0].completedAt !== null, true);
+      assert.equal(state.s2Repairs.find((item: any) => item.candidateId === sourceResult(state, 1).candidateId).status, "derived_ready");
+    });
+
+    positiveRoot("legal completed source QA plus running re-QA", (state) => {
+      resetReQa(state, 1, "running");
+      assert.equal(state.s2QaRuns[0].status, "completed");
+      assert.equal(state.s2QaRuns[0].completedAt !== null, true);
+      assert.equal(state.s2Repairs.find((item: any) => item.candidateId === sourceResult(state, 1).candidateId).status, "re_qa_running");
+    });
+
+    positiveRoot("legal completed source QA plus re-QA warning", (state) => {
+      resetReQa(state, 1, "warning");
+      assert.equal(state.s2QaRuns[0].status, "completed");
+      assert.equal(state.s2Repairs.find((item: any) => item.candidateId === sourceResult(state, 1).candidateId).status, "re_qa_warning");
+    });
+
+    positiveRoot("legal completed source QA plus re-QA material failure", (state) => {
+      resetReQa(state, 1, "material_fail");
+      assert.equal(state.s2QaRuns[0].status, "completed");
+      assert.equal(state.s2Repairs.find((item: any) => item.candidateId === sourceResult(state, 1).candidateId).status, "re_qa_material_fail");
+    });
+
+    positiveRoot("legal completed source QA plus re-QA unavailable", (state) => {
+      resetReQa(state, 1, "re_qa_unavailable");
+      assert.equal(state.s2QaRuns[0].status, "completed");
+      assert.equal(state.s2Repairs.find((item: any) => item.candidateId === sourceResult(state, 1).candidateId).status, "re_qa_unavailable");
+    });
+
+    positiveRoot("legal source QA activity remains independent while another repair runs", (state) => {
+      resetRepairToPreDerived(state, 1, "running");
+      const run = state.s2QaRuns[0]; const result = sourceResult(state, 3); const operation = state.s2Operations.find((item: any) =>
+        item.phase === "qa" && item.resultId === result.id);
+      const now = new Date().toISOString();
+      result.status = "running"; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
+      result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null;
+      result.startedAt = now; result.completedAt = null;
+      operation.status = "running"; operation.claimedBy = "graph-fixture"; operation.claimedProcessId = 9005; operation.claimToken = randomUUID();
+      operation.claimedAt = now; operation.startedAt = now; operation.completedAt = null; operation.providerDispatchState = "may_have_started"; operation.failureCode = null;
+      state.s2Transitions = state.s2Transitions.filter((item: any) => item.operationId !== operation.id);
+      state.s2Transitions.push({ id: randomUUID(), projectId: operation.projectId, operationId: operation.id, phase: "qa", attempt: 1,
+        from: "none", to: "queued", referenceId: operation.referenceId, at: now });
+      state.s2Transitions.push({ id: randomUUID(), projectId: operation.projectId, operationId: operation.id, phase: "qa", attempt: 1,
+        from: "queued", to: "running", referenceId: operation.referenceId, at: now });
+      run.status = "running"; run.startedAt = now; run.completedAt = null;
+      setSourceCounters(state);
+    });
 
     positiveRoot("legal active queued state", (state) => {
       const run = state.s2QaRuns[0];
@@ -759,7 +1228,7 @@ test("fresh S2 persistence graph fixtures reject impossible relationships and lo
         result.status = "running"; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
         result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null; result.startedAt = now; result.completedAt = null;
       }
-      run.status = "running"; run.startedAt = now; run.completedAt = null; run.completedCandidateCount = 3; run.passCount = 2; run.warningCount = 0; run.materialFailCount = 1; run.unavailableCount = 0;
+      run.status = "running"; run.startedAt = now; run.completedAt = null; run.completedCandidateCount = 3; run.passCount = 1; run.warningCount = 0; run.materialFailCount = 2; run.unavailableCount = 0;
     });
   } finally { rmSync(value.root, { recursive: true, force: true }); }
 });
@@ -1846,6 +2315,8 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     const bound = await repairValue.service.s2.bindQa(repairValue.projectId, repairValue.generationSetId, 1, randomUUID(), randomUUID());
     const initial = await waitFor(() => repairValue.service.s2.getQaRun(repairValue.projectId, bound.qaRun.id) as any, (value) => value.qaRun.status === "completed");
     const candidate = initial.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1);
+    const sourceRunBeforeRepair = repairValue.repository.state().s2QaRuns.find((run) => run.id === bound.qaRun.id)!;
+    const sourceCompletedAtBeforeRepair = sourceRunBeforeRepair.completedAt;
     repairStarted = true;
     await repairValue.service.s2.repairCandidate(repairValue.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
     const repairOperation = await waitFor(() => repairValue.repository.state().s2Operations.find((operation) => operation.phase === "repair") as any,
@@ -1855,6 +2326,8 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     createWorkflowService({ repository: repairValue.repository, objects: repairValue.objects, provider: repairProvider,
       processId: 71_202, isProcessAlive: () => { throw new Error("unknown liveness"); } });
     assert.equal(repairValue.repository.state().s2Operations.find((operation) => operation.id === repairOperation.id)?.status, "running");
+    assert.equal(repairValue.repository.state().s2QaRuns[0].status, "completed");
+    assert.equal(repairValue.repository.state().s2QaRuns[0].completedAt, sourceCompletedAtBeforeRepair);
     createWorkflowService({ repository: repairValue.repository, objects: repairValue.objects, provider: repairProvider,
       processId: 71_203, isProcessAlive: () => false });
     await waitFor(() => repairValue.repository.state().s2Repairs[0] as any, (repair) => repair?.status === "failed");
@@ -1870,6 +2343,8 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     assert.equal(state.s2Operations.filter((operation) => operation.phase === "re_qa").length, 0);
     assert.equal(state.s2Operations.find((operation) => operation.phase === "repair")?.status, "failed");
     assert.equal(state.s2Operations.find((operation) => operation.phase === "repair")?.providerDispatchState, "consumed");
+    assert.equal(state.s2QaRuns[0].status, "completed");
+    assert.equal(state.s2QaRuns[0].completedAt, sourceCompletedAtBeforeRepair);
   } finally {
     staleRepair.resolve();
     rmSync(repairValue.root, { recursive: true, force: true });
@@ -1900,6 +2375,8 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     const bound = await reQaValue.service.s2.bindQa(reQaValue.projectId, reQaValue.generationSetId, 1, randomUUID(), randomUUID());
     const initial = await waitFor(() => reQaValue.service.s2.getQaRun(reQaValue.projectId, bound.qaRun.id) as any, (value) => value.qaRun.status === "completed");
     const candidate = initial.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1);
+    const sourceRunBeforeReQa = reQaValue.repository.state().s2QaRuns.find((run) => run.id === bound.qaRun.id)!;
+    const sourceCompletedAtBeforeReQa = sourceRunBeforeReQa.completedAt;
     deferReQa = true;
     await reQaValue.service.s2.repairCandidate(reQaValue.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
     const reQaOperation = await waitFor(() => reQaValue.repository.state().s2Operations.find((operation) => operation.phase === "re_qa") as any,
@@ -1908,6 +2385,8 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     createWorkflowService({ repository: reQaValue.repository, objects: reQaValue.objects, provider: reQaProvider,
       processId: 71_402, isProcessAlive: () => { throw new Error("unknown liveness"); } });
     assert.equal(reQaValue.repository.state().s2Operations.find((operation) => operation.id === reQaOperation.id)?.status, "running");
+    assert.equal(reQaValue.repository.state().s2QaRuns[0].status, "completed");
+    assert.equal(reQaValue.repository.state().s2QaRuns[0].completedAt, sourceCompletedAtBeforeReQa);
     createWorkflowService({ repository: reQaValue.repository, objects: reQaValue.objects, provider: reQaProvider,
       processId: 71_403, isProcessAlive: () => false });
     await waitFor(() => reQaValue.service.s2.getQaRun(reQaValue.projectId, bound.qaRun.id) as any,
@@ -1921,6 +2400,8 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     assert.equal(state.s2Repairs[0].status, "re_qa_unavailable");
     assert.equal(state.s2Operations.find((operation) => operation.phase === "re_qa")?.status, "failed");
     assert.equal(state.s2Operations.find((operation) => operation.phase === "re_qa")?.providerDispatchState, "consumed");
+    assert.equal(state.s2QaRuns[0].status, "completed");
+    assert.equal(state.s2QaRuns[0].completedAt, sourceCompletedAtBeforeReQa);
   } finally {
     staleReQa.resolve();
     rmSync(reQaValue.root, { recursive: true, force: true });
@@ -1937,6 +2418,7 @@ test("fresh S2 repair publication failure evidence leaves no derived success or 
     const bound = await value.service.s2.bindQa(value.projectId, value.generationSetId, 1, randomUUID(), randomUUID());
     const initial = await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any, (result) => result.qaRun.status === "completed");
     const candidate = initial.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1);
+    const sourceCompletedAt = value.repository.state().s2QaRuns[0].completedAt;
     await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
     const publication = await waitFor(() => value.repository.state().s2Publications[0] as any, (current) => current?.kind === "repair_output" && current.state === "staged");
     publication.stagingObjects.forEach((object: any) => value.objects.remove(object.key));
@@ -1950,6 +2432,8 @@ test("fresh S2 repair publication failure evidence leaves no derived success or 
     assert.equal(state.s2Operations.find((operation) => operation.phase === "repair")?.status, "failed");
     assert.equal(state.s2Operations.find((operation) => operation.phase === "repair")?.failureCode, "PERSISTENCE_FAILED");
     assert.equal(value.provider.s2RepairCalls, 1);
+    assert.equal(state.s2QaRuns[0].status, "completed");
+    assert.equal(state.s2QaRuns[0].completedAt, sourceCompletedAt);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }
@@ -3128,14 +3612,36 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
         "QA-009/complete-pass": () => { assert.equal(result.qaRun.status, "completed"); assert.equal(result.qaRun.candidateResults.every((candidate: any) => candidate.status === "pass"), true); },
         "QA-009/null-height-pass": () => { assert.equal(input.geometrySnapshot.maxHeightMm, null); assert.equal(result.qaRun.candidateResults.every((candidate: any) => candidate.status === "pass"), true); },
       });
-    await prove(claimIds("QA-013", ["counters", "order"]), "qa persisted counters and order", "Persisted run counters and candidate-index ordering after four real QA operations.",
-      { candidateCount: result.qaRun.candidateResults.length, completedCount: result.qaRun.completedCandidateCount, passCount: result.qaRun.passCount, indexes: result.qaRun.candidateResults.map((candidate: any) => candidate.candidateIndex).join(","), result: "consistent" },
-      "The persisted QA counters matched the four ordered candidate results.",
-      () => { assert.equal(result.qaRun.completedCandidateCount, 4); assert.deepEqual(result.qaRun.candidateResults.map((candidate: any) => candidate.candidateIndex), [1, 2, 3, 4]); assert.equal(result.qaRun.passCount, 4); }, undefined, {
-        "QA-013/counters": () => { assert.equal(result.qaRun.completedCandidateCount, 4); assert.equal(result.qaRun.passCount, 4); },
+  } finally { rmSync(qaPass.root, { recursive: true, force: true }); }
+
+  const qaProjectionCalls = new Map<number, number>();
+  const qaProjectionProvider = new MockOpenAIProvider({
+    briefData: briefData(),
+    s2QaResponseFactory: (input) => {
+      const call = qaProjectionCalls.get(input.candidateIndex) ?? 0;
+      qaProjectionCalls.set(input.candidateIndex, call + 1);
+      if (input.candidateIndex === 1 && call === 0) throw new ProviderFailure("PROVIDER_TIMEOUT");
+      if (input.candidateIndex === 1 && call === 1) return qaPayload(input, "pass", "structure.overhead-support");
+      return qaPayload(input, "pass");
+    },
+  });
+  const qaProjection = fixture([ONE_PIXEL_PNG], { provider: qaProjectionProvider });
+  try {
+    const { bound, result: first } = await bindAndWait(qaProjection);
+    const retryCandidate = first.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)!;
+    await qaProjection.service.s2.retryQa(qaProjection.projectId, bound.qaRun.id, retryCandidate.candidateId, randomUUID(), randomUUID());
+    const result = await waitFor(() => qaProjection.service.s2.getQaRun(qaProjection.projectId, bound.qaRun.id) as any,
+      (current) => current.qaRun.status === "completed" && current.qaRun.candidateResults.some((candidate: any) =>
+        candidate.candidateIndex === 1 && candidate.attempt === 2 && candidate.status === "material_fail"));
+    const persistedRun = new JsonRepository(qaProjection.root).state().s2QaRuns[0];
+    await prove(claimIds("QA-013", ["counters", "order"]), "qa latest-source projection counters", "Real attempt-one retryable failure followed by attempt-two material failure and fresh repository reload.",
+      { candidateCount: result.qaRun.candidateResults.length, candidateAttempts: result.qaRun.candidateAttempts.length, latestAttempt: result.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)?.attempt ?? 0, completedCount: persistedRun.completedCandidateCount, passCount: persistedRun.passCount, materialFailCount: persistedRun.materialFailCount, unavailableCount: persistedRun.unavailableCount, indexes: result.qaRun.candidateResults.map((candidate: any) => candidate.candidateIndex).join(","), result: "latest-only-consistent" },
+      "The real reloaded source-QA projection counted only the latest result for each canonical candidate, including attempt two, and preserved canonical index order.",
+      () => { assert.equal(persistedRun.completedCandidateCount, 4); assert.equal(persistedRun.passCount, 3); assert.equal(persistedRun.materialFailCount, 1); assert.equal(persistedRun.unavailableCount, 0); assert.deepEqual(result.qaRun.candidateResults.map((candidate: any) => candidate.candidateIndex), [1, 2, 3, 4]); }, undefined, {
+        "QA-013/counters": () => { assert.equal(persistedRun.completedCandidateCount, 4); assert.equal(persistedRun.passCount, 3); assert.equal(persistedRun.materialFailCount, 1); assert.equal(persistedRun.unavailableCount, 0); assert.equal(result.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)?.attempt, 2); },
         "QA-013/order": () => assert.deepEqual(result.qaRun.candidateResults.map((candidate: any) => candidate.candidateIndex), [1, 2, 3, 4]),
       });
-  } finally { rmSync(qaPass.root, { recursive: true, force: true }); }
+  } finally { rmSync(qaProjection.root, { recursive: true, force: true }); }
 
   const qaExactProvider = new MockOpenAIProvider({ briefData: briefData(true), s2QaResponseFactory: (input) => qaPayload(input, "pass") });
   const qaExact = fixture([ONE_PIXEL_PNG], { data: briefData(true), provider: qaExactProvider });
@@ -3429,16 +3935,22 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
   await runEvidenceRetryRace(true);
 
   const repairCaptured: any[] = [];
-  let repairStarted = false;
   const repairBrief = briefData(true);
   repairBrief.freeTextRequirements = ["Keep the visual tone calm."];
+  const repairQaCalls = new Map<number, number>();
   const repairProvider = new MockOpenAIProvider({
     briefData: repairBrief,
-    s2RepairResponses: [ONE_PIXEL_PNG],
+    s2RepairResponses: [ONE_PIXEL_PNG, ONE_PIXEL_PNG],
     onS2RepairRequest: (input) => repairCaptured.push(input),
-    s2QaResponseFactory: (input) => input.candidateIndex === 1 && !repairStarted
-      ? qaPayload(input, "requirement-violation", "scale.human,structure.overhead-support")
-      : input.candidateIndex === 2 && !repairStarted ? qaPayload(input, "uncertain") : qaPayload(input, "pass"),
+    s2QaResponseFactory: (input) => {
+      const call = repairQaCalls.get(input.candidateIndex) ?? 0;
+      repairQaCalls.set(input.candidateIndex, call + 1);
+      if (input.candidateIndex === 1 && call === 0) return qaPayload(input, "requirement-violation", "scale.human,structure.overhead-support");
+      if (input.candidateIndex === 2 && call === 0) return qaPayload(input, "uncertain");
+      if (input.candidateIndex === 3 && call === 0) throw new ProviderFailure("PROVIDER_TIMEOUT");
+      if (input.candidateIndex === 3 && call === 1) return qaPayload(input, "pass", "structure.overhead-support");
+      return qaPayload(input, "pass");
+    },
   });
   const repairValue = fixture([ONE_PIXEL_PNG], { data: repairBrief, provider: repairProvider });
   try {
@@ -3450,12 +3962,20 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const { bound, result: initial } = await bindAndWait(repairValue, updated.draft.revision);
     const initialCandidate = initial.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)!;
     const passCandidate = initial.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 2)!;
-    repairStarted = true;
+    const secondCandidate = initial.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 3)!;
+    assert.equal(secondCandidate.status, "qa_unavailable_retryable");
+    await repairValue.service.s2.retryQa(repairValue.projectId, bound.qaRun.id, secondCandidate.candidateId, randomUUID(), randomUUID());
+    await waitFor(() => repairValue.service.s2.getQaRun(repairValue.projectId, bound.qaRun.id) as any,
+      (current) => current.qaRun.candidateResults.some((candidate: any) => candidate.candidateIndex === 3 && candidate.attempt === 2 && candidate.status === "material_fail"));
     const started = await repairValue.service.s2.repairCandidate(repairValue.projectId, bound.qaRun.id, initialCandidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
-    const after = await waitFor(() => repairValue.service.s2.getQaRun(repairValue.projectId, bound.qaRun.id) as any, (current) => current.qaRun.repairs?.[0]?.status === "re_qa_pass");
+    await waitFor(() => repairValue.service.s2.getQaRun(repairValue.projectId, bound.qaRun.id) as any, (current) => current.qaRun.repairs?.some((item: any) => item.candidateId === initialCandidate.candidateId && item.status === "re_qa_pass"));
+    await repairValue.service.s2.repairCandidate(repairValue.projectId, bound.qaRun.id, secondCandidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    const after = await waitFor(() => repairValue.service.s2.getQaRun(repairValue.projectId, bound.qaRun.id) as any, (current) => current.qaRun.repairs?.filter((item: any) => item.status === "re_qa_pass").length === 2);
     const state = repairValue.repository.state();
     const input = state.s2Inputs[0];
     const repair = state.s2Repairs[0];
+    const secondRepair = state.s2Repairs.find((item) => item.candidateId === secondCandidate.candidateId)!;
+    const secondLatest = state.s2QaRuns[0].candidateResults.find((item) => item.candidateId === secondCandidate.candidateId && item.attempt === 2)!;
     const derived = state.s2DerivedCandidates[0];
     const reQa = state.s2ReQaResults[0];
     const repairOperation = state.s2Operations.find((operation) => operation.phase === "repair")!;
@@ -3508,20 +4028,20 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
         "REPAIR-005/uncertainty-ineligible": () => { assert.equal(passCandidate.status, "warning"); assert.equal(ineligibleCode, "REPAIR_NOT_ELIGIBLE"); },
       });
     await prove(claimIds("REPAIR-006", ["geometry", "open-side", "source-lineage", "brief"]), "repair immutable context", "Real repair prompt and persisted input snapshots for geometry, open sides, source lineage, and confirmed brief facts.",
-      { widthMm: input.geometrySnapshot.widthMm, depthMm: input.geometrySnapshot.depthMm, openSides: input.geometrySnapshot.openSides.join(","), sourceSha256: input.sourceCandidates[0].sourceSha256, briefVersionId: input.confirmedBriefVersionId, result: "preserved" },
-      "The real repair prompt preserved exact geometry, open sides, source lineage, and confirmed brief identity.",
-      () => { assert.equal(request.prompt.includes("north,west"), true); assert.equal(repair.sourceSha256, input.sourceCandidates[0].sourceSha256); assert.equal(repair.sourceAssetId, input.sourceCandidates[0].sourceAssetId); }, undefined, {
+      { widthMm: input.geometrySnapshot.widthMm, depthMm: input.geometrySnapshot.depthMm, openSides: input.geometrySnapshot.openSides.join(","), sourceSha256: repair.sourceSha256, latestAttempt: secondLatest.attempt, secondRepairSourceSha256: secondRepair.sourceSha256, briefVersionId: input.confirmedBriefVersionId, result: "preserved" },
+      "The real repair prompt preserved exact geometry, open sides, confirmed brief identity, and linked the second repair to the candidate's latest source-QA attempt.",
+      () => { assert.equal(request.prompt.includes("north,west"), true); assert.equal(repair.sourceSha256, input.sourceCandidates[0].sourceSha256); assert.equal(repair.sourceAssetId, input.sourceCandidates[0].sourceAssetId); assert.equal(secondLatest.attempt, 2); assert.equal(secondLatest.repairAttemptId, secondRepair.id); assert.equal(secondRepair.sourceSha256, secondLatest.sourceSha256); }, undefined, {
         "REPAIR-006/geometry": () => { assert.equal(input.geometrySnapshot.widthMm, 9000); assert.equal(input.geometrySnapshot.depthMm, 6000); },
         "REPAIR-006/open-side": () => { assert.deepEqual(input.geometrySnapshot.openSides, ["north", "west"]); assert.equal(request.prompt.includes("north,west"), true); },
-        "REPAIR-006/source-lineage": () => { assert.equal(repair.sourceSha256, input.sourceCandidates[0].sourceSha256); assert.equal(repair.sourceAssetId, input.sourceCandidates[0].sourceAssetId); },
+        "REPAIR-006/source-lineage": () => { assert.equal(repair.sourceSha256, input.sourceCandidates[0].sourceSha256); assert.equal(repair.sourceAssetId, input.sourceCandidates[0].sourceAssetId); assert.equal(secondLatest.attempt, 2); assert.equal(secondLatest.repairAttemptId, secondRepair.id); assert.equal(secondRepair.sourceSha256, secondLatest.sourceSha256); },
         "REPAIR-006/brief": () => { assert.equal(input.confirmedBriefVersionId.length > 0, true); assert.equal(request.prompt.includes("Keep the entry clear."), true); },
       });
-    await prove(claimIds("REPAIR-007", ["already-exists", "exhausted"]), "repair one-attempt guard", "Real second repair request after a completed first attempt with no repair retry operation.",
-      { attempts: state.s2Repairs.length, secondCode: repairAgainCode, repairOperations: state.s2Operations.filter((operation) => operation.phase === "repair").length, result: "single-attempt" },
-      "The real repair lineage retained one attempt and rejected a second request without a hidden retry.",
-      () => { assert.equal(state.s2Repairs.length, 1); assert.equal(repairAgainCode, "REPAIR_ALREADY_EXISTS"); assert.equal(state.s2Operations.filter((operation) => operation.phase === "repair").length, 1); }, undefined, {
+    await prove(claimIds("REPAIR-007", ["already-exists", "exhausted"]), "repair candidate-scoped cardinality", "Real two-candidate repair workflow with one completed repair per candidate and a rejected same-candidate second request.",
+      { attempts: state.s2Repairs.length, secondCode: repairAgainCode, repairOperations: state.s2Operations.filter((operation) => operation.phase === "repair").length, independentCandidate: state.s2Repairs.some((item) => item.candidateId === secondCandidate.candidateId), result: "one-per-candidate" },
+      "The real repair graph allowed independent candidate repairs while rejecting a second repair for the same candidate.",
+      () => { assert.equal(state.s2Repairs.length, 2); assert.equal(repairAgainCode, "REPAIR_ALREADY_EXISTS"); assert.equal(state.s2Operations.filter((operation) => operation.phase === "repair").length, 2); assert.equal(state.s2Repairs.some((item) => item.candidateId === secondCandidate.candidateId), true); }, undefined, {
         "REPAIR-007/already-exists": () => assert.equal(repairAgainCode, "REPAIR_ALREADY_EXISTS"),
-        "REPAIR-007/exhausted": () => { assert.equal(state.s2Repairs.length, 1); assert.equal(state.s2Operations.filter((operation) => operation.phase === "repair").length, 1); },
+        "REPAIR-007/exhausted": () => { assert.equal(state.s2Repairs.length, 2); assert.equal(state.s2Operations.filter((operation) => operation.phase === "repair").length, 2); assert.equal(state.s2Repairs.some((item) => item.candidateId === secondCandidate.candidateId), true); },
       });
     await prove(claimIds("REPAIR-008", ["source-first", "refs-order", "logos-order"]), "repair image ordering", "Captured local repair provider input built from the persisted source, reference order, and logo order.",
       { imageCount: repairCaptured[0].images.length, sourceFirst: Buffer.from(repairCaptured[0].images[0]).equals(sourceBefore), referenceOneHash: sha256(repairCaptured[0].images[1]), referenceTwoHash: sha256(repairCaptured[0].images[2]), logoHash: sha256(repairCaptured[0].images[3]), result: "ordered" },
@@ -3590,11 +4110,11 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
          "REPAIR-016/no-hard-geometry": () => assert.equal(request.prompt.includes("exact geometry"), true),
          "REPAIR-016/no-engineering-venue": () => assert.equal(request.prompt.includes("do not claim engineering or approval"), true),
        });
-    await prove(claimIds("REQA-001", ["one-created", "after-valid"]), "re-qa one-result creation", "Real successful repair publication followed by exactly one persisted re-QA result.",
+    await prove(claimIds("REQA-001", ["one-created", "after-valid"]), "re-qa one-result-per-repair creation", "Real two-candidate repair publications followed by one persisted re-QA result per repair.",
       { derivedCount: state.s2DerivedCandidates.length, reQaCount: state.s2ReQaResults.length, reQaStatus: reQa.status, result: "one-after-valid" },
-      "The real valid repair output created one derived candidate and one re-QA result.",
-      () => { assert.equal(state.s2DerivedCandidates.length, 1); assert.equal(state.s2ReQaResults.length, 1); assert.equal(reQa.status, "pass"); }, undefined, {
-        "REQA-001/one-created": () => { assert.equal(state.s2DerivedCandidates.length, 1); assert.equal(state.s2ReQaResults.length, 1); },
+      "The real valid repair outputs created one derived candidate and one re-QA result for each independently repaired candidate.",
+      () => { assert.equal(state.s2DerivedCandidates.length, 2); assert.equal(state.s2ReQaResults.length, 2); assert.equal(reQa.status, "pass"); }, undefined, {
+        "REQA-001/one-created": () => { assert.equal(state.s2DerivedCandidates.length, 2); assert.equal(state.s2ReQaResults.length, 2); },
         "REQA-001/after-valid": () => assert.equal(reQa.status, "pass"),
       });
     await prove(claimIds("REQA-002", ["hard-facts", "requirements", "schema", "model", "algorithm"]), "re-qa persisted contract", "Real re-QA result linked to the immutable S2 input, decoder profile, model, schema, and algorithm hashes.",
@@ -3607,21 +4127,52 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
         "REQA-002/model": () => assert.equal(input.qaModel, S2_QA_MODEL),
         "REQA-002/algorithm": () => { assert.equal(repairSourceText.includes("function evaluate("), true); assert.equal(repairSourceText.includes('verdict: material.length ? "MATERIAL_FAIL"'), true); },
       });
-    await prove(claimIds("REQA-003", ["pass", "warning", "material-fail", "unavailable"]), "re-qa outcome aggregation", "Real pass re-QA plus previously executed local warning, material, and unavailable QA outcomes.",
-      { passStatus: reQa.status, warningObserved: true, materialObserved: initialCandidate.status === "material_fail", unavailableObserved: failureStatuses.every((status) => status.includes("unavailable")), result: "server-aggregated" },
-      "The real re-QA persisted pass while the same local workflow retained distinct warning, material-fail, and unavailable outcome classes.",
-      () => { assert.equal(reQa.status, "pass"); assert.equal(initialCandidate.status, "material_fail"); assert.equal(failureStatuses.every((status) => status.includes("unavailable")), true); }, undefined, {
-        "REQA-003/pass": () => assert.equal(reQa.status, "pass"),
-        "REQA-003/warning": () => assert.equal(passCandidate.status, "warning"),
-        "REQA-003/material-fail": () => assert.equal(initialCandidate.status, "material_fail"),
-        "REQA-003/unavailable": () => assert.equal(failureStatuses.every((status) => status.includes("unavailable")), true),
-      });
-    await prove(claimIds("REQA-004", ["no-retry", "no-second-repair"]), "re-qa retry boundary", "Real successful re-QA with one repair provider call and a rejected second repair request.",
-      { repairProviderCalls: repairProvider.s2RepairCalls, repairAttempts: state.s2Repairs.length, secondRepairCode: repairAgainCode, reQaOperations: state.s2Operations.filter((operation) => operation.phase === "re_qa").length, result: "single-pass" },
-      "The real re-QA completed once and did not trigger a hidden retry or a second repair.",
-      () => { assert.equal(repairProvider.s2RepairCalls, 1); assert.equal(state.s2Repairs.length, 1); assert.equal(repairAgainCode, "REPAIR_ALREADY_EXISTS"); assert.equal(state.s2Operations.filter((operation) => operation.phase === "re_qa").length, 1); }, undefined, {
-        "REQA-004/no-retry": () => { assert.equal(repairProvider.s2RepairCalls, 1); assert.equal(state.s2Operations.filter((operation) => operation.phase === "re_qa").length, 1); },
-        "REQA-004/no-second-repair": () => { assert.equal(state.s2Repairs.length, 1); assert.equal(repairAgainCode, "REPAIR_ALREADY_EXISTS"); },
+    const reQaOutcomeCalls = new Map<number, number>();
+    const reQaOutcomeProvider = new MockOpenAIProvider({
+      briefData: repairBrief,
+      s2RepairResponses: [ONE_PIXEL_PNG, ONE_PIXEL_PNG, ONE_PIXEL_PNG, ONE_PIXEL_PNG],
+      s2QaResponseFactory: (input) => {
+        const call = reQaOutcomeCalls.get(input.candidateIndex) ?? 0;
+        reQaOutcomeCalls.set(input.candidateIndex, call + 1);
+        if (call === 0) return qaPayload(input, "pass", "structure.overhead-support");
+        if (input.candidateIndex === 1) return qaPayload(input, "pass");
+        if (input.candidateIndex === 2) return qaPayload(input, "warning");
+        if (input.candidateIndex === 3) return qaPayload(input, "pass", "structure.overhead-support");
+        throw new ProviderFailure("PROVIDER_TIMEOUT");
+      },
+    });
+    const reQaOutcomeValue = fixture([ONE_PIXEL_PNG], { data: repairBrief, provider: reQaOutcomeProvider });
+    try {
+      const { bound: outcomeBound, result: outcomeInitial } = await bindAndWait(reQaOutcomeValue);
+      const sourceRunCompletedAt = outcomeInitial.qaRun.completedAt;
+      for (const candidate of outcomeInitial.qaRun.candidateResults) {
+        await reQaOutcomeValue.service.s2.repairCandidate(reQaOutcomeValue.projectId, outcomeBound.qaRun.id, candidate.candidateId, outcomeBound.inputVersionId, randomUUID(), randomUUID());
+        await waitFor(() => reQaOutcomeValue.service.s2.getQaRun(reQaOutcomeValue.projectId, outcomeBound.qaRun.id) as any,
+          (current) => current.qaRun.reQa.some((item: any) => item.candidateId === candidate.candidateId &&
+            ["pass", "warning", "material_fail", "re_qa_unavailable"].includes(item.status)));
+      }
+      const outcomeState = new JsonRepository(reQaOutcomeValue.root).state();
+      const outcomeStatuses = outcomeState.s2ReQaResults.slice().sort((left, right) => left.candidateIndex - right.candidateIndex).map((item) => item.status);
+      const outcomeRepairStatuses = outcomeState.s2Repairs.slice().sort((left, right) =>
+        outcomeState.s2Inputs[0].sourceCandidates.find((source) => source.candidateId === left.candidateId)!.candidateIndex -
+        outcomeState.s2Inputs[0].sourceCandidates.find((source) => source.candidateId === right.candidateId)!.candidateIndex).map((item) => item.status);
+      const outcomeRun = outcomeState.s2QaRuns[0];
+      await prove(claimIds("REQA-003", ["pass", "warning", "material-fail", "unavailable"]), "re-qa outcome aggregation", "Four real repair and re-QA workflows producing pass, warning, material-fail, and unavailable terminal outcomes.",
+        { reQaStatuses: outcomeStatuses.join(","), repairStatuses: outcomeRepairStatuses.join(","), sourceRunStatus: outcomeRun.status, sourceCompletedAtPreserved: outcomeRun.completedAt === sourceRunCompletedAt, repairCalls: reQaOutcomeProvider.s2RepairCalls, reQaCalls: reQaOutcomeProvider.s2QaCalls - 4, result: "independent-terminal-outcomes" },
+        "The real re-QA workflows persisted all four locked terminal outcome classes while the source QA run remained completed with its original timestamp.",
+        () => { assert.deepEqual(outcomeStatuses, ["pass", "warning", "material_fail", "re_qa_unavailable"]); assert.equal(outcomeRun.status, "completed"); assert.equal(outcomeRun.completedAt, sourceRunCompletedAt); assert.equal(reQaOutcomeProvider.s2RepairCalls, 4); assert.equal(reQaOutcomeProvider.s2QaCalls, 8); }, undefined, {
+          "REQA-003/pass": () => assert.equal(outcomeStatuses[0], "pass"),
+          "REQA-003/warning": () => assert.equal(outcomeStatuses[1], "warning"),
+          "REQA-003/material-fail": () => assert.equal(outcomeStatuses[2], "material_fail"),
+          "REQA-003/unavailable": () => assert.equal(outcomeStatuses[3], "re_qa_unavailable"),
+        });
+    } finally { rmSync(reQaOutcomeValue.root, { recursive: true, force: true }); }
+    await prove(claimIds("REQA-004", ["no-retry", "no-second-repair"]), "re-qa retry boundary", "Real two-candidate successful re-QA workflow with one re-QA per repair and a rejected same-candidate second repair request.",
+      { repairProviderCalls: repairProvider.s2RepairCalls, repairAttempts: state.s2Repairs.length, secondRepairCode: repairAgainCode, reQaOperations: state.s2Operations.filter((operation) => operation.phase === "re_qa").length, result: "one-reqa-per-repair" },
+      "The real re-QA workflows completed once per repair and did not trigger a hidden retry or a second repair for one candidate.",
+      () => { assert.equal(repairProvider.s2RepairCalls, 2); assert.equal(state.s2Repairs.length, 2); assert.equal(repairAgainCode, "REPAIR_ALREADY_EXISTS"); assert.equal(state.s2Operations.filter((operation) => operation.phase === "re_qa").length, 2); }, undefined, {
+        "REQA-004/no-retry": () => { assert.equal(repairProvider.s2RepairCalls, 2); assert.equal(state.s2Operations.filter((operation) => operation.phase === "re_qa").length, 2); },
+        "REQA-004/no-second-repair": () => { assert.equal(state.s2Repairs.length, 2); assert.equal(repairAgainCode, "REPAIR_ALREADY_EXISTS"); },
       });
     await prove(claimIds("REQA-005", ["derived-immutable", "source-immutable", "repair-linked", "reqa-linked"]), "re-qa lineage identity", "Real derived candidate, repair attempt, source bytes, and re-QA persisted linkage.",
       { sourceSha256: sourceBefore.length > 0 ? sha256(sourceBefore) : "", repairId: repair.id, derivedRepairId: derived.repairAttemptId, reQaRepairId: reQa.repairAttemptId, derivedId: derived.id, reQaDerivedId: reQa.derivedCandidateId, result: "linked-immutable" },
