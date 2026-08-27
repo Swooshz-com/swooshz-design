@@ -2,6 +2,85 @@
 
 Current audit update: 2026-08-27
 
+## Current exact-head G3 audit: bounded non-convergence simplification
+
+Repository: Swooshz-com/swooshz-design
+
+Branch: web/run-007-s2-g3-nonconvergence-reset
+
+Previous exact head: 8d5b43b95e9566d64ad1313e95b151de456919af
+
+Implementation commit: 0ec1b16269e79591b7a305a85d9c6121d989e3ee
+
+Authority: Web review 5038709158, child #7 authority 5436389607, parent #1
+authority 5436392692, and locks DL-SD-S2-G1-001, DL-SD-S2-G2-003, and
+DL-SD-S2-G3-001. This work is the selected bounded non-convergence
+simplification on the existing persistence relationship/lifecycle-validation
+root. It is not repair 3/3, G1 re-entry, or G2 re-entry. PR #17 remains the
+same Draft, unmerged lineage. PR #15/run-006 remains closed/unmerged and
+noncanonical; PR #18 remains merged/canonical G2. docs/G2_S2_CONTRACT.md,
+the runtime retry implementation, UI surfaces, and unrelated S1 behavior
+were not modified.
+
+### Bounded correction evidence
+
+- src/lib/s2-persistence.ts removes the global attempt-2 cardinality rule and
+  validates retry topology independently for canonical candidates/indexes 1..4:
+  exactly one attempt 1, zero or one attempt 2 for that candidate, identical
+  bound source identity, and no global attempt-2 ordering or allowance.
+- A candidate retry is accepted only when its own attempt-1 result is
+  qa_unavailable_retryable and its own persisted QA operation is failed,
+  dispatch-consumed, and carries an authorized transient provider failure
+  code. The attempt-2 result is not retryable and its QA operation and
+  s2_qa_retry idempotency identity remain project/run/candidate/result scoped.
+- Existing latest-result lifecycle and counter derivation remain unchanged;
+  different candidates can accumulate legal retries without corrupting
+  completedCandidateCount, passCount, warningCount, materialFailCount,
+  unavailableCount, status, or completedAt.
+- The execution-bound positive test uses the real bind/retry/commit path with
+  two distinct candidates independently timing out. Candidate A is retried
+  and reloaded before candidate B is retried; both retain exactly one attempt
+  1 and one attempt 2, candidates 1 and 4 retain only attempt 1, six local
+  mock QA provider calls have candidate counts [1,2,2,1], and every dispatch
+  identity is observed exactly once.
+- The persisted graph matrix now rejects 26 focused impossible retry and
+  relationship states, including same-candidate duplicate attempt 2, source
+  identity/index mismatch, missing authorized retry lineage, retryable attempt
+  2, cross-candidate operation/idempotency identity, and cross-project retry
+  idempotency. Three legal lifecycle roots remain accepted.
+
+### Current follow-up validation
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Full S2 evidence and runtime suite | PASS, 24/24 | Section 24: 103 rows, 329 claims; missing 0, unknown 0, duplicate 0, skipped 0 |
+| Multi-candidate real retry/reload positive | PASS | Two independent real retries committed and reloaded; counters/status/latest outcomes and provider dispatch identities matched |
+| Persistence graph negative/positive matrix | PASS | 26 real persisted JSON negative loads rejected; 3 legal lifecycle loads accepted |
+| Complete S1 regression and PDF extraction | PASS, 41/41 | pnpm test; PDF extraction/validation fixtures pass with pdfjs-dist 6.2.108 |
+| Frozen dependency and native security validation | PASS | Frozen offline install; pnpm audit --offline found no known vulnerabilities; sharp 0.35.3 native load with libvips 8.18.3 |
+| Typecheck, lint, and production build | PASS | pnpm run typecheck; pnpm run lint; pnpm run build with Next.js 16.3.2/Turbopack |
+| Diff/conflict/hygiene and changed-content scan | PASS | git diff --check exit 0; no unmerged paths, conflict markers, debug markers, secret patterns, or protected-file changes |
+| Client credential/provider boundary and privacy review | PASS in scope | No added credential, authorization, bearer, private-key, storage-key, logging, or provider-boundary surface; existing server-only provider/private-storage paths reviewed |
+| Loopback browser smoke | PASS | Built app served only at 127.0.0.1:3101; real browser rendered /projects/new with the Create project heading, project-name field, submit control, and HTTP 200; browser and agent-owned server were stopped |
+| GitHub exact-head admission inventory | PASS, CI not claimed | Main and PR #17 admission remained exact before publication; exact-head statuses, check runs, and workflow runs were empty/zero; no CI green claim made |
+| External-safety boundary | PASS | No live provider, provider credential, customer/private data, deployment, destructive live action, or deep security scan used |
+
+### Disposition and documentation closure
+
+The exact retry-topology defect is corrected within the existing PR #17
+lineage. Parent #1 was not modified. G2 re-entry is NO; G4 is NO; Ready and
+merge are NO; S3 is NO. The canonical audit is updated here without changing
+the contract or creating a duplicate report. Pre-existing untracked
+.playwright-cli/, .tmp/, and _agent-toolkit-backups/ material remains
+unstaged. The final exact head, GitHub post-push inventory, and one child #7
+submission are recorded in the publication packet; no PR #17 conversation
+worker packet is posted.
+
+ELI5: the safety checker no longer treats four designs as sharing one retry
+coupon. Each design has its own one retry coupon, two designs were proven to
+use theirs through real persistence and reload, and everything else stayed
+the same.
+
 ## Current exact-head G3 audit: bounded S2 persistence graph and locked workflow repair
 
 Repository: Swooshz-com/swooshz-design
