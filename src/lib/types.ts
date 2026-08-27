@@ -380,6 +380,7 @@ export type S2RepairStatus =
   | "re_qa_unavailable";
 export type S2Verdict = "PASS" | "WARNING" | "MATERIAL_FAIL" | "QA_UNAVAILABLE";
 export type S2RequirementObserved = "present" | "absent" | "uncertain" | "not_verifiable";
+export type S2ProviderDispatchState = "not_started" | "may_have_started" | "consumed";
 
 export type S2AssetRecord = {
   id: UUID;
@@ -595,6 +596,7 @@ export type S2Operation = {
   claimedAt: Timestamp | null;
   startedAt: Timestamp | null;
   completedAt: Timestamp | null;
+  providerDispatchState: S2ProviderDispatchState;
   failureCode: string | null;
   resultId: UUID | null;
 };

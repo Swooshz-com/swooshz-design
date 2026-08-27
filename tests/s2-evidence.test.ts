@@ -26,6 +26,7 @@ import {
   S2_MAX_TOTAL_RGBA_BYTES,
 } from "../src/lib/s2-media";
 import { buildS2QaRequest, buildS2RepairRequest, S2_QA_MODEL, S2_QA_SCHEMA } from "../src/lib/s2-provider";
+import { canonicalRepairInputHash, operationInputHash } from "../src/lib/s2";
 import { handleApiRequest } from "../src/lib/api";
 import { createWorkflowService, type WorkflowService, type WorkflowServiceOptions } from "../src/lib/workflow";
 import { jcs, sha256 } from "../src/lib/utils";
@@ -51,7 +52,7 @@ type FixtureOptions = {
   data?: any;
   provider?: MockOpenAIProvider;
   geometry?: any;
-} & Pick<WorkflowServiceOptions, "processId" | "isProcessAlive" | "onPublicationPhase">;
+} & Pick<WorkflowServiceOptions, "processId" | "isProcessAlive" | "onProviderDispatchPhase" | "onPublicationPhase">;
 
 type Fixture = { service: WorkflowService; provider: MockOpenAIProvider; repository: JsonRepository; objects: PrivateObjectStore; root: string; projectId: string; generationSetId: string };
 
@@ -295,6 +296,30 @@ async function bindAndWait(value: Fixture, expectedRevision = 1): Promise<any> {
   return { bound, result };
 }
 
+function s2MultipartBody(fileBytes: Uint8Array, fileName = "chunked.png", kind = "reference"): Buffer {
+  const boundary = "s2-stream-boundary";
+  return Buffer.concat([
+    Buffer.from("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + fileName + "\"\r\nContent-Type: image/png\r\n\r\n", "latin1"),
+    Buffer.from(fileBytes),
+    Buffer.from("\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"kind\"\r\n\r\n" + kind + "\r\n--" + boundary + "--\r\n", "latin1"),
+  ]);
+}
+
+function chunkedStream(bytes: Uint8Array, chunkSize: number): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= bytes.byteLength) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(offset + chunkSize, bytes.byteLength);
+      controller.enqueue(bytes.slice(offset, end));
+      offset = end;
+    },
+  });
+}
+
 test("fresh S2 runtime proves persisted bind, four terminal candidates, explicit retry, repair publication and re-QA", async () => {
   const value = fixture();
   try {
@@ -322,6 +347,82 @@ test("fresh S2 runtime proves persisted bind, four terminal candidates, explicit
     assert.equal(state.s2DerivedCandidates.length, 1);
     assert.equal(state.s2Publications.filter((item) => item.state === "committed").length, 1);
   } finally { rmSync(value.root, { recursive: true, force: true }); }
+});
+
+test("fresh S2 persistence rejects present malformed or unknown records and keeps absent legacy collections empty", () => {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-s2-persistence-"));
+  try {
+    writeFileSync(join(root, "state.json"), JSON.stringify({ projects: [] }), "utf8");
+    const legacy = new JsonRepository(root);
+    assert.deepEqual(legacy.state().s2Operations, []);
+    const valid = legacy.state();
+    valid.s2Drafts.push({
+      id: randomUUID(), projectId: randomUUID(), revision: 1, status: "editable",
+      referenceAssetIds: [], logoAssetIds: [], updatedAt: new Date(0).toISOString(),
+      frozenAt: null, frozenByQaRunId: null,
+    });
+    writeFileSync(legacy.statePath, JSON.stringify(valid), "utf8");
+    assert.doesNotThrow(() => new JsonRepository(root));
+
+    const withUnknown = { ...valid, s2Drafts: [{ ...valid.s2Drafts[0], unexpected: true }] };
+    writeFileSync(legacy.statePath, JSON.stringify(withUnknown), "utf8");
+    assert.throws(() => new JsonRepository(root), (error) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
+
+    const withMalformedCollection = { ...valid, s2Operations: { not: "an array" } };
+    writeFileSync(legacy.statePath, JSON.stringify(withMalformedCollection), "utf8");
+    assert.throws(() => new JsonRepository(root), (error) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh S2 multipart route streams arbitrary chunks and rejects an oversized file before normalization", async () => {
+  const value = fixture();
+  try {
+    const boundary = "s2-stream-boundary";
+    const body = s2MultipartBody(ONE_PIXEL_PNG);
+    const request = new Request("http://localhost", {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data; boundary=" + boundary, "Idempotency-Key": randomUUID() },
+      body: chunkedStream(body, 7),
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+    const accepted = await handleApiRequest(request, ["projects", value.projectId, "s2", "reference-assets"], value.service);
+    assert.equal(accepted.status, 201);
+    assert.equal(value.repository.state().s2Assets.length, 1);
+
+    const oversizedHeaderBoundary = "s2-header-boundary";
+    const oversizedHeader = Array.from({ length: 20 }, (_, index) =>
+      "X-S2-" + String(index).padStart(2, "0") + ": " + "a".repeat(1000)).join("\r\n");
+    const oversizedHeaderBody = Buffer.concat([
+      Buffer.from("--" + oversizedHeaderBoundary + "\r\n" + oversizedHeader +
+        "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"header.png\"\r\nContent-Type: image/png\r\n\r\n", "latin1"),
+      Buffer.from(ONE_PIXEL_PNG),
+      Buffer.from("\r\n--" + oversizedHeaderBoundary + "--\r\n", "latin1"),
+    ]);
+    const oversizedHeaderRequest = new Request("http://localhost", {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data; boundary=" + oversizedHeaderBoundary, "Idempotency-Key": randomUUID() },
+      body: chunkedStream(oversizedHeaderBody, 31),
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+    const headerRejected = await handleApiRequest(oversizedHeaderRequest, ["projects", value.projectId, "s2", "reference-assets"], value.service);
+    assert.equal(headerRejected.status, 400);
+    assert.equal(value.repository.state().s2Assets.length, 1);
+
+    const tooLargeBody = s2MultipartBody(Buffer.alloc(S2_MAX_SOURCE_BYTES + 1));
+    const tooLargeRequest = new Request("http://localhost", {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data; boundary=" + boundary, "Idempotency-Key": randomUUID() },
+      body: chunkedStream(tooLargeBody, 4096),
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+    const rejected = await handleApiRequest(tooLargeRequest, ["projects", value.projectId, "s2", "reference-assets"], value.service);
+    assert.equal(rejected.status, 413);
+    assert.equal(value.repository.state().s2Assets.length, 1);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
 });
 
 test("fresh S2 media path proves the revised MEDIA-012 exact square and first representable over-dimension boundary", async () => {
@@ -749,7 +850,7 @@ test("fresh S2 retry evidence creates a real late attempt-1 race and fences atte
       value.service.s2.getReferenceDraft(value.projectId);
       const bound = await value.service.s2.bindQa(value.projectId, value.generationSetId, 1, randomUUID(), randomUUID());
       const op = await waitFor(() => value.repository.state().s2Operations.find((item) => item.phase === "qa" && item.candidateId === value.repository.state().s2QaRuns[0]?.candidateResults.find((result) => result.candidateIndex === 1)?.candidateId) as any, (current) => current?.status === "running" && current.claimToken !== null);
-      assert.ok(staleInput);
+      await waitFor(() => staleInput, (current) => current !== null);
       (value.service.s2 as any).failQa(op.id, op.claimToken, new ProviderFailure("PROVIDER_TIMEOUT"));
       const failed = value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any;
       const candidateId = failed.qaRun.candidateResults.find((item: any) => item.candidateIndex === 1).candidateId;
@@ -942,7 +1043,20 @@ test("fresh S2 repair evidence preserves source lineage, ordered inputs, bounded
     assert.equal(repair.reQaCandidateResultId, reQa.id);
     assert.equal(reQa.repairAttemptId, repair.id);
     assert.equal(reQa.derivedCandidateId, derived.id);
-    assert.equal(repairOperation?.inputHash, repair.repairInputHash);
+    const repairReferenceProjection = inputBefore.referenceAssetIds.map((assetId, index) => {
+      const asset = state.s2Assets.find((item) => item.id === assetId)!;
+      return { assetId, normalizedSha256: asset.normalizedSha256, width: asset.width, height: asset.height, normalizedBytes: asset.normalizedBytes, slot: index + 1 };
+    });
+    const repairLogoProjection = inputBefore.logoAssetIds.map((assetId, index) => {
+      const asset = state.s2Assets.find((item) => item.id === assetId)!;
+      return { assetId, normalizedSha256: asset.normalizedSha256, width: asset.width, height: asset.height, normalizedBytes: asset.normalizedBytes, slot: index + 1 };
+    });
+    assert.equal(repair.repairInputHash, canonicalRepairInputHash(inputBefore, inputBefore.sourceCandidates[0], repair.eligibleFindingIds, repairReferenceProjection, repairLogoProjection));
+    assert.equal(repairOperation?.inputHash, operationInputHash("s2_repair", value.projectId, {
+      qaRunId: bound.qaRun.id, candidateId: candidate.candidateId, expectedInputVersionId: bound.inputVersionId,
+      eligibleFindingIds: repair.eligibleFindingIds,
+    }));
+    assert.notEqual(repairOperation?.inputHash, repair.repairInputHash);
     assert.equal(reQaOperation?.inputHash, inputBefore.inputHash);
     assert.equal(after.qaRun.repairs.length, 1);
     assert.equal(after.qaRun.reQa.length, 1);
@@ -1046,6 +1160,7 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     const qaOperation = await waitFor(() => qaValue.repository.state().s2Operations.find((operation) => operation.phase === "qa" && operation.candidateId === qaValue.repository.state().s2QaRuns[0]?.candidateResults.find((result) => result.candidateIndex === 1)?.candidateId) as any,
       (operation) => operation?.status === "running" && operation.claimedProcessId === 71_101);
     await waitFor(() => qaCalls, (value) => value === 4);
+    assert.equal(qaValue.repository.state().s2Operations.find((operation) => operation.id === qaOperation.id)?.providerDispatchState, "may_have_started");
     createWorkflowService({ repository: qaValue.repository, objects: qaValue.objects, provider: qaProvider,
       processId: 71_102, isProcessAlive: () => { throw new Error("unknown liveness"); } });
     assert.equal(qaCalls, 4);
@@ -1053,24 +1168,22 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     createWorkflowService({ repository: qaValue.repository, objects: qaValue.objects, provider: qaProvider,
       processId: 71_103, isProcessAlive: () => false });
     await waitFor(() => qaValue.service.s2.getQaRun(qaValue.projectId, bound.qaRun.id) as any, (value) => value.qaRun.status === "completed");
-    assert.equal(qaCalls, 5);
-    assert.equal(qaValue.repository.state().s2Operations.find((operation) => operation.id === qaOperation.id)?.status, "succeeded");
+    assert.equal(qaCalls, 4);
+    assert.equal(qaValue.repository.state().s2Operations.find((operation) => operation.id === qaOperation.id)?.status, "failed");
+    assert.equal(qaValue.repository.state().s2Operations.find((operation) => operation.id === qaOperation.id)?.providerDispatchState, "consumed");
     staleQa.resolve();
     await new Promise((resolve) => setTimeout(resolve, 40));
     const latest = qaValue.service.s2.getQaRun(qaValue.projectId, bound.qaRun.id) as any;
-    assert.equal(latest.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1).status, "pass");
-    assert.equal(latest.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1).providerRequestId, "mock-s2-qa-4");
+    assert.equal(latest.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1).status, "qa_unavailable_retryable");
+    assert.equal(latest.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1).providerRequestId, null);
   } finally {
     staleQa.resolve();
     rmSync(qaValue.root, { recursive: true, force: true });
   }
 
   const staleRepair = deferred<void>();
-  const staleReQa = deferred<void>();
   let firstRepair = true;
-  let firstReQa = true;
   let repairStarted = false;
-  let deferReQa = false;
   let repairCalls = 0;
   const repairProvider = new MockOpenAIProvider({
     briefData: briefData(),
@@ -1087,17 +1200,6 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     }
     return originalRepair(input);
   };
-  const originalRepairQa = repairProvider.runS2Qa.bind(repairProvider);
-  (repairProvider as any).runS2Qa = async (input: any) => {
-    if (deferReQa && input.candidateIndex === 1) {
-      if (firstReQa) {
-        firstReQa = false;
-        await staleReQa.promise;
-        return { payload: qaPayload(input, "pass"), providerRequestId: "stale-reqa" };
-      }
-    }
-    return originalRepairQa(input);
-  };
   const repairValue = fixture([ONE_PIXEL_PNG], { provider: repairProvider, processId: 71_201 });
   try {
     repairValue.service.s2.getReferenceDraft(repairValue.projectId);
@@ -1105,40 +1207,83 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     const initial = await waitFor(() => repairValue.service.s2.getQaRun(repairValue.projectId, bound.qaRun.id) as any, (value) => value.qaRun.status === "completed");
     const candidate = initial.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1);
     repairStarted = true;
-    deferReQa = true;
     await repairValue.service.s2.repairCandidate(repairValue.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
     const repairOperation = await waitFor(() => repairValue.repository.state().s2Operations.find((operation) => operation.phase === "repair") as any,
       (operation) => operation?.status === "running" && operation.claimedProcessId === 71_201);
     await waitFor(() => repairCalls, (value) => value === 1);
+    assert.equal(repairValue.repository.state().s2Operations.find((operation) => operation.id === repairOperation.id)?.providerDispatchState, "may_have_started");
     createWorkflowService({ repository: repairValue.repository, objects: repairValue.objects, provider: repairProvider,
       processId: 71_202, isProcessAlive: () => { throw new Error("unknown liveness"); } });
     assert.equal(repairValue.repository.state().s2Operations.find((operation) => operation.id === repairOperation.id)?.status, "running");
     createWorkflowService({ repository: repairValue.repository, objects: repairValue.objects, provider: repairProvider,
       processId: 71_203, isProcessAlive: () => false });
-    const reQaOperation = await waitFor(() => repairValue.repository.state().s2Operations.find((operation) => operation.phase === "re_qa") as any,
-      (operation) => operation?.status === "running" && operation.claimedProcessId === 71_203);
-    assert.ok(reQaOperation);
-    createWorkflowService({ repository: repairValue.repository, objects: repairValue.objects, provider: repairProvider,
-      processId: 71_204, isProcessAlive: () => false });
-    await waitFor(() => repairValue.repository.state().s2ReQaResults[0] as any, (result) => result?.status === "pass");
-    assert.equal(repairCalls, 2);
+    await waitFor(() => repairValue.repository.state().s2Repairs[0] as any, (repair) => repair?.status === "failed");
+    assert.equal(repairCalls, 1);
     staleRepair.resolve();
-    staleReQa.resolve();
     await new Promise((resolve) => setTimeout(resolve, 60));
     const state = repairValue.repository.state();
-    assert.equal(state.s2DerivedCandidates.length, 1);
-    assert.equal(state.s2ReQaResults.length, 1);
-    assert.equal(state.s2ReQaResults[0].status, "pass");
-    assert.equal(state.s2Repairs[0].status, "re_qa_pass");
-    assert.equal(state.s2Publications.filter((publication) => publication.state === "committed").length, 1);
+    assert.equal(state.s2DerivedCandidates.length, 0);
+    assert.equal(state.s2ReQaResults.length, 0);
+    assert.equal(state.s2Repairs[0].status, "failed");
+    assert.equal(state.s2Publications.filter((publication) => publication.state === "committed").length, 0);
     assert.equal(state.s2Operations.filter((operation) => operation.phase === "repair").length, 1);
-    assert.equal(state.s2Operations.filter((operation) => operation.phase === "re_qa").length, 1);
-    assert.equal(state.s2Operations.find((operation) => operation.phase === "repair")?.status, "succeeded");
-    assert.equal(state.s2Operations.find((operation) => operation.phase === "re_qa")?.status, "succeeded");
+    assert.equal(state.s2Operations.filter((operation) => operation.phase === "re_qa").length, 0);
+    assert.equal(state.s2Operations.find((operation) => operation.phase === "repair")?.status, "failed");
+    assert.equal(state.s2Operations.find((operation) => operation.phase === "repair")?.providerDispatchState, "consumed");
   } finally {
     staleRepair.resolve();
-    staleReQa.resolve();
     rmSync(repairValue.root, { recursive: true, force: true });
+  }
+
+  const staleReQa = deferred<void>();
+  let deferReQa = false;
+  let reQaStarted = false;
+  let reQaCalls = 0;
+  const reQaProvider = new MockOpenAIProvider({
+    briefData: briefData(),
+    s2RepairResponses: [ONE_PIXEL_PNG],
+    s2QaResponseFactory: (input, callIndex) => qaPayload(input, "pass", callIndex < 4 && input.candidateIndex === 1 ? "structure.overhead-support" : undefined),
+  });
+  const originalReQa = reQaProvider.runS2Qa.bind(reQaProvider);
+  (reQaProvider as any).runS2Qa = async (input: any) => {
+    reQaCalls += 1;
+    if (deferReQa && input.candidateIndex === 1) {
+      reQaStarted = true;
+      await staleReQa.promise;
+      return { payload: qaPayload(input, "pass"), providerRequestId: "stale-reqa" };
+    }
+    return originalReQa(input);
+  };
+  const reQaValue = fixture([ONE_PIXEL_PNG], { provider: reQaProvider, processId: 71_401 });
+  try {
+    reQaValue.service.s2.getReferenceDraft(reQaValue.projectId);
+    const bound = await reQaValue.service.s2.bindQa(reQaValue.projectId, reQaValue.generationSetId, 1, randomUUID(), randomUUID());
+    const initial = await waitFor(() => reQaValue.service.s2.getQaRun(reQaValue.projectId, bound.qaRun.id) as any, (value) => value.qaRun.status === "completed");
+    const candidate = initial.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1);
+    deferReQa = true;
+    await reQaValue.service.s2.repairCandidate(reQaValue.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    const reQaOperation = await waitFor(() => reQaValue.repository.state().s2Operations.find((operation) => operation.phase === "re_qa") as any,
+      (operation) => operation?.status === "running" && operation.claimedProcessId === 71_401 && reQaStarted);
+    assert.equal(reQaCalls, 5);
+    createWorkflowService({ repository: reQaValue.repository, objects: reQaValue.objects, provider: reQaProvider,
+      processId: 71_402, isProcessAlive: () => { throw new Error("unknown liveness"); } });
+    assert.equal(reQaValue.repository.state().s2Operations.find((operation) => operation.id === reQaOperation.id)?.status, "running");
+    createWorkflowService({ repository: reQaValue.repository, objects: reQaValue.objects, provider: reQaProvider,
+      processId: 71_403, isProcessAlive: () => false });
+    await waitFor(() => reQaValue.service.s2.getQaRun(reQaValue.projectId, bound.qaRun.id) as any,
+      (value) => value.qaRun.reQa[0]?.status === "re_qa_unavailable");
+    staleReQa.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const state = reQaValue.repository.state();
+    assert.equal(reQaCalls, 5);
+    assert.equal(state.s2DerivedCandidates.length, 1);
+    assert.equal(state.s2ReQaResults[0].status, "re_qa_unavailable");
+    assert.equal(state.s2Repairs[0].status, "re_qa_unavailable");
+    assert.equal(state.s2Operations.find((operation) => operation.phase === "re_qa")?.status, "failed");
+    assert.equal(state.s2Operations.find((operation) => operation.phase === "re_qa")?.providerDispatchState, "consumed");
+  } finally {
+    staleReQa.resolve();
+    rmSync(reQaValue.root, { recursive: true, force: true });
   }
 });
 
@@ -2016,12 +2161,12 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     await waitFor(() => concurrentBind.service.s2.getQaRun(concurrentBind.projectId, winner.value.qaRun.id) as any, (current) => current.qaRun.status === "completed");
     const concurrentOverlap = arrivals === 2;
     await prove(["BIND-006/concurrent-one", "CONC-001/claim-uniqueness", "CONC-001/no-duplicate-call", "CONC-006/no-overwrite", "CONC-006/no-duplicate"], "bind concurrent serialization", "Two simultaneous real bind calls held at the source phase and raced through one repository boundary.",
-      { overlap: concurrentOverlap, callers: arrivals, inputsPersisted: state.s2Inputs.length, runsPersisted: state.s2QaRuns.length, qaOperations: state.s2Operations.filter((operation) => operation.phase === "qa").length, loserCode: loser.reason?.code ?? "", result: "one-winner-one-conflict" },
+      { overlap: concurrentOverlap, callers: arrivals, inputsPersisted: state.s2Inputs.length, runsPersisted: state.s2QaRuns.length, qaOperations: state.s2Operations.filter((operation) => operation.phase === "qa").length, qaProviderCalls: concurrentBind.provider.s2QaCalls, loserCode: loser.reason?.code ?? "", result: "one-winner-one-conflict" },
       "The actual overlapping bind race produced one persisted input/run and one conflict without duplicate candidate operations.",
       () => { assert.equal(concurrentOverlap, true); assert.equal(state.s2Inputs.length, 1); assert.equal(state.s2QaRuns.length, 1); assert.equal(state.s2Operations.filter((operation) => operation.phase === "qa").length, 4); assert.equal(loser.reason?.code, "S2_QA_RUN_EXISTS"); }, undefined, {
         "BIND-006/concurrent-one": () => { assert.equal(concurrentOverlap, true); assert.equal(loser.reason?.code, "S2_QA_RUN_EXISTS"); },
         "CONC-001/claim-uniqueness": () => { assert.equal(arrivals, 2); assert.equal(state.s2Inputs.length, 1); assert.equal(state.s2QaRuns.length, 1); },
-        "CONC-001/no-duplicate-call": () => { assert.equal(arrivals, 2); assert.equal(state.s2Operations.filter((operation) => operation.phase === "qa").length, 4); },
+        "CONC-001/no-duplicate-call": () => { assert.equal(arrivals, 2); assert.equal(state.s2Operations.filter((operation) => operation.phase === "qa").length, 4); assert.equal(concurrentBind.provider.s2QaCalls, 4); },
         "CONC-006/no-overwrite": () => { assert.equal(state.s2Inputs.length, 1); assert.equal(state.s2QaRuns.length, 1); },
         "CONC-006/no-duplicate": () => assert.equal(state.s2Operations.filter((operation) => operation.phase === "qa").length, 4),
       });
@@ -2876,29 +3021,26 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     staleActiveQa.resolve(); await new Promise((resolve) => setTimeout(resolve, 30));
     const final = activeQa.service.s2.getQaRun(activeQa.projectId, bound.qaRun.id) as any;
     const latest = final.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)!;
-    const qaRestartDuringActivePhase = qaWasActiveBeforeRestart && unknownState.status === "running" && activeQaCalls === 5;
-    await prove(["CONC-003/qa-active"], "active QA restart recovery", "A real provider QA call held active while unknown and definitely-dead replacement services inspected and recovered it.",
-      { restartDuringActivePhase: qaRestartDuringActivePhase, unknownOwnerStatus: unknownState.status, providerCalls: activeQaCalls, finalStatus: latest.status, finalProviderRequest: latest.providerRequestId ?? "", result: "recovered-fenced" },
-      "The active QA restart fixture kept unknown liveness busy, requeued a definitely-dead operation, and fenced the stale completion.",
-      () => { assert.equal(qaRestartDuringActivePhase, true); assert.equal(unknownState.status, "running"); assert.equal(activeQaCalls, 5); assert.equal(latest.status, "pass"); assert.equal(latest.providerRequestId, "mock-s2-qa-4"); });
+    const qaRestartDuringActivePhase = qaWasActiveBeforeRestart && unknownState.status === "running" && activeQaCalls === 4;
+    await prove(["CONC-003/qa-active"], "active QA restart recovery", "A real provider QA call held active while unknown and definitely-dead replacement services inspected and resolved it without a duplicate call.",
+      { restartDuringActivePhase: qaRestartDuringActivePhase, unknownOwnerStatus: unknownState.status, providerCalls: activeQaCalls, finalStatus: latest.status, finalProviderRequest: latest.providerRequestId ?? "", result: "unavailable-no-duplicate" },
+      "The active QA restart fixture kept unknown liveness busy, resolved the definitely-dead provider boundary conservatively, and fenced the stale completion.",
+      () => { assert.equal(qaRestartDuringActivePhase, true); assert.equal(unknownState.status, "running"); assert.equal(activeQaCalls, 4); assert.equal(latest.status, "qa_unavailable_retryable"); assert.equal(latest.providerRequestId, null); });
   } finally { staleActiveQa.resolve(); rmSync(activeQa.root, { recursive: true, force: true }); }
 
-  const activeRepairStale = deferred<void>();
   const activeReQaStale = deferred<void>();
-  let activeRepairFirst = true;
   let activeReQaFirst = true;
   let activeReQaDeferred = false;
-  let activeRepairCalls = 0;
   let activeReQaCalls = 0;
   const activeRepairProvider = new MockOpenAIProvider({
     briefData: briefData(),
     s2RepairResponses: [ONE_PIXEL_PNG],
     s2QaResponseFactory: (input) => input.candidateIndex === 1 && !activeReQaDeferred ? qaPayload(input, "requirement-violation") : qaPayload(input, "pass"),
   });
+  let activeRepairCalls = 0;
   const activeRepairOriginal = activeRepairProvider.runS2Repair.bind(activeRepairProvider);
   (activeRepairProvider as any).runS2Repair = async (input: any) => {
     activeRepairCalls += 1;
-    if (activeRepairFirst) { activeRepairFirst = false; await activeRepairStale.promise; return { pngBytes: ONE_PIXEL_PNG, providerRequestId: "late-active-repair" }; }
     return activeRepairOriginal(input);
   };
   const activeReQaOriginal = activeRepairProvider.runS2Qa.bind(activeRepairProvider);
@@ -2909,7 +3051,11 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     }
     return activeReQaOriginal(input);
   };
-  const activeRepair = fixture([ONE_PIXEL_PNG], { provider: activeRepairProvider, processId: 73_401 });
+  const activeRepair = fixture([ONE_PIXEL_PNG], {
+    provider: activeRepairProvider,
+    processId: 73_401,
+    onPublicationPhase: (phase) => phase === "after-publication-staged" ? "interrupt" : undefined,
+  });
   try {
     activeRepair.service.s2.getReferenceDraft(activeRepair.projectId);
     const bound = await activeRepair.service.s2.bindQa(activeRepair.projectId, activeRepair.generationSetId, 1, randomUUID(), randomUUID());
@@ -2919,17 +3065,16 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     await activeRepair.service.s2.repairCandidate(activeRepair.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
     const repairOperation = await waitFor(() => activeRepair.repository.state().s2Operations.find((operation) => operation.phase === "repair") as any, (operation) => operation?.status === "running" && operation.claimedProcessId === 73_401);
     await waitFor(() => activeRepairCalls, (value) => value === 1);
+    assert.equal(activeRepair.repository.state().s2Operations.find((operation) => operation.id === repairOperation.id)?.providerDispatchState, "may_have_started");
     createWorkflowService({ repository: activeRepair.repository, objects: activeRepair.objects, provider: activeRepair.provider, processId: 73_402, isProcessAlive: () => { throw new Error("unknown liveness"); } });
     const unknownRepair = activeRepair.repository.state().s2Operations.find((operation) => operation.id === repairOperation.id)!;
     createWorkflowService({ repository: activeRepair.repository, objects: activeRepair.objects, provider: activeRepair.provider, processId: 73_403, isProcessAlive: () => false });
-    await waitFor(() => activeRepairCalls, (value) => value === 2);
-    activeRepairStale.resolve();
-    const reQaOperation = await waitFor(() => activeRepair.repository.state().s2Operations.find((operation) => operation.phase === "re_qa") as any, (operation) => operation?.status === "running");
+    const reQaOperation = await waitFor(() => activeRepair.repository.state().s2Operations.find((operation) => operation.phase === "re_qa") as any, (operation) => operation?.status === "running" && operation.claimedProcessId === 73_403);
     await waitFor(() => activeReQaCalls, (value) => value === 1);
     createWorkflowService({ repository: activeRepair.repository, objects: activeRepair.objects, provider: activeRepair.provider, processId: 73_404, isProcessAlive: () => false });
-    await waitFor(() => activeReQaCalls, (value) => value === 2);
+    await waitFor(() => activeRepair.repository.state().s2ReQaResults[0] as any, (result) => result?.status === "re_qa_unavailable");
     activeReQaStale.resolve();
-    await waitFor(() => activeRepair.service.s2.getQaRun(activeRepair.projectId, bound.qaRun.id) as any, (current) => current.qaRun.reQa.some((item: any) => item.status === "pass"));
+    await waitFor(() => activeRepair.service.s2.getQaRun(activeRepair.projectId, bound.qaRun.id) as any, (current) => current.qaRun.reQa.some((item: any) => item.status === "re_qa_unavailable"));
     await new Promise((resolve) => setTimeout(resolve, 40));
     const state = activeRepair.repository.state();
     const final = activeRepair.service.s2.getQaRun(activeRepair.projectId, bound.qaRun.id) as any;
@@ -2937,31 +3082,31 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const reQaRecord = state.s2ReQaResults[0];
     const finalRepairOperation = state.s2Operations.find((operation) => operation.phase === "repair")!;
     const finalReQaOperation = state.s2Operations.find((operation) => operation.phase === "re_qa")!;
-    const repairRestartDuringActivePhase = unknownRepair.status === "running" && activeRepairCalls === 2 && activeReQaCalls === 2;
+    const repairRestartDuringActivePhase = unknownRepair.status === "running" && activeRepairCalls === 1 && activeReQaCalls === 1;
     const repairPublicationState = state.s2Publications.find((publication) => publication.kind === "repair_output") as any;
     const ownedStagingRemaining = repairPublicationState?.stagingObjects.filter((object: any) => activeRepair.objects.exists(object.key)).length ?? 0;
     await prove(claimIds("CONC-003", ["repair-active", "reqa-active"]), "active repair and re-qa restart recovery", "Real repair and re-QA provider calls held active while unknown/dead replacement services recovered both phases.",
-      { restartDuringActivePhase: repairRestartDuringActivePhase, unknownRepairStatus: unknownRepair.status, repairCalls: activeRepairCalls, reQaCalls: activeReQaCalls, repairStatus: repairRecord.status, reQaStatus: reQaRecord.status, result: "recovered-fenced" },
-      "The active repair and re-QA restart fixture held unknown owners busy, reclaimed dead owners, and completed once with stale outputs fenced.",
-      () => { assert.equal(repairRestartDuringActivePhase, true); assert.equal(unknownRepair.status, "running"); assert.equal(activeRepairCalls, 2); assert.equal(activeReQaCalls, 2); assert.equal(repairRecord.status, "re_qa_pass"); assert.equal(reQaRecord.status, "pass"); assert.equal(finalRepairOperation.status, "succeeded"); assert.equal(finalReQaOperation.status, "succeeded"); assert.equal(final.qaRun.reQa.length, 1); }, undefined, {
-        "CONC-003/repair-active": () => { assert.equal(repairRestartDuringActivePhase, true); assert.equal(unknownRepair.status, "running"); assert.equal(activeRepairCalls, 2); assert.equal(repairRecord.status, "re_qa_pass"); },
-        "CONC-003/reqa-active": () => { assert.equal(activeReQaCalls, 2); assert.equal(reQaRecord.status, "pass"); assert.equal(finalReQaOperation.status, "succeeded"); },
+      { restartDuringActivePhase: repairRestartDuringActivePhase, unknownRepairStatus: unknownRepair.status, repairCalls: activeRepairCalls, reQaCalls: activeReQaCalls, repairStatus: repairRecord.status, reQaStatus: reQaRecord.status, result: "recovered-once-unavailable" },
+      "The active repair publication recovered once, and the active re-QA call became unavailable without a duplicate provider call.",
+      () => { assert.equal(repairRestartDuringActivePhase, true); assert.equal(unknownRepair.status, "running"); assert.equal(activeRepairCalls, 1); assert.equal(activeReQaCalls, 1); assert.equal(repairRecord.status, "re_qa_unavailable"); assert.equal(reQaRecord.status, "re_qa_unavailable"); assert.equal(finalRepairOperation.status, "succeeded"); assert.equal(finalReQaOperation.status, "failed"); assert.equal(final.qaRun.reQa.length, 1); }, undefined, {
+        "CONC-003/repair-active": () => { assert.equal(repairRestartDuringActivePhase, true); assert.equal(unknownRepair.status, "running"); assert.equal(activeRepairCalls, 1); assert.equal(repairRecord.status, "re_qa_unavailable"); },
+        "CONC-003/reqa-active": () => { assert.equal(activeReQaCalls, 1); assert.equal(reQaRecord.status, "re_qa_unavailable"); assert.equal(finalReQaOperation.status, "failed"); },
       });
     await prove(claimIds("CONC-004", ["late-fence", "owned-cleanup"]), "active repair stale completion fencing", "Late active repair/re-QA completions released after replacement claims and publication cleanup.",
-      { claimTokenFencing: finalRepairOperation.claimToken === null && finalReQaOperation.claimToken === null && state.s2DerivedCandidates.length === 1 && state.s2ReQaResults.length === 1, staleRepairRequest: "late-active-repair", staleReQaRequest: "late-active-reqa", derivedCount: state.s2DerivedCandidates.length, reQaCount: state.s2ReQaResults.length, ownedStagingRemaining, result: "stale-ignored-owned-cleanup" },
-      "The real late repair/re-QA completions could not overwrite the replacement claim and left one owned derived publication.",
+      { claimTokenFencing: finalRepairOperation.claimToken === null && finalReQaOperation.claimToken === null && state.s2DerivedCandidates.length === 1 && state.s2ReQaResults.length === 1, staleRepairRequest: "none", staleReQaRequest: "late-active-reqa", derivedCount: state.s2DerivedCandidates.length, reQaCount: state.s2ReQaResults.length, ownedStagingRemaining, result: "stale-ignored-owned-cleanup" },
+      "The real late re-QA completion could not overwrite the replacement claim and left one owned derived publication.",
       () => { assert.equal(state.s2DerivedCandidates.length, 1); assert.equal(state.s2ReQaResults.length, 1); assert.equal(finalRepairOperation.claimToken, null); assert.equal(finalReQaOperation.claimToken, null); }, undefined, {
         "CONC-004/late-fence": () => { assert.equal(finalRepairOperation.claimToken, null); assert.equal(finalReQaOperation.claimToken, null); assert.equal(state.s2DerivedCandidates.length, 1); assert.equal(state.s2ReQaResults.length, 1); },
         "CONC-004/owned-cleanup": () => assert.equal(ownedStagingRemaining, 0),
       });
     await prove(claimIds("CONC-005", ["no-missing-object", "no-false-terminal"]), "active repair durable truth", "Real recovered repair publication and re-QA state after stale completions and owner replacement.",
-      { claimTokenFencing: finalRepairOperation.claimToken === null && finalReQaOperation.claimToken === null && state.s2DerivedCandidates.length === 1 && state.s2ReQaResults.length === 1, derivedObjectExists: activeRepair.objects.exists(state.s2DerivedCandidates[0].storageKeyNormalized), reQaStatus: reQaRecord.status, repairStatus: repairRecord.status, publicationState: (state.s2Publications.find((publication) => publication.kind === "repair_output") as any)?.state ?? "", result: "durable-success" },
-      "The recovered workflow retained the committed output object and did not report a false terminal failure.",
-      () => { assert.equal(activeRepair.objects.exists(state.s2DerivedCandidates[0].storageKeyNormalized), true); assert.equal(reQaRecord.status, "pass"); assert.equal(repairRecord.status, "re_qa_pass"); assert.equal((state.s2Publications.find((publication) => publication.kind === "repair_output") as any)?.state, "committed"); }, undefined, {
+      { claimTokenFencing: finalRepairOperation.claimToken === null && finalReQaOperation.claimToken === null && state.s2DerivedCandidates.length === 1 && state.s2ReQaResults.length === 1, derivedObjectExists: activeRepair.objects.exists(state.s2DerivedCandidates[0].storageKeyNormalized), reQaStatus: reQaRecord.status, repairStatus: repairRecord.status, publicationState: (state.s2Publications.find((publication) => publication.kind === "repair_output") as any)?.state ?? "", result: "durable-unavailable" },
+      "The recovered workflow retained the committed output object and did not report a false successful re-QA conclusion.",
+      () => { assert.equal(activeRepair.objects.exists(state.s2DerivedCandidates[0].storageKeyNormalized), true); assert.equal(reQaRecord.status, "re_qa_unavailable"); assert.equal(repairRecord.status, "re_qa_unavailable"); assert.equal((state.s2Publications.find((publication) => publication.kind === "repair_output") as any)?.state, "committed"); }, undefined, {
         "CONC-005/no-missing-object": () => assert.equal(activeRepair.objects.exists(state.s2DerivedCandidates[0].storageKeyNormalized), true),
-        "CONC-005/no-false-terminal": () => { assert.equal(reQaRecord.status, "pass"); assert.equal(repairRecord.status, "re_qa_pass"); assert.equal(repairPublicationState?.state, "committed"); },
+        "CONC-005/no-false-terminal": () => { assert.equal(reQaRecord.status, "re_qa_unavailable"); assert.equal(repairRecord.status, "re_qa_unavailable"); assert.equal(repairPublicationState?.state, "committed"); },
       });
-  } finally { activeRepairStale.resolve(); activeReQaStale.resolve(); rmSync(activeRepair.root, { recursive: true, force: true }); }
+  } finally { activeReQaStale.resolve(); rmSync(activeRepair.root, { recursive: true, force: true }); }
 
   const routeValue = fixture();
   let lastRouteRequest: Request | null = null;

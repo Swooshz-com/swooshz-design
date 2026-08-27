@@ -182,64 +182,181 @@ async function multipartFile(request: Request): Promise<{ fileName: string; mime
   };
 }
 
+const S2_MULTIPART_HEADER_BYTES = 16 * 1024;
+const S2_MULTIPART_FIELD_BYTES = 512;
+const S2_MULTIPART_TRAILER_BYTES = 256;
+
+function s2MultipartError(field = "file", code = "MULTIPART_INVALID"): AppError {
+  return new AppError(400, "INVALID_REQUEST", [{ field, code }]);
+}
+
+function s2MultipartDisposition(value: string): { name: string; fileName: string | null } {
+  if (!/^form-data(?:;|$)/i.test(value)) throw s2MultipartError();
+  const nameMatch = value.match(/(?:^|;)\s*name=(?:"([^"]*)"|([^;\s]*))/i);
+  const fileNameMatch = value.match(/(?:^|;)\s*filename=(?:"([^"]*)"|([^;\s]*))/i);
+  const name = nameMatch?.[1] ?? nameMatch?.[2] ?? "";
+  const fileName = fileNameMatch?.[1] ?? fileNameMatch?.[2] ?? null;
+  if (!name || name.length > 64 || /[\u0000-\u001f\u007f]/.test(name)) throw s2MultipartError("body", "INVALID_FIELD");
+  if (fileName !== null && (fileName.length > 256 || /[\u0000-\u001f\u007f]/.test(fileName))) throw s2MultipartError("file", "INVALID_FIELD");
+  return { name, fileName };
+}
+
+function s2MultipartHeaders(value: Buffer): Map<string, string> {
+  const headers = new Map<string, string>();
+  const text = value.toString("latin1");
+  if (!text || text.includes("\r\n\r\n")) throw s2MultipartError();
+  for (const line of text.split("\r\n")) {
+    const separator = line.indexOf(":");
+    if (separator <= 0 || !/^[!#$%&'*+.^_|~0-9A-Za-z-]+$/.test(line.slice(0, separator))) throw s2MultipartError();
+    const name = line.slice(0, separator).toLowerCase();
+    const headerValue = line.slice(separator + 1).trim();
+    if (headers.has(name) || headerValue.length > 4096 || /[\r\n]/.test(headerValue)) throw s2MultipartError();
+    headers.set(name, headerValue);
+  }
+  return headers;
+}
+
 async function multipartS2File(request: Request): Promise<{ fileName: string; mimeType: string; kind: "reference" | "logo"; bytes: Uint8Array }> {
   const contentType = request.headers.get("content-type") ?? "";
   const match = contentType.match(/^multipart\/form-data\s*;\s*boundary=(?:"([^"]+)"|([^;\s]+))\s*$/i);
-  if (!match) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_REQUIRED" }]);
+  if (!match) throw s2MultipartError("file", "MULTIPART_REQUIRED");
   const boundary = match[1] ?? match[2];
-  if (!boundary || boundary.length > 70) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
+  if (!boundary || boundary.length > 70 || /[\r\n]/.test(boundary)) throw s2MultipartError();
+  const marker = Buffer.from("--" + boundary, "latin1");
+  const delimiter = Buffer.from("\r\n" + marker.toString("latin1"), "latin1");
+  const headerEnd = Buffer.from("\r\n\r\n", "latin1");
   const contentLength = request.headers.get("content-length");
-  if (contentLength && Number.isSafeInteger(Number(contentLength)) && Number(contentLength) > S2_MAX_MULTIPART_BODY_BYTES) {
-    throw new AppError(413, "MEDIA_TOO_LARGE", [{ field: "file", code: "MEDIA_TOO_LARGE" }]);
+  if (contentLength !== null) {
+    const parsedLength = Number(contentLength);
+    if (!Number.isSafeInteger(parsedLength) || parsedLength < 0) throw s2MultipartError("body", "MULTIPART_INVALID");
+    if (parsedLength > S2_MAX_MULTIPART_BODY_BYTES) {
+      throw new AppError(413, "MEDIA_TOO_LARGE", [{ field: "file", code: "MEDIA_TOO_LARGE" }]);
+    }
   }
-  if (!request.body) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
-  const reader = request.body.getReader(); const chunks: Buffer[] = []; let total = 0;
+  if (!request.body) throw s2MultipartError();
+
+  type Part = { name: string; fileName: string | null; mimeType: string; chunks: Buffer[]; size: number };
+  const fields = new Map<string, Part>();
+  let current: Part | null = null;
+  let pending = Buffer.alloc(0);
+  let total = 0;
+  let trailerBytes = 0;
+  let state: "initial" | "headers" | "body" | "suffix" | "trailer" = "initial";
+
+  const appendPartBytes = (value: Buffer): void => {
+    if (!current || value.length === 0) return;
+    const limit = current.name === "file" ? S2_MAX_SOURCE_BYTES : S2_MULTIPART_FIELD_BYTES;
+    if (current.size + value.length > limit) {
+      if (current.name === "file") throw new AppError(413, "MEDIA_TOO_LARGE", [{ field: "file", code: "MEDIA_TOO_LARGE" }]);
+      throw s2MultipartError(current.name, "FIELD_TOO_LARGE");
+    }
+    current.chunks.push(Buffer.from(value));
+    current.size += value.length;
+  };
+
+  const finishPart = (): void => {
+    if (!current) throw s2MultipartError();
+    if (fields.has(current.name)) throw s2MultipartError(current.name, "INVALID_FIELD");
+    fields.set(current.name, current);
+    current = null;
+  };
+
+  const processPending = (): void => {
+    while (true) {
+      if (state === "initial") {
+        if (pending.length < marker.length) return;
+        if (!pending.subarray(0, marker.length).equals(marker)) throw s2MultipartError();
+        pending = Buffer.from(pending.subarray(marker.length));
+        state = "suffix";
+      }
+      if (state === "headers") {
+        const end = pending.indexOf(headerEnd);
+        if (end < 0) {
+          if (pending.length > S2_MULTIPART_HEADER_BYTES) throw s2MultipartError();
+          return;
+        }
+        if (end > S2_MULTIPART_HEADER_BYTES) throw s2MultipartError();
+        const headers = s2MultipartHeaders(pending.subarray(0, end));
+        const disposition = s2MultipartDisposition(headerValue(headers, "content-disposition"));
+        if (!["file", "kind", "filename"].includes(disposition.name) || fields.has(disposition.name)) {
+          throw s2MultipartError(disposition.name || "body", "INVALID_FIELD");
+        }
+        current = { name: disposition.name, fileName: disposition.fileName, mimeType: headerValue(headers, "content-type"), chunks: [], size: 0 };
+        pending = Buffer.from(pending.subarray(end + headerEnd.length));
+        state = "body";
+      }
+      if (state === "body") {
+        const next = pending.indexOf(delimiter);
+        if (next < 0) {
+          const keep = Math.min(pending.length, Math.max(0, delimiter.length - 1));
+          const complete = pending.length - keep;
+          if (complete > 0) appendPartBytes(pending.subarray(0, complete));
+          pending = Buffer.from(pending.subarray(complete));
+          return;
+        }
+        appendPartBytes(pending.subarray(0, next));
+        pending = Buffer.from(pending.subarray(next + delimiter.length));
+        finishPart();
+        state = "suffix";
+      }
+      if (state === "suffix") {
+        if (pending.length < 2) return;
+        if (pending.subarray(0, 2).toString("latin1") === "--") {
+          pending = Buffer.from(pending.subarray(2));
+          state = "trailer";
+        } else if (pending.subarray(0, 2).toString("latin1") === "\r\n") {
+          pending = Buffer.from(pending.subarray(2));
+          state = "headers";
+        } else {
+          throw s2MultipartError();
+        }
+      }
+      if (state === "trailer") {
+        trailerBytes += pending.length;
+        if (trailerBytes > S2_MULTIPART_TRAILER_BYTES ||
+            Array.from(pending).some((byte) => ![9, 10, 13, 32].includes(byte))) throw s2MultipartError();
+        pending = Buffer.alloc(0);
+        return;
+      }
+    }
+  };
+
+  const reader = request.body.getReader();
   try {
     while (true) {
-      const next = await reader.read(); if (next.done) break;
-      const chunk = Buffer.from(next.value); total += chunk.byteLength;
-      if (total > S2_MAX_MULTIPART_BODY_BYTES) {
+      const next = await reader.read();
+      if (next.done) break;
+      if (next.value.byteLength > S2_MAX_MULTIPART_BODY_BYTES - total) {
         await reader.cancel().catch(() => undefined);
         throw new AppError(413, "MEDIA_TOO_LARGE", [{ field: "file", code: "MEDIA_TOO_LARGE" }]);
       }
-      chunks.push(chunk);
+      total += next.value.byteLength;
+      const chunk = Buffer.from(next.value);
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      processPending();
     }
-  } finally { reader.releaseLock(); }
-  const body = Buffer.concat(chunks, total); const marker = Buffer.from("--" + boundary, "latin1");
-  const delimiter = Buffer.from("\r\n" + marker.toString("latin1"), "latin1");
-  if (!body.subarray(0, marker.length).equals(marker)) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
-  const parts: { headers: Map<string, string>; bytes: Buffer }[] = []; let cursor = marker.length;
-  while (true) {
-    if (body.subarray(cursor, cursor + 2).toString("latin1") === "--") { cursor += 2; break; }
-    if (body.subarray(cursor, cursor + 2).toString("latin1") !== "\r\n") throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
-    cursor += 2; const headerEnd = body.indexOf(Buffer.from("\r\n\r\n", "latin1"), cursor);
-    if (headerEnd < 0) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
-    const headers = new Map<string, string>();
-    for (const line of body.subarray(cursor, headerEnd).toString("latin1").split("\r\n")) {
-      const separator = line.indexOf(":"); if (separator > 0) headers.set(line.slice(0, separator).trim().toLowerCase(), line.slice(separator + 1).trim());
-    }
-    const start = headerEnd + 4; const nextBoundary = body.indexOf(delimiter, start);
-    if (nextBoundary < 0) throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
-    parts.push({ headers, bytes: body.subarray(start, nextBoundary) }); cursor = nextBoundary + delimiter.length;
-    if (body.subarray(cursor, cursor + 2).toString("latin1") === "--") { cursor += 2; break; }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-  if (cursor < body.length && body.subarray(cursor).toString("latin1").trim() !== "") throw new AppError(400, "INVALID_REQUEST", [{ field: "file", code: "MULTIPART_INVALID" }]);
-  const fields = new Map<string, { headers: Map<string, string>; bytes: Buffer }>();
-  for (const part of parts) {
-    const disposition = headerValue(part.headers, "content-disposition");
-    const name = disposition.match(/(?:^|;)\s*name="([^"]*)"/i)?.[1] ?? "";
-    if (!name || fields.has(name) || !["file", "kind", "filename"].includes(name)) throw new AppError(400, "INVALID_REQUEST", [{ field: name || "body", code: "INVALID_FIELD" }]);
-    fields.set(name, part);
-  }
-  const file = fields.get("file"); const kindPart = fields.get("kind");
-  if (!file || !kindPart || fields.size > 3) throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "S2_FIELDS_REQUIRED" }]);
-  if (file.bytes.byteLength > S2_MAX_SOURCE_BYTES) throw new AppError(413, "MEDIA_TOO_LARGE", [{ field: "file", code: "MEDIA_TOO_LARGE" }]);
-  const kind = kindPart.bytes.toString("utf8").trim();
+
+  processPending();
+  const finalState: string = state;
+  if (finalState !== "trailer" || current !== null || pending.length !== 0) throw s2MultipartError();
+  const file = fields.get("file");
+  const kindPart = fields.get("kind");
+  if (!file || !kindPart || fields.size > 3) throw s2MultipartError("body", "S2_FIELDS_REQUIRED");
+  const decodeField = (part: Part): string => {
+    try { return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(part.chunks, part.size)); }
+    catch { throw s2MultipartError(part.name, "INVALID_FIELD"); }
+  };
+  const kind = decodeField(kindPart).trim();
   if (kind !== "reference" && kind !== "logo") throw new AppError(400, "INVALID_ASSET_KIND", [{ field: "kind", code: "INVALID_ASSET_KIND" }]);
-  const fileDisposition = headerValue(file.headers, "content-disposition");
-  const fileName = fields.get("filename")?.bytes.toString("utf8").trim() ||
-    fileDisposition.match(/(?:^|;)\s*filename="([^"]*)"/i)?.[1] || "asset";
-  return { fileName, mimeType: headerValue(file.headers, "content-type"), kind, bytes: file.bytes };
+  const suppliedFileName = fields.get("filename") ? decodeField(fields.get("filename")!).trim() : "";
+  const fileName = suppliedFileName || file.fileName || "asset";
+  return { fileName, mimeType: file.mimeType, kind, bytes: Buffer.concat(file.chunks, file.size) };
 }
 
 function serviceForRequest(): WorkflowService {

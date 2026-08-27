@@ -49,6 +49,7 @@ export type WorkflowServiceOptions = {
   workerId?: string;
   processId?: number;
   isProcessAlive?: (processId: number) => boolean;
+  onProviderDispatchPhase?: S2WorkflowServiceOptions["onProviderDispatchPhase"];
   onPublicationPhase?: S2WorkflowServiceOptions["onPublicationPhase"];
 };
 
@@ -184,6 +185,7 @@ export class WorkflowService {
       workerId: this.workerId,
       processId: this.processId,
       isProcessAlive: this.isProcessAlive,
+      onProviderDispatchPhase: options.onProviderDispatchPhase,
       onPublicationPhase: options.onPublicationPhase,
     });
   }

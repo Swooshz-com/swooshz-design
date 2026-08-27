@@ -13,7 +13,7 @@
   "dependencies": {
     "fs-ext-extra-prebuilt": "2.2.13",
     "next": "16.3.2",
-    "pdfjs-dist": "6.1.200",
+    "pdfjs-dist": "6.2.108",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "sharp": "0.35.3"

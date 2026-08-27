@@ -42,7 +42,12 @@ import {
 import { S2_QA_MODEL, S2_QA_SCHEMA, type S2ProviderContract, type S2QaProviderInput } from "./s2-provider";
 import { ProviderFailure } from "./openai";
 
-export type S2PublicationPhase = "after-publication-staged" | "after-final-promotion";
+export type S2PublicationPhase =
+  | "before-publication-intent"
+  | "after-publication-intent"
+  | "after-publication-staged"
+  | "after-final-promotion";
+export type S2DispatchPhase = "before-dispatch" | "after-dispatch-marked";
 export type S2WorkflowServiceOptions = {
   repository: JsonRepository;
   objects: PrivateObjectStore;
@@ -52,6 +57,7 @@ export type S2WorkflowServiceOptions = {
   workerId?: string;
   processId?: number;
   isProcessAlive?: (processId: number) => boolean;
+  onProviderDispatchPhase?: (phase: S2DispatchPhase, operation: S2Operation) => "interrupt" | void | Promise<"interrupt" | void>;
   onPublicationPhase?: (phase: S2PublicationPhase, publication: S2Publication) => "interrupt" | void | Promise<"interrupt" | void>;
 };
 export type S2PublicAsset = {
@@ -107,8 +113,8 @@ const REPAIR_OBJECTIVES: Readonly<Record<string, string>> = {
 function fail(status: number, code: string, field = "request"): AppError {
   return new AppError(status, code, [{ field, code }]);
 }
-function operationHash(operation: string, projectId: UUID, value: unknown): Sha256 {
-  return sha256(jcs({ operation, projectId, value }));
+export function operationInputHash(operation: string, projectId: UUID, input: unknown): Sha256 {
+  return sha256(jcs({ operation, projectId, input }));
 }
 function terminal(status: string): boolean {
   return ["pass", "warning", "material_fail", "qa_unavailable_retryable", "qa_unavailable_terminal"].includes(status);
@@ -185,6 +191,55 @@ function rulesFor(geometry: BoothGeometry): S2DesignRuleSnapshot[] {
 }
 function orderedFindings(ids: readonly string[]): string[] {
   return Array.from(new Set(ids)).sort((a, b) => a.localeCompare(b));
+}
+
+export type RepairAssetProjection = {
+  assetId: UUID;
+  normalizedSha256: Sha256;
+  width: number;
+  height: number;
+  normalizedBytes: number;
+  slot: number;
+};
+
+function repairAssetProjection(asset: S2AssetRecord, slot: number): RepairAssetProjection {
+  return {
+    assetId: asset.id,
+    normalizedSha256: asset.normalizedSha256,
+    width: asset.width,
+    height: asset.height,
+    normalizedBytes: asset.normalizedBytes,
+    slot,
+  };
+}
+
+export function canonicalRepairInputHash(
+  input: S2InputVersion,
+  source: S2CandidateSource,
+  orderedFindingIds: readonly string[],
+  referenceAssets: readonly RepairAssetProjection[],
+  logoAssets: readonly RepairAssetProjection[],
+): Sha256 {
+  return sha256(jcs({
+    schemaVersion: "s2-repair-v1",
+    inputVersionId: input.id,
+    qaRunId: input.qaRunId,
+    candidateId: source.candidateId,
+    sourceAssetId: source.sourceAssetId,
+    sourceSha256: source.sourceSha256,
+    sourceByteSize: source.sourceByteSize,
+    sourceWidth: source.sourceWidth,
+    sourceHeight: source.sourceHeight,
+    sourcePixelCount: source.sourcePixelCount,
+    sourceDecodedRgbaBytes: source.sourceDecodedRgbaBytes,
+    bindingHash: input.bindingHash,
+    orderedFindingIds,
+    referenceAssets,
+    logoAssets,
+    confirmedBriefContentHash: input.confirmedBriefContentHash,
+    geometryHash: input.geometryHash,
+    attempt: 1,
+  }));
 }
 function publicAsset(asset: S2AssetRecord): S2PublicAsset {
   return { id: asset.id, projectId: asset.projectId, kind: asset.kind, status: asset.status,
@@ -309,6 +364,7 @@ export class S2WorkflowService {
   private readonly workerId: string;
   private readonly processId: number;
   private readonly isProcessAlive: (processId: number) => boolean;
+  private readonly onProviderDispatchPhase: S2WorkflowServiceOptions["onProviderDispatchPhase"];
   private readonly onPublicationPhase: S2WorkflowServiceOptions["onPublicationPhase"];
   private readonly inFlight = new Set<UUID>();
 
@@ -325,6 +381,7 @@ export class S2WorkflowService {
         return (error as NodeJS.ErrnoException).code !== "ESRCH";
       }
     });
+    this.onProviderDispatchPhase = options.onProviderDispatchPhase;
     this.onPublicationPhase = options.onPublicationPhase;
     this.recoverPublications();
     this.recoverOperations();
@@ -362,6 +419,9 @@ export class S2WorkflowService {
   private async notify(phase: S2PublicationPhase, publication: S2Publication): Promise<void> {
     if ((await this.onPublicationPhase?.(phase, cloneJson(publication))) === "interrupt") throw new ProcessInterruption();
   }
+  private async notifyDispatch(phase: S2DispatchPhase, operation: S2Operation): Promise<void> {
+    if ((await this.onProviderDispatchPhase?.(phase, cloneJson(operation))) === "interrupt") throw new ProcessInterruption();
+  }
   private markPublication(id: UUID, stateValue: "promoted" | "committed" | "aborted"): void {
     this.repository.transact((state) => {
       const publication = state.s2Publications.find((item) => item.id === id);
@@ -387,10 +447,23 @@ export class S2WorkflowService {
         const repair = state.s2Repairs.find((item) => item.id === stored.repairAttemptId);
         if (repair && repair.derivedCandidateId === null) { repair.status = "failed"; repair.completedAt = this.clock(); }
         if (operation && operation.status !== "succeeded") {
-          operation.status = "failed"; operation.failureCode = "PERSISTENCE_FAILED"; operation.completedAt = this.clock(); this.clearClaim(operation);
+          operation.status = "failed"; operation.providerDispatchState = "consumed";
+          operation.failureCode = "PERSISTENCE_FAILED"; operation.completedAt = this.clock(); this.clearClaim(operation);
         }
       }
       stored.state = "aborted"; stored.updatedAt = this.clock();
+    });
+  }
+  private abortRepairPublicationIfOwned(publicationId: UUID, operationId: UUID, token: UUID): boolean {
+    return this.repository.transact((state) => {
+      const publication = state.s2Publications.find((item) => item.id === publicationId);
+      const operation = state.s2Operations.find((item) => item.id === operationId);
+      if (!publication || publication.kind !== "repair_output" ||
+          publication.state === "committed" || publication.state === "aborted" ||
+          !operation || !this.claimMatches(operation, token)) return false;
+      publication.state = "aborted";
+      publication.updatedAt = this.clock();
+      return true;
     });
   }
 
@@ -403,6 +476,128 @@ export class S2WorkflowService {
   private claimMatches(operation: S2Operation, token: UUID): boolean {
     return operation.status === "running" && operation.claimToken === token &&
       operation.claimedBy === this.workerId && operation.claimedProcessId === this.processId;
+  }
+  private operationInputMatches(state: StoreState, operation: S2Operation): boolean {
+    const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
+    if (!run) return false;
+    if (operation.phase === "qa" || operation.phase === "re_qa") {
+      const input = state.s2Inputs.find((item) => item.id === run.inputVersionId);
+      return input?.inputHash === operation.inputHash;
+    }
+    const repair = operation.repairAttemptId
+      ? state.s2Repairs.find((item) => item.id === operation.repairAttemptId)
+      : undefined;
+    return repair !== undefined &&
+      operation.inputHash === operationInputHash("s2_repair", operation.projectId, {
+        qaRunId: operation.qaRunId,
+        candidateId: operation.candidateId,
+        expectedInputVersionId: repair.inputVersionId,
+        eligibleFindingIds: repair.eligibleFindingIds,
+      });
+  }
+  private beginProviderDispatch(operationId: UUID, token: UUID): S2Operation | null {
+    return this.repository.transact((state) => {
+      const operation = state.s2Operations.find((item) => item.id === operationId);
+      if (!operation || !this.claimMatches(operation, token)) return null;
+      if (operation.providerDispatchState !== "not_started") return null;
+      if (!this.operationInputMatches(state, operation)) throw fail(409, "STATE_CONFLICT");
+      operation.providerDispatchState = "may_have_started";
+      return cloneJson(operation);
+    });
+  }
+  private requeueUnstartedOperation(state: StoreState, operation: S2Operation): void {
+    operation.status = "queued";
+    operation.startedAt = null;
+    operation.completedAt = null;
+    this.clearClaim(operation);
+    const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
+    if (run) {
+      run.status = "queued";
+      run.completedAt = null;
+      if (operation.phase === "qa") {
+        const result = run.candidateResults.find((item) => item.id === operation.resultId);
+        if (result) {
+          result.status = "queued";
+          result.startedAt = null;
+          result.completedAt = null;
+          result.providerRequestId = null;
+        }
+      }
+    }
+    if (operation.phase === "repair" && operation.repairAttemptId) {
+      const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
+      if (repair) {
+        repair.status = "queued";
+        repair.startedAt = null;
+        repair.completedAt = null;
+        repair.providerRequestId = null;
+      }
+    }
+    if (operation.phase === "re_qa" && operation.repairAttemptId) {
+      const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
+      const result = state.s2ReQaResults.find((item) => item.id === operation.resultId);
+      if (repair) repair.status = "derived_ready";
+      if (result) {
+        result.status = "queued";
+        result.startedAt = null;
+        result.completedAt = null;
+        result.providerRequestId = null;
+      }
+    }
+  }
+  private resolveAmbiguousOperation(state: StoreState, operation: S2Operation): void {
+    const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
+    if (operation.phase === "qa") {
+      const result = run?.candidateResults.find((item) => item.id === operation.resultId);
+      if (result) {
+        result.status = operation.attempt === 1 ? "qa_unavailable_retryable" : "qa_unavailable_terminal";
+        result.verdict = "QA_UNAVAILABLE";
+        result.requirementObservations = [];
+        result.designObservations = [];
+        result.materialFindingIds = [];
+        result.warningFindingIds = [];
+        result.uncertainFindingIds = [];
+        result.providerRequestId = null;
+        result.completedAt = this.clock();
+      }
+      if (run) this.recompute(run);
+      operation.failureCode = "PROVIDER_UNAVAILABLE";
+    } else if (operation.phase === "repair") {
+      const repair = operation.repairAttemptId
+        ? state.s2Repairs.find((item) => item.id === operation.repairAttemptId)
+        : undefined;
+      if (repair) {
+        repair.status = "failed";
+        repair.providerRequestId = null;
+        repair.completedAt = this.clock();
+      }
+      operation.failureCode = "REPAIR_PROVIDER_FAILED";
+    } else {
+      const result = state.s2ReQaResults.find((item) => item.id === operation.resultId);
+      const repair = operation.repairAttemptId
+        ? state.s2Repairs.find((item) => item.id === operation.repairAttemptId)
+        : undefined;
+      if (result) {
+        result.status = "re_qa_unavailable";
+        result.verdict = "QA_UNAVAILABLE";
+        result.requirementObservations = [];
+        result.designObservations = [];
+        result.materialFindingIds = [];
+        result.warningFindingIds = [];
+        result.uncertainFindingIds = [];
+        result.providerRequestId = null;
+        result.completedAt = this.clock();
+      }
+      if (repair) {
+        repair.status = "re_qa_unavailable";
+        repair.completedAt = this.clock();
+      }
+      operation.failureCode = "RE_QA_UNAVAILABLE";
+    }
+    operation.providerDispatchState = "consumed";
+    operation.status = "failed";
+    operation.completedAt = this.clock();
+    this.clearClaim(operation);
   }
   private commitRepairPublication(state: StoreState, publication: S2RepairPublication): void {
     if (!state.s2DerivedCandidates.some((item) => item.id === publication.intendedDerived.id)) {
@@ -422,7 +617,7 @@ export class S2WorkflowService {
     }
     const operation = state.s2Operations.find((item) => item.id === publication.operationId);
     if (operation) {
-      operation.status = "succeeded"; operation.completedAt = this.clock(); this.clearClaim(operation);
+      operation.status = "succeeded"; operation.providerDispatchState = "consumed"; operation.completedAt = this.clock(); this.clearClaim(operation);
       this.transition(state, operation.projectId, operation.id, operation.phase, operation.attempt, "running", "derived_ready", operation.referenceId);
       this.transition(state, operation.projectId, publication.intendedReQaOperation.id, "re_qa", 1, "derived_ready", "queued", operation.referenceId);
     }
@@ -444,8 +639,7 @@ export class S2WorkflowService {
           });
         }
         if (!publication.finalObjects.every((item) => this.objectMatches(item))) {
-          const ownedFinalKeys = publication.finalObjects.filter((item) => this.objectMatches(item)).map((item) => item.key);
-          this.cleanup(publication, ownedFinalKeys); this.abortPublication(publication); continue;
+          this.cleanup(publication); this.abortPublication(publication); continue;
         }
         this.repository.transact((state) => {
           const stored = state.s2Publications.find((item) => item.id === publication.id);
@@ -472,9 +666,17 @@ export class S2WorkflowService {
           let live = true;
           try { live = this.isProcessAlive(operation.claimedProcessId); } catch { live = true; }
           if (live) continue;
-          operation.status = "queued"; operation.startedAt = null; operation.completedAt = null; this.clearClaim(operation);
+          if (operation.providerDispatchState === "not_started") {
+            this.requeueUnstartedOperation(state, operation);
+          } else {
+            this.resolveAmbiguousOperation(state, operation);
+          }
         }
-        if (operation.status === "queued") result.push(operation.id);
+        if (operation.status === "queued" && operation.providerDispatchState === "not_started") {
+          result.push(operation.id);
+        } else if (operation.status === "queued" && operation.providerDispatchState === "may_have_started") {
+          this.resolveAmbiguousOperation(state, operation);
+        }
       }
       return result;
     });
@@ -494,7 +696,7 @@ export class S2WorkflowService {
     const before = this.state(); this.project(before, projectId);
     if (before.s2Drafts.find((item) => item.projectId === projectId)?.status === "frozen") throw fail(409, "DRAFT_FROZEN");
     const media = await normalizeS2Media({ kind, fileName, mimeType, bytes, maxInputBytes: 8_388_608 });
-    const inputHash = operationHash("s2_asset_upload", projectId, { kind, originalSha256: media.originalSha256, originalBytes: media.originalBytes.byteLength });
+    const inputHash = operationInputHash("s2_asset_upload", projectId, { kind, originalSha256: media.originalSha256, originalBytes: media.originalBytes.byteLength });
     const replayId = this.repository.transact((state) => {
       this.project(state, projectId);
       if (this.draft(state, projectId, true).status === "frozen") throw fail(409, "DRAFT_FROZEN");
@@ -507,8 +709,8 @@ export class S2WorkflowService {
       return { asset: publicAsset(asset), draft: publicDraft(state, this.draft(state, projectId, false)), replayed: true };
     }
     const assetId = this.uuid();
-    const stagedOriginal = privateStorageKey("projects", projectId, "s2", "staging", assetId, "original");
-    const stagedNormalized = privateStorageKey("projects", projectId, "s2", "staging", assetId, "normalized.png");
+    const stagedOriginal = privateStorageKey("projects", projectId, "s2", "staging", "reference-assets", assetId, "original");
+    const stagedNormalized = privateStorageKey("projects", projectId, "s2", "staging", "reference-assets", assetId, "normalized.png");
     const finalOriginal = privateStorageKey("projects", projectId, "s2", "references", assetId, "original");
     const finalNormalized = privateStorageKey("projects", projectId, "s2", "references", assetId, "normalized.png");
     const intended: S2AssetRecord = { id: assetId, projectId, kind, status: "ready",
@@ -562,9 +764,9 @@ export class S2WorkflowService {
         typeof expectedRevision !== "number" || !Number.isInteger(expectedRevision) || expectedRevision < 1) throw fail(400, "INVALID_REQUEST");
     const refs = referenceAssetIds.map((id) => { assertUuid(id, "referenceAssetIds"); return id; });
     const logos = logoAssetIds.map((id) => { assertUuid(id, "logoAssetIds"); return id; });
-    const inputHash = operationHash("s2_draft_update", projectId, { expectedRevision, referenceAssetIds: refs, logoAssetIds: logos });
     const result = this.repository.transact((state) => {
       this.project(state, projectId); const draft = this.draft(state, projectId, true);
+      const inputHash = operationInputHash("s2_draft_update", projectId, { draftId: draft.id, expectedRevision, referenceAssetIds: refs, logoAssetIds: logos });
       if (draft.status === "frozen") throw fail(409, "DRAFT_FROZEN");
       if (this.idem(state, key, "s2_draft_update", projectId, inputHash)) return { draft: cloneJson(draft), replayed: true };
       if (draft.revision !== expectedRevision) throw fail(409, "DRAFT_REVISION_CONFLICT");
@@ -659,7 +861,7 @@ export class S2WorkflowService {
         qaModel: S2_QA_MODEL, qaSchema: S2_QA_SCHEMA, referenceAssets, logoAssets }));
       const bindingHash = sha256(jcs({ schemaVersion: "s2-binding-v1", projectId, sourceGenerationSetId,
         draftRevision: draft.revision, inputHash, sourceCandidates: sources.map(sourceProjection), referenceAssets, logoAssets }));
-      const idemHash = operationHash("s2_bind", projectId, { sourceGenerationSetId, expectedDraftRevision, bindingHash });
+      const idemHash = operationInputHash("s2_bind", projectId, { sourceGenerationSetId, expectedDraftRevision, bindingHash });
       const replay = this.idem(state, key, "s2_bind", projectId, idemHash);
       if (replay) {
         const run = state.s2QaRuns.find((item) => item.id === String(replay.result.qaRunId));
@@ -693,7 +895,7 @@ export class S2WorkflowService {
         const operationId = this.uuid(); operationIds.push(operationId);
         state.s2Operations.push({ id: operationId, projectId, phase: "qa", attempt: 1, qaRunId, candidateId: item.candidateId,
           repairAttemptId: null, inputHash, referenceId, status: "queued", claimedBy: null, claimedProcessId: null, claimToken: null,
-          claimedAt: null, startedAt: null, completedAt: null, failureCode: null, resultId: item.id });
+          claimedAt: null, startedAt: null, completedAt: null, providerDispatchState: "not_started", failureCode: null, resultId: item.id });
         this.transition(state, projectId, operationId, "qa", 1, "none", "queued", referenceId);
       }
       this.remember(state, key, "s2_bind", projectId, idemHash, { inputVersionId, qaRunId, operationIds });
@@ -725,9 +927,32 @@ export class S2WorkflowService {
     const input = this.inputFor(state, run);
     const latest = Array.from(new Set(run.candidateResults.map((item) => item.candidateId))).map((id) => this.latest(run, id))
       .sort((a, b) => a.candidateIndex - b.candidateIndex);
-    return { qaRun: { ...cloneJson(run), candidateResults: cloneJson(latest), candidateAttempts: cloneJson(run.candidateResults),
-      repairs: cloneJson(state.s2Repairs.filter((item) => item.qaRunId === run.id)), reQa: cloneJson(state.s2ReQaResults.filter((item) => item.qaRunId === run.id)) },
-      input: { ...cloneJson(input), sourceCandidates: input.sourceCandidates.map(sourceProjection) } };
+    const repairs = state.s2Repairs.filter((item) => item.qaRunId === run.id);
+    const candidates = latest.map((candidate) => {
+      const eligibleFindingIds = this.eligibleFindings(candidate, input);
+      const hasRepair = repairs.some((repair) => repair.candidateId === candidate.candidateId);
+      return {
+        ...cloneJson(candidate),
+        repairEligible: eligibleFindingIds !== null && !hasRepair,
+        eligibleRepairFindingIds: eligibleFindingIds ?? [],
+      };
+    });
+    const unavailableCount = candidates.filter((item) =>
+      item.status === "qa_unavailable_retryable" || item.status === "qa_unavailable_terminal").length;
+    const summary = {
+      kind: run.status !== "completed"
+        ? "processing"
+        : unavailableCount === candidates.length
+          ? "all_results_unavailable"
+          : unavailableCount > 0
+            ? "results_include_unavailable"
+            : "results_available",
+      resultCount: candidates.filter((item) => terminal(item.status)).length,
+      unavailableCount,
+    };
+    return { qaRun: { ...cloneJson(run), candidateResults: cloneJson(candidates), candidateAttempts: cloneJson(run.candidateResults),
+      repairs: cloneJson(repairs), reQa: cloneJson(state.s2ReQaResults.filter((item) => item.qaRunId === run.id)),
+      summary }, input: { ...cloneJson(input), sourceCandidates: input.sourceCandidates.map(sourceProjection) } };
   }
   getQaRun(projectId: UUID, qaRunId: UUID): Record<string, unknown> {
     const state = this.state(); this.project(state, projectId);
@@ -806,6 +1031,10 @@ export class S2WorkflowService {
       if (!run) throw fail(500, "PERSISTENCE_FAILED");
       const input = this.inputFor(state, run); const bytes = this.sourceBytes(input, claim.operation.candidateId);
       if (!this.provider.runS2Qa) throw new ProviderFailure("PROVIDER_NOT_CONFIGURED");
+      await this.notifyDispatch("before-dispatch", claim.operation);
+      const dispatched = this.beginProviderDispatch(operationId, claim.token);
+      if (!dispatched) return;
+      await this.notifyDispatch("after-dispatch-marked", dispatched);
       const response = await this.provider.runS2Qa(this.qaInput(input, claim.operation.candidateId, bytes));
       const value = evaluate(validateProvider(response.payload, input), input);
       this.repository.transact((current) => {
@@ -817,9 +1046,12 @@ export class S2WorkflowService {
         result.verdict = value.verdict; result.requirementObservations = value.requirements; result.designObservations = value.designRules;
         result.materialFindingIds = value.material; result.warningFindingIds = value.warning; result.uncertainFindingIds = value.uncertain;
         result.providerRequestId = safeRequestId(response.providerRequestId); result.completedAt = this.clock();
-        operation.status = "succeeded"; operation.completedAt = this.clock(); this.clearClaim(operation); this.recompute(currentRun);
+        operation.status = "succeeded"; operation.providerDispatchState = "consumed"; operation.completedAt = this.clock(); this.clearClaim(operation); this.recompute(currentRun);
       });
-    } catch (error) { this.failQa(operationId, claim.token, error); }
+    } catch (error) {
+      if (error instanceof ProcessInterruption) throw error;
+      this.failQa(operationId, claim.token, error);
+    }
   }
   private failQa(operationId: UUID, token: UUID, error: unknown): void {
     try {
@@ -831,7 +1063,7 @@ export class S2WorkflowService {
         const canRetry = retryable(error) && operation.attempt === 1;
         result.status = canRetry ? "qa_unavailable_retryable" : "qa_unavailable_terminal";
         result.verdict = "QA_UNAVAILABLE"; result.completedAt = this.clock();
-        operation.status = "failed"; operation.failureCode = error instanceof ProviderFailure ? error.safeCode : error instanceof AppError ? error.code : "QA_PROVIDER_FAILED";
+        operation.status = "failed"; operation.providerDispatchState = "consumed"; operation.failureCode = error instanceof ProviderFailure ? error.safeCode : error instanceof AppError ? error.code : "QA_PROVIDER_FAILED";
         operation.completedAt = this.clock(); this.clearClaim(operation); this.recompute(run);
       });
     } catch { /* retain conservative durable state */ }
@@ -841,7 +1073,7 @@ export class S2WorkflowService {
       this.project(state, projectId); const run = state.s2QaRuns.find((item) => item.id === qaRunId);
       if (!run || run.projectId !== projectId) throw fail(404, "QA_NOT_FOUND");
       const current = this.latest(run, candidateId);
-      const inputHash = operationHash("s2_qa_retry", projectId, { qaRunId, candidateId, expectedAttempt: 1 });
+      const inputHash = operationInputHash("s2_qa_retry", projectId, { qaRunId, candidateId, expectedAttempt: 1 });
       if (this.idem(state, key, "s2_qa_retry", projectId, inputHash)) return { replayed: true };
       if (current.status !== "qa_unavailable_retryable") throw fail(409, run.candidateResults.some((item) => item.candidateId === candidateId && item.attempt === 2) ? "QA_RETRY_EXHAUSTED" : "QA_NOT_RETRYABLE");
       const input = this.inputFor(state, run); const source = input.sourceCandidates.find((item) => item.candidateId === candidateId);
@@ -852,7 +1084,7 @@ export class S2WorkflowService {
       const operationId = this.uuid(); run.candidateResults.push(retryResult); run.status = "queued"; run.completedAt = null;
       state.s2Operations.push({ id: operationId, projectId, phase: "qa", attempt: 2, qaRunId, candidateId, repairAttemptId: null,
         inputHash: input.inputHash, referenceId, status: "queued", claimedBy: null, claimedProcessId: null, claimToken: null,
-        claimedAt: null, startedAt: null, completedAt: null, failureCode: null, resultId: retryResult.id });
+        claimedAt: null, startedAt: null, completedAt: null, providerDispatchState: "not_started", failureCode: null, resultId: retryResult.id });
       this.remember(state, key, "s2_qa_retry", projectId, inputHash, { qaRunId, candidateId, operationId, resultId: retryResult.id });
       return { replayed: false };
     });
@@ -863,9 +1095,9 @@ export class S2WorkflowService {
     return { ...this.getQaRun(projectId, qaRunId), replayed: result.replayed };
   }
 
-  private eligible(result: S2QaCandidateResult, input: S2InputVersion): string[] {
+  private eligibleFindings(result: S2QaCandidateResult, input: S2InputVersion): string[] | null {
     if (result.status !== "material_fail" || result.verdict !== "MATERIAL_FAIL" || result.uncertainFindingIds.length ||
-        result.materialFindingIds.length < 1 || result.materialFindingIds.length > 3) throw fail(409, "REPAIR_NOT_ELIGIBLE");
+        result.materialFindingIds.length < 1 || result.materialFindingIds.length > 3) return null;
     const ids = orderedFindings(result.materialFindingIds);
     const rules = new Map(input.designRuleSnapshot.map((item) => [item.ruleId, item]));
     const requirements = new Map(input.canonicalRequirements.map((item) => [item.requirementId, item]));
@@ -874,23 +1106,38 @@ export class S2WorkflowService {
       return (rule && (!rule.repairable || rule.applicability !== "applicable")) ||
         (requirement && requirement.criticality !== "material") || (!rule && !requirement) ||
         (!rule && !/^brief\.(functional|mandatory)\.\d{3}$/.test(id));
-    })) throw fail(409, "REPAIR_NOT_ELIGIBLE");
-    if (ids.filter((id) => /^brief\.(functional|mandatory)\.\d{3}$/.test(id)).length > 1) throw fail(409, "REPAIR_NOT_ELIGIBLE");
+    })) return null;
+    if (ids.filter((id) => /^brief\.(functional|mandatory)\.\d{3}$/.test(id)).length > 1) return null;
     return ids;
   }
-  private repairImages(state: StoreState, input: S2InputVersion, candidateId: UUID): { images: Buffer[]; manifestHash: Sha256; manifest: Record<string, unknown>[] } {
+  private eligible(result: S2QaCandidateResult, input: S2InputVersion): string[] {
+    const ids = this.eligibleFindings(result, input);
+    if (!ids) throw fail(409, "REPAIR_NOT_ELIGIBLE");
+    return ids;
+  }
+  private repairImages(state: StoreState, input: S2InputVersion, candidateId: UUID): {
+    images: Buffer[];
+    manifestHash: Sha256;
+    manifest: Record<string, unknown>[];
+    referenceAssets: RepairAssetProjection[];
+    logoAssets: RepairAssetProjection[];
+  } {
     const source = input.sourceCandidates.find((item) => item.candidateId === candidateId);
     if (!source) throw fail(409, "QA_BINDING_CONFLICT");
     const images = [this.sourceBytes(input, candidateId)];
     const measures = [{ encodedBytes: source.sourceByteSize, width: source.sourceWidth, height: source.sourceHeight,
       pixelCount: source.sourcePixelCount, decodedRgbaBytes: source.sourceDecodedRgbaBytes }];
     const manifest: Record<string, unknown>[] = [];
+    const referenceAssets: RepairAssetProjection[] = [];
+    const logoAssets: RepairAssetProjection[] = [];
     for (const [kind, ids] of [["reference", input.referenceAssetIds], ["logo", input.logoAssetIds]] as const) {
       ids.forEach((id, slot) => {
         const asset = state.s2Assets.find((item) => item.id === id);
         if (!asset || asset.kind !== kind || asset.status !== "ready") throw fail(409, "QA_BINDING_CONFLICT");
         const bytes = this.objects.read(asset.storageKeyNormalized);
         if (bytes.byteLength !== asset.normalizedBytes || sha256(bytes) !== asset.normalizedSha256) throw fail(409, "QA_BINDING_CONFLICT");
+        const projection = repairAssetProjection(asset, slot + 1);
+        (kind === "reference" ? referenceAssets : logoAssets).push(projection);
         manifest.push({ kind, assetId: id, slot: slot + 1, normalizedSha256: asset.normalizedSha256,
           width: asset.width, height: asset.height, normalizedBytes: asset.normalizedBytes });
         images.push(bytes); measures.push({ ...s2NormalizedMeasure({ normalizedBytes: bytes, width: asset.width, height: asset.height }), encodedBytes: bytes.byteLength });
@@ -898,7 +1145,7 @@ export class S2WorkflowService {
     }
     if (images.length > S2_MAX_REPAIR_IMAGES) throw fail(422, "MEDIA_AGGREGATE_LIMIT_EXCEEDED");
     enforceS2AggregateLimits(measures, "assets", S2_MAX_REPAIR_IMAGES);
-    return { images, manifestHash: sha256(jcs(manifest)), manifest };
+    return { images, manifestHash: sha256(jcs(manifest)), manifest, referenceAssets, logoAssets };
   }
   private repairPrompt(input: S2InputVersion, source: S2CandidateSource, findings: readonly string[], manifestHash: Sha256, manifest: readonly Record<string, unknown>[]): string {
     const confirmedBrief = input.canonicalRequirements.filter((item) => item.source === "confirmed_brief");
@@ -927,22 +1174,25 @@ export class S2WorkflowService {
       if (run.inputVersionId !== expectedInputVersionId) throw fail(409, "QA_BINDING_CONFLICT");
       const input = this.inputFor(state, run); const current = this.latest(run, candidateId); const findings = this.eligible(current, input);
       const images = this.repairImages(state, input, candidateId);
-      const inputHash = operationHash("s2_repair", projectId, { qaRunId, candidateId, expectedInputVersionId, findings, manifestHash: images.manifestHash });
-      if (this.idem(state, key, "s2_repair", projectId, inputHash)) return { replayed: true };
-      if (state.s2Repairs.some((item) => item.qaRunId === qaRunId && item.candidateId === candidateId)) throw fail(409, "REPAIR_ALREADY_EXISTS");
       const source = input.sourceCandidates.find((item) => item.candidateId === candidateId);
       if (!source) throw fail(409, "QA_BINDING_CONFLICT");
+      const operationHash = operationInputHash("s2_repair", projectId, {
+        qaRunId, candidateId, expectedInputVersionId, eligibleFindingIds: findings,
+      });
+      if (this.idem(state, key, "s2_repair", projectId, operationHash)) return { replayed: true };
+      if (state.s2Repairs.some((item) => item.qaRunId === qaRunId && item.candidateId === candidateId)) throw fail(409, "REPAIR_ALREADY_EXISTS");
+      const repairHash = canonicalRepairInputHash(input, source, findings, images.referenceAssets, images.logoAssets);
       const prompt = this.repairPrompt(input, source, findings, images.manifestHash, images.manifest);
       const repairId = this.uuid(); const operationId = this.uuid();
       const repair: S2RepairAttempt = { id: repairId, projectId, qaRunId, inputVersionId: input.id, candidateId, attempt: 1,
         status: "queued", eligibleFindingIds: findings, sourceAssetId: source.sourceAssetId, sourceByteSize: source.sourceByteSize,
-        sourceSha256: source.sourceSha256, repairInputHash: inputHash, repairPromptHash: sha256(prompt), outputSha256: null,
+        sourceSha256: source.sourceSha256, repairInputHash: repairHash, repairPromptHash: sha256(prompt), outputSha256: null,
         derivedCandidateId: null, reQaCandidateResultId: null, providerRequestId: null, createdAt: this.clock(), startedAt: null, completedAt: null };
       current.repairAttemptId = repairId; state.s2Repairs.push(repair);
       state.s2Operations.push({ id: operationId, projectId, phase: "repair", attempt: 1, qaRunId, candidateId,
-        repairAttemptId: repairId, inputHash, referenceId, status: "queued", claimedBy: null, claimedProcessId: null,
-        claimToken: null, claimedAt: null, startedAt: null, completedAt: null, failureCode: null, resultId: null });
-      this.remember(state, key, "s2_repair", projectId, inputHash, { repairAttemptId: repairId, operationId });
+        repairAttemptId: repairId, inputHash: operationHash, referenceId, status: "queued", claimedBy: null, claimedProcessId: null,
+        claimToken: null, claimedAt: null, startedAt: null, completedAt: null, providerDispatchState: "not_started", failureCode: null, resultId: null });
+      this.remember(state, key, "s2_repair", projectId, operationHash, { repairAttemptId: repairId, operationId });
       return { replayed: false };
     });
     if (!result.replayed) {
@@ -954,7 +1204,8 @@ export class S2WorkflowService {
 
   private async runRepair(operationId: UUID): Promise<void> {
     const claim = this.claim(operationId); if (!claim) return;
-    let publication: S2RepairPublication | null = null; let staged: string | null = null; const promotedFinalKeys: string[] = [];
+    let publication: S2RepairPublication | null = null;
+    let staged: string | null = null;
     try {
       const state = this.state(); const operation = claim.operation;
       const repair = state.s2Repairs.find((item) => item.id === operation.repairAttemptId);
@@ -964,13 +1215,19 @@ export class S2WorkflowService {
       const source = input.sourceCandidates.find((item) => item.candidateId === operation.candidateId);
       if (!source) throw fail(409, "QA_BINDING_CONFLICT");
       if (!this.provider.runS2Repair) throw new ProviderFailure("PROVIDER_NOT_CONFIGURED");
-      const response = await this.provider.runS2Repair({ promptText: this.repairPrompt(input, source, repair.eligibleFindingIds, images.manifestHash, images.manifest), images: images.images });
+      await this.notifyDispatch("before-dispatch", claim.operation);
+      const dispatched = this.beginProviderDispatch(operationId, claim.token);
+      if (!dispatched) return;
+      await this.notifyDispatch("after-dispatch-marked", dispatched);
+      const response = await this.provider.runS2Repair({
+        promptText: this.repairPrompt(input, source, repair.eligibleFindingIds, images.manifestHash, images.manifest),
+        images: images.images,
+      });
       assertS2Png(response.pngBytes, S2_MAX_REPAIR_OUTPUT_BYTES);
       const normalized = await normalizeS2Media({ kind: "reference", fileName: "provider-output.png", mimeType: "image/png",
         bytes: response.pngBytes, maxInputBytes: S2_MAX_REPAIR_OUTPUT_BYTES });
-      staged = privateStorageKey("projects", operation.projectId, "s2", "repairs", repair.id, "staged.png");
+      staged = privateStorageKey("projects", operation.projectId, "s2", "repairs", repair.id, "staged", "provider-output.png");
       const finalKey = privateStorageKey("projects", operation.projectId, "s2", "repairs", repair.id, "output.png");
-      this.objects.put(staged, normalized.normalizedBytes); this.verify(staged, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
       const derived: S2DerivedCandidate = { id: this.uuid(), projectId: operation.projectId, sourceGenerationSetId: input.sourceGenerationSetId,
         inputVersionId: input.id, qaRunId: run.id, sourceCandidateId: source.candidateId, repairAttemptId: repair.id,
         sourceAssetId: source.sourceAssetId, sourceByteSize: source.sourceByteSize, sourceSha256: source.sourceSha256,
@@ -985,21 +1242,27 @@ export class S2WorkflowService {
       const reQaOperation: S2Operation = { id: reQaOperationId, projectId: operation.projectId, phase: "re_qa", attempt: 1,
         qaRunId: run.id, candidateId: source.candidateId, repairAttemptId: repair.id, inputHash: input.inputHash,
         referenceId: operation.referenceId, status: "queued", claimedBy: null, claimedProcessId: null, claimToken: null,
-        claimedAt: null, startedAt: null, completedAt: null, failureCode: null, resultId: reQaId };
+        claimedAt: null, startedAt: null, completedAt: null, providerDispatchState: "not_started", failureCode: null, resultId: reQaId };
       publication = { kind: "repair_output", id: this.uuid(), projectId: operation.projectId, operationId,
-        repairAttemptId: repair.id, qaRunId: run.id, candidateId: source.candidateId, inputVersionId: input.id, inputHash: input.inputHash,
+        repairAttemptId: repair.id, qaRunId: run.id, candidateId: source.candidateId, inputVersionId: input.id, inputHash: operation.inputHash,
         stagingObjects: [{ key: staged, sha256: normalized.normalizedSha256, byteSize: normalized.normalizedBytes.byteLength }],
         finalObjects: [{ key: finalKey, sha256: normalized.normalizedSha256, byteSize: normalized.normalizedBytes.byteLength }],
         intendedDerived: derived, intendedReQa: reQa, intendedReQaOperation: reQaOperation,
         providerRequestId: safeRequestId(response.providerRequestId), state: "staged", createdAt: this.clock(), updatedAt: this.clock() };
+      await this.notify("before-publication-intent", publication);
       this.repository.transact((current) => {
         const stored = current.s2Operations.find((item) => item.id === operationId);
         if (!stored || !this.claimMatches(stored, claim.token)) throw fail(409, "STATE_CONFLICT");
         current.s2Publications.push(cloneJson(publication!));
       });
+      await this.notify("after-publication-intent", publication);
+      this.objects.put(staged, normalized.normalizedBytes);
+      this.verify(staged, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
       await this.notify("after-publication-staged", publication);
-      this.objects.promote(staged, finalKey); promotedFinalKeys.push(finalKey); this.verify(finalKey, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
-      this.markPublication(publication.id, "promoted"); await this.notify("after-final-promotion", publication);
+      this.objects.promote(staged, finalKey);
+      this.verify(finalKey, normalized.normalizedBytes.byteLength, normalized.normalizedSha256);
+      this.markPublication(publication.id, "promoted");
+      await this.notify("after-final-promotion", publication);
       const committed = this.repository.transact((current) => {
         const stored = current.s2Publications.find((item) => item.id === publication!.id);
         const operationState = current.s2Operations.find((item) => item.id === operationId);
@@ -1008,14 +1271,19 @@ export class S2WorkflowService {
         this.commitRepairPublication(current, stored as S2RepairPublication);
         stored.state = "committed"; stored.updatedAt = this.clock(); return true;
       });
-      if (!committed) { this.cleanup(publication, promotedFinalKeys); return; }
+      if (!committed) { this.cleanup(publication); return; }
       this.cleanup(publication);
       const next = this.state().s2Operations.find((item) => item.id === reQaOperationId);
       if (next) this.startOperation(next.id);
     } catch (error) {
       if (error instanceof ProcessInterruption) throw error;
-      if (publication) this.cleanup(publication, promotedFinalKeys); else if (staged) this.objects.remove(staged);
-      if (publication) { try { this.markPublication(publication.id, "aborted"); } catch { /* preserve durable state */ } }
+      if (publication) {
+        let owned = false;
+        try { owned = this.abortRepairPublicationIfOwned(publication.id, operationId, claim.token); } catch { /* recovery remains conservative */ }
+        if (owned) this.cleanup(publication);
+      } else if (staged) {
+        this.objects.remove(staged);
+      }
       this.failRepair(operationId, claim.token, error);
     }
   }
@@ -1027,7 +1295,7 @@ export class S2WorkflowService {
         const repair = operation?.repairAttemptId ? state.s2Repairs.find((item) => item.id === operation.repairAttemptId) : null;
         if (!operation || !repair || !this.claimMatches(operation, token)) return;
         repair.status = "failed"; repair.completedAt = this.clock();
-        operation.status = "failed"; operation.failureCode = error instanceof AppError ? error.code :
+        operation.status = "failed"; operation.providerDispatchState = "consumed"; operation.failureCode = error instanceof AppError ? error.code :
           error instanceof ProviderFailure ? error.safeCode : "REPAIR_PROVIDER_FAILED";
         operation.completedAt = this.clock(); this.clearClaim(operation);
       });
@@ -1045,6 +1313,10 @@ export class S2WorkflowService {
       const input = this.inputFor(state, run); const bytes = this.objects.read(derived.storageKeyNormalized);
       if (bytes.byteLength !== derived.normalizedBytes || sha256(bytes) !== derived.outputSha256) throw fail(503, "RE_QA_UNAVAILABLE");
       if (!this.provider.runS2Qa) throw new ProviderFailure("PROVIDER_NOT_CONFIGURED");
+      await this.notifyDispatch("before-dispatch", claim.operation);
+      const dispatched = this.beginProviderDispatch(operationId, claim.token);
+      if (!dispatched) return;
+      await this.notifyDispatch("after-dispatch-marked", dispatched);
       const response = await this.provider.runS2Qa(this.qaInput(input, operation.candidateId, bytes));
       const value = evaluate(validateProvider(response.payload, input), input);
       this.repository.transact((current) => {
@@ -1058,9 +1330,11 @@ export class S2WorkflowService {
         storedResult.warningFindingIds = value.warning; storedResult.uncertainFindingIds = value.uncertain;
         storedResult.providerRequestId = safeRequestId(response.providerRequestId); storedResult.completedAt = this.clock();
         storedRepair.status = value.verdict === "PASS" ? "re_qa_pass" : value.verdict === "WARNING" ? "re_qa_warning" : "re_qa_material_fail";
-        storedRepair.completedAt = this.clock(); stored.status = "succeeded"; stored.completedAt = this.clock(); this.clearClaim(stored);
+        storedRepair.completedAt = this.clock(); stored.status = "succeeded"; stored.providerDispatchState = "consumed";
+        stored.completedAt = this.clock(); this.clearClaim(stored);
       });
     } catch (error) {
+      if (error instanceof ProcessInterruption) throw error;
       try {
         this.repository.transact((state) => {
           const operation = state.s2Operations.find((item) => item.id === operationId);
@@ -1069,7 +1343,8 @@ export class S2WorkflowService {
           if (!operation || !result || !repair || !this.claimMatches(operation, claim.token)) return;
           result.status = "re_qa_unavailable"; result.verdict = "QA_UNAVAILABLE"; result.completedAt = this.clock();
           repair.status = "re_qa_unavailable"; repair.completedAt = this.clock();
-          operation.status = "failed"; operation.failureCode = error instanceof AppError ? error.code :
+          operation.status = "failed"; operation.providerDispatchState = "consumed";
+          operation.failureCode = error instanceof AppError ? error.code :
             error instanceof ProviderFailure ? error.safeCode : "RE_QA_UNAVAILABLE";
           operation.completedAt = this.clock(); this.clearClaim(operation);
         });

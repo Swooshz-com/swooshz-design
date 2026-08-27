@@ -1,4 +1,95 @@
-# S2 G3 fresh-lineage completion audit
+# S2 G3 production-readiness completion audit
+
+Current audit update: 2026-08-27
+
+## Current exact-head G3 audit: bounded non-convergence simplification
+
+Repository: `Swooshz-com/swooshz-design`
+
+Branch: `web/run-007-s2-g3-nonconvergence-reset`
+
+Scope: the authorized bounded simplification for the current fresh S2 G3
+non-convergence review. The implementation preserves
+`DL-SD-S2-G2-003`; `docs/G2_S2_CONTRACT.md` was not modified. Historical
+PR #15/run-006 remains untouched. No G2 re-entry, G4 advancement, Ready state,
+merge, deployment, live provider call, credential use, customer/private data,
+or destructive action was performed.
+
+The final commit SHA and attached GitHub status are returned in the exact-head
+G3 packet and controlling Draft PR #17 comment.
+
+### Root-cause and bounded-simplification evidence
+
+- Provider dispatch now records `not_started`, `may_have_started`, and
+  `consumed`. Definitely-dead owners are requeued only before dispatch;
+  owners after the dispatch boundary resolve conservatively unavailable.
+  Live and unknown liveness remains claimed/busy. QA, repair, and re-QA
+  restart fixtures prove no duplicate provider call and no late completion
+  overwrite.
+- S2 operation idempotency uses the locked
+  `sha256(UTF8 jcs({operation, projectId, input}))` projection. Repair
+  provenance independently uses the locked canonical repair-input projection;
+  the evidence asserts the two hashes are distinct and reproducible.
+- Present S2 persisted collections are schema-validated on load for exact
+  record keys, bounded values, UUID/SHA/timestamp shapes, nested records,
+  relationships, and lifecycle/claim invariants. Unknown or malformed
+  present records fail with `PERSISTENCE_FAILED`; absent S2 collections
+  retain the legacy empty-state default.
+- Repair publication persists intent after claim verification and before
+  staging, uses the locked
+  `projects/{projectId}/s2/repairs/{repairAttemptId}/staged/provider-output.png`
+  key, verifies staged/final bytes, and performs only ownership-safe staging
+  cleanup. Late or stale workers cannot delete a final object or publish
+  derived success.
+- Reference and logo staging uses the locked
+  `projects/{projectId}/s2/staging/reference-assets/{assetId}/...` shape.
+  Final references remain under
+  `projects/{projectId}/s2/references/{assetId}/...`.
+- Server-owned repair eligibility and truthful QA summaries distinguish
+  processing, usable results, results containing unavailable candidates, and
+  all-results-unavailable states. The client does not infer repairability or
+  render an unavailable result as success.
+- The S2 multipart parser consumes a bounded stream, rejects oversized
+  bodies/files before normalization, enforces bounded headers/fields/trailer,
+  handles arbitrary chunk boundaries, rejects unknown/duplicate fields, and
+  cancels the reader on failure.
+
+### Current validation
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| S2 evidence and runtime suite | PASS, 19/19 tests | 103 base rows, 329 derived claims; missing 0, unknown 0, duplicate 0, skipped 0 |
+| Complete S1 regression | PASS, 41/41 tests | `tests/g3.test.ts` |
+| Typecheck | PASS | `pnpm run typecheck` |
+| Configured lint | PASS | `pnpm run lint` (repository script maps to TypeScript check) |
+| Production build | PASS | `pnpm run build`; Next.js 16.3.2/Turbopack routes generated |
+| Dependency audit | PASS | `pdfjs-dist` updated from 6.1.200 to patched 6.2.108; `pnpm audit --offline`: no known vulnerabilities |
+| Diff hygiene | PASS | `git diff --check` |
+| Browser smoke | PASS, loopback only | Production build served at 127.0.0.1:3101; `/projects/new` 200; synthetic S2 QA route 404; request inventory contained only loopback URLs |
+| Provider/live-system boundary | PASS | Zero live provider calls, deployment, credential use, or external-system mutation |
+
+### Evidence and audit limitations
+
+The full completed QA browser flow was not clicked because doing so would
+invoke the real provider adapter; the authorized scope requires zero live
+provider calls. Deterministic local workflow/client tests cover the persisted
+QA, unavailable, repair, and re-QA states. Codex Security was not available in
+the installed capabilities; standard manual/static security, privacy,
+storage-path, secret-pattern, dependency, persistence, and failure-injection
+checks were completed. No known unresolved P0/P1 blocker was found in scope.
+GitHub CI/check status is reported from the actual PR after push and is not
+claimed by this local audit.
+
+### Generated and local artifacts
+
+No generated tracked output was intentionally edited. The dependency lockfile
+change is intentional. Existing `.playwright-cli/` and
+`_agent-toolkit-backups/` untracked material was preserved; local browser
+startup logs under `.tmp/localhost/` are not part of the commit.
+
+---
+
+## Historical 2026-08-26 audit record
 
 Date: 2026-08-26
 Final repair validation update: 2026-08-27
