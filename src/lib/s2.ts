@@ -189,8 +189,35 @@ function rulesFor(geometry: BoothGeometry): S2DesignRuleSnapshot[] {
   return RULE_CATALOGUE.map((rule) => ({ ...rule,
     applicability: rule.ruleId === "geometry.max-height" && geometry.maxHeightMm === null ? "not_applicable" : "applicable" }));
 }
-function orderedFindings(ids: readonly string[]): string[] {
-  return Array.from(new Set(ids)).sort((a, b) => a.localeCompare(b));
+
+const REPAIR_FINDING_FAMILY_ORDER: Readonly<Record<string, number>> = {
+  "footprint.within-boundary": 1,
+  "access.open-sides": 2,
+  "circulation.primary-access": 3,
+  "zones.inside-footprint": 4,
+  "structure.no-floating": 5,
+  "structure.screen-support": 6,
+  "structure.overhead-support": 7,
+  "scale.human": 8,
+  "geometry.intersections": 9,
+  "branding.prohibited": 10,
+};
+
+function canonicalFindingOrder(id: string): { family: number; item: number } | null {
+  const fixedFamily = REPAIR_FINDING_FAMILY_ORDER[id];
+  if (fixedFamily !== undefined) return { family: fixedFamily, item: 0 };
+  const functional = /^brief\.functional\.(\d{3})$/.exec(id);
+  if (functional) return { family: 11, item: Number(functional[1]) };
+  const mandatory = /^brief\.mandatory\.(\d{3})$/.exec(id);
+  if (mandatory) return { family: 12, item: Number(mandatory[1]) };
+  return null;
+}
+
+function orderedFindings(ids: readonly string[]): string[] | null {
+  const entries = Array.from(new Set(ids)).map((id) => ({ id, order: canonicalFindingOrder(id) }));
+  if (entries.some((entry) => entry.order === null)) return null;
+  entries.sort((left, right) => left.order!.family - right.order!.family || left.order!.item - right.order!.item);
+  return entries.map((entry) => entry.id);
 }
 
 export type RepairAssetProjection = {
@@ -1099,6 +1126,7 @@ export class S2WorkflowService {
     if (result.status !== "material_fail" || result.verdict !== "MATERIAL_FAIL" || result.uncertainFindingIds.length ||
         result.materialFindingIds.length < 1 || result.materialFindingIds.length > 3) return null;
     const ids = orderedFindings(result.materialFindingIds);
+    if (!ids) return null;
     const rules = new Map(input.designRuleSnapshot.map((item) => [item.ruleId, item]));
     const requirements = new Map(input.canonicalRequirements.map((item) => [item.requirementId, item]));
     if (ids.some((id) => {

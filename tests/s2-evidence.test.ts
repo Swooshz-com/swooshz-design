@@ -26,12 +26,11 @@ import {
   S2_MAX_TOTAL_RGBA_BYTES,
 } from "../src/lib/s2-media";
 import { buildS2QaRequest, buildS2RepairRequest, S2_QA_MODEL, S2_QA_SCHEMA } from "../src/lib/s2-provider";
-import { canonicalRepairInputHash, operationInputHash } from "../src/lib/s2";
 import { handleApiRequest } from "../src/lib/api";
 import { createWorkflowService, type WorkflowService, type WorkflowServiceOptions } from "../src/lib/workflow";
 import { jcs, sha256 } from "../src/lib/utils";
 import { AppError } from "../src/lib/types";
-import { createS2QaClient, createS2ReferencesClient } from "../app/components/S2Client";
+import { createS2QaClient, createS2ReferencesClient, s2QaCandidateControls, s2QaUserFacingState } from "../app/components/S2Client";
 import { createIdempotencyKeyRetainer, UnknownNetworkOutcome } from "../src/lib/client-idempotency";
 import { deriveClaimManifest, manifestBaseRowCount, manifestVariantCount, type ClaimDefinition } from "./s2-evidence-manifest";
 
@@ -320,6 +319,91 @@ function chunkedStream(bytes: Uint8Array, chunkSize: number): ReadableStream<Uin
   });
 }
 
+function trackedChunkedStream(bytes: Uint8Array, chunkSize: number): { stream: ReadableStream<Uint8Array>; stats: () => { pulls: number; cancelled: boolean } } {
+  let offset = 0;
+  let pulls = 0;
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulls += 1;
+      if (offset >= bytes.byteLength) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(offset + chunkSize, bytes.byteLength);
+      controller.enqueue(bytes.slice(offset, end));
+      offset = end;
+    },
+    cancel() { cancelled = true; },
+  });
+  return { stream, stats: () => ({ pulls, cancelled }) };
+}
+
+function lazyTrackedChunks(chunks: readonly Uint8Array[]): { body: ReadableStream<Uint8Array>; stats: () => { pulls: number; cancelled: boolean } } {
+  let pulls = 0;
+  let cancelled = false;
+  const body = {
+    getReader() {
+      let index = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulls += 1;
+          if (index >= chunks.length) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(chunks[index]);
+          index += 1;
+        },
+        cancel() { cancelled = true; },
+      });
+      return stream.getReader();
+    },
+  } as unknown as ReadableStream<Uint8Array>;
+  return { body, stats: () => ({ pulls, cancelled }) };
+}
+
+function requestWithStream(headers: HeadersInit, body: ReadableStream<Uint8Array>): Request {
+  return { method: "POST", headers: new Headers(headers), body } as unknown as Request;
+}
+
+function hashCanonicalOperationInput(operation: string, projectId: string, input: unknown): string {
+  return sha256(jcs({ operation, projectId, input }));
+}
+
+function independentRepairInput(
+  input: any,
+  source: any,
+  orderedFindingIds: readonly string[],
+  referenceAssets: readonly Record<string, unknown>[],
+  logoAssets: readonly Record<string, unknown>[],
+): Record<string, unknown> {
+  return {
+    schemaVersion: "s2-repair-v1",
+    inputVersionId: input.id,
+    qaRunId: input.qaRunId,
+    candidateId: source.candidateId,
+    sourceAssetId: source.sourceAssetId,
+    sourceSha256: source.sourceSha256,
+    sourceByteSize: source.sourceByteSize,
+    sourceWidth: source.sourceWidth,
+    sourceHeight: source.sourceHeight,
+    sourcePixelCount: source.sourcePixelCount,
+    sourceDecodedRgbaBytes: source.sourceDecodedRgbaBytes,
+    bindingHash: input.bindingHash,
+    orderedFindingIds,
+    referenceAssets,
+    logoAssets,
+    confirmedBriefContentHash: input.confirmedBriefContentHash,
+    geometryHash: input.geometryHash,
+    attempt: 1,
+  };
+}
+
+function assertExactKeys(value: Record<string, unknown>, expected: readonly string[]): void {
+  assert.deepEqual(Object.keys(value).sort(), [...expected].sort());
+}
+
 test("fresh S2 runtime proves persisted bind, four terminal candidates, explicit retry, repair publication and re-QA", async () => {
   const value = fixture();
   try {
@@ -381,15 +465,39 @@ test("fresh S2 multipart route streams arbitrary chunks and rejects an oversized
   try {
     const boundary = "s2-stream-boundary";
     const body = s2MultipartBody(ONE_PIXEL_PNG);
+    const missingKeyBody = lazyTrackedChunks([body]);
+    const missingKeyRequest = requestWithStream(
+      { "content-type": "multipart/form-data; boundary=" + boundary },
+      missingKeyBody.body,
+    );
+    const missingKeyResponse = await handleApiRequest(missingKeyRequest, ["projects", value.projectId, "s2", "reference-assets"], value.service);
+    const missingKeyError = await missingKeyResponse.json() as any;
+    assert.equal(missingKeyResponse.status, 400);
+    assert.equal(missingKeyError.error.fieldErrors[0].code, "UUID_REQUIRED");
+    assert.equal(missingKeyBody.stats().pulls, 0);
+
+    const invalidKeyBody = lazyTrackedChunks([body]);
+    const invalidKeyRequest = requestWithStream(
+      { "content-type": "multipart/form-data; boundary=" + boundary, "Idempotency-Key": "not-a-uuid" },
+      invalidKeyBody.body,
+    );
+    const invalidKeyResponse = await handleApiRequest(invalidKeyRequest, ["projects", value.projectId, "s2", "reference-assets"], value.service);
+    const invalidKeyError = await invalidKeyResponse.json() as any;
+    assert.equal(invalidKeyResponse.status, 400);
+    assert.equal(invalidKeyError.error.fieldErrors[0].code, "UUID_REQUIRED");
+    assert.equal(invalidKeyBody.stats().pulls, 0);
+
+    const validBody = trackedChunkedStream(body, 7);
     const request = new Request("http://localhost", {
       method: "POST",
       headers: { "content-type": "multipart/form-data; boundary=" + boundary, "Idempotency-Key": randomUUID() },
-      body: chunkedStream(body, 7),
+      body: validBody.stream,
       duplex: "half",
     } as RequestInit & { duplex: "half" });
     const accepted = await handleApiRequest(request, ["projects", value.projectId, "s2", "reference-assets"], value.service);
     assert.equal(accepted.status, 201);
     assert.equal(value.repository.state().s2Assets.length, 1);
+    assert.equal(validBody.stats().pulls > 0, true);
 
     const oversizedHeaderBoundary = "s2-header-boundary";
     const oversizedHeader = Array.from({ length: 20 }, (_, index) =>
@@ -422,6 +530,38 @@ test("fresh S2 multipart route streams arbitrary chunks and rejects an oversized
     assert.equal(value.repository.state().s2Assets.length, 1);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("fresh S2 repair eligibility uses section-16 canonical finding order instead of lexical order", async () => {
+  const cases = [
+    {
+      badRule: "access.open-sides,footprint.within-boundary",
+      providerOrder: ["footprint.within-boundary", "access.open-sides"],
+      canonicalOrder: ["footprint.within-boundary", "access.open-sides"],
+    },
+    {
+      badRule: "structure.overhead-support,scale.human",
+      providerOrder: ["scale.human", "structure.overhead-support"],
+      canonicalOrder: ["structure.overhead-support", "scale.human"],
+    },
+  ];
+  for (const current of cases) {
+    const provider = new MockOpenAIProvider({
+      briefData: briefData(),
+      s2QaResponseFactory: (input) => input.candidateIndex === 1 ? qaPayload(input, "pass", current.badRule) : qaPayload(input),
+    });
+    const value = fixture([ONE_PIXEL_PNG], { provider });
+    try {
+      const { result } = await bindAndWait(value);
+      const candidate = result.qaRun.candidateResults.find((item: any) => item.candidateIndex === 1);
+      assert.equal(candidate.status, "material_fail");
+      assert.deepEqual(candidate.materialFindingIds, current.providerOrder);
+      assert.deepEqual(candidate.eligibleRepairFindingIds, current.canonicalOrder);
+      assert.equal(candidate.repairEligible, true);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -998,11 +1138,16 @@ test("fresh S2 route and client evidence proves persisted refresh, preview priva
 
 test("fresh S2 repair evidence preserves source lineage, ordered inputs, bounded prompt semantics and one re-QA", async () => {
   const captured: any[] = [];
+  const qaAttempts = new Map<number, number>();
   const provider = new MockOpenAIProvider({
     briefData: briefData(),
     s2RepairResponses: [ONE_PIXEL_PNG],
     onS2RepairRequest: (input) => captured.push(input),
-    s2QaResponseFactory: (input, callIndex) => qaPayload(input, callIndex < 4 && input.candidateIndex === 1 ? "pass" : "pass", callIndex < 4 && input.candidateIndex === 1 ? "structure.overhead-support" : undefined),
+    s2QaResponseFactory: (input) => {
+      const attempt = qaAttempts.get(input.candidateIndex) ?? 0;
+      qaAttempts.set(input.candidateIndex, attempt + 1);
+      return qaPayload(input, "pass", input.candidateIndex === 1 && attempt === 0 ? "structure.overhead-support,scale.human,footprint.within-boundary" : undefined);
+    },
   });
   const value = fixture([ONE_PIXEL_PNG], { provider });
   try {
@@ -1014,6 +1159,8 @@ test("fresh S2 repair evidence preserves source lineage, ordered inputs, bounded
     const { bound, result } = await bindAndWait(value, updated.draft.revision);
     const candidate = result.qaRun.candidateResults.find((item: any) => item.candidateIndex === 1);
     assert.equal(candidate.status, "material_fail");
+    assert.deepEqual(candidate.materialFindingIds, ["footprint.within-boundary", "scale.human", "structure.overhead-support"]);
+    assert.deepEqual(candidate.eligibleRepairFindingIds, ["footprint.within-boundary", "structure.overhead-support", "scale.human"]);
     const inputBefore = value.repository.state().s2Inputs[0];
     const sourceBefore = Buffer.from(value.objects.read(inputBefore.sourceCandidates[0].sourceStorageKey));
     const started = await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
@@ -1035,6 +1182,13 @@ test("fresh S2 repair evidence preserves source lineage, ordered inputs, bounded
     assert.equal(Buffer.from(captured[0].images[3]).equals(value.objects.read(state.s2Assets.find((asset) => asset.id === logo.asset.id)!.storageKeyNormalized)), true);
     assert.deepEqual({ model: request.model, n: request.n, size: request.size, quality: request.quality, output_format: request.output_format, imageCount: request.images.length }, { model: "gpt-image-2-2026-04-21", n: 1, size: "1536x1024", quality: "medium", output_format: "png", imageCount: 4 });
     assert.equal(request.prompt.includes("do not claim engineering or approval"), true);
+    const objectiveStarts = [
+      "Keep every visible element within the exact supplied width and depth footprint.",
+      "Correct the clearly unsupported overhead visual issue",
+      "Apply a bounded plausible visual scale correction",
+    ].map((text) => request.prompt.indexOf(text));
+    assert.equal(objectiveStarts.every((index) => index >= 0), true);
+    assert.equal(objectiveStarts[0] < objectiveStarts[1] && objectiveStarts[1] < objectiveStarts[2], true);
     assert.equal(repair.sourceAssetId, inputBefore.sourceCandidates[0].sourceAssetId);
     assert.equal(repair.sourceSha256, inputBefore.sourceCandidates[0].sourceSha256);
     assert.equal(sha256(value.objects.read(inputBefore.sourceCandidates[0].sourceStorageKey)), inputBefore.sourceCandidates[0].sourceSha256);
@@ -1051,17 +1205,111 @@ test("fresh S2 repair evidence preserves source lineage, ordered inputs, bounded
       const asset = state.s2Assets.find((item) => item.id === assetId)!;
       return { assetId, normalizedSha256: asset.normalizedSha256, width: asset.width, height: asset.height, normalizedBytes: asset.normalizedBytes, slot: index + 1 };
     });
-    assert.equal(repair.repairInputHash, canonicalRepairInputHash(inputBefore, inputBefore.sourceCandidates[0], repair.eligibleFindingIds, repairReferenceProjection, repairLogoProjection));
-    assert.equal(repairOperation?.inputHash, operationInputHash("s2_repair", value.projectId, {
+    const expectedRepairInput = independentRepairInput(inputBefore, inputBefore.sourceCandidates[0], repair.eligibleFindingIds, repairReferenceProjection, repairLogoProjection);
+    assertExactKeys(expectedRepairInput, ["schemaVersion", "inputVersionId", "qaRunId", "candidateId", "sourceAssetId", "sourceSha256", "sourceByteSize", "sourceWidth", "sourceHeight", "sourcePixelCount", "sourceDecodedRgbaBytes", "bindingHash", "orderedFindingIds", "referenceAssets", "logoAssets", "confirmedBriefContentHash", "geometryHash", "attempt"]);
+    repairReferenceProjection.forEach((item) => assertExactKeys(item, ["assetId", "normalizedSha256", "width", "height", "normalizedBytes", "slot"]));
+    repairLogoProjection.forEach((item) => assertExactKeys(item, ["assetId", "normalizedSha256", "width", "height", "normalizedBytes", "slot"]));
+    assert.equal(repair.repairInputHash, sha256(jcs(expectedRepairInput)));
+    const expectedRepairOperationInput = {
       qaRunId: bound.qaRun.id, candidateId: candidate.candidateId, expectedInputVersionId: bound.inputVersionId,
       eligibleFindingIds: repair.eligibleFindingIds,
-    }));
+    };
+    assertExactKeys(expectedRepairOperationInput, ["qaRunId", "candidateId", "expectedInputVersionId", "eligibleFindingIds"]);
+    assert.equal(repairOperation?.inputHash, hashCanonicalOperationInput("s2_repair", value.projectId, expectedRepairOperationInput));
     assert.notEqual(repairOperation?.inputHash, repair.repairInputHash);
+    assert.notEqual(sha256(jcs({ ...expectedRepairInput, sourceAssetId: randomUUID() })), repair.repairInputHash);
+    assert.notEqual(sha256(jcs({ ...expectedRepairInput, bindingHash: "0".repeat(64) })), repair.repairInputHash);
+    assert.notEqual(sha256(jcs({ ...expectedRepairInput, orderedFindingIds: ["structure.screen-support", ...repair.eligibleFindingIds] })), repair.repairInputHash);
+    assert.notEqual(sha256(jcs({ ...expectedRepairInput, orderedFindingIds: [...repair.eligibleFindingIds].reverse() })), repair.repairInputHash);
+    assert.notEqual(sha256(jcs({ ...expectedRepairInput, referenceAssets: repairReferenceProjection.map((item, index) => index === 0 ? { ...item, normalizedBytes: item.normalizedBytes + 1 } : item) })), repair.repairInputHash);
+    assert.notEqual(sha256(jcs({ ...expectedRepairInput, logoAssets: repairLogoProjection.map((item, index) => index === 0 ? { ...item, slot: item.slot + 1 } : item) })), repair.repairInputHash);
     assert.equal(reQaOperation?.inputHash, inputBefore.inputHash);
     assert.equal(after.qaRun.repairs.length, 1);
     assert.equal(after.qaRun.reQa.length, 1);
     assert.equal(await expectCode(() => value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, candidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID()), "REPAIR_ALREADY_EXISTS"), true);
     assert.equal(provider.s2RepairCalls, 1);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("fresh S2 evidence independently reconstructs all five persisted idempotency input hashes", async () => {
+  const value = fixture();
+  try {
+    const initialDraft = value.service.s2.getReferenceDraft(value.projectId);
+    const uploadKey = randomUUID();
+    const uploaded = await value.service.s2.uploadAsset(value.projectId, "reference", "hash-reference.png", "image/png", ONE_PIXEL_PNG, uploadKey);
+    const uploadState = value.repository.state();
+    const uploadedRecord = uploadState.idempotency.find((item) => item.key === uploadKey)!;
+    const uploadedAsset = uploadState.s2Assets.find((item) => item.id === uploaded.asset.id)!;
+    const uploadInput = { kind: "reference", originalSha256: uploadedAsset.originalSha256, originalBytes: uploadedAsset.originalBytes };
+    assertExactKeys(uploadInput, ["kind", "originalSha256", "originalBytes"]);
+    assertExactKeys(uploadedRecord, ["key", "operation", "projectId", "inputHash", "result", "createdAt"]);
+    assertExactKeys(uploadedRecord.result, ["assetId"]);
+    assert.equal(uploadedRecord.operation, "s2_asset_upload");
+    assert.equal(uploadedRecord.projectId, value.projectId);
+    assert.equal(uploadedRecord.inputHash, hashCanonicalOperationInput("s2_asset_upload", value.projectId, uploadInput));
+    assert.notEqual(hashCanonicalOperationInput("s2_asset_upload", value.projectId, { ...uploadInput, originalBytes: uploadInput.originalBytes + 1 }), uploadedRecord.inputHash);
+    const assetsBeforeReuse = uploadState.s2Assets.length;
+    const providerCallsBeforeReuse = value.provider.s2QaCalls;
+    assert.equal(await expectCode(() => value.service.s2.uploadAsset(value.projectId, "logo", "hash-reference.png", "image/png", ONE_PIXEL_PNG, uploadKey), "IDEMPOTENCY_KEY_REUSE"), true);
+    assert.equal(value.repository.state().s2Assets.length, assetsBeforeReuse);
+    assert.equal(value.provider.s2QaCalls, providerCallsBeforeReuse);
+
+    const draftKey = randomUUID();
+    const draftInput = { draftId: initialDraft.id, expectedRevision: initialDraft.revision, referenceAssetIds: [uploaded.asset.id], logoAssetIds: [] };
+    const updated = value.service.s2.updateDraft(value.projectId, draftInput.expectedRevision, draftInput.referenceAssetIds, draftInput.logoAssetIds, draftKey);
+    const draftRecord = value.repository.state().idempotency.find((item) => item.key === draftKey)!;
+    assertExactKeys(draftInput, ["draftId", "expectedRevision", "referenceAssetIds", "logoAssetIds"]);
+    assertExactKeys(draftRecord, ["key", "operation", "projectId", "inputHash", "result", "createdAt"]);
+    assertExactKeys(draftRecord.result, ["draftId"]);
+    assert.equal(draftRecord.operation, "s2_draft_update");
+    assert.equal(draftRecord.inputHash, hashCanonicalOperationInput("s2_draft_update", value.projectId, draftInput));
+    assert.notEqual(hashCanonicalOperationInput("s2_draft_update", value.projectId, { ...draftInput, expectedRevision: draftInput.expectedRevision + 1 }), draftRecord.inputHash);
+    assert.equal(await expectCode(() => value.service.s2.updateDraft(value.projectId, draftInput.expectedRevision, [], [], draftKey), "IDEMPOTENCY_KEY_REUSE"), true);
+
+    const bindKey = randomUUID();
+    const bound = await value.service.s2.bindQa(value.projectId, value.generationSetId, updated.draft.revision, bindKey, randomUUID());
+    const bindState = value.repository.state();
+    const boundInput = bindState.s2Inputs.find((item) => item.id === bound.inputVersionId)!;
+    const bindRecord = bindState.idempotency.find((item) => item.key === bindKey)!;
+    const bindInput = { sourceGenerationSetId: value.generationSetId, expectedDraftRevision: updated.draft.revision, bindingHash: boundInput.bindingHash };
+    assertExactKeys(bindInput, ["sourceGenerationSetId", "expectedDraftRevision", "bindingHash"]);
+    assertExactKeys(bindRecord, ["key", "operation", "projectId", "inputHash", "result", "createdAt"]);
+    assertExactKeys(bindRecord.result, ["inputVersionId", "qaRunId", "operationIds"]);
+    assert.equal(bindRecord.operation, "s2_bind");
+    assert.equal(bindRecord.inputHash, hashCanonicalOperationInput("s2_bind", value.projectId, bindInput));
+    assert.notEqual(hashCanonicalOperationInput("s2_bind", value.projectId, { ...bindInput, expectedDraftRevision: bindInput.expectedDraftRevision + 1 }), bindRecord.inputHash);
+
+    const completed = await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any, (current) => current.qaRun.status === "completed");
+    const retryCandidate = completed.qaRun.candidateResults.find((item: any) => item.candidateIndex === 2);
+    assert.equal(retryCandidate.status, "qa_unavailable_retryable");
+    const retryKey = randomUUID();
+    await value.service.s2.retryQa(value.projectId, bound.qaRun.id, retryCandidate.candidateId, retryKey, randomUUID());
+    const retryRecord = value.repository.state().idempotency.find((item) => item.key === retryKey)!;
+    const retryInput = { qaRunId: bound.qaRun.id, candidateId: retryCandidate.candidateId, expectedAttempt: 1 };
+    assertExactKeys(retryInput, ["qaRunId", "candidateId", "expectedAttempt"]);
+    assertExactKeys(retryRecord, ["key", "operation", "projectId", "inputHash", "result", "createdAt"]);
+    assertExactKeys(retryRecord.result, ["qaRunId", "candidateId", "operationId", "resultId"]);
+    assert.equal(retryRecord.operation, "s2_qa_retry");
+    assert.equal(retryRecord.inputHash, hashCanonicalOperationInput("s2_qa_retry", value.projectId, retryInput));
+    assert.notEqual(hashCanonicalOperationInput("s2_qa_retry", value.projectId, { ...retryInput, expectedAttempt: 2 }), retryRecord.inputHash);
+
+    const materialCandidate = completed.qaRun.candidateResults.find((item: any) => item.candidateIndex === 1);
+    assert.equal(materialCandidate.status, "material_fail");
+    const repairKey = randomUUID();
+    await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, materialCandidate.candidateId, bound.inputVersionId, repairKey, randomUUID());
+    await waitFor(() => value.repository.state().s2Repairs.length, (count) => count === 1);
+    const repairRecord = value.repository.state().idempotency.find((item) => item.key === repairKey)!;
+    const persistedRepair = value.repository.state().s2Repairs[0];
+    const repairInput = { qaRunId: bound.qaRun.id, candidateId: materialCandidate.candidateId, expectedInputVersionId: bound.inputVersionId, eligibleFindingIds: persistedRepair.eligibleFindingIds };
+    assertExactKeys(repairInput, ["qaRunId", "candidateId", "expectedInputVersionId", "eligibleFindingIds"]);
+    assertExactKeys(repairRecord, ["key", "operation", "projectId", "inputHash", "result", "createdAt"]);
+    assertExactKeys(repairRecord.result, ["repairAttemptId", "operationId"]);
+    assert.equal(repairRecord.operation, "s2_repair");
+    assert.equal(repairRecord.inputHash, hashCanonicalOperationInput("s2_repair", value.projectId, repairInput));
+    assert.notEqual(hashCanonicalOperationInput("s2_repair", value.projectId, { ...repairInput, eligibleFindingIds: ["structure.screen-support", ...repairInput.eligibleFindingIds] }), repairRecord.inputHash);
+    assert.notEqual(repairRecord.inputHash, persistedRepair.repairInputHash);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }
@@ -1819,25 +2067,75 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     });
 
   const exactSource = paddedPng(ONE_PIXEL_PNG, S2_MAX_SOURCE_BYTES);
-  const exactSourceResult = await normalizeS2Media({ kind: "reference", fileName: "exact-source.png", mimeType: "image/png", bytes: exactSource });
-  const overSourceCode = await observedErrorCode(() => normalizeS2Media({ kind: "reference", fileName: "over-source.png", mimeType: "image/png", bytes: paddedPng(ONE_PIXEL_PNG, S2_MAX_SOURCE_BYTES + 1) }));
-  await prove(claimIds("MEDIA-009", ["exact-accepted", "next-rejected"]), "media source-byte boundary", "Real padded PNG source at exactly 8 MiB and the next-byte fixture.",
-    { exactBytes: exactSourceResult.originalBytes.byteLength, overCode: overSourceCode, result: "exact-accepted-next-rejected" },
-    "The real source-byte boundary accepted exactly 8 MiB and rejected the next byte.",
-    () => { assert.equal(exactSourceResult.originalBytes.byteLength, S2_MAX_SOURCE_BYTES); assert.equal(overSourceCode, "MEDIA_TOO_LARGE"); }, undefined, {
-      "MEDIA-009/exact-accepted": () => assert.equal(exactSourceResult.originalBytes.byteLength, S2_MAX_SOURCE_BYTES),
-      "MEDIA-009/next-rejected": () => assert.equal(overSourceCode, "MEDIA_TOO_LARGE"),
-    });
+  const mediaBoundary = fixture();
+  try {
+    const exactBody = trackedChunkedStream(s2MultipartBody(exactSource), 4093);
+    const exactResponse = await handleApiRequest(requestWithStream({
+      "content-type": "multipart/form-data; boundary=s2-stream-boundary",
+      "Idempotency-Key": randomUUID(),
+    }, exactBody.stream), ["projects", mediaBoundary.projectId, "s2", "reference-assets"], mediaBoundary.service);
+    const exactState = mediaBoundary.repository.state();
+    const exactAsset = exactState.s2Assets[0];
+    const assetsBeforeOverrun = exactState.s2Assets.length;
+    const publicationsBeforeOverrun = exactState.s2Publications.length;
+    const idempotencyBeforeOverrun = exactState.idempotency.length;
+    const overBody = trackedChunkedStream(s2MultipartBody(paddedPng(ONE_PIXEL_PNG, S2_MAX_SOURCE_BYTES + 1)), 4093);
+    const overResponse = await handleApiRequest(requestWithStream({
+      "content-type": "multipart/form-data; boundary=s2-stream-boundary",
+      "Idempotency-Key": randomUUID(),
+    }, overBody.stream), ["projects", mediaBoundary.projectId, "s2", "reference-assets"], mediaBoundary.service);
+    const afterOverrun = mediaBoundary.repository.state();
+    const multipartTotalBelowBodyCeiling = s2MultipartBody(exactSource).byteLength < S2_MAX_MULTIPART_BODY_BYTES;
+    await prove(claimIds("MEDIA-009", ["exact-accepted", "next-rejected"]), "media source-byte boundary", "The real multipart upload route accepted a deterministic padded PNG with exactly 8,388,608 file bytes from boundary-crossing chunks and rejected the next byte during streaming intake.",
+      { exactRouteStatus: exactResponse.status, exactFileBytes: exactAsset?.originalBytes ?? 0, exactStreamPulls: exactBody.stats().pulls, exactBodyCancelled: exactBody.stats().cancelled, multipartTotal: s2MultipartBody(exactSource).byteLength, multipartTotalBelowBodyCeiling, overRouteStatus: overResponse.status, overStreamPulls: overBody.stats().pulls, overBodyCancelled: overBody.stats().cancelled, assetsBeforeOverrun, assetsAfterOverrun: afterOverrun.s2Assets.length, publicationsBeforeOverrun, publicationsAfterOverrun: afterOverrun.s2Publications.length, idempotencyBeforeOverrun, idempotencyAfterOverrun: afterOverrun.idempotency.length, offendingExcessRetained: false, result: "real-route-exact-accepted-next-rejected" },
+      "The real multipart route measured exactly 8 MiB in the persisted original asset, kept the full multipart body below the independent body ceiling, and rejected 8 MiB plus one without creating an asset, publication, or idempotency record for the rejected upload.",
+      () => {
+        assert.equal(exactResponse.status, 201);
+        assert.equal(exactAsset?.originalBytes, S2_MAX_SOURCE_BYTES);
+        assert.equal(exactBody.stats().pulls > 0, true);
+        assert.equal(exactBody.stats().cancelled, false);
+        assert.equal(multipartTotalBelowBodyCeiling, true);
+        assert.equal(overResponse.status, 413);
+        assert.equal(overBody.stats().cancelled, true);
+        assert.equal(afterOverrun.s2Assets.length, assetsBeforeOverrun);
+        assert.equal(afterOverrun.s2Publications.length, publicationsBeforeOverrun);
+        assert.equal(afterOverrun.idempotency.length, idempotencyBeforeOverrun);
+      }, undefined, {
+        "MEDIA-009/exact-accepted": () => { assert.equal(exactResponse.status, 201); assert.equal(exactAsset?.originalBytes, S2_MAX_SOURCE_BYTES); assert.equal(multipartTotalBelowBodyCeiling, true); },
+        "MEDIA-009/next-rejected": () => { assert.equal(overResponse.status, 413); assert.equal(overBody.stats().cancelled, true); assert.equal(afterOverrun.s2Assets.length, assetsBeforeOverrun); assert.equal(afterOverrun.s2Publications.length, publicationsBeforeOverrun); },
+      });
+  } finally { rmSync(mediaBoundary.root, { recursive: true, force: true }); }
 
   const bodyBoundary = fixture();
-  let bodyStatus = 0;
   try {
-    const response = await handleApiRequest(new Request("http://localhost", { method: "POST", headers: { "content-type": "multipart/form-data; boundary=s2-boundary", "content-length": String(S2_MAX_MULTIPART_BODY_BYTES + 1), "Idempotency-Key": randomUUID() }, body: Buffer.alloc(S2_MAX_MULTIPART_BODY_BYTES + 1) }), ["projects", bodyBoundary.projectId, "s2", "reference-assets"], bodyBoundary.service);
-    bodyStatus = response.status;
-    await prove(["MEDIA-010/body-boundary"], "media multipart-body boundary", "Real API multipart request whose declared body is one byte over the 9 MiB bound.",
-      { contentLength: S2_MAX_MULTIPART_BODY_BYTES + 1, status: bodyStatus, result: "rejected" },
-      "The real S2 multipart route rejected the body before unbounded buffering.",
-      () => assert.equal(bodyStatus, 413));
+    const declaredBody = lazyTrackedChunks([Buffer.from("-")]);
+    const declaredResponse = await handleApiRequest(requestWithStream({
+      "content-type": "multipart/form-data; boundary=s2-stream-boundary",
+      "content-length": String(S2_MAX_MULTIPART_BODY_BYTES + 1),
+      "Idempotency-Key": randomUUID(),
+    }, declaredBody.body), ["projects", bodyBoundary.projectId, "s2", "reference-assets"], bodyBoundary.service);
+    const streamedBody = lazyTrackedChunks([Buffer.from("-"), Buffer.alloc(S2_MAX_MULTIPART_BODY_BYTES)]);
+    const streamedResponse = await handleApiRequest(requestWithStream({
+      "content-type": "multipart/form-data; boundary=s2-stream-boundary",
+      "Idempotency-Key": randomUUID(),
+    }, streamedBody.body), ["projects", bodyBoundary.projectId, "s2", "reference-assets"], bodyBoundary.service);
+    const streamedState = bodyBoundary.repository.state();
+    const structuralMaximum = S2_MAX_SOURCE_BYTES + (3 * 16_384) + 1_024 + 570;
+    const structuralGap = S2_MAX_MULTIPART_BODY_BYTES - structuralMaximum;
+    await prove(["MEDIA-010/body-boundary"], "media multipart-body guard and structural reachability", "Real route evidence for declared over-cap rejection before body consumption and streamed no-Content-Length rejection at the body counter, with the locked multipart structural maximum recorded.",
+      { configuredBodyCeiling: S2_MAX_MULTIPART_BODY_BYTES, declaredContentLength: S2_MAX_MULTIPART_BODY_BYTES + 1, declaredStatus: declaredResponse.status, declaredBodyPulls: declaredBody.stats().pulls, streamedContentLength: null, streamedStatus: streamedResponse.status, streamedBodyPulls: streamedBody.stats().pulls, streamedBodyCancelled: streamedBody.stats().cancelled, streamedBodyRetained: false, streamedAssets: streamedState.s2Assets.length, streamedPublications: streamedState.s2Publications.length, structuralMaximum, arithmetic: "8,388,608 + 49,152 + 1,024 + 570 = 8,439,354", structuralGap, exactValidNineMiB: "structurally unreachable / non-applicable; not synthetically manufactured", result: "declared-pre-body-and-streamed-counter-rejected" },
+      "The real route rejected a declared 9,437,185-byte body before any body pull and rejected a no-Content-Length stream when its second chunk crossed 9,437,184, cancelled the reader before retaining the excess, and recorded that exact-valid 9 MiB multipart equality is structurally unreachable/non-applicable.",
+      () => {
+        assert.equal(declaredResponse.status, 413);
+        assert.equal(declaredBody.stats().pulls, 0);
+        assert.equal(streamedResponse.status, 413);
+        assert.equal(streamedBody.stats().pulls, 2);
+        assert.equal(streamedBody.stats().cancelled, true);
+        assert.equal(streamedState.s2Assets.length, 0);
+        assert.equal(streamedState.s2Publications.length, 0);
+        assert.equal(structuralMaximum, 8_439_354);
+        assert.equal(structuralGap, 997_830);
+      });
   } finally { rmSync(bodyBoundary.root, { recursive: true, force: true }); }
 
   const maxSquare = await solidPng(S2_MAX_DIMENSION, S2_MAX_DIMENSION, { r: 12, g: 34, b: 56 });
@@ -3202,13 +3500,146 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
         "ROUTE-005/frozen-readonly": () => { assert.equal(frozen.status, "frozen"); assert.equal(frozen.frozenByQaRunId, bound.qaRun.id); assert.equal(frozenWriteCode, "DRAFT_FROZEN"); },
         "ROUTE-005/empty-valid": () => assert.equal(initial.referenceAssetIds.length, 0),
       });
-    await prove(claimIds("ROUTE-006", ["repair-control", "retry-control"]), "route repair retry controls", "Real QA client retry and repair controls invoking the corresponding production API paths.",
-      { retryCandidate: retryCandidate?.candidateId ?? "none", repairCandidate: materialCandidate?.candidateId ?? "none", retryResponseStatus: retryProjection.qaRun.status, repairResponseStatus: repairedProjection.qaRun.status, finalStatus: finalQaProjection.qaRun.status, finalReQaStatus: finalQaProjection.qaRun.reQa.at(-1)?.status ?? "none", result: "server-controlled" },
-      "The real QA client exposed retry and repair actions that changed only server-persisted state.",
-      () => { assert.equal(["running", "completed"].includes(retryProjection.qaRun.status), true); assert.equal(["running", "completed"].includes(repairedProjection.qaRun.status), true); assert.equal(["running", "completed"].includes(finalQaProjection.qaRun.status), true); assert.equal(finalQaProjection.qaRun.reQa.some((item: any) => item.status === "pass"), true); }, undefined, {
-        "ROUTE-006/repair-control": () => { assert.equal(materialCandidate?.status, "material_fail"); assert.equal(finalQaProjection.qaRun.reQa.some((item: any) => item.status === "pass"), true); },
-        "ROUTE-006/retry-control": () => { assert.equal(retryCandidate?.status, "qa_unavailable_retryable"); assert.equal(["running", "completed"].includes(retryProjection.qaRun.status), true); },
+    const matrixValues: Fixture[] = [];
+    try {
+      const ineligibleProvider = new MockOpenAIProvider({
+        briefData: briefData(),
+        s2QaResponseFactory: (input) => input.candidateIndex === 1
+          ? qaPayload(input, "pass", "geometry.max-height")
+          : qaPayload(input, "pass"),
       });
+      const ineligibleValue = fixture([ONE_PIXEL_PNG], { provider: ineligibleProvider, geometry: { widthMm: 9000, depthMm: 6000, openSides: ["north", "west"], maxHeightMm: 4000 } });
+      matrixValues.push(ineligibleValue);
+      const ineligibleInitial = await bindAndWait(ineligibleValue);
+      const ineligibleCandidate = ineligibleInitial.result.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)!;
+      const ineligibleRepairResponse = await handleApiRequest(new Request("http://localhost", {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": randomUUID() },
+        body: JSON.stringify({ expectedInputVersionId: ineligibleInitial.bound.inputVersionId }),
+      }), ["projects", ineligibleValue.projectId, "s2", "qa-runs", ineligibleInitial.bound.qaRun.id, "candidates", ineligibleCandidate.candidateId, "repair"], ineligibleValue.service);
+      const ineligibleRepairBody = await ineligibleRepairResponse.json() as any;
+
+      const warningProvider = new MockOpenAIProvider({
+        briefData: briefData(),
+        s2QaResponseFactory: (input) => input.candidateIndex === 1 ? qaPayload(input, "warning") : qaPayload(input, "pass"),
+      });
+      const warningValue = fixture([ONE_PIXEL_PNG], { provider: warningProvider });
+      matrixValues.push(warningValue);
+      const warningInitial = await bindAndWait(warningValue);
+      const warningCandidate = warningInitial.result.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)!;
+      const passCandidate = warningInitial.result.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 2)!;
+
+      const unavailableProvider = new MockOpenAIProvider({
+        briefData: briefData(),
+        s2QaResponseFactory: () => { throw new ProviderFailure("PROVIDER_TIMEOUT"); },
+      });
+      const unavailableValue = fixture([ONE_PIXEL_PNG], { provider: unavailableProvider });
+      matrixValues.push(unavailableValue);
+      const unavailableInitial = await bindAndWait(unavailableValue);
+      const unavailableRetryableCandidate = unavailableInitial.result.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)!;
+      await unavailableValue.service.s2.retryQa(unavailableValue.projectId, unavailableInitial.bound.qaRun.id, unavailableRetryableCandidate.candidateId, randomUUID(), randomUUID());
+      const unavailableTerminal = await waitFor(() => unavailableValue.service.s2.getQaRun(unavailableValue.projectId, unavailableInitial.bound.qaRun.id) as any,
+        (current) => current.qaRun.candidateResults.some((candidate: any) => candidate.candidateId === unavailableRetryableCandidate.candidateId && candidate.status === "qa_unavailable_terminal"));
+      const unavailableTerminalCandidate = unavailableTerminal.qaRun.candidateResults.find((candidate: any) => candidate.candidateId === unavailableRetryableCandidate.candidateId)!;
+
+      const finalMaterialCandidate = finalQaProjection.qaRun.candidateResults.find((candidate: any) => candidate.candidateId === materialCandidate?.candidateId)!;
+      const eligibleControls = s2QaCandidateControls(materialCandidate!, false);
+      const retryControls = s2QaCandidateControls(retryCandidate!, false);
+      const ineligibleControls = s2QaCandidateControls(ineligibleCandidate, false);
+      const warningControls = s2QaCandidateControls(warningCandidate, false);
+      const passControls = s2QaCandidateControls(passCandidate, false);
+      const terminalControls = s2QaCandidateControls(unavailableTerminalCandidate, false);
+      const existingRepairControls = s2QaCandidateControls(finalMaterialCandidate, true);
+      await prove(claimIds("ROUTE-006", ["repair-control", "retry-control"]), "route repair retry controls", "Real server-owned eligibility and actual client control projection across eligible, ineligible, warning, pass, unavailable-terminal, existing-repair, and retryable candidate states.",
+        {
+          eligibleStatus: materialCandidate?.status ?? "",
+          eligibleRepairEligible: materialCandidate?.repairEligible ?? false,
+          eligibleFindingIds: (materialCandidate?.eligibleRepairFindingIds ?? []).join(","),
+          eligibleRepairControl: eligibleControls.canRepair,
+          ineligibleStatus: ineligibleCandidate.status,
+          ineligibleRepairEligible: ineligibleCandidate.repairEligible,
+          ineligibleFindingIds: (ineligibleCandidate.eligibleRepairFindingIds ?? []).join(","),
+          ineligibleApiStatus: ineligibleRepairResponse.status,
+          ineligibleApiCode: ineligibleRepairBody.error?.code ?? "",
+          ineligibleRepairControl: ineligibleControls.canRepair,
+          warningStatus: warningCandidate.status,
+          warningRepairControl: warningControls.canRepair,
+          passStatus: passCandidate.status,
+          passRepairControl: passControls.canRepair,
+          unavailableTerminalStatus: unavailableTerminalCandidate.status,
+          unavailableTerminalRepairControl: terminalControls.canRepair,
+          unavailableTerminalRetryControl: terminalControls.canRetry,
+          existingRepairStatus: finalMaterialCandidate.status,
+          existingRepairEligible: finalMaterialCandidate.repairEligible ?? false,
+          existingRepairFindingIds: (finalMaterialCandidate.eligibleRepairFindingIds ?? []).join(","),
+          existingRepairControl: existingRepairControls.canRepair,
+          retryableStatus: retryCandidate?.status ?? "",
+          retryableControl: retryControls.canRetry,
+          result: "server-owned-control-matrix",
+        },
+        "The real server-owned projection exposed repair only for the eligible MATERIAL_FAIL, returned REPAIR_NOT_ELIGIBLE for the ineligible MATERIAL_FAIL, omitted repair for warning/pass/terminal/existing-repair states, and preserved retry only for the retryable unavailable state.",
+        () => {
+          assert.equal(materialCandidate?.status, "material_fail");
+          assert.equal(materialCandidate?.repairEligible, true);
+          assert.equal((materialCandidate?.eligibleRepairFindingIds?.length ?? 0) > 0, true);
+          assert.equal(eligibleControls.canRepair, true);
+          assert.equal(ineligibleCandidate.status, "material_fail");
+          assert.equal(ineligibleCandidate.repairEligible, false);
+          assert.deepEqual(ineligibleCandidate.eligibleRepairFindingIds, []);
+          assert.equal(ineligibleRepairResponse.status, 409);
+          assert.equal(ineligibleRepairBody.error?.code, "REPAIR_NOT_ELIGIBLE");
+          assert.equal(ineligibleControls.canRepair, false);
+          assert.equal(warningCandidate.status, "warning");
+          assert.equal(warningControls.canRepair, false);
+          assert.equal(passCandidate.status, "pass");
+          assert.equal(passControls.canRepair, false);
+          assert.equal(unavailableTerminalCandidate.status, "qa_unavailable_terminal");
+          assert.equal(terminalControls.canRepair, false);
+          assert.equal(terminalControls.canRetry, false);
+          assert.equal(finalMaterialCandidate.repairEligible, false);
+          assert.equal((finalMaterialCandidate.eligibleRepairFindingIds ?? []).length, 0);
+          assert.equal(existingRepairControls.canRepair, false);
+          assert.equal(retryCandidate?.status, "qa_unavailable_retryable");
+          assert.equal(retryControls.canRetry, true);
+          assert.equal(finalQaProjection.qaRun.reQa.some((item: any) => item.status === "pass"), true);
+        }, undefined, {
+          "ROUTE-006/repair-control": () => {
+            assert.equal(materialCandidate?.repairEligible, true);
+            assert.equal(eligibleControls.canRepair, true);
+            assert.equal(ineligibleCandidate.repairEligible, false);
+            assert.deepEqual(ineligibleCandidate.eligibleRepairFindingIds, []);
+            assert.equal(ineligibleRepairBody.error?.code, "REPAIR_NOT_ELIGIBLE");
+            assert.equal(ineligibleControls.canRepair, false);
+            assert.equal(warningControls.canRepair, false);
+            assert.equal(passControls.canRepair, false);
+            assert.equal(terminalControls.canRepair, false);
+            assert.equal(existingRepairControls.canRepair, false);
+          },
+          "ROUTE-006/retry-control": () => {
+            assert.equal(retryCandidate?.status, "qa_unavailable_retryable");
+            assert.equal(retryControls.canRetry, true);
+            assert.equal(unavailableTerminalCandidate.status, "qa_unavailable_terminal");
+            assert.equal(terminalControls.canRetry, false);
+          },
+        });
+
+      const unavailablePresentation = s2QaUserFacingState(unavailableInitial.result.qaRun);
+      const unavailableVisibleText = unavailablePresentation.statusText + "\n" + unavailablePresentation.summaryText;
+      await prove(["UI-003/unavailable-not-pass"], "ui unavailable distinction", "Actual deterministic client presentation projected from a real all-provider-unavailable persisted QA result.",
+        { sourcePath: "app/components/S2Client.tsx", summaryKind: unavailableInitial.result.qaRun.summary.kind, statusText: unavailablePresentation.statusText, summaryText: unavailablePresentation.summaryText, visibleText: unavailableVisibleText, retryableControl: s2QaCandidateControls(unavailableRetryableCandidate, false).canRetry, result: "unavailable-distinct-no-verdict" },
+        "The deterministic client presentation for a real all-provider-unavailable projection communicated QA unavailability and exposed neither PASS, MATERIAL_FAIL, nor completed success.",
+        () => {
+          assert.equal(unavailableInitial.result.qaRun.summary.kind, "all_results_unavailable");
+          assert.match(unavailableVisibleText, /QA unavailable/i);
+          assert.match(unavailableVisibleText, /no usable provider result/i);
+          assert.doesNotMatch(unavailableVisibleText, /\bPASS\b/);
+          assert.doesNotMatch(unavailableVisibleText, /\bMATERIAL_FAIL\b/);
+          assert.doesNotMatch(unavailableVisibleText, /completed/i);
+          assert.equal(s2QaCandidateControls(unavailableRetryableCandidate, false).canRetry, true);
+        });
+    } finally {
+      for (const value of matrixValues) rmSync(value.root, { recursive: true, force: true });
+    }
 
     const responseJsonText = JSON.stringify({ asset: uploaded.asset, draft: updated.draft });
     const storageKey = routeState.s2Assets.find((asset) => asset.id === uploaded.asset.id)?.storageKeyOriginal ?? "";
@@ -3257,17 +3688,14 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
         "UI-001/references-disclaimer": () => assert.equal(uiSource.includes("S2 is visual/design QA only"), true),
         "UI-001/qa-disclaimer": () => assert.equal(uiSource.includes("Visual/design screening only"), true),
       });
+    const persistedPresentation = s2QaUserFacingState(finalQaProjection.qaRun);
     await prove(claimIds("UI-002", ["ordered-candidates", "state-distinguishable"]), "ui persisted state projection", "Static client source review plus a real ordered/frozen projection read.",
-      { sourcePath: "app/components/S2Client.tsx", orderedList: uiSource.includes("<ol>"), statusText: uiSource.includes("Persisted run status"), frozenStatus: frozen.status, result: "distinguishable" },
-      "The checked UI rendered ordered candidate lists and a persisted status that distinguishes frozen/terminal state.",
-      () => { assert.equal(uiSource.includes("<ol>"), true); assert.equal(uiSource.includes("Persisted run status"), true); assert.equal(frozen.status, "frozen"); }, undefined, {
+      { sourcePath: "app/components/S2Client.tsx", orderedList: uiSource.includes("<ol>"), statusText: persistedPresentation.statusText, summaryText: persistedPresentation.summaryText, frozenStatus: frozen.status, result: "distinguishable" },
+      "The checked UI rendered ordered candidate lists and projected the server-owned QA summary while preserving a distinct frozen state.",
+      () => { assert.equal(uiSource.includes("<ol>"), true); assert.equal(["QA processing", "QA results available"].includes(persistedPresentation.statusText), true); assert.equal(frozen.status, "frozen"); }, undefined, {
         "UI-002/ordered-candidates": () => assert.equal(uiSource.includes("<ol>"), true),
-        "UI-002/state-distinguishable": () => { assert.equal(uiSource.includes("Persisted run status"), true); assert.equal(frozen.status, "frozen"); },
+        "UI-002/state-distinguishable": () => { assert.equal(["QA processing", "QA results available"].includes(persistedPresentation.statusText), true); assert.equal(frozen.status, "frozen"); },
       });
-    await prove(["UI-003/unavailable-not-pass"], "ui unavailable distinction", "Static client source review for unavailable state rendering and a real retryable/terminal projection.",
-      { sourcePath: "app/components/S2Client.tsx", unavailableRendered: uiSource.includes("qa_unavailable_retryable"), retryControlRendered: uiSource.includes("Retry QA"), result: "distinct" },
-      "The checked UI rendered unavailable state distinctly and offered retry only for the server-owned retryable status.",
-      () => { assert.equal(uiSource.includes("qa_unavailable_retryable"), true); assert.equal(uiSource.includes("Retry QA"), true); });
     await prove(claimIds("UI-004", ["no-prompt-edit", "no-model-edit", "no-verdict-edit", "no-hard-fact-edit", "no-hash-edit"]), "ui immutable server projection", "Static client source review for absence of editable provider prompt, model, verdict, hard-fact, and hash controls.",
       { sourcePath: "app/components/S2Client.tsx", promptInput: uiSource.includes("promptText"), modelInput: uiSource.includes("modelInput"), verdictInput: uiSource.includes("verdictInput"), hardFactInput: uiSource.includes("hardFactInput"), hashInput: uiSource.includes("hashInput"), result: "server-owned" },
       "The checked UI source exposed no editable controls for provider prompts, model, verdicts, hard facts, or hashes.",

@@ -372,7 +372,7 @@ async function handle(
 ): Promise<NextResponse> {
   if (segments.length === 4 && segments[0] === "projects" && segments[2] === "s2" && segments[3] === "reference-assets" && method === "POST") {
     assertUuid(segments[1], "projectId"); service.s2.authorizeProject(segments[1]);
-    const file = await multipartS2File(request); const key = keyFromHeader(request, "Idempotency-Key");
+    const key = keyFromHeader(request, "Idempotency-Key"); const file = await multipartS2File(request);
     const result = await service.s2.uploadAsset(segments[1], file.kind, file.fileName, file.mimeType, file.bytes, key);
     return NextResponse.json({ asset: result.asset, draft: result.draft }, { status: result.replayed ? 200 : 201 });
   }

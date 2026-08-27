@@ -16,6 +16,7 @@ type Observation = { requirementId?: string; ruleId?: string; observed: string; 
 type Candidate = { candidateId: string; candidateIndex: number; status: string; verdict: string; materialFindingIds: string[]; warningFindingIds: string[]; uncertainFindingIds: string[]; requirementObservations: Observation[]; designObservations: Observation[]; repairEligible?: boolean; eligibleRepairFindingIds?: string[] };
 type QaSummary = { kind: "processing" | "results_available" | "results_include_unavailable" | "all_results_unavailable"; resultCount: number; unavailableCount: number };
 export type S2QaProjection = { qaRun: { id: string; status: string; candidateResults: Candidate[]; repairs: Array<{ candidateId: string; status: string; derivedCandidateId: string | null }>; reQa: Array<{ candidateId: string; status: string; verdict: string }>; summary?: QaSummary }; input: { id: string } };
+export type S2QaPresentation = { statusText: string; summaryText: string };
 
 function apiPath(projectId: string, suffix: string): string { return "/api/projects/" + projectId + suffix; }
 async function readJson(response: Response): Promise<any> {
@@ -88,6 +89,25 @@ export function createS2QaClient(options: { projectId: string; qaRunId: string; 
   return { refresh, retry, repair };
 }
 
+export function s2QaUserFacingState(run: S2QaProjection["qaRun"] | null | undefined): S2QaPresentation {
+  switch (run?.summary?.kind) {
+    case "processing":
+      return { statusText: "QA processing", summaryText: "QA is still processing." };
+    case "results_available":
+      return { statusText: "QA results available", summaryText: "Results are available for all candidates." };
+    case "results_include_unavailable":
+      return { statusText: "QA results available with unavailable candidates", summaryText: "Results are available, but at least one candidate remains unavailable." };
+    case "all_results_unavailable":
+      return { statusText: "QA unavailable - no usable provider result", summaryText: "QA finished without a usable provider result. No pass/fail conclusion is available." };
+    default:
+      return { statusText: "Loading persisted QA state", summaryText: "Loading persisted QA state." };
+  }
+}
+
+export function s2QaCandidateControls(candidate: Pick<Candidate, "status" | "repairEligible">, hasRepair = false): { canRetry: boolean; canRepair: boolean } {
+  return { canRetry: candidate.status === "qa_unavailable_retryable", canRepair: candidate.repairEligible === true && !hasRepair };
+}
+
 export function S2ReferencesScreen({ projectId, sourceGenerationSetId }: { projectId: string; sourceGenerationSetId: string | null }) {
   const [draft, setDraft] = useState<Draft | null>(null); const [file, setFile] = useState<File | null>(null);
   const [kind, setKind] = useState<"reference" | "logo">("reference"); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
@@ -118,14 +138,6 @@ export function S2QaScreen({ projectId, qaRunId }: { projectId: string; qaRunId:
   async function retry(id: string) { setBusy(true); try { setProjection(await client.retry(id)); } catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); } finally { setBusy(false); } }
   async function repair(id: string) { if (!projection) return; setBusy(true); try { setProjection(await client.repair(id, projection.input.id)); } catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); } finally { setBusy(false); } }
   const run = projection?.qaRun;
-  const summaryText = run?.summary?.kind === "processing"
-    ? "QA is still processing."
-    : run?.summary?.kind === "all_results_unavailable"
-      ? "QA finished without a usable provider result. No pass/fail conclusion is available."
-      : run?.summary?.kind === "results_include_unavailable"
-        ? "Results are available, but at least one candidate remains unavailable."
-        : run?.summary?.kind === "results_available"
-          ? "Results are available for all candidates."
-          : "Loading persisted QA state.";
-  return <main><p className="muted">Swooshz Design / S2 buildability QA</p><h1>Buildability QA</h1><p className="disclaimer">Visual/design screening only. No engineering, venue, code, fabrication, rigging, cost, construction, or approval conclusion is produced.</p>{error ? <p className="error">{error}</p> : null}<p className="muted">Persisted run status: {run?.status ?? "loading"}</p><p aria-live="polite">{summaryText}</p><button type="button" disabled={busy} onClick={() => void refresh()}>Refresh persisted result</button><div className="candidate-grid">{run?.candidateResults.map((candidate) => { const repairState = run.repairs.find((item) => item.candidateId === candidate.candidateId); const reQa = run.reQa.find((item) => item.candidateId === candidate.candidateId); return <article className="candidate" key={candidate.candidateId}><h2>Candidate {candidate.candidateIndex}</h2><p><strong>{candidate.status}</strong> / {candidate.verdict}</p>{candidate.materialFindingIds.length ? <p>Material findings: {candidate.materialFindingIds.join(", ")}</p> : null}{candidate.warningFindingIds.length ? <p>Warnings: {candidate.warningFindingIds.join(", ")}</p> : null}{candidate.uncertainFindingIds.length ? <p>Uncertainty remains WARNING: {candidate.uncertainFindingIds.join(", ")}</p> : null}<details><summary>Evidence observations</summary>{candidate.requirementObservations.map((item) => <p key={item.requirementId}>{item.requirementId}: {item.observed} ({item.confidence}) - {item.evidence}</p>)}{candidate.designObservations.map((item) => <p key={item.ruleId}>{item.ruleId}: {item.observed} ({item.confidence}) - {item.evidence}</p>)}</details>{candidate.status === "qa_unavailable_retryable" ? <button type="button" disabled={busy} onClick={() => void retry(candidate.candidateId)}>Retry QA</button> : null}{candidate.repairEligible === true && !repairState ? <button type="button" disabled={busy} onClick={() => void repair(candidate.candidateId)}>Request bounded repair</button> : null}{repairState ? <p>Repair: {repairState.status}</p> : null}{reQa ? <p>Re-QA: {reQa.status} / {reQa.verdict}</p> : null}</article>; })}</div></main>;
+  const presentation = s2QaUserFacingState(run);
+  return <main><p className="muted">Swooshz Design / S2 buildability QA</p><h1>Buildability QA</h1><p className="disclaimer">Visual/design screening only. No engineering, venue, code, fabrication, rigging, cost, construction, or approval conclusion is produced.</p>{error ? <p className="error">{error}</p> : null}<p className="muted">{presentation.statusText}</p><p aria-live="polite">{presentation.summaryText}</p><button type="button" disabled={busy} onClick={() => void refresh()}>Refresh persisted result</button><div className="candidate-grid">{run?.candidateResults.map((candidate) => { const repairState = run.repairs.find((item) => item.candidateId === candidate.candidateId); const reQa = run.reQa.find((item) => item.candidateId === candidate.candidateId); const controls = s2QaCandidateControls(candidate, Boolean(repairState)); return <article className="candidate" key={candidate.candidateId}><h2>Candidate {candidate.candidateIndex}</h2><p><strong>{candidate.status}</strong> / {candidate.verdict}</p>{candidate.materialFindingIds.length ? <p>Material findings: {candidate.materialFindingIds.join(", ")}</p> : null}{candidate.warningFindingIds.length ? <p>Warnings: {candidate.warningFindingIds.join(", ")}</p> : null}{candidate.uncertainFindingIds.length ? <p>Uncertainty remains WARNING: {candidate.uncertainFindingIds.join(", ")}</p> : null}<details><summary>Evidence observations</summary>{candidate.requirementObservations.map((item) => <p key={item.requirementId}>{item.requirementId}: {item.observed} ({item.confidence}) - {item.evidence}</p>)}{candidate.designObservations.map((item) => <p key={item.ruleId}>{item.ruleId}: {item.observed} ({item.confidence}) - {item.evidence}</p>)}</details>{controls.canRetry ? <button type="button" disabled={busy} onClick={() => void retry(candidate.candidateId)}>Retry QA</button> : null}{controls.canRepair ? <button type="button" disabled={busy} onClick={() => void repair(candidate.candidateId)}>Request bounded repair</button> : null}{repairState ? <p>Repair: {repairState.status}</p> : null}{reQa ? <p>Re-QA: {reQa.status} / {reQa.verdict}</p> : null}</article>; })}</div></main>;
 }
