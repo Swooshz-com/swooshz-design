@@ -150,9 +150,9 @@ function fixtureFor(testId: string, variantId: string): string {
   if (testId === "REPAIR-007") return "Real two-candidate repair workflow proving one repair per (qaRunId, candidateId), independent candidate repair, and same-candidate rejection.";
   if (testId === "REQA-003") return "Four real repair/re-QA workflows proving pass, warning, material-fail, and unavailable outcomes without changing source-QA completion.";
   if (testId === "REPAIR-011") return "Production OpenAIProvider.runS2Repair adapter with one controlled local response per locked output class.";
-  if (testId === "PRIV-001") return "Real local S2 success/failure/error run with captured console sinks, production provider adapter request/response markers, safe error envelope, and private object keys.";
+  if (testId === "PRIV-001") return "Real local S2 success/failure/error run with captured console sinks; each exact privacy marker is checked against captured logs and safe envelopes; production provider adapter markers and private object keys are exercised.";
   if (testId === "PRIV-002") return "Changed-client/provider boundary review for credentials, tokens, private keys, environment reads, and authorization headers.";
-  if (testId === "PRIV-005") return "Canonical-base tracked changed-surface credential scan with controlled redaction negative, loopback-only provider guard, frozen dependency metadata, and product audit target.";
+  if (testId === "PRIV-005") return "Canonical-base tracked changed-surface credential scan with controlled redaction negative, measured normal-run provider transport counters, a separate blocked guard probe, frozen dependency metadata, and product audit target.";
   if (testId === "UI-002") return "Shuffled QA projection derived from the actual persisted server projection, passed through the production candidate-order renderer helper, with real available and unavailable state projections.";
   if (testId.startsWith("UI-")) return "Local rendered S2 reference and QA screens with visual-only disclosure and state controls.";
   const family = testId.split("-")[0];

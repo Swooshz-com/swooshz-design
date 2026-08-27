@@ -2729,8 +2729,45 @@ async function captureConsoleSinks(action: () => unknown): Promise<string[]> {
   return entries;
 }
 
+type ProviderTransportMeasurement = { nonLoopbackAttempts: number; networkForwardCount: number };
+
+function providerTransportMeasurement(): ProviderTransportMeasurement {
+  return { nonLoopbackAttempts: 0, networkForwardCount: 0 };
+}
+
+function createProviderTransportGuard(measurement: ProviderTransportMeasurement, upstream: typeof fetch): typeof fetch {
+  return async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (!["127.0.0.1", "localhost", "::1"].includes(url.hostname)) {
+      measurement.nonLoopbackAttempts += 1;
+      throw new Error("non-loopback provider blocked");
+    }
+    measurement.networkForwardCount += 1;
+    return upstream(input, init);
+  };
+}
+
+function installProviderTransportGuard(measurement: ProviderTransportMeasurement): () => void {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = createProviderTransportGuard(measurement, originalFetch);
+  return () => { globalThis.fetch = originalFetch; };
+}
+
+function assertNoLiveProviderDispatch(measurement: ProviderTransportMeasurement): void {
+  assert.equal(measurement.nonLoopbackAttempts, 0);
+  assert.equal(measurement.networkForwardCount, 0);
+}
+
 function assertLogMarkersAbsent(logEntries: readonly string[], markers: readonly string[]): void {
   for (const entry of logEntries) for (const marker of markers) assert.equal(entry.includes(marker), false);
+}
+
+function assertLogMarkerAbsent(logEntries: readonly string[], marker: string): void {
+  assert.equal(logEntries.some((entry) => entry.includes(marker)), false);
+}
+
+function assertSafeEnvelopeMarkerAbsent(envelopes: readonly string[], marker: string): void {
+  assert.equal(envelopes.some((envelope) => envelope.includes(marker)), false);
 }
 
 type SecretFinding = { kind: string; sourcePath: string; redacted: "[REDACTED]" };
@@ -2770,17 +2807,6 @@ function scanChangedTrackedSurface(baseRef: string): { files: string[]; text: st
     findings.push(...scanSecretText(file, text));
   }
   return { files, text: parts.join("\n"), findings };
-}
-
-function loopbackOnlyFetch(counter: { nonLoopbackAttempts: number }): typeof fetch {
-  return async (input) => {
-    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
-    if (!["127.0.0.1", "localhost", "::1"].includes(url.hostname)) {
-      counter.nonLoopbackAttempts += 1;
-      throw new Error("non-loopback provider blocked");
-    }
-    return new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } });
-  };
 }
 
 function claimIds(testId: string, variants: readonly string[]): string[] {
@@ -2962,7 +2988,7 @@ test("execution-bound evidence validator negative self-tests", async () => {
   assert.throws(() => assertLogMarkersAbsent([sensitiveLogMarker], [sensitiveLogMarker]));
   const changedUiOrder = [1, 3, 2, 4];
   assert.throws(() => assert.deepEqual(changedUiOrder, [1, 2, 3, 4]));
-  assert.throws(() => assert.equal(1, 0));
+  assert.throws(() => assertNoLiveProviderDispatch({ nonLoopbackAttempts: 1, networkForwardCount: 0 }));
   const injectedSecret = "OPENAI_API_KEY=\"" + "sk-" + "A".repeat(24) + "\"";
   const injectedFindings = scanSecretText("controlled-injected-secret.fixture", injectedSecret);
   assert.equal(injectedFindings.some((finding) => finding.kind === "openai-api-key"), true);
@@ -3013,7 +3039,10 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     }
   };
 
-  const uploadValue = fixture();
+  const normalEvidenceTransport = providerTransportMeasurement();
+  const restoreNormalEvidenceTransportGuard = installProviderTransportGuard(normalEvidenceTransport);
+  try {
+    const uploadValue = fixture();
   try {
     const upload = await uploadValue.service.s2.uploadAsset(uploadValue.projectId, "reference", "uploaded.png", "image/png", ONE_PIXEL_PNG, randomUUID());
     const stored = uploadValue.repository.state().s2Assets.find((asset) => asset.id === upload.asset.id)!;
@@ -4662,6 +4691,7 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     let privacyAdapterFailureCode = "";
     let privacyErrorStatus = 0;
     let privacyErrorBody: any = null;
+    let privacyInputFileName = "";
     let privacyUploadedStorageKey = "";
     let privacyAdapterPrompt = "";
     let privacyAdapterImageBytes = Buffer.alloc(0);
@@ -4685,8 +4715,9 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       const privacyValue = fixture([ONE_PIXEL_PNG], { provider: privacyProvider });
       try {
         privacyValue.service.s2.getReferenceDraft(privacyValue.projectId);
+        privacyInputFileName = "..\\private\\" + privacyMarkers.privatePath + ".png";
         const uploaded = await privacyValue.service.s2.uploadAsset(privacyValue.projectId, "reference",
-          "..\\private\\" + privacyMarkers.privatePath + ".png", "image/png", ONE_PIXEL_PNG, randomUUID());
+          privacyInputFileName, "image/png", ONE_PIXEL_PNG, randomUUID());
         privacyUploadedStorageKey = privacyValue.repository.state().s2Assets.find((item) => item.id === uploaded.asset.id)?.storageKeyOriginal ?? "";
         const boundPrivacy = await privacyValue.service.s2.bindQa(privacyValue.projectId, privacyValue.generationSetId, 1, randomUUID(), randomUUID());
         privacyRun = await waitFor(() => privacyValue.service.s2.getQaRun(privacyValue.projectId, boundPrivacy.qaRun.id) as any,
@@ -4733,7 +4764,9 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       code: privacyAdapterFailureCode, message: "The request could not be completed. Try again or contact support with the reference ID.",
     } });
     assertLogMarkersAbsent(privacyLogEntries, Object.values(privacyMarkers));
-    assertLogMarkersAbsent([privacySafeFailureEnvelope], Object.values(privacyMarkers));
+    const privacySafeEnvelopeText = JSON.stringify(privacyErrorBody);
+    const privacySafeEnvelopes = [privacySafeEnvelopeText, privacySafeFailureEnvelope];
+    assertLogMarkersAbsent(privacySafeEnvelopes, Object.values(privacyMarkers));
     await prove(claimIds("ROUTE-001", ["auth-all"]), "route project authorization", "Real API requests for a random project and the authorized local project through every S2 route family.",
       { authorizedProject: routeValue.projectId.length > 0, unknownProjectStatus, unauthorizedRoutes: 1, result: "guarded" },
       "The real API rejected an unknown project without exposing a project record while allowing the authorized local project flow.",
@@ -4915,20 +4948,19 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const storageKey = routeState.s2Assets.find((asset) => asset.id === uploaded.asset.id)?.storageKeyOriginal ?? "";
     const privateProjectPreview = await routeApi("/api/projects/" + randomUUID() + "/s2/reference-assets/" + uploaded.asset.id, { method: "GET" });
     const privacyLogText = privacyLogEntries.join("\n");
-    const privacySafeEnvelopeText = JSON.stringify(privacyErrorBody);
     const privacyMarkerFree = Object.values(privacyMarkers).every((marker) => !privacyLogText.includes(marker));
-    const privacySafeEnvelopeMarkerFree = Object.values(privacyMarkers).every((marker) => !privacySafeEnvelopeText.includes(marker) && !privacySafeFailureEnvelope.includes(marker));
+    const privacySafeEnvelopeMarkerFree = Object.values(privacyMarkers).every((marker) => privacySafeEnvelopes.every((envelope) => !envelope.includes(marker)));
     const privacyEvidenceCount = privacyRun?.qaRun.candidateResults.reduce((sum: number, candidate: any) => sum + candidate.requirementObservations.length + candidate.designObservations.length, 0) ?? 0;
     await prove(claimIds("PRIV-001", ["image-bytes", "base64", "prompt", "provider-payload", "evidence", "private-path"]), "privacy payload boundary", "Real local S2 success/failure run, production provider adapter success/failure, captured console sinks, API error envelope, traversal-shaped private filename, and private object keys.",
-      { responseOmitsImageBytes: !responseJsonText.includes("89504e470d0a1a0a"), responseOmitsBase64: !responseJsonText.includes("iVBORw0KGgo"), responseOmitsPrompt: !responseJsonText.includes("bounded visual correction"), adapterImageMarkerRoundTrip: privacyAdapterImageBytes.toString("utf8") === privacyMarkers.imageBytes, adapterBase64Marker: privacyAdapterImageBytes.toString("base64") === privacyBase64, adapterPromptMarker: privacyAdapterPrompt === privacyMarkers.prompt, providerPayloadObserved: privacyProviderPayloadSeen && privacyAdapterRequestId === privacyMarkers.providerPayload, evidenceObserved: privacyEvidenceSeen && privacyEvidenceCount > 0, s2FailureCode: privacyFailureCode, adapterFailureCode: privacyAdapterFailureCode, errorStatus: privacyErrorStatus, logEntryCount: privacyLogEntries.length, logMarkersAbsent: privacyMarkerFree, safeEnvelopeMarkersAbsent: privacySafeEnvelopeMarkerFree, storagePathPrivate: storageKey.startsWith("projects/") && storageKey.includes("/s2/") && !storageKey.includes(".."), result: "minimized" },
+      { responseOmitsImageBytes: !responseJsonText.includes("89504e470d0a1a0a"), responseOmitsBase64: !responseJsonText.includes("iVBORw0KGgo"), responseOmitsPrompt: !responseJsonText.includes("bounded visual correction"), adapterImageMarkerRoundTrip: privacyAdapterImageBytes.toString("utf8") === privacyMarkers.imageBytes, adapterBase64Marker: privacyAdapterImageBytes.toString("base64") === privacyBase64, adapterPromptMarker: privacyAdapterPrompt === privacyMarkers.prompt, providerPayloadObserved: privacyProviderPayloadSeen && privacyAdapterRequestId === privacyMarkers.providerPayload, evidenceObserved: privacyEvidenceSeen && privacyEvidenceCount > 0, privacyInputPathContainsMarker: privacyInputFileName.includes(privacyMarkers.privatePath), s2FailureCode: privacyFailureCode, adapterFailureCode: privacyAdapterFailureCode, errorStatus: privacyErrorStatus, logEntryCount: privacyLogEntries.length, logMarkersAbsent: privacyMarkerFree, safeEnvelopeMarkersAbsent: privacySafeEnvelopeMarkerFree, storagePathPrivate: storageKey.startsWith("projects/") && storageKey.includes("/s2/") && !storageKey.includes(".."), result: "minimized" },
       "The real local success, provider failure, API error, captured logging sinks, and private object route kept image bytes, encoded payloads, prompts, raw provider data, evidence markers, and private path markers out of logs and safe error envelopes while retaining private project-scoped storage.",
       () => { assert.equal(privacyMarkerFree, true); assert.equal(privacySafeEnvelopeMarkerFree, true); assert.equal(privacyErrorStatus, 400); assert.equal(privacyErrorBody?.error?.code, "IDEMPOTENCY_KEY_REQUIRED"); assert.equal(privacyFailureCode, "PROVIDER_TIMEOUT"); assert.equal(privacyAdapterFailureCode, "PROVIDER_UNAVAILABLE"); assert.equal(directPreview.status, 200); assert.equal(previewBytes.length > 0, true); assert.equal(privateProjectPreview.status, 404); }, undefined, {
-        "PRIV-001/image-bytes": () => { assert.equal(privacyAdapterImageBytes.toString("utf8"), privacyMarkers.imageBytes); assert.equal(responseJsonText.includes("89504e470d0a1a0a"), false); },
-        "PRIV-001/base64": () => { assert.equal(privacyAdapterImageBytes.toString("base64"), privacyBase64); assert.equal(responseJsonText.includes("iVBORw0KGgo"), false); },
-        "PRIV-001/prompt": () => { assert.equal(privacyAdapterPrompt, privacyMarkers.prompt); assert.equal(responseJsonText.includes("bounded visual correction"), false); },
-        "PRIV-001/provider-payload": () => { assert.equal(privacyProviderPayloadSeen, true); assert.equal(privacyAdapterRequestId, privacyMarkers.providerPayload); assert.equal(privacyMarkerFree, true); },
-        "PRIV-001/evidence": () => { assert.equal(privacyEvidenceSeen, true); assert.equal(privacyEvidenceCount > 0, true); assert.equal(privacySafeEnvelopeMarkerFree, true); },
-        "PRIV-001/private-path": () => { assert.equal(storageKey.startsWith("projects/"), true); assert.equal(storageKey.includes("/s2/"), true); assert.equal(storageKey.includes(".."), false); assert.equal(privateProjectPreview.status, 404); assert.equal(privacyUploadedStorageKey.includes(privacyMarkers.privatePath), false); },
+        "PRIV-001/image-bytes": () => { assertLogMarkerAbsent(privacyLogEntries, privacyMarkers.imageBytes); assertSafeEnvelopeMarkerAbsent(privacySafeEnvelopes, privacyMarkers.imageBytes); assert.equal(privacyAdapterImageBytes.toString("utf8"), privacyMarkers.imageBytes); assert.equal(responseJsonText.includes("89504e470d0a1a0a"), false); },
+        "PRIV-001/base64": () => { assertLogMarkerAbsent(privacyLogEntries, privacyMarkers.base64); assertSafeEnvelopeMarkerAbsent(privacySafeEnvelopes, privacyMarkers.base64); assert.equal(privacyAdapterImageBytes.toString("base64"), privacyBase64); assert.equal(responseJsonText.includes("iVBORw0KGgo"), false); },
+        "PRIV-001/prompt": () => { assertLogMarkerAbsent(privacyLogEntries, privacyMarkers.prompt); assertSafeEnvelopeMarkerAbsent(privacySafeEnvelopes, privacyMarkers.prompt); assert.equal(privacyAdapterPrompt, privacyMarkers.prompt); assert.equal(responseJsonText.includes("bounded visual correction"), false); },
+        "PRIV-001/provider-payload": () => { assertLogMarkerAbsent(privacyLogEntries, privacyMarkers.providerPayload); assertSafeEnvelopeMarkerAbsent(privacySafeEnvelopes, privacyMarkers.providerPayload); assert.equal(privacyProviderPayloadSeen, true); assert.equal(privacyAdapterRequestId, privacyMarkers.providerPayload); },
+        "PRIV-001/evidence": () => { assertLogMarkerAbsent(privacyLogEntries, privacyMarkers.evidence); assertSafeEnvelopeMarkerAbsent(privacySafeEnvelopes, privacyMarkers.evidence); assert.equal(privacyEvidenceSeen, true); assert.equal(privacyEvidenceCount > 0, true); },
+        "PRIV-001/private-path": () => { assertLogMarkerAbsent(privacyLogEntries, privacyMarkers.privatePath); assertSafeEnvelopeMarkerAbsent(privacySafeEnvelopes, privacyMarkers.privatePath); assert.equal(privacyInputFileName.includes(privacyMarkers.privatePath), true); assert.equal(storageKey.startsWith("projects/"), true); assert.equal(storageKey.includes("/s2/"), true); assert.equal(storageKey.includes(".."), false); assert.equal(privateProjectPreview.status, 404); assert.equal(privacyUploadedStorageKey.includes(privacyMarkers.privatePath), false); },
       });
     const changedSurface = scanChangedTrackedSurface("68fbbb8653733554730d90316ce6e91719f1ffce");
     const changedSourceText = routeClientSource + readFileSync("src/lib/s2-provider.ts", "utf8") + readFileSync("src/lib/openai.ts", "utf8");
@@ -5009,22 +5041,28 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     });
     const packageText = readFileSync("package.json", "utf8");
     const lockText = readFileSync("pnpm-lock.yaml", "utf8");
-    const loopbackGuardCounter = { nonLoopbackAttempts: 0 };
-    const guardedProvider = new OpenAIProvider({ apiKey: "local-test-only", fetchImpl: loopbackOnlyFetch(loopbackGuardCounter) });
+    const blockedGuardProbe = providerTransportMeasurement();
+    const guardedProvider = new OpenAIProvider({
+      apiKey: "local-test-only",
+      fetchImpl: createProviderTransportGuard(blockedGuardProbe, async () => { throw new Error("unexpected network forward"); }),
+    });
     let guardedProviderFailureCode = "";
     try { await guardedProvider.extractBrief(new Uint8Array([0])); }
     catch (error) { guardedProviderFailureCode = error instanceof ProviderFailure ? error.safeCode : "UNKNOWN_ERROR"; }
+    const normalEvidenceLiveProviderDispatches = normalEvidenceTransport.nonLoopbackAttempts;
+    const normalEvidenceNetworkForwardCount = normalEvidenceTransport.networkForwardCount;
+    assertNoLiveProviderDispatch(normalEvidenceTransport);
     const localProviderCalls = providerCallCounts(routeValue);
     const frozenDependencyLock = lockText.includes("lockfileVersion: '9.0'") && lockText.includes("sharp@0.35.3") && lockText.includes("pdfjs-dist@6.2.108");
     const dependencyVersionsPinned = packageText.includes('"sharp": "0.35.3"') && packageText.includes('"pdfjs-dist": "6.2.108"');
     const redactedSecretFindings = changedSurface.findings.map((finding) => finding.kind + "=" + finding.redacted).join(",");
-    await prove(claimIds("PRIV-005", ["secret-scan", "dependency-review", "no-live-provider"]), "privacy changed-content and dependency review", "Canonical-base tracked changed-surface scan with controlled injected-secret redaction negative, frozen sharp/pdfjs lock review, production product audit target, and a measured loopback-only provider guard.",
-      { sourcePath: "git diff 68fbbb8653733554730d90316ce6e91719f1ffce + package.json + pnpm-lock.yaml", changedFileCount: changedSurface.files.length, changedSurfaceFiles: changedSurface.files.join(","), secretFindingCount: changedSurface.findings.length, redactedSecretFindings, frozenDependencyLock, dependencyVersionsPinned, sharpVersionPinned: packageText.includes('"sharp": "0.35.3"'), pdfjsVersionPinned: packageText.includes('"pdfjs-dist": "6.2.108"'), productionAuditTarget: "pnpm audit --prod", mockS2QaCalls: localProviderCalls.s2Qa, mockS2RepairCalls: localProviderCalls.s2Repair, liveProviderCalls: 0, blockedNonLoopbackAttempts: loopbackGuardCounter.nonLoopbackAttempts, guardFailureCode: guardedProviderFailureCode, result: "clean-offline" },
-      "The canonical-base changed tracked surface had no credential findings, controlled secret findings were redacted, sharp/pdfjs versions matched the frozen lock, local provider fixtures completed without live calls, and the real provider adapter was fail-closed by a measured loopback-only guard.",
-      () => { assert.equal(changedSurface.files.length > 0, true); assert.equal(changedSurface.findings.length, 0); assert.equal(frozenDependencyLock, true); assert.equal(dependencyVersionsPinned, true); assert.equal(loopbackGuardCounter.nonLoopbackAttempts, 1); assert.equal(guardedProviderFailureCode, "PROVIDER_UNAVAILABLE"); assert.equal(localProviderCalls.s2Qa > 0, true); assert.equal(localProviderCalls.s2Repair > 0, true); assert.equal(0, 0); }, undefined, {
+    await prove(claimIds("PRIV-005", ["secret-scan", "dependency-review", "no-live-provider"]), "privacy changed-content and dependency review", "Canonical-base tracked changed-surface scan with controlled injected-secret redaction negative, frozen sharp/pdfjs lock review, measured normal-evidence provider transport, separate blocked guard probe, and production audit target.",
+      { sourcePath: "git diff 68fbbb8653733554730d90316ce6e91719f1ffce + package.json + pnpm-lock.yaml", changedFileCount: changedSurface.files.length, changedSurfaceFiles: changedSurface.files.join(","), secretFindingCount: changedSurface.findings.length, redactedSecretFindings, frozenDependencyLock, dependencyVersionsPinned, sharpVersionPinned: packageText.includes('"sharp": "0.35.3"'), pdfjsVersionPinned: packageText.includes('"pdfjs-dist": "6.2.108"'), productionAuditTarget: "pnpm audit --prod", mockS2QaCalls: localProviderCalls.s2Qa, mockS2RepairCalls: localProviderCalls.s2Repair, normalEvidenceLiveProviderDispatches, normalEvidenceNonLoopbackAttempts: normalEvidenceTransport.nonLoopbackAttempts, normalEvidenceNetworkForwardCount, blockedGuardProbeAttempts: blockedGuardProbe.nonLoopbackAttempts, blockedGuardProbeNetworkForwardCount: blockedGuardProbe.networkForwardCount, guardFailureCode: guardedProviderFailureCode, result: "clean-offline" },
+      "The canonical-base changed tracked surface had no credential findings, controlled secret findings were redacted, sharp/pdfjs versions matched the frozen lock, normal evidence measured zero non-loopback provider dispatches and zero network forwards, and the separate blocked probe intercepted one non-loopback attempt without forwarding.",
+      () => { assert.equal(changedSurface.files.length > 0, true); assert.equal(changedSurface.findings.length, 0); assert.equal(frozenDependencyLock, true); assert.equal(dependencyVersionsPinned, true); assertNoLiveProviderDispatch(normalEvidenceTransport); assert.equal(blockedGuardProbe.nonLoopbackAttempts, 1); assert.equal(blockedGuardProbe.networkForwardCount, 0); assert.equal(guardedProviderFailureCode, "PROVIDER_UNAVAILABLE"); assert.equal(localProviderCalls.s2Qa > 0, true); assert.equal(localProviderCalls.s2Repair > 0, true); }, undefined, {
         "PRIV-005/secret-scan": () => { assert.equal(changedSurface.findings.length, 0); assert.equal(redactedSecretFindings, ""); },
         "PRIV-005/dependency-review": () => { assert.equal(frozenDependencyLock, true); assert.equal(dependencyVersionsPinned, true); assert.equal(packageText.includes('"sharp": "0.35.3"'), true); assert.equal(packageText.includes('"pdfjs-dist": "6.2.108"'), true); },
-        "PRIV-005/no-live-provider": () => { assert.equal(localProviderCalls.s2Qa > 0, true); assert.equal(localProviderCalls.s2Repair > 0, true); assert.equal(loopbackGuardCounter.nonLoopbackAttempts, 1); assert.equal(guardedProviderFailureCode, "PROVIDER_UNAVAILABLE"); assert.equal(0, 0); },
+        "PRIV-005/no-live-provider": () => { assertNoLiveProviderDispatch(normalEvidenceTransport); assert.equal(blockedGuardProbe.nonLoopbackAttempts, 1); assert.equal(blockedGuardProbe.networkForwardCount, 0); assert.equal(guardedProviderFailureCode, "PROVIDER_UNAVAILABLE"); },
       });
   } finally { rmSync(routeValue.root, { recursive: true, force: true }); }
 
@@ -5103,5 +5141,8 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     assert.deepEqual(missing, []);
     assert.equal(new Set(records.map((record) => record.claimId)).size, records.length);
     console.log(JSON.stringify({ evidenceArtifact: artifactFile, rowCount: manifestBaseRowCount, claimCount: records.length, missingClaims: 0, unknownClaims: 0, duplicateClaims: 0, skippedClaims: 0 }));
-  } finally { rmSync(artifactRoot, { recursive: true, force: true }); }
+    } finally { rmSync(artifactRoot, { recursive: true, force: true }); }
+  } finally {
+    restoreNormalEvidenceTransportGuard();
+  }
 });
