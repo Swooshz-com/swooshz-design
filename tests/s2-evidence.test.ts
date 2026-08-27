@@ -479,6 +479,93 @@ test("fresh S2 runtime proves persisted bind, four terminal candidates, explicit
   } finally { rmSync(value.root, { recursive: true, force: true }); }
 });
 
+test("fresh S2 retry topology permits independent candidate retries through commit and reload", async () => {
+  const attempts = new Map<number, number>();
+  const providerCalls: Array<{ candidateId: string; candidateIndex: number }> = [];
+  const dispatches: Array<{ id: string; candidateId: string; attempt: number }> = [];
+  const provider = new MockOpenAIProvider({
+    briefData: briefData(),
+    onS2QaRequest: (input) => providerCalls.push({ candidateId: input.candidateId, candidateIndex: input.candidateIndex }),
+    s2QaResponseFactory: (input) => {
+      const attempt = attempts.get(input.candidateIndex) ?? 0;
+      attempts.set(input.candidateIndex, attempt + 1);
+      if ((input.candidateIndex === 2 || input.candidateIndex === 3) && attempt === 0) throw new ProviderFailure("PROVIDER_TIMEOUT");
+      return qaPayload(input, "pass");
+    },
+  });
+  const value = fixture([ONE_PIXEL_PNG], {
+    provider,
+    onProviderDispatchPhase: (phase, operation) => {
+      if (phase === "after-dispatch-marked" && operation.phase === "qa") dispatches.push({ id: operation.id, candidateId: operation.candidateId, attempt: operation.attempt });
+    },
+  });
+  try {
+    const { bound, result: first } = await bindAndWait(value);
+    const retryA = first.qaRun.candidateResults.find((item: any) => item.candidateIndex === 2)!;
+    const retryB = first.qaRun.candidateResults.find((item: any) => item.candidateIndex === 3)!;
+    assert.equal(retryA.status, "qa_unavailable_retryable");
+    assert.equal(retryB.status, "qa_unavailable_retryable");
+
+    const firstRetry = await value.service.s2.retryQa(value.projectId, bound.qaRun.id, retryA.candidateId, randomUUID(), randomUUID());
+    assert.equal(firstRetry.replayed, false);
+    const afterA = await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any,
+      (current) => current.qaRun.candidateResults.some((item: any) => item.candidateId === retryA.candidateId && item.attempt === 2 && item.status === "pass"));
+    assert.equal(afterA.qaRun.candidateAttempts.filter((item: any) => item.candidateId === retryA.candidateId).length, 2);
+    const afterAState = new JsonRepository(value.root).state();
+    const afterARun = afterAState.s2QaRuns.find((item) => item.id === bound.qaRun.id)!;
+    assert.equal(afterARun.completedCandidateCount, 4);
+    assert.equal(afterARun.passCount, 3);
+    assert.equal(afterARun.unavailableCount, 1);
+
+    const secondRetry = await value.service.s2.retryQa(value.projectId, bound.qaRun.id, retryB.candidateId, randomUUID(), randomUUID());
+    assert.equal(secondRetry.replayed, false);
+    const finalProjection = await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any,
+      (current) => current.qaRun.status === "completed" && current.qaRun.candidateResults.some((item: any) => item.candidateId === retryB.candidateId && item.attempt === 2 && item.status === "pass"));
+    assert.equal(finalProjection.qaRun.status, "completed");
+
+    const reloaded = new JsonRepository(value.root).state();
+    const run = reloaded.s2QaRuns.find((item) => item.id === bound.qaRun.id)!;
+    const attemptsFor = (candidateId: string) => run.candidateResults.filter((item) => item.candidateId === candidateId).sort((left, right) => left.attempt - right.attempt);
+    assert.deepEqual(attemptsFor(retryA.candidateId).map((item) => item.attempt), [1, 2]);
+    assert.deepEqual(attemptsFor(retryB.candidateId).map((item) => item.attempt), [1, 2]);
+    for (const candidate of run.candidateResults.filter((item) => item.candidateIndex === 1 || item.candidateIndex === 4)) {
+      assert.equal(attemptsFor(candidate.candidateId).length, 1);
+      assert.equal(candidate.attempt, 1);
+    }
+
+    const qaOperations = reloaded.s2Operations.filter((item) => item.qaRunId === run.id && item.phase === "qa");
+    assert.equal(qaOperations.length, 6);
+    for (const candidateId of [retryA.candidateId, retryB.candidateId]) {
+      const retryResult = attemptsFor(candidateId).find((item) => item.attempt === 2)!;
+      const operation = qaOperations.find((item) => item.resultId === retryResult.id)!;
+      assert.equal(operation.candidateId, candidateId);
+      assert.equal(operation.attempt, 2);
+      assert.equal(operation.inputHash, reloaded.s2Inputs[0].inputHash);
+      const retryRecord = reloaded.idempotency.find((item) => item.operation === "s2_qa_retry" && (item.result as any).resultId === retryResult.id)!;
+      assert.equal(retryRecord.projectId, value.projectId);
+      assert.equal((retryRecord.result as any).qaRunId, run.id);
+      assert.equal((retryRecord.result as any).candidateId, candidateId);
+      assert.equal((retryRecord.result as any).operationId, operation.id);
+      assert.equal((retryRecord.result as any).resultId, retryResult.id);
+    }
+
+    const latest = [1, 2, 3, 4].map((index) => run.candidateResults.filter((item) => item.candidateIndex === index).sort((left, right) => right.attempt - left.attempt)[0]);
+    const terminalStatuses = new Set(["pass", "warning", "material_fail", "qa_unavailable_retryable", "qa_unavailable_terminal"]);
+    assert.equal(run.completedCandidateCount, latest.filter((item) => terminalStatuses.has(item.status)).length);
+    assert.equal(run.passCount, latest.filter((item) => item.status === "pass").length);
+    assert.equal(run.warningCount, latest.filter((item) => item.status === "warning").length);
+    assert.equal(run.materialFailCount, latest.filter((item) => item.status === "material_fail").length);
+    assert.equal(run.unavailableCount, latest.filter((item) => item.status === "qa_unavailable_retryable" || item.status === "qa_unavailable_terminal").length);
+    assert.equal(run.completedAt !== null, true);
+
+    assert.equal(provider.s2QaCalls, 6);
+    assert.deepEqual([1, 2, 3, 4].map((index) => providerCalls.filter((call) => call.candidateIndex === index).length), [1, 2, 2, 1]);
+    assert.equal(dispatches.length, qaOperations.length);
+    assert.equal(new Set(dispatches.map((dispatch) => dispatch.id)).size, qaOperations.length);
+    for (const operation of qaOperations) assert.equal(dispatches.filter((dispatch) => dispatch.id === operation.id).length, 1);
+  } finally { rmSync(value.root, { recursive: true, force: true }); }
+});
+
 test("fresh S2 persistence rejects present malformed or unknown records and keeps absent legacy collections empty", () => {
   const root = mkdtempSync(join(tmpdir(), "swooshz-s2-persistence-"));
   try {
@@ -566,6 +653,39 @@ test("fresh S2 persistence graph fixtures reject impossible relationships and lo
       result.status = "qa_unavailable_retryable"; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
       result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null;
     });
+    rejectedRoot("QA retry: duplicate attempt two for one candidate", (state) => {
+      const result = state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 2);
+      state.s2QaRuns[0].candidateResults.push({ ...result, id: randomUUID() });
+    });
+    rejectedRoot("QA retry: attempt two candidate identity mismatch", (state) => {
+      const result = state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 2);
+      result.candidateId = state.s2Inputs[0].sourceCandidates[0].candidateId;
+    });
+    rejectedRoot("QA retry: attempt two candidate index mismatch", (state) => {
+      const result = state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 2);
+      result.candidateIndex = 1;
+    });
+    rejectedRoot("QA retry: attempt one was not retryable", (state) => {
+      const result = state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 1 && item.candidateIndex === 2);
+      result.status = "qa_unavailable_terminal";
+    });
+    rejectedRoot("QA retry: attempt two operation points at another candidate", (state) => {
+      const retryResult = state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 2);
+      const operation = state.s2Operations.find((item: any) => item.resultId === retryResult.id);
+      operation.candidateId = state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 1 && item.candidateIndex === 1).candidateId;
+    });
+    rejectedRoot("QA retry idempotency: result points at another candidate", (state) => {
+      const record = state.idempotency.find((item: any) => item.operation === "s2_qa_retry");
+      record.result.candidateId = state.s2Inputs[0].sourceCandidates[0].candidateId;
+    });
+    rejectedRoot("QA retry idempotency: operation points at another candidate", (state) => {
+      const record = state.idempotency.find((item: any) => item.operation === "s2_qa_retry");
+      record.result.operationId = state.s2Operations.find((item: any) => item.phase === "qa" && item.attempt === 1).id;
+    });
+    rejectedRoot("QA retry idempotency: record points at another project", (state) => {
+      const projectId = addForeignProject(state);
+      state.idempotency.find((item: any) => item.operation === "s2_qa_retry").projectId = projectId;
+    });
     rejectedRoot("candidate: repair link must be the original attempt", (state) => {
       state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 1 && item.repairAttemptId !== null).repairAttemptId = randomUUID();
     });
@@ -601,7 +721,7 @@ test("fresh S2 persistence graph fixtures reject impossible relationships and lo
       const transition = state.s2Transitions.find((item: any) => item.phase === "qa");
       transition.from = "pass"; transition.to = "running"; transition.referenceId = randomUUID();
     });
-    assert.equal(rejected.length, 18);
+    assert.equal(rejected.length, 26);
     assert.equal(rejected.every((item) => item.code === "PERSISTENCE_FAILED"), true);
 
     const terminal = positiveRoot("legal frozen/bound terminal repair and re-QA state", () => undefined);

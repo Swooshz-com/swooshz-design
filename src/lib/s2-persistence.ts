@@ -35,6 +35,9 @@ const TERMINAL_CANDIDATE_STATUSES = [
   "pass", "warning", "material_fail", "qa_unavailable_retryable", "qa_unavailable_terminal",
 ] as const;
 const UNAVAILABLE_STATUSES = ["qa_unavailable_retryable", "qa_unavailable_terminal", "re_qa_unavailable"] as const;
+const RETRYABLE_QA_FAILURE_CODES = new Set([
+  "PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE", "PROVIDER_RATE_LIMIT", "PROVIDER_SERVER_ERROR", "QA_PROVIDER_INCOMPLETE",
+]);
 
 type AnyRecord = Record<string, unknown>;
 
@@ -356,6 +359,64 @@ function validateRunResultLineage(result: S2QaCandidateResult, run: S2QaRun, inp
   validateObservationSet(result, input);
 }
 
+function validateRunRetryTopology(
+  run: S2QaRun,
+  input: S2InputVersion,
+  operations: Map<string, S2Operation>,
+  idempotency: Map<string, StoreState["idempotency"][number]>,
+): void {
+  const attemptOne = run.candidateResults.filter((item) => item.attempt === 1);
+  const attemptTwo = run.candidateResults.filter((item) => item.attempt === 2);
+  ensure(attemptOne.length === 4 && attemptOne.every((item, index) => item.candidateIndex === SOURCE_INDEXES[index]), "qa-run.initial-topology");
+  const sources = SOURCE_INDEXES.map((index) => {
+    const source = input.sourceCandidates[index - 1];
+    ensure(source !== undefined && source.candidateIndex === index, "qa-run.canonical-source");
+    return source;
+  });
+  ensure(new Set(sources.map((source) => source.candidateId)).size === sources.length, "qa-run.canonical-source-unique");
+
+  for (const source of sources) {
+    const initial = attemptOne.filter((item) => item.candidateId === source.candidateId);
+    ensure(initial.length === 1, "qa-run.initial-cardinality");
+    const first = initial[0];
+    ensure(first.candidateId === source.candidateId && first.candidateIndex === source.candidateIndex &&
+      first.sourceAssetId === source.sourceAssetId && first.sourceByteSize === source.sourceByteSize && first.sourceSha256 === source.sourceSha256, "qa-run.initial-lineage");
+    const retries = attemptTwo.filter((item) => item.candidateId === source.candidateId);
+    ensure(retries.length <= 1, "qa-run.retry-cardinality");
+    if (retries.length === 0) continue;
+
+    const retry = retries[0];
+    ensure(first.status === "qa_unavailable_retryable", "qa-run.retry-eligibility");
+    ensure(retry.status !== "qa_unavailable_retryable", "qa-run.retry-attempt-two-status");
+    ensure(retry.qaRunId === run.id && retry.inputVersionId === input.id && retry.candidateId === first.candidateId &&
+      retry.candidateIndex === first.candidateIndex && retry.sourceAssetId === first.sourceAssetId &&
+      retry.sourceByteSize === first.sourceByteSize && retry.sourceSha256 === first.sourceSha256, "qa-run.retry-lineage");
+
+    const initialOperations = Array.from(operations.values()).filter((operation) => operation.phase === "qa" && operation.qaRunId === run.id &&
+      operation.attempt === 1 && operation.resultId === first.id);
+    ensure(initialOperations.length === 1, "qa-run.retry-initial-operation");
+    const initialOperation = initialOperations[0];
+    ensure(initialOperation.status === "failed" && initialOperation.providerDispatchState === "consumed" &&
+      initialOperation.failureCode !== null && RETRYABLE_QA_FAILURE_CODES.has(initialOperation.failureCode), "qa-run.retry-initial-failure");
+
+    const retryOperations = Array.from(operations.values()).filter((operation) => operation.phase === "qa" && operation.qaRunId === run.id &&
+      operation.attempt === 2 && operation.resultId === retry.id);
+    ensure(retryOperations.length === 1, "qa-run.retry-operation-cardinality");
+    const retryOperation = retryOperations[0];
+    ensure(retryOperation.projectId === run.projectId && retryOperation.candidateId === source.candidateId &&
+      retryOperation.resultId === retry.id && retryOperation.inputHash === input.inputHash, "qa-run.retry-operation-lineage");
+
+    const retryRecords = Array.from(idempotency.values()).filter((record) => {
+      if (record.operation !== "s2_qa_retry" || !isRecord(record.result)) return false;
+      return record.result.qaRunId === run.id && record.result.resultId === retry.id;
+    });
+    ensure(retryRecords.length === 1, "qa-run.retry-idempotency-cardinality");
+    const retryIdentity = retryRecords[0].result as AnyRecord;
+    ensure(retryRecords[0].projectId === run.projectId && retryIdentity.qaRunId === run.id &&
+      retryIdentity.candidateId === source.candidateId && retryIdentity.operationId === retryOperation.id && retryIdentity.resultId === retry.id, "qa-run.retry-idempotency-lineage");
+  }
+}
+
 function validateRunLifecycle(run: S2QaRun, latest: readonly S2QaCandidateResult[], hasRepairLineage: boolean): void {
   const hasQueued = latest.some((item) => item.status === "queued");
   const hasRunning = latest.some((item) => item.status === "running");
@@ -653,6 +714,7 @@ export function validateS2Graph(state: StoreState): void {
       ensure(input !== undefined && input.qaRunId === run.id, "draft.frozen-input");
     } else ensure(input === undefined, "draft.editable-with-bound-input");
   }
+  const idempotency = validateS2Idempotency(state, projects, drafts, inputs, runs, repairs, operations);
   const resultIds = new Set<string>();
   const runByInput = new Set<string>();
   for (const run of runs.values()) {
@@ -660,10 +722,6 @@ export function validateS2Graph(state: StoreState): void {
     ensure(input !== undefined && run.projectId === input.projectId && run.sourceGenerationSetId === input.sourceGenerationSetId && input.qaRunId === run.id, "qa-run.input-lineage");
     ensure(!runByInput.has(input.id), "qa-run.one-per-input");
     runByInput.add(input.id);
-    const attemptOne = run.candidateResults.filter((item) => item.attempt === 1);
-    const attemptTwo = run.candidateResults.filter((item) => item.attempt === 2);
-    ensure(attemptOne.length === 4 && attemptOne.every((item, index) => item.candidateIndex === SOURCE_INDEXES[index]), "qa-run.initial-topology");
-    ensure(attemptTwo.length <= 1 && (attemptTwo.length === 0 || run.candidateResults[run.candidateResults.length - 1].attempt === 2), "qa-run.retry-topology");
     for (const result of run.candidateResults) {
       validateRunResultLineage(result, run, input, resultIds);
       if (result.repairAttemptId !== null) {
@@ -671,10 +729,7 @@ export function validateS2Graph(state: StoreState): void {
         ensure(result.attempt === 1 && repair !== undefined && repair.qaRunId === run.id && repair.candidateId === result.candidateId, "qa-result.repair-lineage");
       }
     }
-    if (attemptTwo.length === 1) {
-      const first = attemptOne.find((item) => item.candidateId === attemptTwo[0].candidateId);
-      ensure(first !== undefined && first.status === "qa_unavailable_retryable", "qa-run.retry-eligibility");
-    }
+    validateRunRetryTopology(run, input, operations, idempotency);
     const latest = SOURCE_INDEXES.map((index) => {
       const values = run.candidateResults.filter((item) => item.candidateIndex === index);
       ensure(values.length > 0, "qa-run.candidate-cardinality");
@@ -761,7 +816,6 @@ export function validateS2Graph(state: StoreState): void {
     }
     validateOperationTarget(operation, result, repair);
   }
-  const idempotency = validateS2Idempotency(state, projects, drafts, inputs, runs, repairs, operations);
   for (const publication of state.s2Publications) {
     ensure(!publicationIds.has(publication.id), "publication.duplicate-id");
     publicationIds.add(publication.id);
