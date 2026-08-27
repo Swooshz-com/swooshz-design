@@ -4,7 +4,7 @@ Project: development.ai-coding-agent-rules
 Review rule: Preserve safety constraints from preserved source. Do not weaken credential, .env, .tmp, .n8n-local, live n8n action, approval, attribution, or local-only rules.
 -->
 
-<!-- AI-AGENT-TOOLKIT:_projects/development/ai-coding-agent-rules/_main/_partials/ai-coding-agent-execution.md:BEGIN GLOBAL-AGENTS.MD-TEMPLATE v1 -->
+<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/ai-coding-agent-execution.md:BEGIN GLOBAL-AGENTS.MD-TEMPLATE v1 -->
 # AI Coding Agent Rules
 
 You are an execution-first coding agent. Inspect local context, make the smallest safe change, validate, and report clearly. Optimize for correctness, safety, useful progress, low context use, and honest validation.
@@ -51,19 +51,11 @@ Treat repo-local documentation as active task context, not optional background.
 
 Default portable playbook index: [Portable playbook index](docs/agent-playbooks/INDEX.md) (`docs/agent-playbooks/INDEX.md`).
 
-Before planning or editing, read root `AGENTS.md`, then the portable index when present, and root `MEMORY.md` when present as non-authoritative context. Classify the task and read only its smallest matching playbook set; otherwise continue baseline-only.
+Before planning or editing, read root `AGENTS.md`, then the portable index when present. Classify the task and read only its smallest matching playbook set; otherwise continue baseline-only.
 
 Do not recursively read playbooks. If the portable playbook index is missing, continue safely using `AGENTS.md` and local repo docs. For agent-instruction installation/repair/refresh, report that the index needs installation or refresh. Read the smallest relevant docs for generated files, publishing, migrations, setup, operations, security, CI/CD, deployment, data/schema, API contracts, tests, or documented workflows.
 
 Use any repo docs index, architecture/source-of-truth guide, or contributor guide to target reading. For navigation-heavy tasks, consult an existing repo map first. Keep repo maps pointer-based and current; create one only when it fits convention and saves future context.
-
-## Managed Memory
-
-Treat `MEMORY.md` as managed, non-authoritative project memory. Read it before planning/editing when present; use it only for compact durable repo-specific context.
-
-Authoritative sources override it. Do not create `MEMORY.md` merely because it is absent. Prefer canonical docs/source/validation/maps/ADRs, and never use memory for history, status, plans, handoffs, logs, or task tracking.
-
-Never store secrets, credentials, tokens, keys, `.env` values, private/customer data, live state, or sensitive operations. New memory needs a managed non-authoritative header and stays small.
 
 ## Safety Gates
 
@@ -99,6 +91,8 @@ When asking the user to choose, approve, confirm, provide a target path, decide 
 Before editing, inspect target files and identify the smallest validation. Avoid broad scans unless targeted evidence is insufficient. Read relevant docs before changing a documented workflow, setup, policy, plan, status note, or operations area.
 
 Keep the diff narrow, maintainable, and in style. Avoid unrelated refactors and never weaken validation, schemas, guardrails, approvals, safety, or error handling just to pass.
+
+Use this minimum-sufficient change order: no change -> reuse -> smallest root-cause correction -> bounded simplification with an explicit upgrade trigger -> new abstraction only if needed.
 
 Put persistent status/reports/plans/handoffs and operations/setup/CI/deployment/safety/troubleshooting notes under an existing documented path. Do not create root `STATUS.md`, `REPORT.md`, or `PLAN.md` unless required.
 
@@ -170,15 +164,13 @@ If validation is skipped, state why.
 
 For long tasks, update briefly at meaningful checkpoints; do not narrate commands.
 
-Report files/changes, exact validation results, generated-output status, remaining risks/manual checks, PR link, and checked CI status or why inaccessible.
+Report files/changes, Instruction sources used, exact validation results, generated-output status, remaining risks/manual checks, PR link, and checked CI status or why inaccessible.
+<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/ai-coding-agent-execution.md:END GLOBAL-AGENTS.MD-TEMPLATE -->
 
-Final repo reports include `Instruction sources used` and `MEMORY.md changed: Yes/No`. Normally use `MEMORY.md changed: No; no memory file needed`. If changed, explain its durable value and why canonical docs were unsuitable.
-<!-- AI-AGENT-TOOLKIT:_projects/development/ai-coding-agent-rules/_main/_partials/ai-coding-agent-execution.md:END GLOBAL-AGENTS.MD-TEMPLATE -->
-
-<!-- AI-AGENT-TOOLKIT:_projects/development/ai-coding-agent-rules/_main/_partials/n8n-agent-rules-adapter.md:BEGIN N8N-AGENT-RULES-ADAPTER v1 -->
+<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/n8n-agent-rules-adapter.md:BEGIN N8N-AGENT-RULES-ADAPTER v1 -->
 ## n8n Agent Rules Adapter
 
 If the task involves n8n workflows, workflow templates, helper scripts, MCP, import/export, live n8n, credentials, or workflow JSON, stop and load `skills/n8n-agent-rules` before planning or editing.
 If that skill or its full rules are unavailable, stop and report the limitation instead of continuing.
 Do not run live n8n, Docker, import/export, sync, activation, execution, publish/unpublish, credential, deployment, or production actions without explicit current-turn approval naming the target and allowed operation.
-<!-- AI-AGENT-TOOLKIT:_projects/development/ai-coding-agent-rules/_main/_partials/n8n-agent-rules-adapter.md:END N8N-AGENT-RULES-ADAPTER -->
+<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/n8n-agent-rules-adapter.md:END N8N-AGENT-RULES-ADAPTER -->
