@@ -539,7 +539,6 @@ export class S2WorkflowService {
     this.clearClaim(operation);
     const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
     if (run) {
-      run.status = "queued";
       run.completedAt = null;
       if (operation.phase === "qa") {
         const result = run.candidateResults.find((item) => item.id === operation.resultId);
@@ -549,6 +548,9 @@ export class S2WorkflowService {
           result.completedAt = null;
           result.providerRequestId = null;
         }
+        run.status = run.candidateResults.some((item) => item.status === "running") ? "running" : "queued";
+      } else {
+        run.status = "running";
       }
     }
     if (operation.phase === "repair" && operation.repairAttemptId) {
@@ -940,6 +942,25 @@ export class S2WorkflowService {
     if (bytes.byteLength !== asset.normalizedBytes || sha256(bytes) !== asset.normalizedSha256) throw fail(409, "QA_BINDING_CONFLICT");
     return { bytes, contentType: "image/png" };
   }
+  getCandidatePreview(projectId: UUID, qaRunId: UUID, candidateId: UUID): { bytes: Buffer; contentType: "image/png" } {
+    const state = this.state(); this.project(state, projectId);
+    const run = state.s2QaRuns.find((item) => item.id === qaRunId);
+    if (!run || run.projectId !== projectId) throw fail(404, "QA_NOT_FOUND");
+    const input = state.s2Inputs.find((item) => item.id === run.inputVersionId);
+    const candidate = run.candidateResults.find((item) => item.candidateId === candidateId);
+    const source = input?.sourceCandidates.find((item) => item.candidateId === candidateId);
+    if (!input || !candidate || !source || candidate.sourceAssetId !== source.sourceAssetId ||
+        candidate.sourceSha256 !== source.sourceSha256 || candidate.sourceByteSize !== source.sourceByteSize) {
+      throw fail(404, "CANDIDATE_NOT_FOUND");
+    }
+    try {
+      const bytes = this.objects.read(source.sourceStorageKey);
+      if (bytes.byteLength !== source.sourceByteSize || sha256(bytes) !== source.sourceSha256) throw new Error("identity");
+      return { bytes, contentType: "image/png" };
+    } catch {
+      throw fail(404, "CANDIDATE_NOT_FOUND");
+    }
+  }
   private inputFor(state: StoreState, run: S2QaRun): S2InputVersion {
     const input = state.s2Inputs.find((item) => item.id === run.inputVersionId);
     if (!input) throw fail(404, "S2_INPUT_NOT_FOUND");
@@ -1108,7 +1129,16 @@ export class S2WorkflowService {
       const retryResult: S2QaCandidateResult = { ...cloneJson(current), id: this.uuid(), attempt: 2, status: "queued", verdict: "QA_UNAVAILABLE",
         requirementObservations: [], designObservations: [], materialFindingIds: [], warningFindingIds: [], uncertainFindingIds: [],
         providerRequestId: null, repairAttemptId: null, startedAt: null, completedAt: null };
-      const operationId = this.uuid(); run.candidateResults.push(retryResult); run.status = "queued"; run.completedAt = null;
+      const operationId = this.uuid(); run.candidateResults.push(retryResult);
+      run.status = run.candidateResults.some((item) => item.status === "running") ? "running" : "queued";
+      run.completedAt = null;
+      const latest = Array.from(new Set(run.candidateResults.map((item) => item.candidateId)))
+        .map((id) => this.latest(run, id));
+      run.completedCandidateCount = latest.filter((item) => terminal(item.status)).length;
+      run.passCount = latest.filter((item) => item.status === "pass").length;
+      run.warningCount = latest.filter((item) => item.status === "warning").length;
+      run.materialFailCount = latest.filter((item) => item.status === "material_fail").length;
+      run.unavailableCount = latest.filter((item) => item.status === "qa_unavailable_retryable" || item.status === "qa_unavailable_terminal").length;
       state.s2Operations.push({ id: operationId, projectId, phase: "qa", attempt: 2, qaRunId, candidateId, repairAttemptId: null,
         inputHash: input.inputHash, referenceId, status: "queued", claimedBy: null, claimedProcessId: null, claimToken: null,
         claimedAt: null, startedAt: null, completedAt: null, providerDispatchState: "not_started", failureCode: null, resultId: retryResult.id });

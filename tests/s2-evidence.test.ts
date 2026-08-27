@@ -28,9 +28,9 @@ import {
 import { buildS2QaRequest, buildS2RepairRequest, S2_QA_MODEL, S2_QA_SCHEMA } from "../src/lib/s2-provider";
 import { handleApiRequest } from "../src/lib/api";
 import { createWorkflowService, type WorkflowService, type WorkflowServiceOptions } from "../src/lib/workflow";
-import { jcs, sha256 } from "../src/lib/utils";
+import { cloneJson, jcs, sha256 } from "../src/lib/utils";
 import { AppError } from "../src/lib/types";
-import { createS2QaClient, createS2ReferencesClient, s2QaCandidateControls, s2QaUserFacingState } from "../app/components/S2Client";
+import { createS2QaClient, createS2ReferencesClient, s2CandidatePreviewPath, s2QaCandidateControls, s2QaUserFacingState } from "../app/components/S2Client";
 import { createIdempotencyKeyRetainer, UnknownNetworkOutcome } from "../src/lib/client-idempotency";
 import { deriveClaimManifest, manifestBaseRowCount, manifestVariantCount, type ClaimDefinition } from "./s2-evidence-manifest";
 
@@ -492,7 +492,7 @@ test("fresh S2 persistence rejects present malformed or unknown records and keep
       frozenAt: null, frozenByQaRunId: null,
     });
     writeFileSync(legacy.statePath, JSON.stringify(valid), "utf8");
-    assert.doesNotThrow(() => new JsonRepository(root));
+    assert.throws(() => new JsonRepository(root), (error) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
 
     const withUnknown = { ...valid, s2Drafts: [{ ...valid.s2Drafts[0], unexpected: true }] };
     writeFileSync(legacy.statePath, JSON.stringify(withUnknown), "utf8");
@@ -504,6 +504,144 @@ test("fresh S2 persistence rejects present malformed or unknown records and keep
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("fresh S2 persistence graph fixtures reject impossible relationships and load legal lifecycle states", async () => {
+  const value = fixture();
+  try {
+    const draft = value.service.s2.getReferenceDraft(value.projectId);
+    const reference = await value.service.s2.uploadAsset(value.projectId, "reference", "graph-reference.png", "image/png", await solidPng(2, 2, { r: 121, g: 1, b: 1 }), randomUUID());
+    const logo = await value.service.s2.uploadAsset(value.projectId, "logo", "graph-logo.png", "image/png", await solidPng(2, 2, { r: 1, g: 122, b: 1 }), randomUUID());
+    const selected = value.service.s2.updateDraft(value.projectId, draft.revision, [reference.asset.id], [logo.asset.id], randomUUID());
+    const { bound, result: firstResult } = await bindAndWait(value, selected.draft.revision);
+    const retryCandidate = firstResult.qaRun.candidateResults.find((item: any) => item.candidateIndex === 2)!;
+    await value.service.s2.retryQa(value.projectId, bound.qaRun.id, retryCandidate.candidateId, randomUUID(), randomUUID());
+    const completed = await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any,
+      (current) => current.qaRun.candidateResults.every((item: any) => item.status === "pass" || item.status === "material_fail"));
+    const materialCandidate = completed.qaRun.candidateResults.find((item: any) => item.status === "material_fail")!;
+    await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, materialCandidate.candidateId, bound.inputVersionId, randomUUID(), randomUUID());
+    await waitFor(() => value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any,
+      (current) => current.qaRun.reQa.some((item: any) => item.status === "pass"));
+    const base = cloneJson(value.repository.state()) as any;
+    const rejected: Array<{ invariant: string; code: string }> = [];
+    const rejectedRoot = (invariant: string, mutate: (state: any) => void): void => {
+      const root = mkdtempSync(join(tmpdir(), "swooshz-s2-graph-negative-"));
+      try {
+        const state = cloneJson(base) as any;
+        mutate(state);
+        writeFileSync(join(root, "state.json"), JSON.stringify(state), "utf8");
+        assert.throws(() => new JsonRepository(root), (error) => error instanceof AppError && error.code === "PERSISTENCE_FAILED", invariant);
+        rejected.push({ invariant, code: "PERSISTENCE_FAILED" });
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    };
+    const positiveRoot = (label: string, mutate: (state: any) => void): any => {
+      const root = mkdtempSync(join(tmpdir(), "swooshz-s2-graph-positive-"));
+      const state = cloneJson(base) as any;
+      mutate(state);
+      writeFileSync(join(root, "state.json"), JSON.stringify(state), "utf8");
+      try {
+        const repository = new JsonRepository(root);
+        assert.doesNotThrow(() => repository.state(), label);
+        return repository.state();
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    };
+    const addForeignProject = (state: any): string => {
+      const projectId = randomUUID();
+      state.projects.push({ ...state.projects[0], projectId, boothGeometry: null, confirmedBriefVersionId: null, activeGenerationSetId: null, briefAssetId: null, briefDraftId: null });
+      return projectId;
+    };
+    rejectedRoot("draft ownership: nonexistent project", (state) => { state.s2Drafts[0].projectId = randomUUID(); });
+    rejectedRoot("cross-project S2 foreign key: input/source generation", (state) => {
+      const projectId = addForeignProject(state);
+      state.s2Inputs[0].projectId = projectId;
+    });
+    rejectedRoot("frozen draft: missing frozenAt", (state) => { state.s2Drafts[0].frozenAt = null; });
+    rejectedRoot("frozen draft: invalid frozenByQaRunId", (state) => { state.s2Drafts[0].frozenByQaRunId = randomUUID(); });
+    rejectedRoot("mutable draft: frozen-only state present", (state) => { state.s2Drafts[0].status = "editable"; state.s2Drafts[0].frozenAt = base.s2Drafts[0].frozenAt; });
+    rejectedRoot("QA run: nonexistent input version", (state) => { state.s2QaRuns[0].inputVersionId = randomUUID(); });
+    rejectedRoot("candidate: source identity from wrong candidate", (state) => { state.s2QaRuns[0].candidateResults[0].sourceAssetId = state.s2Inputs[0].sourceCandidates[1].sourceAssetId; });
+    rejectedRoot("QA run: wrong candidate order/index", (state) => { state.s2QaRuns[0].candidateResults[0].candidateIndex = 2; });
+    rejectedRoot("QA retry: attempt two cannot retry again", (state) => {
+      const result = state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 2);
+      result.status = "qa_unavailable_retryable"; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
+      result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null;
+    });
+    rejectedRoot("candidate: repair link must be the original attempt", (state) => {
+      state.s2QaRuns[0].candidateResults.find((item: any) => item.attempt === 1 && item.repairAttemptId !== null).repairAttemptId = randomUUID();
+    });
+    rejectedRoot("repair: unrelated candidate/input/run", (state) => { state.s2Repairs[0].candidateId = state.s2Inputs[0].sourceCandidates[1].candidateId; });
+    rejectedRoot("repair/re-QA: prohibited second bounded lineage", (state) => { state.s2Repairs.push({ ...state.s2Repairs[0], id: randomUUID() }); });
+    rejectedRoot("publication: unrelated repair operation", (state) => {
+      const publication = state.s2Publications.find((item: any) => item.kind === "repair_output");
+      publication.operationId = state.s2Operations.find((item: any) => item.phase === "qa").id;
+    });
+    rejectedRoot("operation: succeeded with failure metadata", (state) => {
+      const operation = state.s2Operations.find((item: any) => item.phase === "qa" && item.status === "succeeded");
+      operation.failureCode = "PERSISTENCE_FAILED";
+    });
+    rejectedRoot("operation claim: duplicate active claim token", (state) => {
+      const run = state.s2QaRuns[0];
+      const operations = state.s2Operations.filter((item: any) => item.phase === "qa" && (item.candidateId === run.candidateResults.find((result: any) => result.candidateIndex === 3)?.candidateId || item.candidateId === run.candidateResults.find((result: any) => result.candidateIndex === 4)?.candidateId));
+      const now = new Date().toISOString(); const token = randomUUID();
+      for (const operation of operations.slice(0, 2)) {
+        operation.status = "running"; operation.claimedBy = "graph-fixture"; operation.claimedProcessId = 9001; operation.claimToken = token;
+        operation.claimedAt = now; operation.startedAt = now; operation.completedAt = null; operation.providerDispatchState = "may_have_started"; operation.failureCode = null;
+        const result = run.candidateResults.find((item: any) => item.id === operation.resultId);
+        result.status = "running"; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
+        result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null; result.startedAt = now; result.completedAt = null;
+      }
+      run.status = "running"; run.startedAt = now; run.completedAt = null; run.completedCandidateCount = 2; run.passCount = 1; run.warningCount = 0; run.materialFailCount = 1; run.unavailableCount = 0;
+    });
+    rejectedRoot("input: binding hash does not match persisted graph", (state) => { state.s2Inputs[0].bindingHash = "0".repeat(64); });
+    rejectedRoot("idempotency: bind result belongs to another project", (state) => {
+      const projectId = addForeignProject(state);
+      state.idempotency.find((item: any) => item.operation === "s2_bind").projectId = projectId;
+    });
+    rejectedRoot("transition: impossible status pair/reference", (state) => {
+      const transition = state.s2Transitions.find((item: any) => item.phase === "qa");
+      transition.from = "pass"; transition.to = "running"; transition.referenceId = randomUUID();
+    });
+    assert.equal(rejected.length, 18);
+    assert.equal(rejected.every((item) => item.code === "PERSISTENCE_FAILED"), true);
+
+    const terminal = positiveRoot("legal frozen/bound terminal repair and re-QA state", () => undefined);
+    assert.equal(terminal.s2Drafts[0].status, "frozen");
+    assert.equal(terminal.s2Inputs.length, 1);
+    assert.equal(terminal.s2QaRuns[0].status, "running");
+    assert.equal(terminal.s2Repairs[0].status, "re_qa_pass");
+    assert.equal(terminal.s2ReQaResults[0].status, "pass");
+
+    positiveRoot("legal active queued state", (state) => {
+      const run = state.s2QaRuns[0];
+      run.status = "queued"; run.startedAt = null; run.completedAt = null;
+      run.candidateResults = run.candidateResults.filter((item: any) => item.attempt === 1);
+      run.candidateResults.forEach((result: any) => {
+        result.status = "queued"; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
+        result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null; result.repairAttemptId = null; result.startedAt = null; result.completedAt = null;
+      });
+      state.s2Repairs = []; state.s2DerivedCandidates = []; state.s2ReQaResults = [];
+      state.s2Operations = state.s2Operations.filter((item: any) => item.phase === "qa" && item.attempt === 1);
+      state.s2Operations.forEach((operation: any) => { operation.status = "queued"; operation.claimedBy = null; operation.claimedProcessId = null; operation.claimToken = null; operation.claimedAt = null; operation.startedAt = null; operation.completedAt = null; operation.providerDispatchState = "not_started"; operation.failureCode = null; });
+      state.s2Publications = state.s2Publications.filter((item: any) => item.kind === "asset_upload");
+      state.idempotency = state.idempotency.filter((item: any) => item.operation !== "s2_qa_retry" && item.operation !== "s2_repair");
+      run.completedCandidateCount = 0; run.passCount = 0; run.warningCount = 0; run.materialFailCount = 0; run.unavailableCount = 0;
+      state.s2Transitions = state.s2Transitions.filter((item: any) => item.phase === "qa" && item.attempt === 1);
+    });
+
+    positiveRoot("legal may_have_started recovery ambiguity", (state) => {
+      const run = state.s2QaRuns[0]; const now = new Date().toISOString();
+      const operations = state.s2Operations.filter((item: any) => item.phase === "qa" && item.attempt === 1 && (item.candidateId === run.candidateResults.find((result: any) => result.candidateIndex === 3)?.candidateId || item.candidateId === run.candidateResults.find((result: any) => result.candidateIndex === 4)?.candidateId));
+      const token = randomUUID();
+      for (const operation of operations.slice(0, 1)) {
+        operation.status = "running"; operation.claimedBy = "graph-fixture"; operation.claimedProcessId = 9002; operation.claimToken = token;
+        operation.claimedAt = now; operation.startedAt = now; operation.completedAt = null; operation.providerDispatchState = "may_have_started"; operation.failureCode = null;
+        const result = run.candidateResults.find((item: any) => item.id === operation.resultId);
+        result.status = "running"; result.verdict = "QA_UNAVAILABLE"; result.requirementObservations = []; result.designObservations = [];
+        result.materialFindingIds = []; result.warningFindingIds = []; result.uncertainFindingIds = []; result.providerRequestId = null; result.startedAt = now; result.completedAt = null;
+      }
+      run.status = "running"; run.startedAt = now; run.completedAt = null; run.completedCandidateCount = 3; run.passCount = 2; run.warningCount = 0; run.materialFailCount = 1; run.unavailableCount = 0;
+    });
+  } finally { rmSync(value.root, { recursive: true, force: true }); }
 });
 
 test("fresh S2 multipart route streams arbitrary chunks and rejects an oversized file before normalization", async () => {
@@ -876,7 +1014,7 @@ test("fresh S2 draft evidence proves full-array add/remove/reorder, limits, conf
     assert.equal(await expectCode(() => value.service.s2.updateDraft(value.projectId, 3, [second.asset.id], [logo.asset.id], randomUUID()), "DRAFT_REVISION_CONFLICT"), true);
     assert.equal(await expectCode(() => value.service.s2.updateDraft(value.projectId, 4, [logo.asset.id], [], randomUUID()), "ASSET_KIND_MISMATCH"), true);
     assert.equal(await expectCode(() => value.service.s2.updateDraft(value.projectId, 4, [randomUUID()], [], randomUUID()), "ASSET_NOT_FOUND"), true);
-    value.repository.transact((state) => { state.s2Assets.find((asset) => asset.id === second.asset.id)!.status = "deleted"; });
+    value.repository.transact((state) => { const draft = state.s2Drafts.find((item) => item.projectId === value.projectId)!; draft.referenceAssetIds = []; const asset = state.s2Assets.find((item) => item.id === second.asset.id)!; asset.status = "deleted"; asset.deletedAt = new Date().toISOString(); });
     assert.equal(await expectCode(() => value.service.s2.updateDraft(value.projectId, 4, [second.asset.id], [logo.asset.id], randomUUID()), "ASSET_NOT_FOUND"), true);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
@@ -2692,10 +2830,38 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const duplicateCode = await observedErrorCode(() => draftValue.service.s2.updateDraft(draftValue.projectId, removed.draft.revision, [second.asset.id, second.asset.id], [logo.asset.id], randomUUID()));
     const kindCode = await observedErrorCode(() => draftValue.service.s2.updateDraft(draftValue.projectId, removed.draft.revision, [logo.asset.id], [], randomUUID()));
     const missingCode = await observedErrorCode(() => draftValue.service.s2.updateDraft(draftValue.projectId, removed.draft.revision, [randomUUID()], [], randomUUID()));
-    draftValue.repository.transact((state) => { state.s2Assets.find((asset) => asset.id === second.asset.id)!.status = "deleted"; });
+    draftValue.repository.transact((state) => { const draft = state.s2Drafts.find((item) => item.projectId === draftValue.projectId)!; draft.referenceAssetIds = []; const asset = state.s2Assets.find((item) => item.id === second.asset.id)!; asset.status = "deleted"; asset.deletedAt = new Date().toISOString(); });
     const deletedCode = await observedErrorCode(() => draftValue.service.s2.updateDraft(draftValue.projectId, removed.draft.revision, [second.asset.id], [logo.asset.id], randomUUID()));
-    const foreign = await draftValue.service.s2.uploadAsset(draftValue.projectId, "reference", "foreign.png", "image/png", ONE_PIXEL_PNG, randomUUID());
-    draftValue.repository.transact((state) => { state.s2Assets.find((asset) => asset.id === foreign.asset.id)!.projectId = randomUUID(); });
+    const foreignKey = randomUUID();
+    const foreign = await draftValue.service.s2.uploadAsset(draftValue.projectId, "reference", "foreign.png", "image/png", ONE_PIXEL_PNG, foreignKey);
+    const foreignProjectId = randomUUID();
+    draftValue.repository.transact((state) => {
+      const base = state.projects[0];
+      state.projects.push({ ...base, projectId: foreignProjectId, boothGeometry: null, confirmedBriefVersionId: null, activeGenerationSetId: null, briefAssetId: null, briefDraftId: null });
+      const asset = state.s2Assets.find((item) => item.id === foreign.asset.id)!;
+      asset.projectId = foreignProjectId;
+      asset.storageKeyOriginal = "projects/" + foreignProjectId + "/s2/references/" + asset.id + "/original";
+      asset.storageKeyNormalized = "projects/" + foreignProjectId + "/s2/references/" + asset.id + "/normalized.png";
+      const uploadHash = hashCanonicalOperationInput("s2_asset_upload", foreignProjectId, { kind: asset.kind, originalSha256: asset.originalSha256, originalBytes: asset.originalBytes });
+      const idem = state.idempotency.find((item) => item.key === foreignKey)!;
+      idem.projectId = foreignProjectId;
+      idem.inputHash = uploadHash;
+      const publication = state.s2Publications.find((item) => item.kind === "asset_upload" && item.idempotencyKey === foreignKey);
+      assert.equal(publication?.kind, "asset_upload");
+      if (publication?.kind === "asset_upload") {
+        publication.projectId = foreignProjectId;
+        publication.inputHash = uploadHash;
+        publication.intendedAsset = { ...publication.intendedAsset, projectId: foreignProjectId, storageKeyOriginal: asset.storageKeyOriginal, storageKeyNormalized: asset.storageKeyNormalized };
+        publication.stagingObjects = [
+          { key: "projects/" + foreignProjectId + "/s2/staging/reference-assets/" + asset.id + "/original", sha256: asset.originalSha256, byteSize: asset.originalBytes },
+          { key: "projects/" + foreignProjectId + "/s2/staging/reference-assets/" + asset.id + "/normalized.png", sha256: asset.normalizedSha256, byteSize: asset.normalizedBytes },
+        ];
+        publication.finalObjects = [
+          { key: asset.storageKeyOriginal, sha256: asset.originalSha256, byteSize: asset.originalBytes },
+          { key: asset.storageKeyNormalized, sha256: asset.normalizedSha256, byteSize: asset.normalizedBytes },
+        ];
+      }
+    });
     const crossProjectCode = await observedErrorCode(() => draftValue.service.s2.updateDraft(draftValue.projectId, removed.draft.revision, [foreign.asset.id], [], randomUUID()));
     await prove(claimIds("DRAFT-001", ["revision", "editable", "empty-reference", "empty-logo"]), "draft initial state", "Real editable draft before selection after project creation.",
       { revision: initial.revision, status: initial.status, referenceCount: initial.referenceAssetIds.length, logoCount: initial.logoAssetIds.length, result: "editable-empty" },
@@ -3540,7 +3706,11 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       });
   } finally { activeReQaStale.resolve(); rmSync(activeRepair.root, { recursive: true, force: true }); }
 
-  const routeValue = fixture();
+  const previewSources = await Promise.all([
+    solidPng(2, 2, { r: 101, g: 1, b: 1 }), solidPng(2, 2, { r: 1, g: 102, b: 1 }),
+    solidPng(2, 2, { r: 1, g: 1, b: 103 }), solidPng(2, 2, { r: 104, g: 105, b: 1 }),
+  ]);
+  const routeValue = fixture(previewSources);
   let lastRouteRequest: Request | null = null;
   const routeApi = async (input: string, init?: RequestInit): Promise<Response> => {
     const url = new URL(input, "http://localhost");
@@ -3569,13 +3739,30 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const initial = await references.refresh();
     const file = new File([ONE_PIXEL_PNG], "..\\private\\customer.png", { type: "image/png" });
     const uploaded = await references.upload(file, "reference");
-    const updated = await references.update([uploaded.asset.id], [], uploaded.draft.revision);
+    const logoOne = await references.upload(new File([await solidPng(2, 2, { r: 111, g: 1, b: 1 })], "logo-one.png", { type: "image/png" }), "logo");
+    const logoTwo = await references.upload(new File([await solidPng(2, 2, { r: 1, g: 112, b: 1 })], "logo-two.png", { type: "image/png" }), "logo");
+    const selectedWithLogos = await references.update([uploaded.asset.id], [logoOne.asset.id, logoTwo.asset.id], uploaded.draft.revision);
+    const updated = await references.update([uploaded.asset.id], [logoTwo.asset.id, logoOne.asset.id], selectedWithLogos.draft.revision);
+    const staleLogoResponse = await routeApi("/api/projects/" + routeValue.projectId + "/s2/reference-draft", {
+      method: "PATCH", headers: { "content-type": "application/json", "Idempotency-Key": randomUUID() },
+      body: JSON.stringify({ expectedRevision: selectedWithLogos.draft.revision, referenceAssetIds: [uploaded.asset.id], logoAssetIds: [logoOne.asset.id, logoTwo.asset.id] }),
+    });
     const directPreview = await routeApi("/api/projects/" + routeValue.projectId + "/s2/reference-assets/" + uploaded.asset.id, { method: "GET" });
     const previewBytes = Buffer.from(await directPreview.arrayBuffer());
     const bound = await references.bind(updated.draft.revision);
     await waitFor(() => routeValue.service.s2.getQaRun(routeValue.projectId, bound.qaRun.id) as any, (current) => current.qaRun.status === "completed");
     const qaClient = createS2QaClient({ projectId: routeValue.projectId, qaRunId: bound.qaRun.id, fetcher: routeApi });
     const refreshed = await qaClient.refresh();
+    const previewChecks = await Promise.all(refreshed.qaRun.candidateResults.slice().sort((left, right) => left.candidateIndex - right.candidateIndex).map(async (candidate) => {
+      const response = await routeApi(s2CandidatePreviewPath(routeValue.projectId, bound.qaRun.id, candidate.candidateId), { method: "GET" });
+      return { candidateIndex: candidate.candidateIndex, status: response.status, contentType: response.headers.get("content-type") ?? "", bytes: Buffer.from(await response.arrayBuffer()) };
+    }));
+    const crossProjectPreview = await routeApi(s2CandidatePreviewPath(randomUUID(), bound.qaRun.id, refreshed.qaRun.candidateResults[0].candidateId), { method: "GET" });
+    const unknownCandidatePreview = await routeApi(s2CandidatePreviewPath(routeValue.projectId, bound.qaRun.id, randomUUID()), { method: "GET" });
+    const previewOrder = previewChecks.map((item) => item.candidateIndex).join(",");
+    const previewMatches = previewChecks.every((item) => item.status === 200 && item.contentType.startsWith("image/png") && item.bytes.equals(previewSources[item.candidateIndex - 1]));
+    const projectionText = JSON.stringify(refreshed);
+    const previewProjectionPrivate = !projectionText.includes("sourceStorageKey") && !projectionText.includes("storageKeyOriginal") && !projectionText.includes("storageKeyNormalized");
     const retryCandidate = refreshed.qaRun.candidateResults.find((candidate) => candidate.status === "qa_unavailable_retryable");
     const materialCandidate = refreshed.qaRun.candidateResults.find((candidate) => candidate.status === "material_fail");
     const retryProjection = retryCandidate ? await qaClient.retry(retryCandidate.candidateId) : refreshed;
@@ -3622,18 +3809,18 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       "The real client retried the ambiguous bind with the same operation key and the server persisted one input/run.",
       () => { assert.equal(routeBindCalls, 2); assert.equal(routeBindKeys[0], routeBindKeys[1]); assert.equal(routeState.s2Inputs.length, 1); assert.equal(routeState.s2QaRuns.length, 1); });
     await prove(claimIds("ROUTE-004", ["202-refresh", "timeout-refresh", "restart-refresh", "browser-refresh"]), "route persisted refresh flow", "Real 202 bind response, uncertain retry, persisted completion polling, replacement-service read, and client refresh.",
-      { bindInitialStatus: routeBindStatuses[0], bindStatuses: routeBindStatuses.join(","), bindCalls: routeBindCalls, refreshedStatus: refreshed.qaRun.status, retryCandidateStatus: retryCandidate?.status ?? "none", retryStatus: retryProjection.qaRun.status, repairedStatus: repairedProjection.qaRun.status, navigations: navigations.length, navigationToQa: navigations.some((url) => url.includes("/s2/qa/" + bound.qaRun.id)), finalReQaStatus: finalQaProjection.qaRun.reQa.at(-1)?.status ?? "none", result: "refreshes-persisted-state" },
+      { bindInitialStatus: routeBindStatuses[0], bindStatuses: routeBindStatuses.join(","), bindCalls: routeBindCalls, refreshedStatus: refreshed.qaRun.status, retryCandidateStatus: retryCandidate?.status ?? "none", retryStatus: retryProjection.qaRun.status, repairedStatus: repairedProjection.qaRun.status, navigations: navigations.length, navigationToQa: navigations.some((url) => url.includes("/s2/qa/" + bound.qaRun.id)), finalReQaStatus: finalQaProjection.qaRun.reQa.at(-1)?.status ?? "none", previewOrder, previewMatches, crossProjectPreviewStatus: crossProjectPreview.status, unknownCandidatePreviewStatus: unknownCandidatePreview.status, previewProjectionPrivate, result: "refreshes-persisted-state" },
       "The real route/client flow refreshed persisted QA state after asynchronous, timeout, restart, and browser-like reads.",
-      () => { assert.equal(routeBindCalls, 2); assert.equal(refreshed.qaRun.status, "completed"); assert.equal(navigations.some((url) => url.includes("/s2/qa/" + bound.qaRun.id)), true); }, undefined, {
+      () => { assert.equal(routeBindCalls, 2); assert.equal(refreshed.qaRun.status, "completed"); assert.equal(navigations.some((url) => url.includes("/s2/qa/" + bound.qaRun.id)), true); assert.equal(previewOrder, "1,2,3,4"); assert.equal(previewMatches, true); assert.equal(crossProjectPreview.status, 404); assert.equal(unknownCandidatePreview.status, 404); assert.equal(previewProjectionPrivate, true); }, undefined, {
         "ROUTE-004/202-refresh": () => assert.equal(routeBindStatuses[0], 202),
         "ROUTE-004/timeout-refresh": () => { assert.equal(retryCandidate?.status, "qa_unavailable_retryable"); assert.equal(routeBindCalls, 2); },
         "ROUTE-004/restart-refresh": () => { assert.equal(refreshed.qaRun.status, "completed"); assert.equal(finalQaProjection.qaRun.reQa.some((item: any) => item.status === "pass"), true); },
         "ROUTE-004/browser-refresh": () => assert.equal(navigations.some((url) => url.includes("/s2/qa/" + bound.qaRun.id)), true),
       });
     await prove(claimIds("ROUTE-005", ["frozen-readonly", "empty-valid"]), "route frozen and empty projection", "Real empty initial draft, persisted frozen projection, and rejected post-freeze update.",
-      { initialReferenceCount: initial.referenceAssetIds.length, frozenStatus: frozen.status, frozenByQaRunId: frozen.frozenByQaRunId ?? "", frozenClientError, frozenWriteStatus: frozenWriteResponse.status, frozenWriteCode, result: "visible-readonly" },
+      { initialReferenceCount: initial.referenceAssetIds.length, frozenStatus: frozen.status, frozenByQaRunId: frozen.frozenByQaRunId ?? "", frozenClientError, frozenWriteStatus: frozenWriteResponse.status, frozenWriteCode, logoOrder: updated.draft.logoAssetIds.join(","), logoRevision: updated.draft.revision, staleLogoStatus: staleLogoResponse.status, result: "visible-readonly" },
       "The real client exposed an initially empty draft, then a frozen read-only projection after bind.",
-      () => { assert.equal(initial.referenceAssetIds.length, 0); assert.equal(frozen.status, "frozen"); assert.equal(frozen.frozenByQaRunId, bound.qaRun.id); assert.equal(frozenWriteCode, "DRAFT_FROZEN"); }, undefined, {
+      () => { assert.equal(initial.referenceAssetIds.length, 0); assert.equal(frozen.status, "frozen"); assert.equal(frozen.frozenByQaRunId, bound.qaRun.id); assert.equal(frozenWriteCode, "DRAFT_FROZEN"); assert.deepEqual(updated.draft.logoAssetIds, [logoTwo.asset.id, logoOne.asset.id]); assert.equal(staleLogoResponse.status, 409); }, undefined, {
         "ROUTE-005/frozen-readonly": () => { assert.equal(frozen.status, "frozen"); assert.equal(frozen.frozenByQaRunId, bound.qaRun.id); assert.equal(frozenWriteCode, "DRAFT_FROZEN"); },
         "ROUTE-005/empty-valid": () => assert.equal(initial.referenceAssetIds.length, 0),
       });

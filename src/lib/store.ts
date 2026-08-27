@@ -18,6 +18,7 @@ import { randomUUID } from "node:crypto";
 import { flockSync } from "fs-ext-extra-prebuilt";
 import { AppError, type StoreState } from "./types";
 import { uuidV4Pattern } from "./utils";
+import { validateS2Graph } from "./s2-persistence";
 
 const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
@@ -686,6 +687,7 @@ export class JsonRepository {
         merged.generationOperations = [];
       }
       validateS2Collections(parsedRecord, merged);
+      validateS2Graph(merged);
       return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
@@ -1034,6 +1036,11 @@ export class JsonRepository {
     try {
       const fresh = this.load();
       const result = mutation(fresh);
+      try {
+        validateS2Graph(fresh);
+      } catch {
+        throw new AppError(500, "PERSISTENCE_FAILED");
+      }
       this.commit(fresh);
       this.current = fresh;
       return result;
