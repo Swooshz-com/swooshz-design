@@ -1,9 +1,9 @@
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { test } from "node:test";
 import sharp from "sharp";
 import { MockOpenAIProvider, OpenAIProvider, ProviderFailure } from "../src/lib/openai";
@@ -31,7 +31,7 @@ import {
 import { buildS2QaRequest, buildS2RepairRequest, S2_QA_MODEL, S2_QA_SCHEMA } from "../src/lib/s2-provider";
 import { handleApiRequest } from "../src/lib/api";
 import { createWorkflowService, type WorkflowService, type WorkflowServiceOptions } from "../src/lib/workflow";
-import { cloneJson, codePointLength, jcs, sha256 } from "../src/lib/utils";
+import { cloneJson, codePointLength, jcs, sha256, uuidV4Pattern } from "../src/lib/utils";
 import { AppError } from "../src/lib/types";
 import { reduceS2Findings } from "../src/lib/s2-findings";
 import { canonicalRepairInputHash, renderS2RepairPrompt, repairPromptHash } from "../src/lib/s2-repair";
@@ -460,6 +460,40 @@ function providerCallCounts(value: Fixture): Record<string, number> {
     image: value.provider.imageCalls,
     s2Qa: value.provider.s2QaCalls,
     s2Repair: value.provider.s2RepairCalls,
+  };
+}
+
+type RepositorySnapshot = { canonical: string; digest: string };
+
+function repositorySnapshot(value: Fixture): RepositorySnapshot {
+  const canonical = jcs(value.repository.state());
+  return { canonical, digest: sha256(canonical) };
+}
+
+type PrivateObjectSnapshot = { canonical: string; digest: string; fileCount: number; byteCount: number };
+
+function privateObjectSnapshot(objects: PrivateObjectStore): PrivateObjectSnapshot {
+  const entries: Array<{ path: string; byteSize: number; contentSha256: string }> = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const absolutePath = join(directory, entry.name);
+      const objectPath = relative(objects.root, absolutePath).replaceAll("\\", "/");
+      if (entry.isDirectory()) {
+        visit(absolutePath);
+      } else if (entry.isFile()) {
+        const bytes = readFileSync(absolutePath);
+        entries.push({ path: objectPath, byteSize: bytes.byteLength, contentSha256: sha256(bytes) });
+      }
+    }
+  };
+  visit(objects.root);
+  entries.sort((left, right) => left.path.localeCompare(right.path));
+  const canonical = jcs(entries);
+  return {
+    canonical,
+    digest: sha256(canonical),
+    fileCount: entries.length,
+    byteCount: entries.reduce((total, entry) => total + entry.byteSize, 0),
   };
 }
 
@@ -5360,10 +5394,194 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const apiErrorBody = await apiError.json();
     const missingBindRequest = lastRouteRequest!;
     const missingBindBodyObserved = await missingBindRequest.text();
-    const unknownProjectStatus = await routeApi("/api/projects/" + randomUUID() + "/s2/reference-draft", { method: "GET" }).then((response) => response.status);
-    const routeState = routeValue.repository.state();
     const missingKeyNoMutation = JSON.stringify(s2StateCounts(routeValue)) === JSON.stringify(routeStateBeforeMissingKey)
       && JSON.stringify(providerCallCounts(routeValue)) === JSON.stringify(providerCallsBeforeMissingKey);
+    const requiredUnknownProjectMatrix = [
+      { label: "upload", method: "POST", routeFamily: "POST /api/projects/{projectId}/s2/reference-assets" },
+      { label: "draft-read", method: "GET", routeFamily: "GET /api/projects/{projectId}/s2/reference-draft" },
+      { label: "draft-mutation", method: "PATCH", routeFamily: "PATCH /api/projects/{projectId}/s2/reference-draft" },
+      { label: "asset-preview", method: "GET", routeFamily: "GET /api/projects/{projectId}/s2/reference-assets/{assetId}" },
+      { label: "qa-bind", method: "POST", routeFamily: "POST /api/projects/{projectId}/s2/qa-runs" },
+      { label: "qa-status", method: "GET", routeFamily: "GET /api/projects/{projectId}/s2/qa-runs/{qaRunId}" },
+      { label: "candidate-preview", method: "GET", routeFamily: "GET /api/projects/{projectId}/s2/qa-runs/{qaRunId}/candidates/{candidateId}/preview" },
+      { label: "retry", method: "POST", routeFamily: "POST /api/projects/{projectId}/s2/qa-runs/{qaRunId}/candidates/{candidateId}/retry" },
+      { label: "repair", method: "POST", routeFamily: "POST /api/projects/{projectId}/s2/qa-runs/{qaRunId}/candidates/{candidateId}/repair" },
+    ] as const;
+    const unknownProjectId = randomUUID();
+    const matrixCandidateId = refreshed.qaRun.candidateResults[0].candidateId;
+    const matrixUploadBody = s2MultipartBody(ONE_PIXEL_PNG, "unknown-project.png", "reference");
+    const matrixUploadBoundary = "s2-stream-boundary";
+    const matrixSupportingInputsValid = [
+      routeValue.generationSetId,
+      uploaded.asset.id,
+      logoOne.asset.id,
+      bound.qaRun.id,
+      matrixCandidateId,
+      refreshed.input.id,
+    ].every((id) => uuidV4Pattern.test(id))
+      && Number.isSafeInteger(updated.draft.revision) && updated.draft.revision > 0
+      && routeValue.repository.state().projects.every((project) => project.projectId !== unknownProjectId)
+      && ONE_PIXEL_PNG.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+      && matrixUploadBody.byteLength <= S2_MAX_MULTIPART_BODY_BYTES
+      && matrixUploadBody.includes(Buffer.from("name=\"file\"; filename=\"unknown-project.png\"", "latin1"))
+      && matrixUploadBody.includes(Buffer.from("name=\"kind\"", "latin1"))
+      && matrixUploadBody.includes(Buffer.from("\r\nreference\r\n", "latin1"));
+    assert.equal(matrixSupportingInputsValid, true);
+    const unknownMatrixCases = [
+      {
+        label: "upload",
+        method: "POST",
+        routeFamily: requiredUnknownProjectMatrix[0].routeFamily,
+        pathSuffix: "/s2/reference-assets",
+        supporting: "valid PNG, reference kind, filename field, bounded multipart body and UUID Idempotency-Key",
+        request: () => requestWithStream({
+          "content-type": "multipart/form-data; boundary=" + matrixUploadBoundary,
+          "Idempotency-Key": randomUUID(),
+        }, chunkedStream(matrixUploadBody, 23)),
+      },
+      {
+        label: "draft-read",
+        method: "GET",
+        routeFamily: requiredUnknownProjectMatrix[1].routeFamily,
+        pathSuffix: "/s2/reference-draft",
+        supporting: "no body; absent-project UUID only",
+        request: () => new Request("http://localhost/api/projects/" + unknownProjectId + "/s2/reference-draft", { method: "GET" }),
+      },
+      {
+        label: "draft-mutation",
+        method: "PATCH",
+        routeFamily: requiredUnknownProjectMatrix[2].routeFamily,
+        pathSuffix: "/s2/reference-draft",
+        supporting: "positive expectedRevision, real reference/logo asset UUIDs and UUID Idempotency-Key",
+        request: () => new Request("http://localhost/api/projects/" + unknownProjectId + "/s2/reference-draft", {
+          method: "PATCH",
+          headers: { "content-type": "application/json", "Idempotency-Key": randomUUID() },
+          body: JSON.stringify({ expectedRevision: updated.draft.revision, referenceAssetIds: [uploaded.asset.id], logoAssetIds: [logoOne.asset.id] }),
+        }),
+      },
+      {
+        label: "asset-preview",
+        method: "GET",
+        routeFamily: requiredUnknownProjectMatrix[3].routeFamily,
+        pathSuffix: "/s2/reference-assets/" + uploaded.asset.id,
+        supporting: "real uploaded asset UUID",
+        request: () => new Request("http://localhost/api/projects/" + unknownProjectId + "/s2/reference-assets/" + uploaded.asset.id, { method: "GET" }),
+      },
+      {
+        label: "qa-bind",
+        method: "POST",
+        routeFamily: requiredUnknownProjectMatrix[4].routeFamily,
+        pathSuffix: "/s2/qa-runs",
+        supporting: "real generation-set UUID, positive expectedDraftRevision and UUID Idempotency-Key",
+        request: () => new Request("http://localhost/api/projects/" + unknownProjectId + "/s2/qa-runs", {
+          method: "POST",
+          headers: { "content-type": "application/json", "Idempotency-Key": randomUUID() },
+          body: JSON.stringify({ sourceGenerationSetId: routeValue.generationSetId, expectedDraftRevision: updated.draft.revision }),
+        }),
+      },
+      {
+        label: "qa-status",
+        method: "GET",
+        routeFamily: requiredUnknownProjectMatrix[5].routeFamily,
+        pathSuffix: "/s2/qa-runs/" + bound.qaRun.id,
+        supporting: "real QA-run UUID",
+        request: () => new Request("http://localhost/api/projects/" + unknownProjectId + "/s2/qa-runs/" + bound.qaRun.id, { method: "GET" }),
+      },
+      {
+        label: "candidate-preview",
+        method: "GET",
+        routeFamily: requiredUnknownProjectMatrix[6].routeFamily,
+        pathSuffix: "/s2/qa-runs/" + bound.qaRun.id + "/candidates/" + matrixCandidateId + "/preview",
+        supporting: "real QA-run and candidate UUIDs",
+        request: () => new Request("http://localhost/api/projects/" + unknownProjectId + "/s2/qa-runs/" + bound.qaRun.id + "/candidates/" + matrixCandidateId + "/preview", { method: "GET" }),
+      },
+      {
+        label: "retry",
+        method: "POST",
+        routeFamily: requiredUnknownProjectMatrix[7].routeFamily,
+        pathSuffix: "/s2/qa-runs/" + bound.qaRun.id + "/candidates/" + matrixCandidateId + "/retry",
+        supporting: "required empty body, real QA-run/candidate UUIDs and UUID Idempotency-Key",
+        request: () => new Request("http://localhost/api/projects/" + unknownProjectId + "/s2/qa-runs/" + bound.qaRun.id + "/candidates/" + matrixCandidateId + "/retry", {
+          method: "POST",
+          headers: { "Idempotency-Key": randomUUID() },
+        }),
+      },
+      {
+        label: "repair",
+        method: "POST",
+        routeFamily: requiredUnknownProjectMatrix[8].routeFamily,
+        pathSuffix: "/s2/qa-runs/" + bound.qaRun.id + "/candidates/" + materialCandidate!.candidateId + "/repair",
+        supporting: "exact expectedInputVersionId body, real QA-run/candidate/input UUIDs and UUID Idempotency-Key",
+        request: () => new Request("http://localhost/api/projects/" + unknownProjectId + "/s2/qa-runs/" + bound.qaRun.id + "/candidates/" + materialCandidate!.candidateId + "/repair", {
+          method: "POST",
+          headers: { "content-type": "application/json", "Idempotency-Key": randomUUID() },
+          body: JSON.stringify({ expectedInputVersionId: refreshed.input.id }),
+        }),
+      },
+    ];
+    const unknownRepositoryBefore = repositorySnapshot(routeValue);
+    const unknownObjectBefore = privateObjectSnapshot(routeValue.objects);
+    const unknownProviderBefore = providerCallCounts(routeValue);
+    const unknownMatrixResults: Array<Record<string, string | number | boolean>> = [];
+    for (const matrixCase of unknownMatrixCases) {
+      const path = ["projects", unknownProjectId, ...matrixCase.pathSuffix.split("/").filter(Boolean)];
+      const request = matrixCase.request();
+      const actualPath = "/api/" + path.join("/");
+      const caseRepositoryBefore = repositorySnapshot(routeValue);
+      const caseObjectBefore = privateObjectSnapshot(routeValue.objects);
+      const caseProviderBefore = providerCallCounts(routeValue);
+      const response = await handleApiRequest(request, path, routeValue.service);
+      const body = await response.json() as any;
+      const caseRepositoryAfter = repositorySnapshot(routeValue);
+      const caseObjectAfter = privateObjectSnapshot(routeValue.objects);
+      const caseProviderAfter = providerCallCounts(routeValue);
+      const safeAuthorizationNotFound = response.status === 404
+        && response.headers.get("content-type")?.startsWith("application/json") === true
+        && Object.keys(body).sort().join("|") === "error"
+        && Object.keys(body.error ?? {}).sort().join("|") === "code|fieldErrors|message|referenceId"
+        && body.error.code === "PROJECT_NOT_FOUND"
+        && body.error.message === "The request could not be completed. Try again or contact support with the reference ID."
+        && Array.isArray(body.error.fieldErrors)
+        && JSON.stringify(body.error.fieldErrors) === JSON.stringify([{ field: "projectId", code: "PROJECT_NOT_FOUND" }])
+        && typeof body.error.referenceId === "string"
+        && uuidV4Pattern.test(body.error.referenceId);
+      const protectedResourceReturned = ["project", "draft", "asset", "qaRun", "input", "candidateResults", "bytes", "data"]
+        .some((key) => Object.prototype.hasOwnProperty.call(body, key));
+      unknownMatrixResults.push({
+        label: matrixCase.label,
+        method: request.method.toUpperCase(),
+        routeFamily: matrixCase.routeFamily,
+        path: actualPath,
+        supplied: matrixCase.supporting,
+        unknownProjectEmbedded: path[1] === unknownProjectId,
+        pathMatchesExpected: actualPath === "/api/projects/" + unknownProjectId + matrixCase.pathSuffix,
+        status: response.status,
+        errorCode: body.error?.code ?? "",
+        safeAuthorizationNotFound,
+        protectedResourceReturned,
+        repositoryUnchanged: caseRepositoryBefore.canonical === caseRepositoryAfter.canonical,
+        privateObjectStateUnchanged: caseObjectBefore.canonical === caseObjectAfter.canonical,
+        providerCallsUnchanged: JSON.stringify(caseProviderBefore) === JSON.stringify(caseProviderAfter),
+        noOperationBeyondAuthorization: caseRepositoryBefore.canonical === caseRepositoryAfter.canonical
+          && caseObjectBefore.canonical === caseObjectAfter.canonical
+          && JSON.stringify(caseProviderBefore) === JSON.stringify(caseProviderAfter),
+      });
+    }
+    const unknownRepositoryAfter = repositorySnapshot(routeValue);
+    const unknownObjectAfter = privateObjectSnapshot(routeValue.objects);
+    const unknownProviderAfter = providerCallCounts(routeValue);
+    const unknownMatrixIdentity = unknownMatrixResults.map((item) => String(item.method) + " " + String(item.routeFamily));
+    const requiredUnknownMatrixIdentity = requiredUnknownProjectMatrix.map((item) => item.method + " " + item.routeFamily);
+    const unknownMatrixLabels = unknownMatrixResults.map((item) => String(item.label));
+    const unknownMatrixComplete = unknownMatrixResults.length === 9
+      && new Set(unknownMatrixLabels).size === 9
+      && new Set(unknownMatrixIdentity).size === 9
+      && JSON.stringify(unknownMatrixIdentity) === JSON.stringify(requiredUnknownMatrixIdentity)
+      && unknownMatrixResults.every((item) => item.unknownProjectEmbedded === true && item.pathMatchesExpected === true
+        && item.status === 404 && item.safeAuthorizationNotFound === true && item.protectedResourceReturned === false
+        && item.noOperationBeyondAuthorization === true);
+    assert.equal(unknownMatrixComplete, true);
+    const routeState = routeValue.repository.state();
     const routeClientSource = readFileSync("app/components/S2Client.tsx", "utf8");
     const privacyMarkers = {
       imageBytes: "s2-privacy-image-bytes-marker-v1",
@@ -5454,10 +5672,58 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const privacySafeEnvelopeText = JSON.stringify(privacyErrorBody);
     const privacySafeEnvelopes = [privacySafeEnvelopeText, privacySafeFailureEnvelope];
     assertLogMarkersAbsent(privacySafeEnvelopes, Object.values(privacyMarkers));
-    await prove(claimIds("ROUTE-001", ["auth-all"]), "route project authorization", "Real API requests for a random project and the authorized local project through every S2 route family.",
-      { authorizedProject: routeValue.projectId.length > 0, unknownProjectStatus, unauthorizedRoutes: 1, result: "guarded" },
-      "The real API rejected an unknown project without exposing a project record while allowing the authorized local project flow.",
-      () => { assert.equal(unknownProjectStatus, 404); assert.equal(routeValue.projectId.length > 0, true); });
+    await prove(claimIds("ROUTE-001", ["auth-all"]), "route project authorization", "Complete nine-case unknown-project matrix through the production S2 dispatcher using one valid absent UUID, real fixture IDs, valid request bodies/headers including bounded multipart upload, per-case safe 404 assertions, canonical whole-repository/object snapshots and measured provider counters.",
+      {
+        authorizedProject: routeValue.projectId.length > 0,
+        unknownProjectId,
+        unknownProjectAbsent: matrixSupportingInputsValid,
+        routeCount: unknownMatrixResults.length,
+        distinctCaseLabels: new Set(unknownMatrixLabels).size,
+        distinctMethodRouteCases: new Set(unknownMatrixIdentity).size,
+        requiredMethodRouteMatrix: requiredUnknownMatrixIdentity.join(";").replaceAll("{projectId}", "{unknownProjectId}"),
+        allStatuses404: unknownMatrixResults.every((item) => item.status === 404),
+        allSafeAuthorizationNotFound: unknownMatrixResults.every((item) => item.safeAuthorizationNotFound === true),
+        allUnknownProjectEmbedded: unknownMatrixResults.every((item) => item.unknownProjectEmbedded === true),
+        allPathsMatchExpected: unknownMatrixResults.every((item) => item.pathMatchesExpected === true),
+        noProtectedResourceReturned: unknownMatrixResults.every((item) => item.protectedResourceReturned === false),
+        repositoryStateBeforeDigest: unknownRepositoryBefore.digest,
+        repositoryStateAfterDigest: unknownRepositoryAfter.digest,
+        repositoryStateUnchanged: unknownRepositoryBefore.canonical === unknownRepositoryAfter.canonical,
+        privateObjectCountBefore: unknownObjectBefore.fileCount,
+        privateObjectCountAfter: unknownObjectAfter.fileCount,
+        privateObjectBytesBefore: unknownObjectBefore.byteCount,
+        privateObjectBytesAfter: unknownObjectAfter.byteCount,
+        privateObjectDigestBefore: unknownObjectBefore.digest,
+        privateObjectDigestAfter: unknownObjectAfter.digest,
+        privateObjectStateUnchanged: unknownObjectBefore.canonical === unknownObjectAfter.canonical,
+        providerCallsBefore: JSON.stringify(unknownProviderBefore),
+        providerCallsAfter: JSON.stringify(unknownProviderAfter),
+        providerCallsUnchanged: JSON.stringify(unknownProviderBefore) === JSON.stringify(unknownProviderAfter),
+        zeroProviderDispatch: unknownProviderBefore.s2Qa === unknownProviderAfter.s2Qa && unknownProviderBefore.s2Repair === unknownProviderAfter.s2Repair,
+        zeroOperationIdempotencyResultMutation: unknownRepositoryBefore.canonical === unknownRepositoryAfter.canonical,
+        zeroUploadStagingPublicationSideEffects: unknownObjectBefore.canonical === unknownObjectAfter.canonical
+          && unknownRepositoryBefore.canonical === unknownRepositoryAfter.canonical,
+        perCaseExecution: JSON.stringify(unknownMatrixResults),
+        result: "complete-nine-case-matrix-guarded",
+      },
+      "The production dispatcher rejected one valid absent project UUID at every required S2 route family with safe HTTP 404 before route-specific access, mutation, object, provider or operation work.",
+      () => {
+        assert.equal(routeValue.projectId.length > 0, true);
+        assert.equal(matrixSupportingInputsValid, true);
+        assert.equal(unknownMatrixResults.length, 9);
+        assert.equal(new Set(unknownMatrixLabels).size, 9);
+        assert.equal(new Set(unknownMatrixIdentity).size, 9);
+        assert.deepEqual(unknownMatrixIdentity, requiredUnknownMatrixIdentity);
+        assert.equal(unknownMatrixResults.every((item) => item.unknownProjectEmbedded === true), true);
+        assert.equal(unknownMatrixResults.every((item) => item.pathMatchesExpected === true), true);
+        assert.equal(unknownMatrixResults.every((item) => item.status === 404), true);
+        assert.equal(unknownMatrixResults.every((item) => item.safeAuthorizationNotFound === true), true);
+        assert.equal(unknownMatrixResults.every((item) => item.protectedResourceReturned === false), true);
+        assert.equal(unknownMatrixResults.every((item) => item.noOperationBeyondAuthorization === true), true);
+        assert.equal(unknownRepositoryBefore.canonical, unknownRepositoryAfter.canonical);
+        assert.equal(unknownObjectBefore.canonical, unknownObjectAfter.canonical);
+        assert.deepEqual(unknownProviderBefore, unknownProviderAfter);
+      });
     await prove(claimIds("ROUTE-002", ["method", "body", "key", "status", "envelope", "projection-keys"]), "route method body required-key envelope", "Real bind request with a valid body and missing S2 Idempotency-Key through the production API dispatcher, plus exact-key public asset, draft and QA projections.",
       { method: missingBindRequest.method, body: missingBindBodyObserved, status: apiError.status, topLevelCode: apiErrorBody.error?.code ?? "", hasError: Boolean(apiErrorBody.error), hasReferenceId: typeof apiErrorBody.error?.referenceId === "string", keyHeaderProvided: missingBindRequest.headers.has("Idempotency-Key"), noMutation: missingKeyNoMutation, projectionKeyProof, projectionPrivateFieldsAbsent, finalProjectionPrivateFieldsAbsent, result: "required-key-safe-error-and-minimal-projection" },
       "The real route rejected a missing required S2 Idempotency-Key with HTTP 400, the locked top-level code, a safe reference-bearing envelope, and no mutation.",
