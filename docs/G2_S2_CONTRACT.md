@@ -1,8 +1,8 @@
 # S2 G2 Implementation Contract
 
-Decision Lock: DL-SD-S2-G2-003
+Decision Lock: DL-SD-S2-G2-004
 
-Status: normative contract for G3 implementation upon Web acceptance and canonical merge
+Status: normative contract for G3 implementation after Web acceptance and canonical merge
 
 Programme parent: #1 - Swooshz Design v0.1 Rolling Work Queue
 
@@ -12,30 +12,35 @@ Accepted predecessor lock: DL-SD-S2-G1-001
 
 Accepted predecessor record: issue #7 comment 5412018969
 
-Revision scope: MEDIA-014 / BIND-009 aggregate-RGBA evidence feasibility clarification only.
-Revision canonical base: 3d5aca89a698f05fbb51c5f980d2578b5f44b007
+Revision scope: bounded G2 contract clarification and lifecycle simplification for
+source-run failure posture, canonical finding-ID uniqueness, repair prompt-hash
+integrity, and Section-24 evidence integrity.
+Revision canonical base: 68fbbb8653733554730d90316ce6e91719f1ffce
 
-Revision branch: web/run-009-s2-g2-rgba-aggregate-clarification
+Revision branch: web/run-011-s2-g2-004-contract-reentry
 
-This revision supersedes DL-SD-S2-G2-002 as the current canonical G2
-contract revision once Web accepts and merges it. All non-conflicting
-DL-SD-S2-G2-002 decisions are incorporated unchanged. The previous accepted
-G2 history remains traceable through the immediately previous G2-002 revision
+This revision supersedes DL-SD-S2-G2-003 as the current canonical G2
+contract revision once Web accepts and merges it. DL-SD-S2-G2-003 remains
+historical accepted authority and is incorporated unchanged except where this
+revision explicitly supersedes it. All unrelated G1/G2 product decisions and
+numeric limits remain in force. The previous accepted G2 history remains
+traceable through the immediately previous G2-002 revision
 at accepted head d6e9cd1198e423db8fbc796327ffffe36846135b, canonical merge
 3d5aca89a698f05fbb51c5f980d2578b5f44b007, and clarification branch
 web/run-008-s2-g2-media012-clarification, together with the G2-001 lock,
 canonical base eff3ae3a49791052741c571c3322ca53520fb9f2, and prepared branch
 web/run-005-s2-g2-contract.
 
-This document is the complete S2 G2 implementation contract. The words MUST,
-MUST NOT, SHOULD, and MAY are normative. G3 MUST implement this document
-without making material product, provider, persistence, media, or workflow
-decisions.
+After Web acceptance and canonical merge, this document is the complete S2 G2
+implementation contract. The words MUST, MUST NOT, SHOULD, and MAY are
+normative. G3 MUST implement this document without making material product,
+provider, persistence, media, or workflow decisions.
 
 G2 authoring is documentation-only. This branch MUST NOT add S2 runtime code,
 routes, components, services, dependencies, package changes, lockfile changes,
 credentials, provider calls, deployment, or S1 behavior changes. G3 product
-implementation remains unauthorized until Web accepts this lock.
+implementation remains unauthorized until Web accepts and merges
+DL-SD-S2-G2-004.
 
 ## 1. Locked outcome and scope
 
@@ -370,7 +375,7 @@ type S2AssetKind = "reference" | "logo";
 type S2AssetStatus = "ready" | "deleted";
 type S2DraftStatus = "editable" | "frozen";
 type S2InputStatus = "bound";
-type S2QaRunStatus = "queued" | "running" | "completed" | "failed";
+type S2QaRunStatus = "queued" | "running" | "completed";
 type S2CandidateStatus =
   "queued" | "running" | "pass" | "warning" |
   "material_fail" | "qa_unavailable_retryable" |
@@ -389,6 +394,22 @@ type S2RequirementObserved = "present" | "absent" | "uncertain" | "not_verifiabl
 The persisted model MUST distinguish an immutable source candidate from an S2
 derived candidate. G3 MUST NOT mutate or reinterpret ConceptCandidate to hold
 repair output.
+
+Every server-owned finding-ID array MUST contain canonical finding IDs in the
+deterministic canonical order defined by sections 9.1 and 10.1, with no
+duplicate ID. This applies to materialFindingIds, warningFindingIds,
+uncertainFindingIds, and eligibleFindingIds. The three candidate
+classification arrays are collectively unique: one canonical finding ID MUST
+appear in at most one of materialFindingIds, warningFindingIds, or
+uncertainFindingIds. Requirement and design-rule observation arrays remain
+separate and may contain distinct observations that resolve to one shared
+canonical finding ID.
+
+For a combined classification order, the server traverses canonical
+requirement order from section 9.1 followed by design-rule catalogue order
+from section 10.1. A shared canonical ID occupies its first applicable
+position and the later domain occurrence is omitted from the combined ID
+array.
 
 ### 5.2 Persisted records
 
@@ -664,7 +685,7 @@ The hash name, input schema and order below are locked:
 | inputHash | SHA-256 of UTF-8 jcs({schemaVersion:"s2-input-v1", sourceGenerationSetId, sourceCandidates, confirmedBriefVersionId, confirmedBriefContentHash, geometryHash, requirementHash, designRulesVersion, designRuleSnapshot, decoderProfile, qaModel, qaSchema, referenceAssets, logoAssets}) |
 | bindingHash | SHA-256 of UTF-8 jcs({schemaVersion:"s2-binding-v1", projectId, sourceGenerationSetId, draftRevision, inputHash, sourceCandidates, referenceAssets, logoAssets}) |
 | repairInputHash | SHA-256 of UTF-8 jcs({schemaVersion:"s2-repair-v1", inputVersionId, qaRunId, candidateId, sourceAssetId, sourceSha256, sourceByteSize, sourceWidth, sourceHeight, sourcePixelCount, sourceDecodedRgbaBytes, bindingHash, orderedFindingIds, referenceAssets, logoAssets, confirmedBriefContentHash, geometryHash, attempt:1}) |
-| repairPromptHash | SHA-256 of UTF-8 bytes of the exact rendered s2-repair-v1 prompt, before provider submission |
+| repairPromptHash | SHA-256 of the exact UTF-8 bytes of the deterministic rendered s2-repair-v1 prompt, before provider submission; the prompt is reconstructable from the immutable authoritative repair inputs and the hash is independently verified at graph validation/load and immediately before dispatch |
 | outputSha256 | SHA-256 of the exact repaired normalized PNG bytes after provider output validation and s2-media-v1 normalization |
 
 sourceCandidates is an array of four objects ordered by candidateIndex. Each
@@ -681,6 +702,15 @@ ConceptAsset.sha256/byteSize values, not a new S2 normalization. The
 referenceAssets and logoAssets arrays contain assetId, normalizedSha256, width,
 height, normalizedBytes and one-based slot order. Their order is the persisted
 draft order, not hash order.
+
+For repairInputHash, orderedFindingIds is the server-owned canonical unique
+ordered finding set used for repair eligibility. The repair input manifest is
+the exact ordered source, reference and logo manifest in section 15.1; its
+immutable hashes, dimensions, sizes, roles and slot order are part of the
+repair-input hash input. The persisted repairInputHash is the hash of that
+complete immutable repair-input aggregate and is the repair input-manifest
+hash referenced by REPAIR-012. repairInputHash remains distinct from
+repairPromptHash, operationInputHash, bindingHash and inputHash.
 
 The inputHash and bindingHash MUST be recomputed from persisted snapshots
 inside the bind transaction. A client-provided hash is advisory and MUST NOT
@@ -709,6 +739,11 @@ The exact input values are:
 Reuse with the same operation, project, and input returns the original
 authorized result. Reuse with any different input returns
 IDEMPOTENCY_KEY_REUSE and performs no mutation or provider call.
+
+For Repair, the server derives eligibleFindingIds from the persisted
+canonical unique ordered material finding set. A client or request replay
+cannot supply duplicates, change the order, or substitute a domain-qualified
+ID for an established canonical ID.
 
 ## 7. Reference/logo draft and API contract
 
@@ -916,11 +951,15 @@ order with the same all-or-nothing result:
 14. Only after commit, enqueue or dispatch the four QA operations.
 15. Return the queued authorized projection.
 
-If any step fails, no input version, run, frozen draft, claim, idempotency
-result, or public success response may remain. Staging objects created before
-the transaction are cleaned by ownership-aware rollback. A post-commit
-dispatch failure leaves the queued records visible and recoverable; it is not
-reported as a fake QA result.
+If any step before commit fails, no input version, run, frozen draft, claim,
+idempotency result, or public success response may remain. Staging objects
+created before the transaction are cleaned by ownership-aware rollback. A
+failed repository transaction MUST NOT partially mutate run status, operation
+state, result state, counters, or timestamps. Run-scoped persistence or
+invariant failure follows the fail-closed rules in section 18.2 and is not a
+candidate provider verdict. A post-commit dispatch failure leaves the queued
+records visible and recoverable only under the validated claim and recovery
+rules in section 19; it is not a fake QA result or an automatic redispatch.
 
 ### 8.3 Snapshot rules
 
@@ -1139,10 +1178,12 @@ The literal placeholder MUST never be sent.
 The request MUST contain no reference or logo pixels. Reference and logo
 objects are inputs for repair only.
 
-OpenAI API errors, timeouts, malformed responses, safety refusals, decoder
-failures and persistence failures are operation failures. They are not
-provider-authored verdicts and MUST map to the error/state rules in sections
-12, 13 and 22.
+OpenAI API errors, timeouts, malformed responses, safety refusals and decoder
+failures are operation failures. They are not provider-authored verdicts and
+MUST map to the candidate error/state rules in sections 12, 13 and 22. A
+run-scoped persistence or invariant failure is handled only by the atomic
+fail-closed rules in sections 8.2, 18.2 and 19.4; it is not mapped to a
+candidate verdict.
 
 Official provider sources for this locked request are:
 
@@ -1243,10 +1284,24 @@ After strict schema validation, the server:
    keep observedCount null;
 5. excludes every server-marked not_applicable rule before finding
    classification; provider output cannot make a rule applicable;
-6. derives a finding ID from the canonical requirement/rule ID and stable
-   finding kind, never from provider evidence; and
+6. derives an established canonical finding ID from the canonical
+   requirement/rule ID and stable finding kind, never from provider evidence;
+   a requirement and design-rule observation that share an established
+   canonical ID resolve to that same ID; and
 7. persists the original bounded evidence string only in the private
    authorized result projection.
+
+Requirement observations and design-rule observations remain separately
+preserved in their respective arrays. After both domains are classified, the
+server forms the deterministic canonical finding arrays from one combined
+canonical-ID set. If both the requirement observation and the design-rule
+observation independently produce the same canonical material finding
+access.open-sides, both observations MUST be retained, but canonical
+access.open-sides MUST occur only once in materialFindingIds. The same unique
+canonical ordered set is consumed by repair eligibility, persisted
+eligibleFindingIds, repairInputHash, the Repair operationInputHash input, and
+the deterministic repair prompt compiler. No later layer may deduplicate a
+different set or reintroduce a duplicate.
 
 ### 12.2 Finding classification
 
@@ -1282,9 +1337,11 @@ null. Provider evidence cannot change this classification.
 
 The server assigns exactly one candidate verdict:
 
-1. QA_UNAVAILABLE when transport, provider, decoder, local schema, or
-   persistence failure prevents a complete validated observation. It is never
-   a material failure.
+1. QA_UNAVAILABLE when a provider, schema, transport, or decoder failure
+   prevents a complete validated observation. It is never a material failure.
+   A run-scoped persistence or invariant failure is an operational/internal
+   failure outside the durable source-run status machine and is not a
+   candidate verdict, including QA_UNAVAILABLE.
 2. MATERIAL_FAIL when at least one material violation has confidence >= 0.75
    and the complete observation set is otherwise valid.
 3. WARNING when there is no material violation but there is an uncertainty,
@@ -1315,13 +1372,16 @@ index order. No overall run verdict replaces the four candidate verdicts.
 
 ### 13.1 Retry eligibility
 
-Only these conditions can produce qa_unavailable_retryable: provider timeout,
-transient provider 5xx/rate-limit response, transient decoder/resource
-failure, or a recoverable worker/persistence interruption before a terminal
-result. Invalid input, schema-invalid provider output, unsupported media,
-auth/configuration failure, and a known policy refusal are terminal
-qa_unavailable_terminal unless an operator-approved remediation outside this
-contract changes the environment.
+Only these conditions can produce qa_unavailable_retryable: provider or
+transport timeout, transient provider 5xx/rate-limit response, or transient
+decoder/resource failure while the candidate operation remains otherwise
+valid. A worker/process interruption does not itself produce a candidate
+verdict; it may be recovered only under the validated persisted-operation
+rules in section 19. A persistence or invariant failure is not a
+recovery/requeue signal. Invalid input, schema-invalid provider output,
+unsupported media, auth/configuration failure, and a known policy refusal are
+terminal qa_unavailable_terminal unless an operator-approved remediation
+outside this contract changes the environment.
 
 The first operation is attempt 1. One explicit user/operator retry creates
 attempt 2. The retry re-reads the immutable input version and source asset
@@ -1359,8 +1419,8 @@ A repair is eligible only when all of the following are true:
 1. The candidate has a complete server-derived MATERIAL_FAIL verdict.
 2. The candidate has no qa_unavailable, uncertain-only, warning-only, or
    not_verifiable reason for the proposed repair.
-3. The server has persisted one through three material finding IDs, each
-   independently repairable in the allowlist below.
+3. The server has persisted one through three canonical unique ordered
+   material finding IDs, each independently repairable in the allowlist below.
 4. The candidate has no existing S2RepairAttempt, regardless of its status.
 5. The repair does not change confirmed width, depth, open sides, supplied max
    height, required candidate count, brief identity, or S1 source lineage.
@@ -1430,19 +1490,23 @@ The only accepted eligible sets are:
 
 The matrix is symmetric. A triple is accepted only when it contains at most
 one F member, at most one B member, and no outside member. Finding IDs are
-deduplicated and sorted by the canonical order in section 16 before hashing.
-This makes the allowed set exact and prevents the provider from receiving
-ambiguous competing brief changes.
+formed across both observation domains as one canonical-ID unique set and
+sorted by the deterministic canonical order in sections 9.1 and 10.1 before
+eligibility and hashing. A duplicate observation never counts as another
+finding and cannot create a second repair objective. This makes the allowed
+set exact and prevents the provider from receiving ambiguous competing brief
+changes.
 
 ### 14.4 Repair state creation
 
 The repair endpoint creates exactly one attempt value 1 after the eligibility
-decision and idempotency claim are persisted. It stores the ordered finding
-IDs, sourceAssetId/sourceByteSize/sourceSha256, input hash, prompt hash
-placeholder, and immutable lineage.
-The prompt hash is filled before the provider call; any failure before the
-call leaves no claimable success. A failed provider call leaves the attempt
-failed and does not permit a second attempt.
+decision and idempotency claim are persisted. It stores the canonical unique
+ordered finding IDs, sourceAssetId/sourceByteSize/sourceSha256, repair input
+hash, exact prompt hash, and immutable lineage. The prompt is rendered and
+repairPromptHash is computed and persisted before the provider call; no
+provider dispatch is authorised until the prompt hash integrity checks pass.
+Any failure before the call leaves no claimable success. A failed provider
+call leaves the attempt failed and does not permit a second attempt.
 
 ## 15. Repair provider contract
 
@@ -1513,10 +1577,12 @@ replace a derived record.
 ### 16.1 Prompt profile
 
 The compiler profile is s2-repair-v1. It is a deterministic server function
-over the immutable input snapshot, candidate source hash, ordered allowed
-finding IDs, role-ordered image manifest, confirmed brief facts and geometry.
-It does not consume provider evidence prose, timestamps, operation IDs,
-process IDs, client filenames, or mutable draft state.
+over the immutable input snapshot, candidate source identity and hashes,
+canonical unique ordered finding IDs, role-ordered image manifest, confirmed
+brief facts, geometry and repairInputHash. The exact rendered prompt MUST be
+reconstructable from those immutable authoritative inputs. It does not consume
+provider evidence prose, timestamps, operation IDs, process IDs, client
+filenames, or mutable draft state.
 
 The rendered prompt has these sections in this exact order, separated by one
 LF and terminated by one LF:
@@ -1527,6 +1593,14 @@ LF and terminated by one LF:
 4. ordered repair objectives generated from finding IDs;
 5. source image and reference/logo role instructions;
 6. preservation constraints and visual-only disclosure.
+
+The renderer uses fixed ASCII literals, labels, value serialization, section
+order, one LF between sections and one trailing LF. It MUST NOT apply locale
+formatting, trimming, provider-returned text, or any other mutable rewrite.
+The source/reference/logo role section includes the exact role-ordered
+immutable repair input manifest and a deterministic integrity line containing
+repairInputHash. Therefore a change to the canonical ordered finding set or
+to the repair input-manifest hash changes the rendered prompt bytes.
 
 The compiler uses the following fixed objective text:
 
@@ -1564,11 +1638,27 @@ resize, mask, or reorder the image bytes.
 
 ### 16.3 Prompt hash
 
-repairPromptHash is computed from the exact UTF-8 prompt bytes before the
-provider request. The prompt is never logged, returned to the client, or
-included in a thrown error. A repair attempt with the same input hash,
-finding set, manifest hashes and compiler version produces the same prompt
-bytes and prompt hash.
+repairPromptHash MUST equal SHA-256 of the exact UTF-8 bytes of the
+deterministic rendered s2-repair-v1 prompt, before the provider request. The
+prompt is never logged, returned to the client, or included in a thrown error.
+A repair attempt with the same immutable input hash, canonical unique ordered
+finding set, manifest hashes and compiler version produces byte-identical
+prompt content and the same prompt hash.
+
+G3 MUST reconstruct the exact prompt bytes from the immutable authoritative
+repair inputs and verify the persisted repairPromptHash against that
+independently reconstructed byte sequence during persisted-graph validation,
+load, or equivalent integrity validation. G3 MUST perform the same
+independent exact-byte reconstruction and comparison again immediately before
+repair provider dispatch. The persisted repairPromptHash MUST NOT be
+silently rewritten from a reconstructed value.
+
+A prompt-hash mismatch is an operational/internal integrity error and MUST
+fail closed. It produces zero repair provider calls, no derived candidate, no
+successful publication, and no re-QA. It MUST NOT manufacture an unavailable
+result, trigger automatic redispatch, or replace repairPromptHash. This check
+is separate from repairInputHash, operationInputHash, bindingHash and
+inputHash; none may be used as a substitute for repairPromptHash.
 
 ## 17. Exactly one re-QA
 
@@ -1625,12 +1715,25 @@ There is no thaw, reset, or second bind transition in v0.1.
 The run transitions are:
 
     queued -> running -> completed
-                     \-> failed
 
 The run is completed only after all four candidate operations are terminal.
-failed is reserved for a run-level persistence or invariant failure; a
-provider failure is represented on the candidate as qa_unavailable_retryable
-or qa_unavailable_terminal.
+There is no durable failed, cancelled, aborted, corrupt, poisoned, or
+replacement run state in v0.1. Provider, schema, transport and decoder
+failures remain candidate-level qa_unavailable_retryable or
+qa_unavailable_terminal outcomes under section 12; they are not run failure
+states.
+
+Run-scoped persistence or invariant failures are operational/internal
+failures outside the durable source-run status machine. They MUST fail closed,
+MUST NOT become a candidate provider verdict, MUST NOT manufacture completed,
+MUST NOT create a fake unavailable result, and MUST NOT cause automatic
+redispatch. If persisted integrity cannot be verified, no new provider call
+or repair dispatch is authorised from that unverified state. A failed
+repository transaction MUST NOT partially mutate run status, operation state,
+result state, counters, or timestamps. Recovery remains permitted only for an
+otherwise valid persisted operation under the existing claim-token, liveness
+and fencing rules; the persistence or invariant failure itself is not a
+recovery or requeue signal.
 
 Each candidate transitions as follows:
 
@@ -1721,9 +1824,13 @@ Process ownership uses the existing S1 process ID and liveness rules:
 4. no worker may reclaim an uncertain claim merely because its age is high.
 
 Recovery closes only a dead owner's claim under a repository transaction and
-requeues the same operation identity. It does not create a new input, run,
-asset, repair attempt or candidate. A process restart leaves queued/running
-records recoverable according to this rule.
+requeues the same operation identity after the persisted graph and operation
+integrity have been verified. It does not create a new input, run, asset,
+repair attempt or candidate. If persisted integrity cannot be verified, the
+operation fails closed and is not recovered, requeued, redispatched, or used
+for a new repair dispatch. A process restart leaves queued/running records
+recoverable only when the persisted operation is otherwise valid under this
+rule.
 
 ### 19.4 Transaction and publication ordering
 
@@ -1733,6 +1840,14 @@ are written to unique staging keys before final references are committed.
 Database/reference publication and object promotion are paired with recovery
 metadata. A failed transaction cannot leave a public projection claiming a
 missing final object.
+
+Any run-scoped persistence or invariant failure at this boundary is an
+operational/internal failure outside S2QaRunStatus. The repository MUST
+preserve transaction atomicity across run status, operation state, result
+state, counters and timestamps, and MUST NOT convert the failure into a
+candidate verdict, completed run, fake unavailable result, automatic
+redispatch, or recovery/requeue signal. No provider call or repair dispatch
+may start from a persisted graph whose integrity is unverified.
 
 A late completion cannot change a frozen draft, immutable input, terminal
 candidate result, repair attempt, derived candidate or re-QA result. The only
@@ -1949,6 +2064,15 @@ G3 MUST run secret scanning and review the diff for credentials before
 publication. No .env, key, token, private value or customer file may be
 added to the repository.
 
+For the controlled injected-secret negative, the scanner MUST detect the
+synthetic credential and the evidence MUST inspect the actual scanner,
+finding, or report output. That output MAY expose only [REDACTED] for the
+credential value; the raw injected credential value MUST be absent from the
+scanner/report output. Manually redacting a separate copy of the injected
+input string is not evidence of scanner/report redaction. A real secret MUST
+never be placed in repository content, fixtures, prompts, comments, or
+reports.
+
 ## 24. G3 evidence matrix
 
 G3 implementation is not accepted without evidence for every row below. The
@@ -1956,6 +2080,28 @@ test harness MUST use mocked provider adapters, deterministic fixture bytes,
 isolated private storage and synthetic project data. It MUST not call a live
 OpenAI provider, upload real customer material, use credentials, or weaken
 limits to make a fixture pass.
+
+Every emitted evidence claim in this complete matrix MUST exercise the exact
+value, state, boundary, or transition named by that claim and assert the exact
+measured outcome required by the row. The following are explicitly
+insufficient as primary proof:
+
+- constant-success assertions;
+- tautologies;
+- shape-only assertions where exact content is required, including a
+  64-hex-character check in place of prompt-hash verification;
+- source-code token existence;
+- unrelated proxy behavior;
+- an aggregate assertion presented as claim-specific proof without binding the
+  exact claim value; and
+- hard-coded "zero calls" or similar counters that were not measured over the
+  real test-scoped execution.
+
+Where a claim concerns security, privacy, hashing, redaction, sensitivity, or
+fail-closed behavior, the evidence MUST use controlled positive input or
+injection and the exact required absence, change, or rejection measurement
+where applicable. The execution-bound and provenance requirements below are
+binding for every row.
 
 | ID | Evidence required |
 | --- | --- |
@@ -2011,8 +2157,8 @@ limits to make a fixture pass.
 | QA-009 | PASS requires complete high-confidence compliance for applicable records; an absent maxHeightMm cannot block PASS. |
 | QA-010 | WARNING covers uncertainty, not_verifiable or warning-level findings with no material violation and is not a schema failure solely because observedCount is null. |
 | QA-011 | MATERIAL_FAIL requires a complete high-confidence server-owned material violation, including eligible overhead/scale visual failures. |
-| QA-012 | Incomplete, timeout, decoder, persistence, refusal and provider failures never become MATERIAL_FAIL. |
-| QA-013 | Run counters and candidate order remain correct after refresh and restart. |
+| QA-012 | Provider/schema/transport/decoder failures remain candidate-level QA_UNAVAILABLE outcomes and never become MATERIAL_FAIL; run-scoped persistence or invariant failures fail closed outside the durable source-run status machine and produce no candidate verdict or fake completion. |
+| QA-013 | Run counters and candidate order remain correct after refresh and restart; a run-scoped integrity failure cannot manufacture completed or unavailable state. |
 | QA-014 | Evidence is bounded to 400 Unicode code points and is not logged. |
 | QA-015 | With maxHeightMm null, geometry.max-height is omitted from expected schema/coverage and cannot create uncertainty, WARNING or a PASS blocker; with a supplied maxHeightMm it is applicable. |
 | RETRY-001 | Only retryable unavailable state exposes the explicit retry operation. |
@@ -2031,7 +2177,7 @@ limits to make a fixture pass.
 | REPAIR-009 | Repair aggregate count, decoded, RGBA and provider-bound encoded limits are checked before provider call. |
 | REPAIR-010 | Image edit request uses repeated image parts, pinned model, n=1, 1536x1024, medium, PNG, no mask and no input_fidelity. |
 | REPAIR-011 | Empty, multiple, non-PNG, invalid-base64, oversized and corrupt provider output is rejected. |
-| REPAIR-012 | Repair prompt hash is stable and changes when the immutable finding set or manifest hash changes. |
+| REPAIR-012 | Independently render/capture the exact deterministic repair prompt UTF-8 bytes, independently SHA-256 those bytes, and compare that hash with persisted repairPromptHash; identical immutable inputs rerender byte-identically with the same hash, a changed canonical ordered immutable finding set changes prompt content and hash, and a changed repair input-manifest hash changes prompt content and hash. Shape-only checks such as 64 hex characters are insufficient, and an unrelated conflict/error path is not evidence for prompt-hash sensitivity. |
 | REPAIR-013 | Provider evidence text cannot change the deterministic repair objective. |
 | REPAIR-014 | Staging failure, stale claim and publication failure leave no false derived success. |
 | REPAIR-015 | A clear material overhead-support failure receives only a bounded visibly plausible support/grounded correction and no engineering or approval claim. |
@@ -2042,10 +2188,10 @@ limits to make a fixture pass.
 | REQA-004 | Re-QA never exposes a retry and never creates a second repair. |
 | REQA-005 | Derived output, source output, repair attempt and re-QA result remain immutable and linked. |
 | CONC-001 | Two services cannot claim the same logical operation or make duplicate calls. |
-| CONC-002 | Definite ESRCH recovery requeues; unknown liveness remains busy/uncertain. |
-| CONC-003 | Restart during upload, bind, QA, repair and re-QA leaves safe recoverable state. |
+| CONC-002 | Definite ESRCH recovery requeues only an otherwise valid persisted operation; unknown liveness remains busy/uncertain, and a persistence or invariant failure is not a recovery/requeue signal. |
+| CONC-003 | Restart during upload, bind, QA, repair and re-QA leaves safe recoverable state only for otherwise valid persisted operations under claim-token, liveness and fencing rules; no durable source-run failed state is invented. |
 | CONC-004 | Stale claim tokens fence late provider completion and clean only owned staging. |
-| CONC-005 | Persistence failure cannot publish a missing object or a false terminal result. |
+| CONC-005 | A failed repository transaction cannot partially mutate run status, operation state, result state, counters or timestamps, publish a missing object or false terminal result, create a fake unavailable result, or trigger automatic redispatch; unverified persisted state cannot start a provider call or repair dispatch. |
 | CONC-006 | Atomic object put/promote never overwrites another asset or candidate. |
 | ROUTE-001 | Project authorization is enforced on every S2 route and preview. |
 | ROUTE-002 | Exact method, body, key, status and error envelope behavior matches section 7. |
@@ -2065,13 +2211,17 @@ limits to make a fixture pass.
 
 Each evidence record MUST include test ID, fixture/setup, expected result,
 actual result, relevant safe reference ID, and artifact path or test output.
-Provider request/response fixtures MUST be redacted and synthetic.
+The artifact or test output MUST come from the real test-scoped execution that
+exercised the exact claim and MUST preserve enough measured values to bind the
+claim-specific result. Provider request/response fixtures MUST be redacted and
+synthetic. A detached assertion, source-code token, manual copy, or manually
+redacted substitute is not execution-bound evidence.
 
 ## 25. G3 implementation boundary and G2 acceptance gate
 
 ### 25.1 Authorized next work after Web acceptance
 
-After Web explicitly accepts DL-SD-S2-G2-002 in the programme record, G3 may:
+After Web explicitly accepts DL-SD-S2-G2-004 in the programme record, G3 may:
 
 1. add sharp 0.35.3 and the generated dependency/lockfile entries;
 2. implement the S2 types, repository records, private media adapter,
@@ -2098,8 +2248,8 @@ implementation blocker; it does not authorize a decoder substitution.
 
 Web may accept this lock only when:
 
-- this revision branch is based exactly on ae256e6bef8d4af1546320a8869c3c9d98132da8;
-- this is the only product file changed by the G2 authoring task;
+- this revision branch is based exactly on 68fbbb8653733554730d90316ce6e91719f1ffce;
+- this is the only file changed by the G2 authoring task;
 - the lock contains exact media, data, API, provider, verdict, repair,
   concurrency, privacy and evidence behavior;
 - sharp is pinned to 0.35.3 with the cited official evidence;
@@ -2109,7 +2259,8 @@ Web may accept this lock only when:
 - child issue #7 contains the exact-head evidence comment and remains open;
 - current PR review, inline review, conversation comment and check inventories
   are recorded without claiming acceptance; and
-- the next authorised step is G3 implementation only after acceptance.
+- the next authorised step is a fresh G3 implementation lineage only after
+  Web accepts and merges DL-SD-S2-G2-004.
 
 This document is a contract, not an implementation report. Missing runtime
 evidence is expected before G3 and MUST NOT be represented as a fake pass.
