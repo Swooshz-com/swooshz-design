@@ -139,6 +139,7 @@ function typeFor(testId: string, variantId: string): EvidenceType {
 
 function fixtureFor(testId: string, variantId: string): string {
   if (testId === "MEDIA-008") return "Real sharp 0.35.3 decoder fixture for the " + variantId + " PNG/JPEG/WebP rejection class.";
+  if (testId === "MEDIA-021") return "Real normalizeS2Media execution with a delegating Sharp factory that captures the exact constructor options, paired with warning, animation and pixel-boundary fixtures.";
   if (testId === "MEDIA-012") return variantId === "unrepresentable-plus-one"
     ? "Real 4,096 x 4,096 sharp raster plus MEDIA-011 4,097-dimension boundary; no impossible raster is constructed."
     : "Real sharp 0.35.3 4,096 x 4,096 raster through normalizeS2Media and inspectCanonicalS1Png.";
@@ -153,6 +154,7 @@ function fixtureFor(testId: string, variantId: string): string {
   if (testId === "REPAIR-007") return "Real two-candidate repair workflow proving one repair per (qaRunId, candidateId), independent candidate repair, and same-candidate rejection.";
   if (testId === "REQA-003") return "Four real repair/re-QA workflows proving pass, warning, material-fail, and unavailable outcomes without changing source-QA completion.";
   if (testId === "REPAIR-011") return "Production OpenAIProvider.runS2Repair adapter with one controlled local response per locked output class.";
+  if (testId === "REPAIR-004") return "Real QA reduction and repairCandidate admission for compatible spatial pair/triple cases and an incompatible brief.functional plus brief.mandatory two-F case, with measured mock repair-provider dispatch.";
   if (testId === "REPAIR-012") return "Captured exact production repair prompt bytes and a test-only independent G2-004 oracle with direct SHA-256 sensitivity checks over immutable finding and manifest inputs.";
   if (testId === "REPAIR-017") return "Real local repairable access.open-sides material-vs-uncertain workflow with persisted eligibility, operation hash, repair input hash and exact prompt checks.";
   if (testId === "PRIV-001") return "Real local S2 success/failure/error run with captured console sinks; each exact privacy marker is checked against captured logs and safe envelopes; production provider adapter markers and private object keys are exercised.";

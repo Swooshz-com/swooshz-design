@@ -31,6 +31,14 @@ const SHARP_OPTIONS = {
 
 export type S2DetectedMime = "image/png" | "image/jpeg" | "image/webp";
 
+export type S2SharpOptions = NonNullable<Parameters<typeof sharp>[1]>;
+export type S2SharpFactory = (
+  input: NonNullable<Parameters<typeof sharp>[0]>,
+  options: S2SharpOptions,
+) => ReturnType<typeof sharp>;
+
+const defaultS2SharpFactory: S2SharpFactory = (input, options) => sharp(input, options);
+
 export type S2MediaInput = {
   kind: S2AssetKind;
   fileName?: string;
@@ -222,14 +230,17 @@ export function enforceS2AggregateLimits(measures: readonly S2DecodedMeasure[], 
   }
 }
 
-export async function normalizeS2Media(input: S2MediaInput): Promise<S2NormalizedMedia> {
+export async function normalizeS2Media(
+  input: S2MediaInput,
+  sharpFactory: S2SharpFactory = defaultS2SharpFactory,
+): Promise<S2NormalizedMedia> {
   const bytes = Buffer.from(input.bytes);
   const maxInputBytes = input.maxInputBytes ?? S2_MAX_SOURCE_BYTES;
   if (bytes.length < 1 || bytes.length > maxInputBytes) throw mediaError(413, "MEDIA_TOO_LARGE");
   const detectedMime = detectContainer(bytes);
   enforceDeclaredIdentity(input, detectedMime);
   try {
-    const preflight = await sharp(bytes, SHARP_OPTIONS).metadata();
+    const preflight = await sharpFactory(bytes, SHARP_OPTIONS).metadata();
     const format = mimeForFormat(preflight.format);
     if (format !== detectedMime || (preflight.pages !== undefined && preflight.pages !== 1)) {
       throw mediaError(422, preflight.pages && preflight.pages > 1 ? "MEDIA_ANIMATED_NOT_ALLOWED" : "MEDIA_CORRUPT");
@@ -238,7 +249,7 @@ export async function normalizeS2Media(input: S2MediaInput): Promise<S2Normalize
     const pixelCount = preflight.width * preflight.height;
     const decodedRgbaBytes = pixelCount * 4;
     enforceMeasure({ encodedBytes: bytes.length, width: preflight.width, height: preflight.height, pixelCount, decodedRgbaBytes }, { maxEncodedBytes: maxInputBytes });
-    const result = await sharp(bytes, SHARP_OPTIONS)
+    const result = await sharpFactory(bytes, SHARP_OPTIONS)
       .toColourspace("srgb")
       .png({ force: true, palette: false, compressionLevel: 9, adaptiveFiltering: false })
       .toBuffer({ resolveWithObject: true });

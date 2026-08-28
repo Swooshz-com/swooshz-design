@@ -25,6 +25,8 @@ import {
   S2_MAX_SOURCE_BYTES,
   S2_MAX_TOTAL_PIXELS,
   S2_MAX_TOTAL_RGBA_BYTES,
+  type S2SharpFactory,
+  type S2SharpOptions,
 } from "../src/lib/s2-media";
 import { buildS2QaRequest, buildS2RepairRequest, S2_QA_MODEL, S2_QA_SCHEMA } from "../src/lib/s2-provider";
 import { handleApiRequest } from "../src/lib/api";
@@ -3390,8 +3392,16 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       });
   } finally { rmSync(bodyBoundary.root, { recursive: true, force: true }); }
 
+  const decoderInvocations: S2SharpOptions[] = [];
+  const observingSharpFactory: S2SharpFactory = (input, options) => {
+    decoderInvocations.push({ ...options });
+    return sharp(input, options);
+  };
   const maxSquare = await solidPng(S2_MAX_DIMENSION, S2_MAX_DIMENSION, { r: 12, g: 34, b: 56 });
-  const maxSquareMedia = await normalizeS2Media({ kind: "reference", fileName: "max-square.png", mimeType: "image/png", bytes: maxSquare });
+  const maxSquareMedia = await normalizeS2Media(
+    { kind: "reference", fileName: "max-square.png", mimeType: "image/png", bytes: maxSquare },
+    observingSharpFactory,
+  );
   const exactDimensionBytes = await solidPng(S2_MAX_DIMENSION, 1);
   const overDimensionBytes = await solidPng(S2_MAX_DIMENSION + 1, 1);
   const exactDimension = await normalizeS2Media({ kind: "reference", fileName: "edge.png", mimeType: "image/png", bytes: exactDimensionBytes });
@@ -3466,16 +3476,24 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       "MEDIA-020/original-hash": () => assert.equal(normalizedPng.originalSha256, sha256(alphaInput)),
       "MEDIA-020/normalized-hash": () => assert.equal(normalizedPng.normalizedSha256, sha256(normalizedPng.normalizedBytes)),
     });
-  await prove(claimIds("MEDIA-021", ["failOn", "limitInputPixels", "pages", "animated", "no-unlimited"]), "media decoder configuration", "Checked source configuration plus a successful normalized frame through sharp 0.35.3.",
-    { sourcePath: "src/lib/s2-media.ts", failOnWarning: mediaSourceText.includes('failOn: "warning"'), limitInputPixels: S2_MAX_PIXELS_PER_ASSET, pages: 1, animated: false, unlimited: mediaSourceText.includes("unlimited: true"), result: "locked-profile" },
-    "The checked sharp profile contained failOn warning, the exact pixel limit, one page, animation disabled, and no unlimited setting.",
-    () => { assert.equal(mediaSourceText.includes('failOn: "warning"'), true); assert.equal(mediaSourceText.includes("limitInputPixels: S2_MAX_PIXELS_PER_ASSET"), true); assert.equal(mediaSourceText.includes("unlimited: true"), false); assert.equal(normalizedPng.detectedMime, "image/png"); }, undefined,
+  const decoderOptions = decoderInvocations[0];
+  const decoderOptionsConsistent = decoderInvocations.every((options) =>
+    options.failOn === decoderOptions.failOn &&
+    options.limitInputPixels === decoderOptions.limitInputPixels &&
+    options.pages === decoderOptions.pages &&
+    options.animated === decoderOptions.animated &&
+    Object.prototype.hasOwnProperty.call(options, "unlimited") === false);
+  const unlimitedPresent = Object.prototype.hasOwnProperty.call(decoderOptions, "unlimited");
+  await prove(claimIds("MEDIA-021", ["failOn", "limitInputPixels", "pages", "animated", "no-unlimited"]), "media decoder configuration", "Real normalizeS2Media maximum-pixel execution through a delegating Sharp factory that captured each constructor invocation, paired with real warning and animation rejection fixtures.",
+    { invocationCount: decoderInvocations.length, optionsConsistent: decoderOptionsConsistent, failOn: String(decoderOptions.failOn), limitInputPixels: Number(decoderOptions.limitInputPixels), pages: Number(decoderOptions.pages), animated: Boolean(decoderOptions.animated), unlimitedPresent, decoderWarningCode: defectCodes.decoderWarning, multiFrameCode: defectCodes.multiFrame, pixelBoundary: maxSquareMedia.pixelCount, result: "invoked-locked-profile" },
+    "The real media path invoked Sharp twice with the exact locked options, accepted the pixel boundary, and rejected the warning and multi-frame fixtures.",
+    () => { assert.equal(decoderInvocations.length, 2); assert.equal(decoderOptionsConsistent, true); assert.equal(decoderOptions.failOn, "warning"); assert.equal(decoderOptions.limitInputPixels, S2_MAX_PIXELS_PER_ASSET); assert.equal(decoderOptions.pages, 1); assert.equal(decoderOptions.animated, false); assert.equal(unlimitedPresent, false); assert.equal(defectCodes.decoderWarning, "MEDIA_CORRUPT"); assert.equal(defectCodes.multiFrame, "MEDIA_ANIMATED_NOT_ALLOWED"); assert.equal(maxSquareMedia.pixelCount, S2_MAX_PIXELS_PER_ASSET); }, undefined,
     {
-      "MEDIA-021/failOn": () => assert.equal(mediaSourceText.includes('failOn: "warning"'), true),
-      "MEDIA-021/limitInputPixels": () => assert.equal(mediaSourceText.includes("limitInputPixels: S2_MAX_PIXELS_PER_ASSET"), true),
-      "MEDIA-021/pages": () => assert.equal(mediaSourceText.includes("pages: 1"), true),
-      "MEDIA-021/animated": () => assert.equal(mediaSourceText.includes("animated: false"), true),
-      "MEDIA-021/no-unlimited": () => assert.equal(mediaSourceText.includes("unlimited: true"), false),
+      "MEDIA-021/failOn": () => { assert.equal(decoderOptions.failOn, "warning"); assert.equal(defectCodes.decoderWarning, "MEDIA_CORRUPT"); },
+      "MEDIA-021/limitInputPixels": () => { assert.equal(decoderOptions.limitInputPixels, S2_MAX_PIXELS_PER_ASSET); assert.equal(maxSquareMedia.pixelCount, S2_MAX_PIXELS_PER_ASSET); },
+      "MEDIA-021/pages": () => { assert.equal(decoderOptions.pages, 1); assert.equal(defectCodes.multiFrame, "MEDIA_ANIMATED_NOT_ALLOWED"); },
+      "MEDIA-021/animated": () => { assert.equal(decoderOptions.animated, false); assert.equal(animatedCodes.apng, "MEDIA_ANIMATED_NOT_ALLOWED"); assert.equal(animatedCodes.webp, "MEDIA_ANIMATED_NOT_ALLOWED"); },
+      "MEDIA-021/no-unlimited": () => { assert.equal(unlimitedPresent, false); assert.equal(decoderOptionsConsistent, true); },
     });
 
   const cleanup = fixture();
@@ -4731,25 +4749,68 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       });
   } finally { rmSync(repairValue.root, { recursive: true, force: true }); }
 
-  const twoFailProvider = new MockOpenAIProvider({ briefData: briefData(), s2QaResponseFactory: (input) => input.candidateIndex === 1 ? qaPayload(input, "pass", "structure.no-floating,structure.overhead-support") : qaPayload(input, "pass") });
-  const twoFail = fixture([ONE_PIXEL_PNG], { provider: twoFailProvider });
-  const threeFailProvider = new MockOpenAIProvider({ briefData: briefData(), s2QaResponseFactory: (input) => input.candidateIndex === 1 ? qaPayload(input, "pass", "structure.no-floating,structure.overhead-support,scale.human") : qaPayload(input, "pass") });
-  const threeFail = fixture([ONE_PIXEL_PNG], { provider: threeFailProvider });
+  const spatialPairProvider = new MockOpenAIProvider({ briefData: briefData(), s2QaResponseFactory: (input) => input.candidateIndex === 1 ? qaPayload(input, "pass", "structure.no-floating,structure.overhead-support") : qaPayload(input, "pass") });
+  const spatialPair = fixture([ONE_PIXEL_PNG], { provider: spatialPairProvider });
+  const spatialTripleProvider = new MockOpenAIProvider({ briefData: briefData(), s2QaResponseFactory: (input) => input.candidateIndex === 1 ? qaPayload(input, "pass", "structure.no-floating,structure.overhead-support,scale.human") : qaPayload(input, "pass") });
+  const spatialTriple = fixture([ONE_PIXEL_PNG], { provider: spatialTripleProvider });
+  const twoFProvider = new MockOpenAIProvider({
+    briefData: briefData(),
+    s2QaResponseFactory: (input) => {
+      const payload = qaPayload(input, "pass");
+      if (input.candidateIndex !== 1) return payload;
+      for (const findingId of ["brief.functional.001", "brief.mandatory.001"]) {
+        const observation = payload.requirements.find((item: any) => item.requirementId === findingId);
+        if (!observation) throw new Error("missing two-F fixture requirement " + findingId);
+        observation.observed = "absent";
+        observation.observedCount = null;
+        observation.confidence = 0.99;
+      }
+      return payload;
+    },
+  });
+  const twoF = fixture([ONE_PIXEL_PNG], { provider: twoFProvider });
   try {
-    const { result } = await bindAndWait(twoFail);
+    const { bound: pairBound, result } = await bindAndWait(spatialPair);
     const candidate = result.qaRun.candidateResults[0];
-    const { result: tripleResult } = await bindAndWait(threeFail);
+    await spatialPair.service.s2.repairCandidate(spatialPair.projectId, pairBound.qaRun.id, candidate.candidateId, pairBound.inputVersionId, randomUUID(), randomUUID());
+    const pairRepair = await waitFor(() => spatialPair.repository.state().s2Repairs[0] as any,
+      (repair) => repair !== undefined && !["queued", "running", "derived_ready", "re_qa_running"].includes(repair.status));
+
+    const { bound: tripleBound, result: tripleResult } = await bindAndWait(spatialTriple);
     const tripleCandidate = tripleResult.qaRun.candidateResults[0];
-    await prove(claimIds("REPAIR-004", ["spatial-pair", "spatial-triple", "two-fail", "matrix-exact"]), "repair multi-finding matrix", "Real QA payload with two independent material spatial rule failures through the production evaluator.",
-      { findingCount: candidate.materialFindingIds.length, findings: candidate.materialFindingIds.join(","), status: candidate.status, tripleFindingCount: tripleCandidate.materialFindingIds.length, tripleFindings: tripleCandidate.materialFindingIds.join(","), tripleStatus: tripleCandidate.status, result: "matrix-material-fail" },
-      "The real evaluator retained the exact compatible spatial pair and triple while rejecting the two-finding F case as material failure.",
-      () => { assert.equal(candidate.status, "material_fail"); assert.equal(candidate.materialFindingIds.length, 2); assert.deepEqual(candidate.materialFindingIds, ["structure.no-floating", "structure.overhead-support"]); assert.equal(tripleCandidate.status, "material_fail"); assert.equal(tripleCandidate.materialFindingIds.length, 3); assert.deepEqual(tripleCandidate.materialFindingIds, ["scale.human", "structure.no-floating", "structure.overhead-support"]); }, undefined, {
-        "REPAIR-004/spatial-pair": () => { assert.equal(candidate.materialFindingIds.length, 2); assert.deepEqual(candidate.materialFindingIds, ["structure.no-floating", "structure.overhead-support"]); },
-        "REPAIR-004/spatial-triple": () => { assert.equal(tripleCandidate.materialFindingIds.length, 3); assert.deepEqual(tripleCandidate.materialFindingIds, ["scale.human", "structure.no-floating", "structure.overhead-support"]); },
-        "REPAIR-004/two-fail": () => { assert.equal(candidate.status, "material_fail"); assert.equal(candidate.materialFindingIds.length, 2); },
-        "REPAIR-004/matrix-exact": () => { assert.deepEqual(candidate.materialFindingIds, ["structure.no-floating", "structure.overhead-support"]); assert.deepEqual(tripleCandidate.materialFindingIds, ["scale.human", "structure.no-floating", "structure.overhead-support"]); },
+    await spatialTriple.service.s2.repairCandidate(spatialTriple.projectId, tripleBound.qaRun.id, tripleCandidate.candidateId, tripleBound.inputVersionId, randomUUID(), randomUUID());
+    const tripleRepair = await waitFor(() => spatialTriple.repository.state().s2Repairs[0] as any,
+      (repair) => repair !== undefined && !["queued", "running", "derived_ready", "re_qa_running"].includes(repair.status));
+
+    const { bound: twoFBound, result: twoFResult } = await bindAndWait(twoF);
+    const twoFCandidate = twoFResult.qaRun.candidateResults[0];
+    const beforeTwoF = twoF.repository.state();
+    const beforeTwoFCounts = {
+      repairAttempts: beforeTwoF.s2Repairs.length,
+      repairOperations: beforeTwoF.s2Operations.filter((operation) => operation.phase === "repair").length,
+      derivedCandidates: beforeTwoF.s2DerivedCandidates.length,
+      reQaResults: beforeTwoF.s2ReQaResults.length,
+      repairProviderDispatches: twoFProvider.s2RepairCalls,
+    };
+    const twoFCode = await observedErrorCode(() => twoF.service.s2.repairCandidate(twoF.projectId, twoFBound.qaRun.id, twoFCandidate.candidateId, twoFBound.inputVersionId, randomUUID(), randomUUID()));
+    const afterTwoF = twoF.repository.state();
+    const afterTwoFCounts = {
+      repairAttempts: afterTwoF.s2Repairs.length,
+      repairOperations: afterTwoF.s2Operations.filter((operation) => operation.phase === "repair").length,
+      derivedCandidates: afterTwoF.s2DerivedCandidates.length,
+      reQaResults: afterTwoF.s2ReQaResults.length,
+      repairProviderDispatches: twoFProvider.s2RepairCalls,
+    };
+    await prove(claimIds("REPAIR-004", ["spatial-pair", "spatial-triple", "two-fail", "matrix-exact"]), "repair multi-finding matrix", "Three real QA reductions followed by repairCandidate: compatible spatial pair/triple requests dispatched once each, while two independent material confirmed-brief requirements were rejected before repair dispatch or state creation.",
+      { spatialPairFindings: candidate.materialFindingIds.join(","), spatialPairDispatches: spatialPairProvider.s2RepairCalls, spatialPairStatus: pairRepair.status, spatialTripleFindings: tripleCandidate.materialFindingIds.join(","), spatialTripleDispatches: spatialTripleProvider.s2RepairCalls, spatialTripleStatus: tripleRepair.status, twoFFindings: twoFCandidate.materialFindingIds.join(","), twoFCode, twoFDispatches: afterTwoFCounts.repairProviderDispatches, twoFRepairAttempts: afterTwoFCounts.repairAttempts, twoFRepairOperations: afterTwoFCounts.repairOperations, twoFDerivedCandidates: afterTwoFCounts.derivedCandidates, twoFReQaResults: afterTwoFCounts.reQaResults, result: "matrix-admission-enforced" },
+      "The real repair path admitted compatible spatial pair/triple sets and rejected the exact two-F set with no provider dispatch or manufactured repair lineage.",
+      () => { assert.deepEqual(candidate.materialFindingIds, ["structure.no-floating", "structure.overhead-support"]); assert.equal(spatialPairProvider.s2RepairCalls, 1); assert.deepEqual(tripleCandidate.materialFindingIds, ["scale.human", "structure.no-floating", "structure.overhead-support"]); assert.equal(spatialTripleProvider.s2RepairCalls, 1); assert.deepEqual(twoFCandidate.materialFindingIds, ["brief.functional.001", "brief.mandatory.001"]); assert.equal(twoFCode, "REPAIR_NOT_ELIGIBLE"); assert.deepEqual(afterTwoFCounts, beforeTwoFCounts); assert.deepEqual(afterTwoFCounts, { repairAttempts: 0, repairOperations: 0, derivedCandidates: 0, reQaResults: 0, repairProviderDispatches: 0 }); }, undefined, {
+        "REPAIR-004/spatial-pair": () => { assert.deepEqual(candidate.materialFindingIds, ["structure.no-floating", "structure.overhead-support"]); assert.equal(spatialPairProvider.s2RepairCalls, 1); assert.equal(pairRepair.eligibleFindingIds.join(","), candidate.materialFindingIds.join(",")); },
+        "REPAIR-004/spatial-triple": () => { assert.deepEqual(tripleCandidate.materialFindingIds, ["scale.human", "structure.no-floating", "structure.overhead-support"]); assert.equal(spatialTripleProvider.s2RepairCalls, 1); assert.equal(tripleRepair.eligibleFindingIds.join(","), tripleCandidate.materialFindingIds.join(",")); },
+        "REPAIR-004/two-fail": () => { assert.deepEqual(twoFCandidate.materialFindingIds, ["brief.functional.001", "brief.mandatory.001"]); assert.equal(twoFCode, "REPAIR_NOT_ELIGIBLE"); assert.equal(twoFProvider.s2RepairCalls, 0); assert.deepEqual(afterTwoFCounts, { repairAttempts: 0, repairOperations: 0, derivedCandidates: 0, reQaResults: 0, repairProviderDispatches: 0 }); },
+        "REPAIR-004/matrix-exact": () => { assert.equal(pairRepair.eligibleFindingIds.join(","), "structure.no-floating,structure.overhead-support"); assert.equal(tripleRepair.eligibleFindingIds.join(","), "scale.human,structure.no-floating,structure.overhead-support"); assert.equal(twoFCode, "REPAIR_NOT_ELIGIBLE"); assert.deepEqual(afterTwoFCounts, beforeTwoFCounts); },
       });
-  } finally { rmSync(twoFail.root, { recursive: true, force: true }); rmSync(threeFail.root, { recursive: true, force: true }); }
+  } finally { rmSync(spatialPair.root, { recursive: true, force: true }); rmSync(spatialTriple.root, { recursive: true, force: true }); rmSync(twoF.root, { recursive: true, force: true }); }
 
   const publicationCases: Array<{ phase: "after-publication-staged" | "after-final-promotion"; live: boolean; uncertain: boolean }> = [
     { phase: "after-publication-staged", live: true, uncertain: false },
