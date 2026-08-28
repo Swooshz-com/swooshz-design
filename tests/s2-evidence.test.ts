@@ -37,6 +37,7 @@ import { validateS2Graph } from "../src/lib/s2-persistence";
 import { createS2QaClient, createS2ReferencesClient, orderS2Candidates, s2CandidatePreviewPath, s2QaCandidateControls, s2QaUserFacingState } from "../app/components/S2Client";
 import { createIdempotencyKeyRetainer, UnknownNetworkOutcome } from "../src/lib/client-idempotency";
 import { deriveClaimManifest, manifestBaseRowCount, manifestVariantCount, type ClaimDefinition } from "./s2-evidence-manifest";
+import { independentRepairInput, independentRepairInputHash, independentRepairPrompt, independentRepairPromptHash } from "./s2-repair-oracle";
 
 const ONE_PIXEL_PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 
@@ -470,35 +471,6 @@ async function assertMissingS2IdempotencyKeyRoute(value: Fixture, request: Reque
 
 function hashCanonicalOperationInput(operation: string, projectId: string, input: unknown): string {
   return sha256(jcs({ operation, projectId, input }));
-}
-
-function independentRepairInput(
-  input: any,
-  source: any,
-  orderedFindingIds: readonly string[],
-  referenceAssets: readonly Record<string, unknown>[],
-  logoAssets: readonly Record<string, unknown>[],
-): Record<string, unknown> {
-  return {
-    schemaVersion: "s2-repair-v1",
-    inputVersionId: input.id,
-    qaRunId: input.qaRunId,
-    candidateId: source.candidateId,
-    sourceAssetId: source.sourceAssetId,
-    sourceSha256: source.sourceSha256,
-    sourceByteSize: source.sourceByteSize,
-    sourceWidth: source.sourceWidth,
-    sourceHeight: source.sourceHeight,
-    sourcePixelCount: source.sourcePixelCount,
-    sourceDecodedRgbaBytes: source.sourceDecodedRgbaBytes,
-    bindingHash: input.bindingHash,
-    orderedFindingIds,
-    referenceAssets,
-    logoAssets,
-    confirmedBriefContentHash: input.confirmedBriefContentHash,
-    geometryHash: input.geometryHash,
-    attempt: 1,
-  };
 }
 
 function assertExactKeys(value: Record<string, unknown>, expected: readonly string[]): void {
@@ -1861,9 +1833,10 @@ test("fresh S2 QA evidence proves strict schema, server-owned verdicts, confiden
   const pass = fixture([ONE_PIXEL_PNG], { provider });
   try {
     const { result } = await bindAndWait(pass);
+    const input = pass.repository.state().s2Inputs[0];
     assert.equal(result.qaRun.passCount, 4);
-    assert.equal(result.qaRun.candidateResults.every((item: any) => item.requirementObservations.length === result.input.canonicalRequirements.length), true);
-    assert.equal(result.qaRun.candidateResults.every((item: any) => item.designObservations.length === result.input.designRuleSnapshot.filter((rule: any) => rule.applicability === "applicable").length), true);
+    assert.equal(result.qaRun.candidateResults.every((item: any) => item.requirementObservations.length === input.canonicalRequirements.length), true);
+    assert.equal(result.qaRun.candidateResults.every((item: any) => item.designObservations.length === input.designRuleSnapshot.filter((rule: any) => rule.applicability === "applicable").length), true);
     const request = buildS2QaRequest(captured[0]);
     const content = (request.input as any[])[1].content;
     assert.equal(request.model, "gpt-5.4-mini-2026-03-17");
@@ -2440,7 +2413,7 @@ test("fresh S2 restart evidence covers active bind, QA, repair and re-QA with co
     await new Promise((resolve) => setTimeout(resolve, 40));
     const latest = qaValue.service.s2.getQaRun(qaValue.projectId, bound.qaRun.id) as any;
     assert.equal(latest.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1).status, "qa_unavailable_retryable");
-    assert.equal(latest.qaRun.candidateResults.find((result: any) => result.candidateIndex === 1).providerRequestId, null);
+    assert.equal(qaValue.repository.state().s2QaRuns[0].candidateResults.find((result) => result.candidateIndex === 1)?.providerRequestId, null);
   } finally {
     staleQa.resolve();
     rmSync(qaValue.root, { recursive: true, force: true });
@@ -4197,10 +4170,10 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const input = height.repository.state().s2Inputs[0];
     const maxHeightRule = input.designRuleSnapshot.find((rule) => rule.ruleId === "geometry.max-height")!;
     await prove(claimIds("QA-015", ["null-omits", "supplied-applies"]), "qa geometry applicability", "Two real geometry snapshots: null maximum height omitted and supplied maximum height applicable.",
-      { suppliedMaxHeightMm: input.geometrySnapshot.maxHeightMm ?? -1, maxHeightRuleApplicability: maxHeightRule.applicability, observedRuleCount: result.input.designRuleSnapshot.filter((rule: any) => rule.applicability === "applicable").length, result: "applicability-bound" },
+      { suppliedMaxHeightMm: input.geometrySnapshot.maxHeightMm ?? -1, maxHeightRuleApplicability: maxHeightRule.applicability, observedRuleCount: input.designRuleSnapshot.filter((rule: any) => rule.applicability === "applicable").length, result: "applicability-bound" },
       "The real geometry snapshot made the maximum-height rule applicable only when the hard fact was supplied.",
       () => { assert.equal(input.geometrySnapshot.maxHeightMm, 4000); assert.equal(maxHeightRule.applicability, "applicable"); }, undefined, {
-        "QA-015/null-omits": () => { assert.equal(input.geometrySnapshot.maxHeightMm, 4000); assert.equal(result.input.designRuleSnapshot.some((rule: any) => rule.ruleId === "geometry.max-height" && rule.applicability === "not_applicable"), false); },
+        "QA-015/null-omits": () => { assert.equal(input.geometrySnapshot.maxHeightMm, 4000); assert.equal(input.designRuleSnapshot.some((rule: any) => rule.ruleId === "geometry.max-height" && rule.applicability === "not_applicable"), false); },
         "QA-015/supplied-applies": () => assert.equal(maxHeightRule.applicability, "applicable"),
       });
     } finally { rmSync(height.root, { recursive: true, force: true }); }
@@ -4338,6 +4311,7 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       const final = value.service.s2.getQaRun(value.projectId, bound.qaRun.id) as any;
       const latest = final.qaRun.candidateResults.find((item: any) => item.candidateIndex === 1);
       const attempts = final.qaRun.candidateAttempts.filter((item: any) => item.candidateIndex === 1);
+      const persistedLatest = value.repository.state().s2QaRuns[0].candidateResults.find((item) => item.candidateIndex === 1)!;
       const qaOperations = value.repository.state().s2Operations.filter((item) => item.phase === "qa" && item.candidateId === candidateId);
       if (!attemptTwoFailure) {
         await prove(claimIds("RETRY-001", ["retryable-visible", "terminal-hidden"]), "retry status visibility", "Real attempt-1 timeout followed by explicit retry and terminal attempt-2 state.",
@@ -4375,11 +4349,11 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
             "RETRY-004/one-call": () => { assert.equal(qaOperations.length, 2); assert.equal(qaOperations.filter((item) => item.attempt === 1).length, 1); assert.equal(qaOperations.filter((item) => item.attempt === 2).length, 1); },
           });
         await prove(claimIds("RETRY-005", ["late-fences-attempt2", "late-fences-terminal"]), "retry late-completion fencing", "A controlled late attempt-1 completion released only after attempt two and terminal truth were persisted.",
-          { race: eventOrder.indexOf("attempt-1-late-complete") > eventOrder.indexOf("attempt-2-terminal"), eventOrder: eventOrder.join(">"), attempts: attempts.length, latestAttempt: latest.attempt, latestStatus: latest.status, staleProviderRequest: latest.providerRequestId === "late-attempt-1", result: "stale-fenced" },
+          { race: eventOrder.indexOf("attempt-1-late-complete") > eventOrder.indexOf("attempt-2-terminal"), eventOrder: eventOrder.join(">"), attempts: attempts.length, latestAttempt: latest.attempt, latestStatus: latest.status, staleProviderRequest: persistedLatest.providerRequestId === "late-attempt-1", result: "stale-fenced" },
           "The late attempt-one completion could not overwrite the persisted latest attempt or terminal state.",
-          () => { assert.equal(attempts.length, 2); assert.equal(latest.attempt, 2); assert.notEqual(latest.providerRequestId, "late-attempt-1"); assert.equal(final.qaRun.status, "completed"); }, undefined, {
+          () => { assert.equal(attempts.length, 2); assert.equal(latest.attempt, 2); assert.notEqual(persistedLatest.providerRequestId, "late-attempt-1"); assert.equal(final.qaRun.status, "completed"); }, undefined, {
             "RETRY-005/late-fences-attempt2": () => { assert.equal(eventOrder.indexOf("attempt-1-late-complete") > eventOrder.indexOf("attempt-2-terminal"), true); assert.equal(latest.attempt, 2); },
-            "RETRY-005/late-fences-terminal": () => { assert.notEqual(latest.providerRequestId, "late-attempt-1"); assert.equal(final.qaRun.status, "completed"); },
+            "RETRY-005/late-fences-terminal": () => { assert.notEqual(persistedLatest.providerRequestId, "late-attempt-1"); assert.equal(final.qaRun.status, "completed"); },
           });
       }
     } finally { stale.resolve(); rmSync(value.root, { recursive: true, force: true }); }
@@ -4537,26 +4511,70 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       return { assetId: asset.id, normalizedSha256: asset.normalizedSha256, width: asset.width, height: asset.height, normalizedBytes: asset.normalizedBytes, slot: index + 1 };
     });
     const capturedPrompt = repairCaptured[0].promptText as string;
-    const reconstructedPrompt = renderS2RepairPrompt(input, repairSource, repair.eligibleFindingIds, repairReferenceAssets, repairLogoAssets, repair.repairInputHash);
-    const changedFindingIds = repair.eligibleFindingIds.includes("access.open-sides")
-      ? ["access.open-sides", "footprint.within-boundary"]
-      : [...repair.eligibleFindingIds, "access.open-sides"];
-    const changedFindingHash = canonicalRepairInputHash(input, repairSource, changedFindingIds, repairReferenceAssets, repairLogoAssets);
-    const changedFindingPrompt = renderS2RepairPrompt(input, repairSource, changedFindingIds, repairReferenceAssets, repairLogoAssets, changedFindingHash);
+    const expectedRepairInput = independentRepairInput(input, repairSource, repair.eligibleFindingIds, repairReferenceAssets, repairLogoAssets);
+    const expectedRepairInputHash = independentRepairInputHash(expectedRepairInput);
+    const expectedPrompt = independentRepairPrompt(input, repairSource, repair.eligibleFindingIds, repairReferenceAssets, repairLogoAssets, repair.repairInputHash);
+    const expectedPromptBytes = Buffer.from(expectedPrompt, "utf8");
+    const expectedCapturedHash = independentRepairPromptHash(expectedPrompt);
+    const capturedPromptHash = independentRepairPromptHash(capturedPrompt);
+    const identicalPrompt = independentRepairPrompt(input, repairSource, repair.eligibleFindingIds, repairReferenceAssets, repairLogoAssets, repair.repairInputHash);
+    const identicalHash = independentRepairPromptHash(identicalPrompt);
+    const changedFindingIds = ["footprint.within-boundary", "access.open-sides", "scale.human", "structure.overhead-support"];
+    const changedFindingInput = independentRepairInput(input, repairSource, changedFindingIds, repairReferenceAssets, repairLogoAssets);
+    const changedFindingHash = independentRepairInputHash(changedFindingInput);
+    const changedFindingPrompt = independentRepairPrompt(input, repairSource, changedFindingIds, repairReferenceAssets, repairLogoAssets, changedFindingHash);
+    const changedFindingPromptHash = independentRepairPromptHash(changedFindingPrompt);
     const changedManifest = repairReferenceAssets.map((asset, index) => index === 0 ? { ...asset, normalizedBytes: asset.normalizedBytes + 1 } : asset);
-    const changedManifestHash = canonicalRepairInputHash(input, repairSource, repair.eligibleFindingIds, changedManifest, repairLogoAssets);
-    const changedManifestPrompt = renderS2RepairPrompt(input, repairSource, repair.eligibleFindingIds, changedManifest, repairLogoAssets, changedManifestHash);
-    const exactCapturedHash = repairPromptHash(capturedPrompt);
-    const identicalPrompt = renderS2RepairPrompt(input, repairSource, repair.eligibleFindingIds, repairReferenceAssets, repairLogoAssets, repair.repairInputHash);
-    await prove(claimIds("REPAIR-012", ["captured-bytes", "identical-render", "finding-sensitive", "manifest-sensitive", "not-shape-only"]), "repair prompt byte binding", "One real captured repair request plus independent deterministic rerenders and changed immutable input projections.",
-      { capturedBytes: Buffer.byteLength(capturedPrompt, "utf8"), capturedHash: exactCapturedHash, storedPromptHash: repair.repairPromptHash, identicalBytes: Buffer.from(identicalPrompt, "utf8").equals(Buffer.from(capturedPrompt, "utf8")), findingHashChanged: changedFindingHash !== repair.repairInputHash, findingPromptHashChanged: repairPromptHash(changedFindingPrompt) !== repair.repairPromptHash, manifestHashChanged: changedManifestHash !== repair.repairInputHash, manifestPromptHashChanged: repairPromptHash(changedManifestPrompt) !== repair.repairPromptHash, objectivePresent: capturedPrompt.includes("Keep every visible element within the exact supplied width and depth footprint."), result: "exact-byte-sensitive" },
-      "The captured repair prompt bytes hash to the persisted hash, rerender identically from immutable inputs, and changes to the reduced finding set or repair manifest change the hash.",
-      () => { assert.equal(Buffer.from(capturedPrompt, "utf8").equals(Buffer.from(reconstructedPrompt, "utf8")), true); assert.equal(exactCapturedHash, repair.repairPromptHash); assert.equal(Buffer.from(identicalPrompt, "utf8").equals(Buffer.from(capturedPrompt, "utf8")), true); assert.notEqual(changedFindingHash, repair.repairInputHash); assert.notEqual(repairPromptHash(changedFindingPrompt), repair.repairPromptHash); assert.notEqual(changedManifestHash, repair.repairInputHash); assert.notEqual(repairPromptHash(changedManifestPrompt), repair.repairPromptHash); }, undefined, {
-        "REPAIR-012/captured-bytes": () => { assert.equal(Buffer.from(capturedPrompt, "utf8").equals(Buffer.from(reconstructedPrompt, "utf8")), true); assert.equal(exactCapturedHash, repair.repairPromptHash); },
-        "REPAIR-012/identical-render": () => assert.equal(Buffer.from(identicalPrompt, "utf8").equals(Buffer.from(capturedPrompt, "utf8")), true),
-        "REPAIR-012/finding-sensitive": () => { assert.notEqual(changedFindingHash, repair.repairInputHash); assert.notEqual(repairPromptHash(changedFindingPrompt), repair.repairPromptHash); },
-        "REPAIR-012/manifest-sensitive": () => { assert.notEqual(changedManifestHash, repair.repairInputHash); assert.notEqual(repairPromptHash(changedManifestPrompt), repair.repairPromptHash); },
-        "REPAIR-012/not-shape-only": () => { const objectiveSection = capturedPrompt.split("\n\nSource image")[0].split("Ordered repair objectives:\n")[1]; assert.equal(exactCapturedHash, repair.repairPromptHash); assert.equal(Buffer.from(capturedPrompt, "utf8").equals(Buffer.from(reconstructedPrompt, "utf8")), true); assert.equal(objectiveSection.split("\n").length, repair.eligibleFindingIds.length); assert.notEqual(objectiveSection, "- none"); },
+    const changedManifestInput = independentRepairInput(input, repairSource, repair.eligibleFindingIds, changedManifest, repairLogoAssets);
+    const changedManifestHash = independentRepairInputHash(changedManifestInput);
+    const changedManifestPrompt = independentRepairPrompt(input, repairSource, repair.eligibleFindingIds, changedManifest, repairLogoAssets, changedManifestHash);
+    const changedManifestPromptHash = independentRepairPromptHash(changedManifestPrompt);
+    const twoLfPrompt = expectedPrompt.replace(/\n(?=Hard geometry facts:|Confirmed brief requirements and prohibitions:|Ordered repair objectives:|Source image and reference\/logo role instructions:|Preservation constraints and visual-only disclosure:)/g, "\n\n");
+    const crlfPrompt = expectedPrompt.replaceAll("\n", "\r\n");
+    const missingTrailingLfPrompt = expectedPrompt.slice(0, -1);
+    const extraTrailingLfPrompt = expectedPrompt + "\n";
+    const numberedFindingIds = ["brief.functional.001", "brief.mandatory.001"];
+    const numberedInput = independentRepairInput(input, repairSource, numberedFindingIds, repairReferenceAssets, repairLogoAssets);
+    const numberedInputHash = independentRepairInputHash(numberedInput);
+    const numberedExpectedPrompt = independentRepairPrompt(input, repairSource, numberedFindingIds, repairReferenceAssets, repairLogoAssets, numberedInputHash);
+    const numberedProductionPrompt = renderS2RepairPrompt(input, repairSource, numberedFindingIds, repairReferenceAssets, repairLogoAssets, numberedInputHash);
+    const functionalObjective = "Make the explicit functional requirement visible and correctly represented without inventing a new requirement.";
+    const mandatoryObjective = "Make the explicit mandatory requirement visible and correctly represented without changing the confirmed brief.";
+    const substitutedWordingPrompt = numberedExpectedPrompt.replace(mandatoryObjective, functionalObjective);
+    const reorderedObjectivePrompt = independentRepairPrompt(input, repairSource, numberedFindingIds.slice().reverse(), repairReferenceAssets, repairLogoAssets, numberedInputHash);
+    const exactFormatNegatives = {
+      crlf: !Buffer.from(crlfPrompt, "utf8").equals(expectedPromptBytes),
+      twoLfBoundary: !Buffer.from(twoLfPrompt, "utf8").equals(expectedPromptBytes),
+      missingTrailingLf: !Buffer.from(missingTrailingLfPrompt, "utf8").equals(expectedPromptBytes),
+      extraTrailingLf: !Buffer.from(extraTrailingLfPrompt, "utf8").equals(expectedPromptBytes),
+      wordingSubstitution: !Buffer.from(substitutedWordingPrompt, "utf8").equals(Buffer.from(numberedExpectedPrompt, "utf8")),
+      objectiveOrder: !Buffer.from(reorderedObjectivePrompt, "utf8").equals(Buffer.from(numberedExpectedPrompt, "utf8")),
+    };
+    await prove(claimIds("REPAIR-012", ["captured-bytes", "identical-render", "finding-sensitive", "manifest-sensitive", "not-shape-only", "exact-format"]), "repair prompt byte binding", "One real captured repair request plus a test-only independent G2-004 oracle, direct UTF-8 SHA-256, exact-format negatives, and changed immutable input projections.",
+      { capturedBytes: Buffer.byteLength(capturedPrompt, "utf8"), expectedBytes: expectedPromptBytes.length, capturedHash: capturedPromptHash, expectedPromptHash: expectedCapturedHash, storedPromptHash: repair.repairPromptHash, persistedRepairInputHashMatches: expectedRepairInputHash === repair.repairInputHash, identicalBytes: Buffer.from(identicalPrompt, "utf8").equals(expectedPromptBytes), identicalHash: identicalHash === expectedCapturedHash, findingHashChanged: changedFindingHash !== repair.repairInputHash, findingPromptHashChanged: changedFindingPromptHash !== expectedCapturedHash, manifestHashChanged: changedManifestHash !== repair.repairInputHash, manifestPromptHashChanged: changedManifestPromptHash !== expectedCapturedHash, productionNumberedPromptMatches: Buffer.from(numberedProductionPrompt, "utf8").equals(Buffer.from(numberedExpectedPrompt, "utf8")), functionalObjectivePresent: numberedExpectedPrompt.includes(functionalObjective), mandatoryObjectivePresent: numberedExpectedPrompt.includes(mandatoryObjective), exactFormatNegatives: JSON.stringify(exactFormatNegatives), result: "independent-exact-byte-sensitive" },
+      "The real repair provider request matched an independently rendered canonical prompt byte-for-byte and an independently calculated SHA-256; identical input was stable, finding and manifest changes changed the expected bytes/hash, and all exact-format drift fixtures failed the oracle comparison.",
+      () => {
+        assert.equal(Buffer.from(capturedPrompt, "utf8").equals(expectedPromptBytes), true);
+        assert.equal(capturedPromptHash, repair.repairPromptHash);
+        assert.equal(expectedCapturedHash, repair.repairPromptHash);
+        assert.equal(expectedRepairInputHash, repair.repairInputHash);
+        assert.equal(Buffer.from(identicalPrompt, "utf8").equals(expectedPromptBytes), true);
+        assert.equal(identicalHash, expectedCapturedHash);
+        assert.notEqual(changedFindingHash, repair.repairInputHash);
+        assert.notEqual(changedFindingPromptHash, expectedCapturedHash);
+        assert.notEqual(changedManifestHash, repair.repairInputHash);
+        assert.notEqual(changedManifestPromptHash, expectedCapturedHash);
+        assert.equal(Buffer.from(numberedProductionPrompt, "utf8").equals(Buffer.from(numberedExpectedPrompt, "utf8")), true);
+        assert.equal(numberedExpectedPrompt.includes(functionalObjective), true);
+        assert.equal(numberedExpectedPrompt.includes(mandatoryObjective), true);
+        assert.deepEqual(exactFormatNegatives, { crlf: true, twoLfBoundary: true, missingTrailingLf: true, extraTrailingLf: true, wordingSubstitution: true, objectiveOrder: true });
+      }, undefined, {
+        "REPAIR-012/captured-bytes": () => { assert.equal(Buffer.from(capturedPrompt, "utf8").equals(expectedPromptBytes), true); assert.equal(capturedPromptHash, repair.repairPromptHash); assert.equal(expectedCapturedHash, repair.repairPromptHash); },
+        "REPAIR-012/identical-render": () => { assert.equal(Buffer.from(identicalPrompt, "utf8").equals(expectedPromptBytes), true); assert.equal(identicalHash, expectedCapturedHash); },
+        "REPAIR-012/finding-sensitive": () => { assert.notEqual(changedFindingHash, repair.repairInputHash); assert.notEqual(changedFindingPromptHash, expectedCapturedHash); },
+        "REPAIR-012/manifest-sensitive": () => { assert.notEqual(changedManifestHash, repair.repairInputHash); assert.notEqual(changedManifestPromptHash, expectedCapturedHash); },
+        "REPAIR-012/not-shape-only": () => { assert.equal(expectedPromptBytes.length > 0, true); assert.equal(expectedCapturedHash, repair.repairPromptHash); assert.equal(Buffer.from(capturedPrompt, "utf8").equals(expectedPromptBytes), true); assert.equal(repair.eligibleFindingIds.length > 0, true); },
+        "REPAIR-012/exact-format": () => { assert.deepEqual(exactFormatNegatives, { crlf: true, twoLfBoundary: true, missingTrailingLf: true, extraTrailingLf: true, wordingSubstitution: true, objectiveOrder: true }); assert.equal(Buffer.from(numberedProductionPrompt, "utf8").equals(Buffer.from(numberedExpectedPrompt, "utf8")), true); },
       });
     const sharedRepairCaptured: any[] = [];
     const sharedRepairQaCalls = new Map<number, number>();
@@ -4818,11 +4836,12 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     staleActiveQa.resolve(); await new Promise((resolve) => setTimeout(resolve, 30));
     const final = activeQa.service.s2.getQaRun(activeQa.projectId, bound.qaRun.id) as any;
     const latest = final.qaRun.candidateResults.find((candidate: any) => candidate.candidateIndex === 1)!;
+    const persistedLatest = activeQa.repository.state().s2QaRuns[0].candidateResults.find((candidate) => candidate.candidateIndex === 1)!;
     const qaRestartDuringActivePhase = qaWasActiveBeforeRestart && unknownState.status === "running" && activeQaCalls === 4;
     await prove(["CONC-003/qa-active"], "active QA restart recovery", "A real provider QA call held active while unknown and definitely-dead replacement services inspected and resolved it without a duplicate call.",
-      { restartDuringActivePhase: qaRestartDuringActivePhase, unknownOwnerStatus: unknownState.status, providerCalls: activeQaCalls, finalStatus: latest.status, finalProviderRequest: latest.providerRequestId ?? "", result: "unavailable-no-duplicate" },
+      { restartDuringActivePhase: qaRestartDuringActivePhase, unknownOwnerStatus: unknownState.status, providerCalls: activeQaCalls, finalStatus: latest.status, finalProviderRequest: persistedLatest.providerRequestId ?? "", result: "unavailable-no-duplicate" },
       "The active QA restart fixture kept unknown liveness busy, resolved the definitely-dead provider boundary conservatively, and fenced the stale completion.",
-      () => { assert.equal(qaRestartDuringActivePhase, true); assert.equal(unknownState.status, "running"); assert.equal(activeQaCalls, 4); assert.equal(latest.status, "qa_unavailable_retryable"); assert.equal(latest.providerRequestId, null); });
+      () => { assert.equal(qaRestartDuringActivePhase, true); assert.equal(unknownState.status, "running"); assert.equal(activeQaCalls, 4); assert.equal(latest.status, "qa_unavailable_retryable"); assert.equal(persistedLatest.providerRequestId, null); });
   } finally { staleActiveQa.resolve(); rmSync(activeQa.root, { recursive: true, force: true }); }
 
   const activeReQaStale = deferred<void>();
@@ -4953,6 +4972,35 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     await waitFor(() => routeValue.service.s2.getQaRun(routeValue.projectId, bound.qaRun.id) as any, (current) => current.qaRun.status === "completed");
     const qaClient = createS2QaClient({ projectId: routeValue.projectId, qaRunId: bound.qaRun.id, fetcher: routeApi });
     const refreshed = await qaClient.refresh();
+    const publicDraftKeys = ["id", "projectId", "revision", "status", "referenceAssetIds", "logoAssetIds", "updatedAt", "frozenAt", "frozenByQaRunId", "assets"] as const;
+    const publicAssetKeys = ["id", "projectId", "kind", "status", "originalBytes", "normalizedSha256", "normalizedBytes", "detectedMime", "width", "height", "hasAlpha", "createdAt", "deletedAt"] as const;
+    const publicQaRunKeys = ["id", "projectId", "inputVersionId", "sourceGenerationSetId", "status", "candidateResults", "candidateAttempts", "completedCandidateCount", "passCount", "warningCount", "materialFailCount", "unavailableCount", "createdAt", "startedAt", "completedAt", "repairs", "reQa", "summary"] as const;
+    const publicSummaryKeys = ["kind", "resultCount", "unavailableCount"] as const;
+    const publicCandidateKeys = ["id", "qaRunId", "inputVersionId", "candidateId", "candidateIndex", "attempt", "sourceAssetId", "sourceByteSize", "status", "verdict", "requirementObservations", "designObservations", "materialFindingIds", "warningFindingIds", "uncertainFindingIds", "startedAt", "completedAt", "repairEligible", "eligibleRepairFindingIds"] as const;
+    const publicCandidateAttemptKeys = publicCandidateKeys.slice(0, -2);
+    const publicRequirementObservationKeys = ["requirementId", "expected", "expectedCount", "expectedValue", "observed", "observedCount", "confidence", "evidence"] as const;
+    const publicDesignObservationKeys = ["ruleId", "observed", "confidence", "evidence"] as const;
+    const publicRepairKeys = ["candidateId", "status", "derivedCandidateId"] as const;
+    const publicReQaKeys = ["candidateId", "status", "verdict"] as const;
+    assertExactKeys(initial as any, publicDraftKeys);
+    assert.equal(initial.assets.length, 0);
+    assertExactKeys(uploaded.asset, publicAssetKeys);
+    assertExactKeys(uploaded.draft, publicDraftKeys);
+    assertExactKeys(uploaded.draft.assets.find((asset: any) => asset.id === uploaded.asset.id), publicAssetKeys);
+    assert.equal("originalSha256" in uploaded.asset, false);
+    assert.equal("pixelCount" in uploaded.asset, false);
+    assert.equal("storageKeyOriginal" in uploaded.asset, false);
+    assert.equal("storageKeyNormalized" in uploaded.asset, false);
+    assertExactKeys(refreshed as any, ["qaRun", "input"]);
+    assertExactKeys(refreshed.input as any, ["id"]);
+    assertExactKeys(refreshed.qaRun as any, publicQaRunKeys);
+    assertExactKeys(refreshed.qaRun.summary as any, publicSummaryKeys);
+    refreshed.qaRun.candidateResults.forEach((candidate: any) => {
+      assertExactKeys(candidate, publicCandidateKeys);
+      candidate.requirementObservations.forEach((observation: any) => assertExactKeys(observation, publicRequirementObservationKeys));
+      candidate.designObservations.forEach((observation: any) => assertExactKeys(observation, publicDesignObservationKeys));
+    });
+    refreshed.qaRun.candidateAttempts.forEach((candidate: any) => assertExactKeys(candidate, publicCandidateAttemptKeys));
     const previewChecks = await Promise.all(refreshed.qaRun.candidateResults.slice().sort((left, right) => left.candidateIndex - right.candidateIndex).map(async (candidate) => {
       const response = await routeApi(s2CandidatePreviewPath(routeValue.projectId, bound.qaRun.id, candidate.candidateId), { method: "GET" });
       return { candidateIndex: candidate.candidateIndex, status: response.status, contentType: response.headers.get("content-type") ?? "", bytes: Buffer.from(await response.arrayBuffer()) };
@@ -4962,13 +5010,36 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const previewOrder = previewChecks.map((item) => item.candidateIndex).join(",");
     const previewMatches = previewChecks.every((item) => item.status === 200 && item.contentType.startsWith("image/png") && item.bytes.equals(previewSources[item.candidateIndex - 1]));
     const projectionText = JSON.stringify(refreshed);
-    const previewProjectionPrivate = !projectionText.includes("sourceStorageKey") && !projectionText.includes("storageKeyOriginal") && !projectionText.includes("storageKeyNormalized");
+    const projectionPrivateFieldsAbsent = [
+      "originalSha256", "sourceSha256", "sourceStorageKey", "storageKeyOriginal", "storageKeyNormalized",
+      "inputHash", "bindingHash", "geometryHash", "requirementHash", "repairInputHash", "repairPromptHash",
+      "providerRequestId", "prompt", "providerPayload", "claimToken",
+    ].every((field) => !projectionText.includes(field));
     const retryCandidate = refreshed.qaRun.candidateResults.find((candidate) => candidate.status === "qa_unavailable_retryable");
     const materialCandidate = refreshed.qaRun.candidateResults.find((candidate) => candidate.status === "material_fail");
     const retryProjection = retryCandidate ? await qaClient.retry(retryCandidate.candidateId) : refreshed;
     const repairedProjection = materialCandidate ? await qaClient.repair(materialCandidate.candidateId, refreshed.input.id) : retryProjection;
     await waitFor(() => routeValue.service.s2.getQaRun(routeValue.projectId, bound.qaRun.id) as any, (current) => current.qaRun.reQa.some((item: any) => item.status === "pass"));
     const finalQaProjection = await qaClient.refresh();
+    finalQaProjection.qaRun.repairs.forEach((repair: any) => assertExactKeys(repair, publicRepairKeys));
+    finalQaProjection.qaRun.reQa.forEach((result: any) => assertExactKeys(result, publicReQaKeys));
+    const finalProjectionPrivateFieldsAbsent = [
+      "originalSha256", "sourceSha256", "sourceStorageKey", "storageKeyOriginal", "storageKeyNormalized",
+      "inputHash", "bindingHash", "geometryHash", "requirementHash", "repairInputHash", "repairPromptHash",
+      "providerRequestId", "prompt", "providerPayload", "claimToken",
+    ].every((field) => !JSON.stringify(finalQaProjection).includes(field));
+    const previewProjectionPrivate = projectionPrivateFieldsAbsent && finalProjectionPrivateFieldsAbsent;
+    const projectionKeyProof = Object.keys(initial).sort().join("|") === [...publicDraftKeys].sort().join("|")
+      && Object.keys(uploaded.asset).sort().join("|") === [...publicAssetKeys].sort().join("|")
+      && Object.keys(refreshed).sort().join("|") === ["input", "qaRun"].sort().join("|")
+      && Object.keys(refreshed.input).sort().join("|") === "id"
+      && Object.keys(refreshed.qaRun).sort().join("|") === [...publicQaRunKeys].sort().join("|")
+      && Object.keys(refreshed.qaRun.summary).sort().join("|") === [...publicSummaryKeys].sort().join("|")
+      && refreshed.qaRun.candidateResults.every((candidate: any) => Object.keys(candidate).sort().join("|") === [...publicCandidateKeys].sort().join("|"))
+      && refreshed.qaRun.candidateAttempts.every((candidate: any) => Object.keys(candidate).sort().join("|") === [...publicCandidateAttemptKeys].sort().join("|"))
+      && finalQaProjection.qaRun.repairs.every((repair: any) => Object.keys(repair).sort().join("|") === [...publicRepairKeys].sort().join("|"))
+      && finalQaProjection.qaRun.reQa.every((result: any) => Object.keys(result).sort().join("|") === [...publicReQaKeys].sort().join("|"))
+      && previewProjectionPrivate;
     const frozen = await references.refresh();
     const frozenClientError = await observedErrorCode(() => references.update(frozen.referenceAssetIds, frozen.logoAssetIds, frozen.revision));
     const frozenWriteResponse = await routeApi("/api/projects/" + routeValue.projectId + "/s2/reference-draft", {
@@ -5083,8 +5154,8 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       { authorizedProject: routeValue.projectId.length > 0, unknownProjectStatus, unauthorizedRoutes: 1, result: "guarded" },
       "The real API rejected an unknown project without exposing a project record while allowing the authorized local project flow.",
       () => { assert.equal(unknownProjectStatus, 404); assert.equal(routeValue.projectId.length > 0, true); });
-    await prove(claimIds("ROUTE-002", ["method", "body", "key", "status", "envelope"]), "route method body required-key envelope", "Real bind request with a valid body and missing S2 Idempotency-Key through the production API dispatcher.",
-      { method: missingBindRequest.method, body: missingBindBodyObserved, status: apiError.status, topLevelCode: apiErrorBody.error?.code ?? "", hasError: Boolean(apiErrorBody.error), hasReferenceId: typeof apiErrorBody.error?.referenceId === "string", keyHeaderProvided: missingBindRequest.headers.has("Idempotency-Key"), noMutation: missingKeyNoMutation, result: "required-key-safe-error" },
+    await prove(claimIds("ROUTE-002", ["method", "body", "key", "status", "envelope", "projection-keys"]), "route method body required-key envelope", "Real bind request with a valid body and missing S2 Idempotency-Key through the production API dispatcher, plus exact-key public asset, draft and QA projections.",
+      { method: missingBindRequest.method, body: missingBindBodyObserved, status: apiError.status, topLevelCode: apiErrorBody.error?.code ?? "", hasError: Boolean(apiErrorBody.error), hasReferenceId: typeof apiErrorBody.error?.referenceId === "string", keyHeaderProvided: missingBindRequest.headers.has("Idempotency-Key"), noMutation: missingKeyNoMutation, projectionKeyProof, projectionPrivateFieldsAbsent, finalProjectionPrivateFieldsAbsent, result: "required-key-safe-error-and-minimal-projection" },
       "The real route rejected a missing required S2 Idempotency-Key with HTTP 400, the locked top-level code, a safe reference-bearing envelope, and no mutation.",
       () => { assert.equal(apiError.status, 400); assert.equal(apiErrorBody.error?.code, "IDEMPOTENCY_KEY_REQUIRED"); assert.equal(Boolean(apiErrorBody.error), true); assert.equal(typeof apiErrorBody.error.referenceId, "string"); assert.equal(missingKeyNoMutation, true); }, undefined, {
         "ROUTE-002/method": () => assert.equal(missingBindRequest.method, "POST"),
@@ -5092,6 +5163,7 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
         "ROUTE-002/key": () => { assert.equal(missingBindRequest.headers.has("Idempotency-Key"), false); assert.equal(apiErrorBody.error?.code, "IDEMPOTENCY_KEY_REQUIRED"); assert.deepEqual(apiErrorBody.error?.fieldErrors, [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]); },
         "ROUTE-002/status": () => assert.equal(apiError.status, 400),
         "ROUTE-002/envelope": () => { assert.equal(Boolean(apiErrorBody.error), true); assert.equal(typeof apiErrorBody.error.referenceId, "string"); assert.equal(missingKeyNoMutation, true); },
+        "ROUTE-002/projection-keys": () => { assert.equal(projectionKeyProof, true); assert.equal(projectionPrivateFieldsAbsent, true); assert.equal(finalProjectionPrivateFieldsAbsent, true); },
       });
     await prove(["ROUTE-003/idempotent-replay"], "route client idempotent bind", "Real S2 client bind with an injected uncertain first response and a retained second request key.",
       { bindCalls: routeBindCalls, sameKey: routeBindKeys[0] === routeBindKeys[1], inputCount: routeState.s2Inputs.length, runCount: routeState.s2QaRuns.length, result: "replayed-safe" },
@@ -5275,6 +5347,14 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
         "PRIV-001/private-path": () => { assertLogMarkerAbsent(privacyLogEntries, privacyMarkers.privatePath); assertSafeEnvelopeMarkerAbsent(privacySafeEnvelopes, privacyMarkers.privatePath); assert.equal(privacyInputFileName.includes(privacyMarkers.privatePath), true); assert.equal(storageKey.startsWith("projects/"), true); assert.equal(storageKey.includes("/s2/"), true); assert.equal(storageKey.includes(".."), false); assert.equal(privateProjectPreview.status, 404); assert.equal(privacyUploadedStorageKey.includes(privacyMarkers.privatePath), false); },
       });
     const changedSurface = scanChangedTrackedSurface("5b813049ca3fad36c537399b5181a94de33ad508");
+    const controlledSecretValue = "sk-" + "A".repeat(24);
+    const controlledSecretFixture = "OPENAI_API_KEY=\"" + controlledSecretValue + "\"";
+    const controlledSecretFindings = scanSecretText("controlled-injected-secret.fixture", controlledSecretFixture);
+    const controlledSecretReport = JSON.stringify(controlledSecretFindings.map((finding) => finding.redacted));
+    const controlledSecretReportSafe = controlledSecretFindings.length > 0
+      && controlledSecretFindings.every((finding) => finding.redacted === "[REDACTED]")
+      && !controlledSecretReport.includes(controlledSecretValue)
+      && !controlledSecretReport.includes(controlledSecretFixture);
     const changedSourceText = routeClientSource + readFileSync("src/lib/s2-provider.ts", "utf8") + readFileSync("src/lib/openai.ts", "utf8");
     await prove(claimIds("PRIV-002", ["credential", "token", "private-key", "env", "auth-header"]), "privacy client credential boundary", "Static changed-client/provider boundary review for credential, token, private-key, environment, and authorization-header exposure.",
       { sourcePath: "app/components/S2Client.tsx", clientHasEnv: routeClientSource.includes("process.env"), clientHasBearer: routeClientSource.includes("Bearer"), clientHasPrivateKey: routeClientSource.includes("PRIVATE KEY"), clientHasAuthHeader: routeClientSource.includes("authorization"), providerAuthServerOnly: changedSourceText.includes("authorization"), result: "client-clean" },
@@ -5369,10 +5449,10 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const dependencyVersionsPinned = packageText.includes('"sharp": "0.35.3"') && packageText.includes('"pdfjs-dist": "6.2.108"');
     const redactedSecretFindings = changedSurface.findings.map((finding) => finding.kind + "=" + finding.redacted).join(",");
     await prove(claimIds("PRIV-005", ["secret-scan", "dependency-review", "no-live-provider"]), "privacy changed-content and dependency review", "Canonical-base changed-surface scan including tracked and current untracked implementation files, with controlled injected-secret redaction negative, frozen sharp/pdfjs lock review, measured normal-evidence provider transport, separate blocked guard probe, and production audit target.",
-      { sourcePath: "git diff 5b813049ca3fad36c537399b5181a94de33ad508 + current untracked files + package.json + pnpm-lock.yaml", changedFileCount: changedSurface.files.length, changedSurfaceFiles: changedSurface.files.join(","), secretFindingCount: changedSurface.findings.length, redactedSecretFindings, frozenDependencyLock, dependencyVersionsPinned, sharpVersionPinned: packageText.includes('"sharp": "0.35.3"'), pdfjsVersionPinned: packageText.includes('"pdfjs-dist": "6.2.108"'), productionAuditTarget: "pnpm audit --prod", mockS2QaCalls: localProviderCalls.s2Qa, mockS2RepairCalls: localProviderCalls.s2Repair, normalEvidenceLiveProviderDispatches, normalEvidenceNonLoopbackAttempts: normalEvidenceTransport.nonLoopbackAttempts, normalEvidenceNetworkForwardCount, blockedGuardProbeAttempts: blockedGuardProbe.nonLoopbackAttempts, blockedGuardProbeNetworkForwardCount: blockedGuardProbe.networkForwardCount, guardFailureCode: guardedProviderFailureCode, result: "clean-offline" },
+      { sourcePath: "git diff 5b813049ca3fad36c537399b5181a94de33ad508 + current untracked files + package.json + pnpm-lock.yaml", changedFileCount: changedSurface.files.length, changedSurfaceFiles: changedSurface.files.join(","), secretFindingCount: changedSurface.findings.length, redactedSecretFindings, controlledSecretFindingCount: controlledSecretFindings.length, controlledSecretReport, controlledSecretReportSafe, frozenDependencyLock, dependencyVersionsPinned, sharpVersionPinned: packageText.includes('"sharp": "0.35.3"'), pdfjsVersionPinned: packageText.includes('"pdfjs-dist": "6.2.108"'), productionAuditTarget: "pnpm audit --prod", mockS2QaCalls: localProviderCalls.s2Qa, mockS2RepairCalls: localProviderCalls.s2Repair, normalEvidenceLiveProviderDispatches, normalEvidenceNonLoopbackAttempts: normalEvidenceTransport.nonLoopbackAttempts, normalEvidenceNetworkForwardCount, blockedGuardProbeAttempts: blockedGuardProbe.nonLoopbackAttempts, blockedGuardProbeNetworkForwardCount: blockedGuardProbe.networkForwardCount, guardFailureCode: guardedProviderFailureCode, result: "clean-offline" },
       "The canonical-base changed surface, including fresh untracked implementation files, had no credential findings, controlled secret findings were redacted, sharp/pdfjs versions matched the frozen lock, normal evidence measured zero non-loopback provider dispatches and zero network forwards, and the separate blocked probe intercepted one non-loopback attempt without forwarding.",
-      () => { assert.equal(changedSurface.files.length > 0, true); assert.equal(changedSurface.findings.length, 0); assert.equal(frozenDependencyLock, true); assert.equal(dependencyVersionsPinned, true); assertNoLiveProviderDispatch(normalEvidenceTransport); assert.equal(blockedGuardProbe.nonLoopbackAttempts, 1); assert.equal(blockedGuardProbe.networkForwardCount, 0); assert.equal(guardedProviderFailureCode, "PROVIDER_UNAVAILABLE"); assert.equal(localProviderCalls.s2Qa > 0, true); assert.equal(localProviderCalls.s2Repair > 0, true); }, undefined, {
-        "PRIV-005/secret-scan": () => { assert.equal(changedSurface.findings.length, 0); assert.equal(redactedSecretFindings, ""); },
+      () => { assert.equal(changedSurface.files.length > 0, true); assert.equal(changedSurface.findings.length, 0); assert.equal(controlledSecretReportSafe, true); assert.equal(frozenDependencyLock, true); assert.equal(dependencyVersionsPinned, true); assertNoLiveProviderDispatch(normalEvidenceTransport); assert.equal(blockedGuardProbe.nonLoopbackAttempts, 1); assert.equal(blockedGuardProbe.networkForwardCount, 0); assert.equal(guardedProviderFailureCode, "PROVIDER_UNAVAILABLE"); assert.equal(localProviderCalls.s2Qa > 0, true); assert.equal(localProviderCalls.s2Repair > 0, true); }, undefined, {
+        "PRIV-005/secret-scan": () => { assert.equal(changedSurface.findings.length, 0); assert.equal(redactedSecretFindings, ""); assert.equal(controlledSecretReportSafe, true); },
         "PRIV-005/dependency-review": () => { assert.equal(frozenDependencyLock, true); assert.equal(dependencyVersionsPinned, true); assert.equal(packageText.includes('"sharp": "0.35.3"'), true); assert.equal(packageText.includes('"pdfjs-dist": "6.2.108"'), true); },
         "PRIV-005/no-live-provider": () => { assertNoLiveProviderDispatch(normalEvidenceTransport); assert.equal(blockedGuardProbe.nonLoopbackAttempts, 1); assert.equal(blockedGuardProbe.networkForwardCount, 0); assert.equal(guardedProviderFailureCode, "PROVIDER_UNAVAILABLE"); },
       });

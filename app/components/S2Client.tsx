@@ -15,7 +15,7 @@ type Draft = { id: string; revision: number; status: "editable" | "frozen"; refe
 type Observation = { requirementId?: string; ruleId?: string; observed: string; observedCount?: number | null; confidence: number; evidence: string };
 export type Candidate = { candidateId: string; candidateIndex: number; status: string; verdict: string; materialFindingIds: string[]; warningFindingIds: string[]; uncertainFindingIds: string[]; requirementObservations: Observation[]; designObservations: Observation[]; repairEligible?: boolean; eligibleRepairFindingIds?: string[] };
 type QaSummary = { kind: "processing" | "results_available" | "results_include_unavailable" | "all_results_unavailable"; resultCount: number; unavailableCount: number };
-export type S2QaProjection = { qaRun: { id: string; status: string; candidateResults: Candidate[]; repairs: Array<{ candidateId: string; status: string; derivedCandidateId: string | null }>; reQa: Array<{ candidateId: string; status: string; verdict: string }>; summary?: QaSummary }; input: { id: string } };
+export type S2QaProjection = { qaRun: { id: string; status: string; candidateResults: Candidate[]; candidateAttempts: Candidate[]; repairs: Array<{ candidateId: string; status: string; derivedCandidateId: string | null }>; reQa: Array<{ candidateId: string; status: string; verdict: string }>; summary: QaSummary }; input: { id: string } };
 export type S2QaPresentation = { statusText: string; summaryText: string };
 
 function apiPath(projectId: string, suffix: string): string { return "/api/projects/" + projectId + suffix; }

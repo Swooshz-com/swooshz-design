@@ -73,14 +73,41 @@ export type S2WorkflowServiceOptions = {
 };
 export type S2PublicAsset = {
   id: UUID; projectId: UUID; kind: "reference" | "logo"; status: "ready" | "deleted";
-  originalSha256: Sha256; originalBytes: number; normalizedSha256: Sha256; normalizedBytes: number;
+  originalBytes: number; normalizedSha256: Sha256; normalizedBytes: number;
   detectedMime: "image/png" | "image/jpeg" | "image/webp"; width: number; height: number;
-  pixelCount: number; hasAlpha: boolean; createdAt: string; deletedAt: string | null;
+  hasAlpha: boolean; createdAt: string; deletedAt: string | null;
 };
 export type S2PublicDraft = {
   id: UUID; projectId: UUID; revision: number; status: "editable" | "frozen";
   referenceAssetIds: UUID[]; logoAssetIds: UUID[]; updatedAt: string; frozenAt: string | null;
   frozenByQaRunId: UUID | null; assets: S2PublicAsset[];
+};
+type S2PublicRequirementObservation = Pick<S2RequirementObservation,
+  "requirementId" | "expected" | "expectedCount" | "expectedValue" | "observed" | "observedCount" | "confidence" | "evidence">;
+type S2PublicDesignObservation = Pick<S2DesignObservation, "ruleId" | "observed" | "confidence" | "evidence">;
+type S2PublicCandidateCore = {
+  id: UUID; qaRunId: UUID; inputVersionId: UUID; candidateId: UUID; candidateIndex: 1 | 2 | 3 | 4; attempt: 1 | 2;
+  sourceAssetId: UUID; sourceByteSize: number; status: S2QaCandidateResult["status"]; verdict: S2QaCandidateResult["verdict"];
+  requirementObservations: S2PublicRequirementObservation[]; designObservations: S2PublicDesignObservation[];
+  materialFindingIds: string[]; warningFindingIds: string[]; uncertainFindingIds: string[];
+  startedAt: string | null; completedAt: string | null;
+};
+type S2PublicCandidate = S2PublicCandidateCore & { repairEligible: boolean; eligibleRepairFindingIds: string[] };
+type S2PublicRepair = { candidateId: UUID; status: S2RepairAttempt["status"]; derivedCandidateId: UUID | null };
+type S2PublicReQa = { candidateId: UUID; status: S2ReQaResult["status"]; verdict: S2ReQaResult["verdict"] };
+type S2PublicSummary = {
+  kind: "processing" | "results_available" | "results_include_unavailable" | "all_results_unavailable";
+  resultCount: number; unavailableCount: number;
+};
+export type S2PublicQaProjection = {
+  qaRun: {
+    id: UUID; projectId: UUID; inputVersionId: UUID; sourceGenerationSetId: UUID; status: S2QaRun["status"];
+    candidateResults: S2PublicCandidate[]; candidateAttempts: S2PublicCandidateCore[];
+    completedCandidateCount: number; passCount: number; warningCount: number; materialFailCount: number; unavailableCount: number;
+    createdAt: string; startedAt: string | null; completedAt: string | null;
+    repairs: S2PublicRepair[]; reQa: S2PublicReQa[]; summary: S2PublicSummary;
+  };
+  input: { id: UUID };
 };
 export type S2Mutation<T> = T & { replayed: boolean };
 
@@ -176,12 +203,88 @@ function rulesFor(geometry: BoothGeometry): S2DesignRuleSnapshot[] {
 
 function publicAsset(asset: S2AssetRecord): S2PublicAsset {
   return { id: asset.id, projectId: asset.projectId, kind: asset.kind, status: asset.status,
-    originalSha256: asset.originalSha256, originalBytes: asset.originalBytes, normalizedSha256: asset.normalizedSha256,
+    originalBytes: asset.originalBytes, normalizedSha256: asset.normalizedSha256,
     normalizedBytes: asset.normalizedBytes, detectedMime: asset.detectedMime, width: asset.width, height: asset.height,
-    pixelCount: asset.pixelCount, hasAlpha: asset.hasAlpha, createdAt: asset.createdAt, deletedAt: asset.deletedAt };
+    hasAlpha: asset.hasAlpha, createdAt: asset.createdAt, deletedAt: asset.deletedAt };
 }
 function publicDraft(state: StoreState, draft: S2ReferenceDraft): S2PublicDraft {
-  return { ...cloneJson(draft), assets: state.s2Assets.filter((asset) => asset.projectId === draft.projectId).map(publicAsset) };
+  return {
+    id: draft.id,
+    projectId: draft.projectId,
+    revision: draft.revision,
+    status: draft.status,
+    referenceAssetIds: draft.referenceAssetIds.slice(),
+    logoAssetIds: draft.logoAssetIds.slice(),
+    updatedAt: draft.updatedAt,
+    frozenAt: draft.frozenAt,
+    frozenByQaRunId: draft.frozenByQaRunId,
+    assets: state.s2Assets.filter((asset) => asset.projectId === draft.projectId).map(publicAsset),
+  };
+}
+function publicRequirementObservation(observation: S2RequirementObservation): S2PublicRequirementObservation {
+  return {
+    requirementId: observation.requirementId,
+    expected: observation.expected,
+    expectedCount: observation.expectedCount,
+    expectedValue: observation.expectedValue,
+    observed: observation.observed,
+    observedCount: observation.observedCount,
+    confidence: observation.confidence,
+    evidence: observation.evidence,
+  };
+}
+function publicDesignObservation(observation: S2DesignObservation): S2PublicDesignObservation {
+  return { ruleId: observation.ruleId, observed: observation.observed, confidence: observation.confidence, evidence: observation.evidence };
+}
+function publicCandidateCore(candidate: S2QaCandidateResult): S2PublicCandidateCore {
+  return {
+    id: candidate.id,
+    qaRunId: candidate.qaRunId,
+    inputVersionId: candidate.inputVersionId,
+    candidateId: candidate.candidateId,
+    candidateIndex: candidate.candidateIndex,
+    attempt: candidate.attempt,
+    sourceAssetId: candidate.sourceAssetId,
+    sourceByteSize: candidate.sourceByteSize,
+    status: candidate.status,
+    verdict: candidate.verdict,
+    requirementObservations: candidate.requirementObservations.map(publicRequirementObservation),
+    designObservations: candidate.designObservations.map(publicDesignObservation),
+    materialFindingIds: candidate.materialFindingIds.slice(),
+    warningFindingIds: candidate.warningFindingIds.slice(),
+    uncertainFindingIds: candidate.uncertainFindingIds.slice(),
+    startedAt: candidate.startedAt,
+    completedAt: candidate.completedAt,
+  };
+}
+function publicCandidate(candidate: S2QaCandidateResult, eligibleFindingIds: readonly string[] | null, hasRepair: boolean): S2PublicCandidate {
+  return {
+    id: candidate.id,
+    qaRunId: candidate.qaRunId,
+    inputVersionId: candidate.inputVersionId,
+    candidateId: candidate.candidateId,
+    candidateIndex: candidate.candidateIndex,
+    attempt: candidate.attempt,
+    sourceAssetId: candidate.sourceAssetId,
+    sourceByteSize: candidate.sourceByteSize,
+    status: candidate.status,
+    verdict: candidate.verdict,
+    requirementObservations: candidate.requirementObservations.map(publicRequirementObservation),
+    designObservations: candidate.designObservations.map(publicDesignObservation),
+    materialFindingIds: candidate.materialFindingIds.slice(),
+    warningFindingIds: candidate.warningFindingIds.slice(),
+    uncertainFindingIds: candidate.uncertainFindingIds.slice(),
+    startedAt: candidate.startedAt,
+    completedAt: candidate.completedAt,
+    repairEligible: eligibleFindingIds !== null && !hasRepair,
+    eligibleRepairFindingIds: eligibleFindingIds ? eligibleFindingIds.slice() : [],
+  };
+}
+function publicRepair(repair: S2RepairAttempt): S2PublicRepair {
+  return { candidateId: repair.candidateId, status: repair.status, derivedCandidateId: repair.derivedCandidateId };
+}
+function publicReQa(result: S2ReQaResult): S2PublicReQa {
+  return { candidateId: result.candidateId, status: result.status, verdict: result.verdict };
 }
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -931,22 +1034,19 @@ export class S2WorkflowService {
     if (!value) throw fail(404, "QA_NOT_FOUND");
     return value;
   }
-  private publicRun(state: StoreState, run: S2QaRun): Record<string, unknown> {
+  private publicRun(state: StoreState, run: S2QaRun): S2PublicQaProjection {
     const input = this.inputFor(state, run);
     const latest = latestSourceQaResults(run.candidateResults);
     const repairs = state.s2Repairs.filter((item) => item.qaRunId === run.id);
     const candidates = latest.map((candidate) => {
       const eligibleFindingIds = this.eligibleFindings(candidate, input);
       const hasRepair = repairs.some((repair) => repair.candidateId === candidate.candidateId);
-      return {
-        ...cloneJson(candidate),
-        repairEligible: eligibleFindingIds !== null && !hasRepair,
-        eligibleRepairFindingIds: eligibleFindingIds ?? [],
-      };
+      return publicCandidate(candidate, eligibleFindingIds, hasRepair);
     });
+    const candidateAttempts = run.candidateResults.map(publicCandidateCore);
     const unavailableCount = candidates.filter((item) =>
       item.status === "qa_unavailable_retryable" || item.status === "qa_unavailable_terminal").length;
-    const summary = {
+    const summary: S2PublicSummary = {
       kind: run.status !== "completed"
         ? "processing"
         : unavailableCount === candidates.length
@@ -957,11 +1057,31 @@ export class S2WorkflowService {
       resultCount: candidates.filter((item) => terminal(item.status)).length,
       unavailableCount,
     };
-    return { qaRun: { ...cloneJson(run), candidateResults: cloneJson(candidates), candidateAttempts: cloneJson(run.candidateResults),
-      repairs: cloneJson(repairs), reQa: cloneJson(state.s2ReQaResults.filter((item) => item.qaRunId === run.id)),
-      summary }, input: { ...cloneJson(input), sourceCandidates: input.sourceCandidates.map(sourceProjection) } };
+    return {
+      qaRun: {
+        id: run.id,
+        projectId: run.projectId,
+        inputVersionId: run.inputVersionId,
+        sourceGenerationSetId: run.sourceGenerationSetId,
+        status: run.status,
+        candidateResults: candidates,
+        candidateAttempts,
+        completedCandidateCount: run.completedCandidateCount,
+        passCount: run.passCount,
+        warningCount: run.warningCount,
+        materialFailCount: run.materialFailCount,
+        unavailableCount: run.unavailableCount,
+        createdAt: run.createdAt,
+        startedAt: run.startedAt,
+        completedAt: run.completedAt,
+        repairs: repairs.map(publicRepair),
+        reQa: state.s2ReQaResults.filter((item) => item.qaRunId === run.id).map(publicReQa),
+        summary,
+      },
+      input: { id: input.id },
+    };
   }
-  getQaRun(projectId: UUID, qaRunId: UUID): Record<string, unknown> {
+  getQaRun(projectId: UUID, qaRunId: UUID): S2PublicQaProjection {
     const state = this.state(); this.project(state, projectId);
     const run = state.s2QaRuns.find((item) => item.id === qaRunId);
     if (!run || run.projectId !== projectId) throw fail(404, "QA_NOT_FOUND");

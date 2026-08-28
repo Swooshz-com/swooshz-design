@@ -85,7 +85,7 @@ const VARIANTS: Record<string, string[]> = {
   "REPAIR-009": ["count", "decoded", "rgba", "encoded-precall"],
   "REPAIR-010": ["repeated-images", "model", "n-one", "size", "medium", "png", "no-mask-fidelity"],
   "REPAIR-011": ["empty", "multiple", "non-png", "invalid-base64", "oversized", "corrupt-truncated"],
-  "REPAIR-012": ["captured-bytes", "identical-render", "finding-sensitive", "manifest-sensitive", "not-shape-only"],
+  "REPAIR-012": ["captured-bytes", "identical-render", "finding-sensitive", "manifest-sensitive", "not-shape-only", "exact-format"],
   "REPAIR-013": ["evidence-ignored"],
   "REPAIR-014": ["staging", "stale-claim", "publication"],
   "REPAIR-015": ["bounded-support", "no-approval"],
@@ -103,7 +103,7 @@ const VARIANTS: Record<string, string[]> = {
   "CONC-005": ["no-missing-object", "no-false-terminal"],
   "CONC-006": ["no-overwrite", "no-duplicate"],
   "ROUTE-001": ["auth-all"],
-  "ROUTE-002": ["method", "body", "key", "status", "envelope"],
+  "ROUTE-002": ["method", "body", "key", "status", "envelope", "projection-keys"],
   "ROUTE-003": ["idempotent-replay"],
   "ROUTE-004": ["202-refresh", "timeout-refresh", "restart-refresh", "browser-refresh"],
   "ROUTE-005": ["frozen-readonly", "empty-valid"],
@@ -153,7 +153,7 @@ function fixtureFor(testId: string, variantId: string): string {
   if (testId === "REPAIR-007") return "Real two-candidate repair workflow proving one repair per (qaRunId, candidateId), independent candidate repair, and same-candidate rejection.";
   if (testId === "REQA-003") return "Four real repair/re-QA workflows proving pass, warning, material-fail, and unavailable outcomes without changing source-QA completion.";
   if (testId === "REPAIR-011") return "Production OpenAIProvider.runS2Repair adapter with one controlled local response per locked output class.";
-  if (testId === "REPAIR-012") return "Captured exact production repair prompt bytes and independent SHA-256 sensitivity checks over immutable finding and manifest inputs.";
+  if (testId === "REPAIR-012") return "Captured exact production repair prompt bytes and a test-only independent G2-004 oracle with direct SHA-256 sensitivity checks over immutable finding and manifest inputs.";
   if (testId === "REPAIR-017") return "Real local repairable access.open-sides material-vs-uncertain workflow with persisted eligibility, operation hash, repair input hash and exact prompt checks.";
   if (testId === "PRIV-001") return "Real local S2 success/failure/error run with captured console sinks; each exact privacy marker is checked against captured logs and safe envelopes; production provider adapter markers and private object keys are exercised.";
   if (testId === "PRIV-002") return "Changed-client/provider boundary review for credentials, tokens, private keys, environment reads, and authorization headers.";
