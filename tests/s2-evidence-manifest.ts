@@ -138,6 +138,8 @@ function typeFor(testId: string, variantId: string): EvidenceType {
 }
 
 function fixtureFor(testId: string, variantId: string): string {
+  if (testId === "QA-014" && variantId === "bound-400") return "Real synthetic provider requirement/design observations with astral Unicode at 400/401 code-point boundaries through production QA validation, transaction persistence, and fresh JsonRepository reload.";
+  if (testId === "QA-014" && variantId === "not-logged") return "Real synthetic provider observation with captured console sinks proving bounded evidence is not logged while remaining privately persisted.";
   if (testId === "MEDIA-008") return "Real sharp 0.35.3 decoder fixture for the " + variantId + " PNG/JPEG/WebP rejection class.";
   if (testId === "MEDIA-021") return "Real normalizeS2Media execution with a delegating Sharp factory that captures the exact constructor options, paired with warning, animation and pixel-boundary fixtures.";
   if (testId === "MEDIA-012") return variantId === "unrepresentable-plus-one"

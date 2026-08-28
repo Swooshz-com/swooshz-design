@@ -17,7 +17,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { flockSync } from "fs-ext-extra-prebuilt";
 import { AppError, type StoreState } from "./types";
-import { uuidV4Pattern } from "./utils";
+import { codePointLength, uuidV4Pattern } from "./utils";
 import { validateS2Graph } from "./s2-persistence";
 
 const LOCK_WAIT_MS = 15_000;
@@ -138,6 +138,13 @@ function persistedArray(value: unknown): unknown[] {
 
 function persistedString(value: unknown, maxLength = 4096, allowEmpty = false): string {
   if (typeof value !== "string" || (!allowEmpty && value.length === 0) || value.length > maxLength) {
+    return invalidS2State();
+  }
+  return value;
+}
+
+function persistedCodePointString(value: unknown, maxLength = 4096, allowEmpty = false): string {
+  if (typeof value !== "string" || (!allowEmpty && value.length === 0) || codePointLength(value) > maxLength) {
     return invalidS2State();
   }
   return value;
@@ -274,7 +281,7 @@ function validateS2RequirementObservation(value: unknown): void {
   if (record.observedCount !== null) persistedInteger(record.observedCount, 0);
   const confidence = persistedNumber(record.confidence, 0);
   if (confidence > 1) invalidS2State();
-  persistedString(record.evidence, 400, true);
+  persistedCodePointString(record.evidence, 400, true);
 }
 
 function validateS2DesignObservation(value: unknown): void {
@@ -283,7 +290,7 @@ function validateS2DesignObservation(value: unknown): void {
   persistedEnum(record.observed, ["compliant", "non_compliant", "uncertain", "not_verifiable"]);
   const confidence = persistedNumber(record.confidence, 0);
   if (confidence > 1) invalidS2State();
-  persistedString(record.evidence, 400, true);
+  persistedCodePointString(record.evidence, 400, true);
 }
 
 const S2_QA_CANDIDATE_KEYS = [

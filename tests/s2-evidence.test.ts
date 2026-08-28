@@ -31,7 +31,7 @@ import {
 import { buildS2QaRequest, buildS2RepairRequest, S2_QA_MODEL, S2_QA_SCHEMA } from "../src/lib/s2-provider";
 import { handleApiRequest } from "../src/lib/api";
 import { createWorkflowService, type WorkflowService, type WorkflowServiceOptions } from "../src/lib/workflow";
-import { cloneJson, jcs, sha256 } from "../src/lib/utils";
+import { cloneJson, codePointLength, jcs, sha256 } from "../src/lib/utils";
 import { AppError } from "../src/lib/types";
 import { reduceS2Findings } from "../src/lib/s2-findings";
 import { canonicalRepairInputHash, renderS2RepairPrompt, repairPromptHash } from "../src/lib/s2-repair";
@@ -42,6 +42,10 @@ import { deriveClaimManifest, manifestBaseRowCount, manifestVariantCount, type C
 import { independentRepairInput, independentRepairInputHash, independentRepairPrompt, independentRepairPromptHash } from "./s2-repair-oracle";
 
 const ONE_PIXEL_PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+
+function astralEvidence(codePoints: number): string {
+  return "😀".repeat(codePoints);
+}
 
 function briefData(exactCount = false) {
   return {
@@ -263,7 +267,11 @@ function qaPayload(input: any, mode: string = "pass", badRule?: string): any {
   const requirements = input.requirements.map((item: any) => {
     const exactUncertain = (mode === "uncertain" || mode === "not-verifiable") && item.expected === "exact_count" && !(mode === "not-verifiable" && item.requirementId === "brief.functional.001");
     const notVerifiable = mode === "not-verifiable" && item.requirementId === "brief.functional.001";
-    const exactEvidence = mode === "exact-evidence" && item.requirementId === "brief.functional.001";
+    const unicodeRequirementEvidence = mode === "unicode-400-requirement" && item.requirementId === "brief.functional.001"
+      ? astralEvidence(400)
+      : mode === "unicode-401-requirement" && item.requirementId === "brief.functional.001"
+        ? astralEvidence(401)
+        : null;
     const exactBoundary = mode === "threshold" && item.expected === "exact_count";
     const belowBoundary = mode === "below-threshold" && item.expected === "exact_count";
     const violation = mode === "requirement-violation" && item.requirementId === "brief.functional.001";
@@ -274,7 +282,7 @@ function qaPayload(input: any, mode: string = "pass", badRule?: string): any {
       observed: exactUncertain || belowBoundary ? "uncertain" : notVerifiable ? "not_verifiable" : violation ? "absent" : item.expected === "absent" ? "absent" : "present",
       observedCount: exactUncertain || belowBoundary || notVerifiable ? null : violation && item.expected === "exact_count" ? item.expectedCount + 1 : item.expected === "exact_count" ? item.expectedCount : null,
       confidence: exactBoundary ? 0.75 : belowBoundary ? 0.7499 : exactUncertain ? 0.5 : 0.99,
-      evidence: exactEvidence ? "x".repeat(400) : "local provider fixture observation",
+      evidence: unicodeRequirementEvidence ?? "local provider fixture observation",
     };
   });
   const badRules = new Set((badRule ?? "").split(",").filter(Boolean));
@@ -282,7 +290,11 @@ function qaPayload(input: any, mode: string = "pass", badRule?: string): any {
     ruleId: item.ruleId,
     observed: mode === "warning" && item.ruleId === "branding.style" ? "non_compliant" : badRules.has(item.ruleId) ? "non_compliant" : "compliant",
     confidence: 0.99,
-    evidence: "local provider fixture observation",
+    evidence: mode === "unicode-400-design" && item.ruleId === "footprint.within-boundary"
+      ? astralEvidence(400)
+      : mode === "unicode-401-design" && item.ruleId === "footprint.within-boundary"
+        ? astralEvidence(401)
+        : "local provider fixture observation",
   }));
   if (mode === "missing") requirements.pop();
   if (mode === "duplicate") requirements.push({ ...requirements[0] });
@@ -2805,6 +2817,98 @@ function assertSafeEnvelopeMarkerAbsent(envelopes: readonly string[], marker: st
   assert.equal(envelopes.some((envelope) => envelope.includes(marker)), false);
 }
 
+type UnicodeEvidenceMode = "unicode-400-requirement" | "unicode-401-requirement" | "unicode-400-design" | "unicode-401-design";
+
+type UnicodeEvidenceResult = {
+  mode: UnicodeEvidenceMode;
+  targetKind: "requirement" | "design";
+  expectedCodePoints: number;
+  independentCodePointCount: number;
+  utilityCodePointCount: number;
+  utf16UnitCount: number;
+  candidateStatus: string;
+  candidateVerdict: string | null;
+  qaFailureCode: string | null;
+  providerCalls: number;
+  persistedObservation: boolean;
+  persistedExact: boolean;
+  freshReloadSucceeded: boolean;
+  reloadPreservedExact: boolean;
+  malformedPersistedStateRejected: boolean;
+  evidenceLogged: boolean;
+};
+
+async function runUnicodeEvidenceCase(mode: UnicodeEvidenceMode): Promise<UnicodeEvidenceResult> {
+  const expectedCodePoints = mode.includes("400") ? 400 : 401;
+  const expectedEvidence = astralEvidence(expectedCodePoints);
+  const targetKind = mode.includes("requirement") ? "requirement" : "design";
+  const provider = new MockOpenAIProvider({
+    briefData: briefData(),
+    s2QaResponseFactory: (input) => input.candidateIndex === 1 ? qaPayload(input, mode) : qaPayload(input, "pass"),
+  });
+  const value = fixture([ONE_PIXEL_PNG], { provider });
+  try {
+    let boundResult: any;
+    const logEntries = await captureConsoleSinks(async () => { boundResult = await bindAndWait(value); });
+    const candidate = boundResult.result.qaRun.candidateResults.find((item: any) => item.candidateIndex === 1)!;
+    const state = value.repository.state() as any;
+    const persistedCandidate = state.s2QaRuns[0].candidateResults.find((item: any) => item.candidateIndex === 1)!;
+    const persistedObservation = targetKind === "requirement"
+      ? persistedCandidate.requirementObservations.find((item: any) => item.requirementId === "brief.functional.001")
+      : persistedCandidate.designObservations.find((item: any) => item.ruleId === "footprint.within-boundary");
+    const persistedEvidence = persistedObservation?.evidence as string | undefined;
+    let reloadedState: any = null;
+    let freshReloadSucceeded = true;
+    try {
+      reloadedState = new JsonRepository(value.root).state();
+    } catch {
+      freshReloadSucceeded = false;
+    }
+    const reloadedCandidate = reloadedState?.s2QaRuns?.[0]?.candidateResults?.find((item: any) => item.candidateIndex === 1);
+    const reloadedObservation = targetKind === "requirement"
+      ? reloadedCandidate?.requirementObservations?.find((item: any) => item.requirementId === "brief.functional.001")
+      : reloadedCandidate?.designObservations?.find((item: any) => item.ruleId === "footprint.within-boundary");
+    const qaOperation = state.s2Operations.find((item: any) => item.phase === "qa" && item.candidateId === candidate.candidateId && item.attempt === 1);
+    let malformedPersistedStateRejected = false;
+    if (persistedObservation) {
+      const poisonedRoot = mkdtempSync(join(tmpdir(), "swooshz-s2-unicode-poisoned-"));
+      try {
+        const poisoned = cloneJson(state) as any;
+        const poisonedCandidate = poisoned.s2QaRuns[0].candidateResults.find((item: any) => item.candidateIndex === 1);
+        const poisonedObservation = targetKind === "requirement"
+          ? poisonedCandidate.requirementObservations.find((item: any) => item.requirementId === "brief.functional.001")
+          : poisonedCandidate.designObservations.find((item: any) => item.ruleId === "footprint.within-boundary");
+        poisonedObservation.evidence = astralEvidence(401);
+        writeFileSync(join(poisonedRoot, "state.json"), JSON.stringify(poisoned), "utf8");
+        assert.throws(() => new JsonRepository(poisonedRoot), (error: any) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
+        malformedPersistedStateRejected = true;
+      } finally {
+        rmSync(poisonedRoot, { recursive: true, force: true });
+      }
+    }
+    return {
+      mode,
+      targetKind,
+      expectedCodePoints,
+      independentCodePointCount: Array.from(expectedEvidence).length,
+      utilityCodePointCount: codePointLength(expectedEvidence),
+      utf16UnitCount: expectedEvidence.length,
+      candidateStatus: candidate.status,
+      candidateVerdict: candidate.verdict ?? null,
+      qaFailureCode: qaOperation?.failureCode ?? null,
+      providerCalls: provider.s2QaCalls,
+      persistedObservation: Boolean(persistedObservation),
+      persistedExact: persistedEvidence === expectedEvidence,
+      freshReloadSucceeded,
+      reloadPreservedExact: reloadedObservation?.evidence === expectedEvidence,
+      malformedPersistedStateRejected,
+      evidenceLogged: logEntries.some((entry) => entry.includes(expectedEvidence)),
+    };
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+}
+
 type SecretFinding = { kind: string; sourcePath: string; redacted: "[REDACTED]" };
 
 const SECRET_PATTERNS: readonly [string, RegExp][] = [
@@ -3161,6 +3265,70 @@ test("repair prompt mismatch fails closed before provider dispatch", async () =>
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }
+});
+
+test("fresh S2 Unicode evidence persists and reloads by code point", async () => {
+  const cases: UnicodeEvidenceResult[] = [];
+  for (const mode of ["unicode-400-requirement", "unicode-401-requirement", "unicode-400-design", "unicode-401-design"] as const) {
+    cases.push(await runUnicodeEvidenceCase(mode));
+  }
+  const requirement400 = cases[0];
+  const requirement401 = cases[1];
+  const design400 = cases[2];
+  const design401 = cases[3];
+
+  for (const boundary of [requirement400, design400]) {
+    assert.equal(boundary.expectedCodePoints, 400);
+    assert.equal(boundary.independentCodePointCount, 400);
+    assert.equal(boundary.utilityCodePointCount, 400);
+    assert.equal(boundary.utf16UnitCount, 800);
+    assert.equal(boundary.utf16UnitCount > boundary.expectedCodePoints, true);
+    assert.equal(boundary.candidateStatus, "pass");
+    assert.equal(boundary.candidateVerdict, "PASS");
+    assert.equal(boundary.qaFailureCode, null);
+    assert.equal(boundary.providerCalls, 4);
+    assert.equal(boundary.persistedObservation, true);
+    assert.equal(boundary.persistedExact, true);
+    assert.equal(boundary.freshReloadSucceeded, true);
+    assert.equal(boundary.reloadPreservedExact, true);
+    assert.equal(boundary.malformedPersistedStateRejected, true);
+    assert.equal(boundary.evidenceLogged, false);
+  }
+
+  for (const rejected of [requirement401, design401]) {
+    assert.equal(rejected.expectedCodePoints, 401);
+    assert.equal(rejected.independentCodePointCount, 401);
+    assert.equal(rejected.utilityCodePointCount, 401);
+    assert.equal(rejected.utf16UnitCount, 802);
+    assert.equal(rejected.utf16UnitCount > rejected.expectedCodePoints, true);
+    assert.equal(rejected.candidateStatus, "qa_unavailable_terminal");
+    assert.equal(rejected.qaFailureCode, "QA_SCHEMA_INVALID");
+    assert.equal(rejected.providerCalls, 4);
+    assert.equal(rejected.persistedObservation, false);
+    assert.equal(rejected.persistedExact, false);
+    assert.equal(rejected.freshReloadSucceeded, true);
+    assert.equal(rejected.reloadPreservedExact, false);
+    assert.equal(rejected.malformedPersistedStateRejected, false);
+    assert.equal(rejected.evidenceLogged, false);
+  }
+  console.log(JSON.stringify({
+    unicodePersistenceEvidence: cases.map((item) => ({
+      mode: item.mode,
+      codePoints: item.independentCodePointCount,
+      utilityCodePoints: item.utilityCodePointCount,
+      utf16Units: item.utf16UnitCount,
+      candidateStatus: item.candidateStatus,
+      candidateVerdict: item.candidateVerdict,
+      qaFailureCode: item.qaFailureCode,
+      providerCalls: item.providerCalls,
+      persistedObservation: item.persistedObservation,
+      persistedExact: item.persistedExact,
+      freshReloadSucceeded: item.freshReloadSucceeded,
+      reloadPreservedExact: item.reloadPreservedExact,
+      malformedPersistedStateRejected: item.malformedPersistedStateRejected,
+      evidenceLogged: item.evidenceLogged,
+    })),
+  }));
 });
 
 test("execution-bound Section-24 matrix proves every revised claim with measured local output", async () => {
@@ -4168,19 +4336,94 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
       });
   } finally { rmSync(material.root, { recursive: true, force: true }); }
 
-  const exactEvidence = fixture([ONE_PIXEL_PNG], { provider: new MockOpenAIProvider({ briefData: briefData(), s2QaResponseFactory: (input, callIndex) => qaPayload(input, callIndex === 0 ? "exact-evidence" : "pass") }) });
-  try {
-    const { result } = await bindAndWait(exactEvidence);
-    const evidence = result.qaRun.candidateResults[0].requirementObservations.find((item: any) => item.requirementId === "brief.functional.001")!.evidence;
-    const stateText = JSON.stringify(exactEvidence.repository.state());
-    await prove(claimIds("QA-014", ["bound-400", "not-logged"]), "qa evidence length boundary", "Real 400-code-point provider evidence through schema validation and persisted observation output.",
-      { evidenceLength: evidence.length, maxAllowed: 400, sensitivePromptLogged: stateText.includes("bounded local repair"), result: "bounded" },
-      "The real evidence field stayed at the 400-code-point boundary and did not record provider prompt text.",
-      () => { assert.equal(evidence.length, 400); assert.equal(stateText.includes("bounded local repair"), false); }, undefined, {
-        "QA-014/bound-400": () => assert.equal(evidence.length, 400),
-        "QA-014/not-logged": () => assert.equal(stateText.includes("bounded local repair"), false),
-      });
-  } finally { rmSync(exactEvidence.root, { recursive: true, force: true }); }
+  const unicodeCases: UnicodeEvidenceResult[] = [];
+  for (const mode of ["unicode-400-requirement", "unicode-401-requirement", "unicode-400-design", "unicode-401-design"] as const) {
+    unicodeCases.push(await runUnicodeEvidenceCase(mode));
+  }
+  const unicodeRequirement400 = unicodeCases.find((item) => item.mode === "unicode-400-requirement")!;
+  const unicodeRequirement401 = unicodeCases.find((item) => item.mode === "unicode-401-requirement")!;
+  const unicodeDesign400 = unicodeCases.find((item) => item.mode === "unicode-400-design")!;
+  const unicodeDesign401 = unicodeCases.find((item) => item.mode === "unicode-401-design")!;
+  const unicodeFacts = {
+    requirement400CodePoints: unicodeRequirement400.independentCodePointCount,
+    requirement400UtilityCodePoints: unicodeRequirement400.utilityCodePointCount,
+    requirement400Utf16Units: unicodeRequirement400.utf16UnitCount,
+    requirement400AcceptedStatus: unicodeRequirement400.candidateStatus,
+    requirement400AcceptedVerdict: unicodeRequirement400.candidateVerdict,
+    requirement400ProviderCalls: unicodeRequirement400.providerCalls,
+    requirement400PersistedExact: unicodeRequirement400.persistedExact,
+    requirement400FreshReload: unicodeRequirement400.freshReloadSucceeded,
+    requirement400ReloadPreservedExact: unicodeRequirement400.reloadPreservedExact,
+    requirement401CodePoints: unicodeRequirement401.independentCodePointCount,
+    requirement401UtilityCodePoints: unicodeRequirement401.utilityCodePointCount,
+    requirement401Utf16Units: unicodeRequirement401.utf16UnitCount,
+    requirement401RejectionCode: unicodeRequirement401.qaFailureCode,
+    requirement401ObservationPersisted: unicodeRequirement401.persistedObservation,
+    requirement401FreshReload: unicodeRequirement401.freshReloadSucceeded,
+    design400CodePoints: unicodeDesign400.independentCodePointCount,
+    design400UtilityCodePoints: unicodeDesign400.utilityCodePointCount,
+    design400Utf16Units: unicodeDesign400.utf16UnitCount,
+    design400AcceptedStatus: unicodeDesign400.candidateStatus,
+    design400AcceptedVerdict: unicodeDesign400.candidateVerdict,
+    design400ProviderCalls: unicodeDesign400.providerCalls,
+    design400PersistedExact: unicodeDesign400.persistedExact,
+    design400FreshReload: unicodeDesign400.freshReloadSucceeded,
+    design400ReloadPreservedExact: unicodeDesign400.reloadPreservedExact,
+    design401CodePoints: unicodeDesign401.independentCodePointCount,
+    design401UtilityCodePoints: unicodeDesign401.utilityCodePointCount,
+    design401Utf16Units: unicodeDesign401.utf16UnitCount,
+    design401RejectionCode: unicodeDesign401.qaFailureCode,
+    design401ObservationPersisted: unicodeDesign401.persistedObservation,
+    design401FreshReload: unicodeDesign401.freshReloadSucceeded,
+    malformedPersistedStateRejectedRequirement: unicodeRequirement400.malformedPersistedStateRejected,
+    malformedPersistedStateRejectedDesign: unicodeDesign400.malformedPersistedStateRejected,
+    result: "unicode-code-point-persistence-boundary",
+  };
+  await prove(["QA-014/bound-400"], "qa unicode evidence persistence boundary", "Real synthetic provider requirement/design observations with astral Unicode at 400/401 code-point boundaries through production QA validation, transaction persistence, and fresh JsonRepository reload.",
+    unicodeFacts,
+    "The real QA provider path accepted exact-400 astral evidence unchanged for requirement and design observations, rejected exact-401 evidence before observation persistence, and preserved valid evidence across fresh repository reload.",
+    () => {
+      assert.equal(unicodeRequirement400.independentCodePointCount, 400);
+      assert.equal(unicodeRequirement400.utilityCodePointCount, 400);
+      assert.equal(unicodeRequirement400.utf16UnitCount, 800);
+      assert.equal(unicodeRequirement400.candidateStatus, "pass");
+      assert.equal(unicodeRequirement400.candidateVerdict, "PASS");
+      assert.equal(unicodeRequirement400.qaFailureCode, null);
+      assert.equal(unicodeRequirement400.providerCalls, 4);
+      assert.equal(unicodeRequirement400.persistedObservation, true);
+      assert.equal(unicodeRequirement400.persistedExact, true);
+      assert.equal(unicodeRequirement400.freshReloadSucceeded, true);
+      assert.equal(unicodeRequirement400.reloadPreservedExact, true);
+      assert.equal(unicodeRequirement401.independentCodePointCount, 401);
+      assert.equal(unicodeRequirement401.utf16UnitCount, 802);
+      assert.equal(unicodeRequirement401.qaFailureCode, "QA_SCHEMA_INVALID");
+      assert.equal(unicodeRequirement401.persistedObservation, false);
+      assert.equal(unicodeRequirement401.freshReloadSucceeded, true);
+      assert.equal(unicodeDesign400.independentCodePointCount, 400);
+      assert.equal(unicodeDesign400.utf16UnitCount, 800);
+      assert.equal(unicodeDesign400.candidateStatus, "pass");
+      assert.equal(unicodeDesign400.candidateVerdict, "PASS");
+      assert.equal(unicodeDesign400.persistedObservation, true);
+      assert.equal(unicodeDesign400.persistedExact, true);
+      assert.equal(unicodeDesign400.freshReloadSucceeded, true);
+      assert.equal(unicodeDesign400.reloadPreservedExact, true);
+      assert.equal(unicodeDesign401.independentCodePointCount, 401);
+      assert.equal(unicodeDesign401.utf16UnitCount, 802);
+      assert.equal(unicodeDesign401.qaFailureCode, "QA_SCHEMA_INVALID");
+      assert.equal(unicodeDesign401.persistedObservation, false);
+      assert.equal(unicodeDesign401.freshReloadSucceeded, true);
+      assert.equal(unicodeRequirement400.malformedPersistedStateRejected, true);
+      assert.equal(unicodeDesign400.malformedPersistedStateRejected, true);
+    });
+  await prove(["QA-014/not-logged"], "qa unicode evidence privacy", "Real synthetic provider observation with captured console sinks proving bounded evidence is not logged while remaining privately persisted.",
+    { requirement400EvidenceLogged: unicodeRequirement400.evidenceLogged, design400EvidenceLogged: unicodeDesign400.evidenceLogged, requirement400PersistedExact: unicodeRequirement400.persistedExact, design400PersistedExact: unicodeDesign400.persistedExact, result: "private-evidence-not-logged" },
+    "The real QA path kept exact bounded evidence out of captured console logs while retaining it unchanged in private persisted observations.",
+    () => {
+      assert.equal(unicodeRequirement400.evidenceLogged, false);
+      assert.equal(unicodeDesign400.evidenceLogged, false);
+      assert.equal(unicodeRequirement400.persistedExact, true);
+      assert.equal(unicodeDesign400.persistedExact, true);
+    });
 
   const height = fixture([ONE_PIXEL_PNG], { geometry: { widthMm: 9000, depthMm: 6000, openSides: ["north", "west"], maxHeightMm: 4000 }, provider: new MockOpenAIProvider({ briefData: briefData(), s2QaResponseFactory: (input) => qaPayload(input, "pass") }) });
   try {
