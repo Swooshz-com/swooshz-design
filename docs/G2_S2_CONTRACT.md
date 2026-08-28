@@ -405,11 +405,13 @@ uncertainFindingIds. Requirement and design-rule observation arrays remain
 separate and may contain distinct observations that resolve to one shared
 canonical finding ID.
 
-For a combined classification order, the server traverses canonical
-requirement order from section 9.1 followed by design-rule catalogue order
-from section 10.1. A shared canonical ID occupies its first applicable
-position and the later domain occurrence is omitted from the combined ID
-array.
+Canonical requirement-then-design-rule catalogue order applies only after
+each applicable observation has been independently classified and any shared
+canonical-ID outcomes have been reduced. A shared canonical ID uses its first
+applicable catalogue position for ordering only; the later domain occurrence
+is omitted from the emitted ID array after reduction. Requirement-before-
+design-rule traversal MUST NOT select, suppress, upgrade, or downgrade the
+finding classification.
 
 ### 5.2 Persisted records
 
@@ -644,6 +646,33 @@ They MAY include normalizedSha256 for deduplication and audit. They MUST NOT
 include original bytes, normalized bytes, storage keys, provider request
 payloads, provider URLs, prompts, or operation claim tokens.
 
+### 5.5 Persisted result invariants
+
+Before a persisted terminal candidate result is exposed or used for repair,
+the server MUST independently recompute its observation classifications from
+the preserved requirementObservations and designObservations plus the
+immutable input and server-owned design-rule snapshots. It MUST apply the
+shared canonical-ID reduction and deterministic catalogue ordering rules; it
+MUST NOT trust a persisted finding array, verdict, or repair eligibility as
+the source of truth for that recomputation.
+
+Persisted graph validation MUST reject the candidate and fail closed when:
+
+- a canonical ID appears in more than one of materialFindingIds,
+  warningFindingIds, or uncertainFindingIds;
+- a canonical ID appears more than once in any server-owned finding-ID array;
+- a shared-ID classification does not equal the deterministic reduction of
+  the independently classified observations;
+- array placement disagrees with the independently recomputed classification;
+  or
+- eligibleFindingIds, repairInputHash, operationInputHash, or any downstream
+  repair value depends on a different canonical post-reduction material set.
+
+Malformed persisted state MUST NOT be silently repaired, deduplicated,
+reclassified, reordered, or have its hashes rewritten. The failure follows
+the run-scoped operational/internal fail-closed posture in sections 18.2 and
+19.4.
+
 ## 6. Canonicalization and hash contract
 
 ### 6.1 Canonical bytes
@@ -703,8 +732,9 @@ referenceAssets and logoAssets arrays contain assetId, normalizedSha256, width,
 height, normalizedBytes and one-based slot order. Their order is the persisted
 draft order, not hash order.
 
-For repairInputHash, orderedFindingIds is the server-owned canonical unique
-ordered finding set used for repair eligibility. The repair input manifest is
+For repairInputHash, orderedFindingIds is the server-owned post-reduction
+canonical unique ordered material finding set used for repair eligibility. The
+repair input manifest is
 the exact ordered source, reference and logo manifest in section 15.1; its
 immutable hashes, dimensions, sizes, roles and slot order are part of the
 repair-input hash input. The persisted repairInputHash is the hash of that
@@ -741,9 +771,9 @@ authorized result. Reuse with any different input returns
 IDEMPOTENCY_KEY_REUSE and performs no mutation or provider call.
 
 For Repair, the server derives eligibleFindingIds from the persisted
-canonical unique ordered material finding set. A client or request replay
-cannot supply duplicates, change the order, or substitute a domain-qualified
-ID for an established canonical ID.
+post-reduction canonical unique ordered material finding set. A client or
+request replay cannot supply duplicates, change the order, or substitute a
+domain-qualified ID for an established canonical ID.
 
 ## 7. Reference/logo draft and API contract
 
@@ -1291,17 +1321,88 @@ After strict schema validation, the server:
 7. persists the original bounded evidence string only in the private
    authorized result projection.
 
-Requirement observations and design-rule observations remain separately
-preserved in their respective arrays. After both domains are classified, the
-server forms the deterministic canonical finding arrays from one combined
-canonical-ID set. If both the requirement observation and the design-rule
-observation independently produce the same canonical material finding
-access.open-sides, both observations MUST be retained, but canonical
-access.open-sides MUST occur only once in materialFindingIds. The same unique
-canonical ordered set is consumed by repair eligibility, persisted
+Every applicable requirement observation and design-rule observation MUST
+first be classified independently under the existing server-owned rules in
+this section and section 12.2, including confidence, materiality and
+applicability. Only after independent classification does the server group
+outcomes by canonical finding ID and reduce shared-ID collisions. Canonical
+catalogue order determines ordering only. Requirement-before-design-rule
+traversal MUST NOT determine finding severity or classification and MUST NOT
+suppress a later material outcome.
+
+For all independently classified outcomes that resolve to one canonical
+finding ID, the server MUST reduce them to exactly one server-owned finding
+classification using this precedence:
+
+1. material violation;
+2. warning-level violation;
+3. uncertain, not_verifiable, or low-confidence uncertainty;
+4. compliant, excluded, or no finding.
+
+Material violation wins over warning-level violation or uncertainty.
+Warning-level violation wins over uncertainty. Uncertainty or
+not_verifiable wins over compliant, excluded, or no-finding outcomes.
+Compliant, excluded, or no-finding outcomes contribute no finding when no
+higher classification exists. Provider prose, provider severity, provider
+verdict, and provider repair flags MUST NOT influence this reduction.
+
+After reduction, the server MUST emit the canonical ID at most once and in
+exactly one of materialFindingIds, warningFindingIds, or uncertainFindingIds.
+Requirement observations and design-rule observations remain independently
+persisted exactly as observed; only the derived canonical finding-ID
+classification is reduced. The post-reduction canonical material finding set
+is the single server-owned set consumed by repair eligibility, persisted
 eligibleFindingIds, repairInputHash, the Repair operationInputHash input, and
-the deterministic repair prompt compiler. No later layer may deduplicate a
-different set or reintroduce a duplicate.
+deterministic repair objective and prompt generation. No downstream layer may
+independently deduplicate, reclassify, reorder, or reconstruct another set.
+
+The known shared access.open-sides ID is resolved as follows:
+
+Case 1 - requirement uncertainty and design-rule material violation:
+
+- The requirement observation is uncertain because confidence is below 0.75.
+- The design-rule observation is high-confidence non_compliant and the
+  server-owned rule is material.
+- Both observations are retained.
+- access.open-sides occurs exactly once in materialFindingIds and is absent
+  from warningFindingIds and uncertainFindingIds.
+- The candidate verdict is MATERIAL_FAIL when the complete observation set is
+  otherwise valid.
+- Repair remains eligible when every other existing repair condition passes.
+
+Case 2 - requirement high-confidence material violation and design-rule
+compliance:
+
+- Both observations are retained.
+- access.open-sides occurs exactly once in materialFindingIds.
+
+Case 3 - requirement uncertainty and design-rule compliance:
+
+- Both observations are retained.
+- access.open-sides occurs exactly once in uncertainFindingIds and produces
+  no material finding from that ID.
+
+Case 4 - high-confidence material violations in both domains:
+
+- Both observations are retained.
+- access.open-sides occurs exactly once in materialFindingIds.
+- The duplicate observation does not count as a second repair finding or
+  repair objective.
+
+This reduction applies to every canonical ID that can occur in both
+observation domains; it is not an access.open-sides special case. An
+applicable geometry.max-height requirement/rule overlap follows the same
+reduction. When maxHeightMm is absent, the requirement remains omitted and
+the design rule remains server-marked not_applicable under the existing
+semantics; no finding is invented.
+
+The candidate verdict and all three canonical finding arrays MUST be derived
+from the same independently classified complete observation set and the same
+post-reduction classifications. A material shared-ID violation MUST NOT
+produce MATERIAL_FAIL while its canonical ID is stored only as warning or
+uncertain. WARNING MUST NOT suppress an independently present material
+violation. Existing MATERIAL_FAIL, WARNING, PASS and QA_UNAVAILABLE
+precedence remains unchanged.
 
 ### 12.2 Finding classification
 
@@ -1342,8 +1443,9 @@ The server assigns exactly one candidate verdict:
    A run-scoped persistence or invariant failure is an operational/internal
    failure outside the durable source-run status machine and is not a
    candidate verdict, including QA_UNAVAILABLE.
-2. MATERIAL_FAIL when at least one material violation has confidence >= 0.75
-   and the complete observation set is otherwise valid.
+2. MATERIAL_FAIL when the post-reduction canonical material finding set
+   contains at least one server-owned material violation with confidence >=
+   0.75 and the complete observation set is otherwise valid.
 3. WARNING when there is no material violation but there is an uncertainty,
    not_verifiable state, or warning-level violation.
 4. PASS only when every required applicable record is complete, every
@@ -1352,13 +1454,17 @@ The server assigns exactly one candidate verdict:
    uncertain/not_verifiable states. Server-marked not_applicable rules are
    excluded and cannot block PASS.
 
-MATERIAL_FAIL takes precedence over WARNING for the same complete observation
-set. QA_UNAVAILABLE takes precedence when the observation set is incomplete
-or invalid; a partial provider response MUST NOT be combined with a
-material-failure claim. Low-confidence, uncertain and not_verifiable
-observations are valid and contribute WARNING when no clear material violation
-exists; they do not become QA_SCHEMA_INVALID merely because observedCount is
-null.
+The candidate verdict and all three finding-ID arrays MUST be derived from the
+same independently classified complete observation set after the shared-ID
+reduction in section 12.1. MATERIAL_FAIL takes precedence over WARNING for
+that set, so a material shared-ID reduction cannot be stored only in
+warningFindingIds or uncertainFindingIds. WARNING MUST NOT suppress an
+independently present post-reduction material finding. QA_UNAVAILABLE takes
+precedence when the observation set is incomplete or invalid; a partial
+provider response MUST NOT be combined with a material-failure claim.
+Low-confidence, uncertain and not_verifiable observations are valid and
+contribute WARNING when no clear material violation exists; they do not become
+QA_SCHEMA_INVALID merely because observedCount is null.
 
 ### 12.4 Run completion
 
@@ -1419,8 +1525,9 @@ A repair is eligible only when all of the following are true:
 1. The candidate has a complete server-derived MATERIAL_FAIL verdict.
 2. The candidate has no qa_unavailable, uncertain-only, warning-only, or
    not_verifiable reason for the proposed repair.
-3. The server has persisted one through three canonical unique ordered
-   material finding IDs, each independently repairable in the allowlist below.
+3. The server has persisted one through three post-reduction canonical unique
+   ordered material finding IDs, each independently repairable in the
+   allowlist below.
 4. The candidate has no existing S2RepairAttempt, regardless of its status.
 5. The repair does not change confirmed width, depth, open sides, supplied max
    height, required candidate count, brief identity, or S1 source lineage.
@@ -1490,23 +1597,26 @@ The only accepted eligible sets are:
 
 The matrix is symmetric. A triple is accepted only when it contains at most
 one F member, at most one B member, and no outside member. Finding IDs are
-formed across both observation domains as one canonical-ID unique set and
-sorted by the deterministic canonical order in sections 9.1 and 10.1 before
-eligibility and hashing. A duplicate observation never counts as another
-finding and cannot create a second repair objective. This makes the allowed
-set exact and prevents the provider from receiving ambiguous competing brief
-changes.
+first independently classified and reduced across both observation domains as
+the post-reduction canonical unique material finding set defined in section
+12.1. Only after that reduction are IDs sorted by the deterministic
+requirement-then-design-rule catalogue order in sections 9.1 and 10.1;
+ordering cannot override or downgrade the reduced classification. A duplicate
+observation never counts as another finding and cannot create a second repair
+objective. This makes the allowed set exact and prevents the provider from
+receiving ambiguous competing brief changes.
 
 ### 14.4 Repair state creation
 
 The repair endpoint creates exactly one attempt value 1 after the eligibility
-decision and idempotency claim are persisted. It stores the canonical unique
-ordered finding IDs, sourceAssetId/sourceByteSize/sourceSha256, repair input
-hash, exact prompt hash, and immutable lineage. The prompt is rendered and
-repairPromptHash is computed and persisted before the provider call; no
-provider dispatch is authorised until the prompt hash integrity checks pass.
-Any failure before the call leaves no claimable success. A failed provider
-call leaves the attempt failed and does not permit a second attempt.
+decision and idempotency claim are persisted. It stores the post-reduction
+canonical unique ordered material finding IDs,
+sourceAssetId/sourceByteSize/sourceSha256, repair input hash, exact prompt
+hash, and immutable lineage. The prompt is rendered and repairPromptHash is
+computed and persisted before the provider call; no provider dispatch is
+authorised until the prompt hash integrity checks pass. Any failure before the
+call leaves no claimable success. A failed provider call leaves the attempt
+failed and does not permit a second attempt.
 
 ## 15. Repair provider contract
 
@@ -1578,8 +1688,9 @@ replace a derived record.
 
 The compiler profile is s2-repair-v1. It is a deterministic server function
 over the immutable input snapshot, candidate source identity and hashes,
-canonical unique ordered finding IDs, role-ordered image manifest, confirmed
-brief facts, geometry and repairInputHash. The exact rendered prompt MUST be
+post-reduction canonical unique ordered material finding IDs, role-ordered
+image manifest, confirmed brief facts, geometry and repairInputHash. The exact
+rendered prompt MUST be
 reconstructable from those immutable authoritative inputs. It does not consume
 provider evidence prose, timestamps, operation IDs, process IDs, client
 filenames, or mutable draft state.
@@ -1641,9 +1752,9 @@ resize, mask, or reorder the image bytes.
 repairPromptHash MUST equal SHA-256 of the exact UTF-8 bytes of the
 deterministic rendered s2-repair-v1 prompt, before the provider request. The
 prompt is never logged, returned to the client, or included in a thrown error.
-A repair attempt with the same immutable input hash, canonical unique ordered
-finding set, manifest hashes and compiler version produces byte-identical
-prompt content and the same prompt hash.
+A repair attempt with the same immutable input hash, post-reduction canonical
+unique ordered material finding set, manifest hashes and compiler version
+produces byte-identical prompt content and the same prompt hash.
 
 G3 MUST reconstruct the exact prompt bytes from the immutable authoritative
 repair inputs and verify the persisted repairPromptHash against that
@@ -2148,25 +2259,26 @@ binding for every row.
 | BIND-010 | Bind reads the immutable S1 ConceptAsset private PNG, verifies exact byte identity, derives S2 metadata safely, and never mutates or renormalizes the S1 object. |
 | QA-001 | One QA request is made per candidate, using only the source candidate image. |
 | QA-002 | The QA request uses the pinned model, store false, high image detail and strict s2_qa_v1 schema. |
-| QA-003 | Exact valid requirement coverage and exactly the server-applicable design-rule coverage persist observations and server-derived findings. |
+| QA-003 | Exact valid requirement coverage and exactly the server-applicable design-rule coverage persist both independently classified observations and server-derived findings; shared canonical IDs are reduced only after independent classification and emitted once in the deterministic finding arrays. |
 | QA-004 | Missing, duplicate, unknown, non-applicable, extra-property, wrong-type and out-of-range outputs map to QA_SCHEMA_INVALID. |
 | QA-005 | Expected values, counts and applicability are server-owned; provider echo or applicability mismatch is rejected. |
 | QA-006 | Confidence 0.7499 is uncertain, null observedCount remains valid for uncertainty, and 0.75 is eligible for high-confidence classification. |
-| QA-007 | Present, absent, judged exact-count, uncertain/null-count, prohibited, compliant and non-compliant cases classify correctly. |
+| QA-007 | Present, absent, judged exact-count, uncertain/null-count, prohibited, compliant and non-compliant cases classify correctly under the server-owned rules before any shared-ID reduction. |
 | QA-008 | Provider severity, verdict, criticality or repair flags are ignored if supplied. |
 | QA-009 | PASS requires complete high-confidence compliance for applicable records; an absent maxHeightMm cannot block PASS. |
 | QA-010 | WARNING covers uncertainty, not_verifiable or warning-level findings with no material violation and is not a schema failure solely because observedCount is null. |
-| QA-011 | MATERIAL_FAIL requires a complete high-confidence server-owned material violation, including eligible overhead/scale visual failures. |
+| QA-011 | MATERIAL_FAIL requires a complete high-confidence server-owned post-reduction material violation, including eligible overhead/scale visual failures, and cannot be suppressed by a warning or uncertainty for the same canonical ID. |
 | QA-012 | Provider/schema/transport/decoder failures remain candidate-level QA_UNAVAILABLE outcomes and never become MATERIAL_FAIL; run-scoped persistence or invariant failures fail closed outside the durable source-run status machine and produce no candidate verdict or fake completion. |
 | QA-013 | Run counters and candidate order remain correct after refresh and restart; a run-scoped integrity failure cannot manufacture completed or unavailable state. |
 | QA-014 | Evidence is bounded to 400 Unicode code points and is not logged. |
 | QA-015 | With maxHeightMm null, geometry.max-height is omitted from expected schema/coverage and cannot create uncertainty, WARNING or a PASS blocker; with a supplied maxHeightMm it is applicable. |
+| QA-016 | Execution-bound access.open-sides shared-ID fixtures preserve both exact requirement and design-rule observations and independently prove material-vs-uncertain yields exactly one canonical ID in materialFindingIds, absent from warningFindingIds and uncertainFindingIds with MATERIAL_FAIL; violation-vs-compliant yields exactly one canonical ID in materialFindingIds and none in the other finding arrays; uncertainty-vs-compliant yields exactly one canonical ID in uncertainFindingIds and none in the other finding arrays; two material observations yield exactly one canonical ID in materialFindingIds and no duplicate repair objective; persisted wrong or duplicate placement is rejected by graph validation. |
 | RETRY-001 | Only retryable unavailable state exposes the explicit retry operation. |
 | RETRY-002 | QA retry uses attempt 2, same immutable input/model/schema and no new run/input/draft. |
 | RETRY-003 | Retry after a terminal result or after attempt 2 returns QA_NOT_RETRYABLE or QA_RETRY_EXHAUSTED. |
 | RETRY-004 | Hidden SDK retries are absent; one logical attempt makes at most one provider call. |
 | RETRY-005 | Late attempt-1 completion cannot overwrite attempt 2 or terminal state. |
-| REPAIR-001 | A complete material failure with one eligible allowlisted spatial/visual finding, including overhead-support or scale, creates one repair attempt. |
+| REPAIR-001 | A complete material failure with one eligible allowlisted spatial/visual finding, including overhead-support or scale, creates one repair attempt; a repairable access.open-sides material-vs-uncertain shared-ID case remains one post-reduction material finding when all other repair conditions pass. |
 | REPAIR-002 | Warning, pass, unavailable, uncertain-only and not-verifiable-only results are not repairable. |
 | REPAIR-003 | Each allowlisted singleton repairs only its own intended correction. |
 | REPAIR-004 | Compatible spatial pairs and triples follow the exact matrix; two F findings fail. |
@@ -2182,6 +2294,7 @@ binding for every row.
 | REPAIR-014 | Staging failure, stale claim and publication failure leave no false derived success. |
 | REPAIR-015 | A clear material overhead-support failure receives only a bounded visibly plausible support/grounded correction and no engineering or approval claim. |
 | REPAIR-016 | A clear material scale failure receives only a plausible bounded visual scale correction and no hard-geometry, engineering or venue claim. |
+| REPAIR-017 | Execution-bound repairable access.open-sides material-vs-uncertain observations prove the post-reduction canonical material set is exactly the set used by repair eligibility and eligibleFindingIds, Repair operationInputHash, repairInputHash, deterministic repair objectives and the independently hashed repair prompt, with no duplicate repair objective. |
 | REQA-001 | One and only one re-QA operation is created after a valid derived output. |
 | REQA-002 | Re-QA uses the same hard facts, requirements, schema, model and server verdict algorithm. |
 | REQA-003 | Re-QA can persist pass, warning, material_fail and unavailable independently of source verdict. |
