@@ -4,6 +4,7 @@ import {
   S2_MAX_PIXELS_PER_ASSET,
   S2_MAX_REPAIR_OUTPUT_BYTES,
   enforceS2AggregateLimits,
+  inspectCanonicalS1Png,
 } from "./s2-media";
 import { sha256 } from "./utils";
 
@@ -32,6 +33,7 @@ export async function inspectExactS3Png(input: Uint8Array): Promise<S3ExactPng> 
   if (bytes.length < 1 || bytes.length > S2_MAX_REPAIR_OUTPUT_BYTES) throw mediaError("MEDIA_TOO_LARGE");
   if (!bytes.subarray(0, 8).equals(PNG_SIGNATURE)) throw mediaError("MEDIA_SIGNATURE_MISMATCH");
   try {
+    await inspectCanonicalS1Png(bytes);
     const metadata = await sharp(bytes, {
       failOn: "warning",
       limitInputPixels: S2_MAX_PIXELS_PER_ASSET,

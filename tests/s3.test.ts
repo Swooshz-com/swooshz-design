@@ -15,9 +15,8 @@ import { handleApiRequest, type ApiRequestDependencies } from "../src/lib/api";
 import { compileS3Assessment, compileS3Refinement, intentHash, normalizeS3Intent, renderS3AssessmentPrompt, renderS3RefinementPrompt, S3_ASSESSMENT_JSON_SCHEMA, sourceBindingHash } from "../src/lib/s3-compiler";
 import { buildS3AssessmentRequest, buildS3ImageRequest } from "../src/lib/s3-provider";
 import { inspectExactS3Png, createExactS3FixturePng } from "../src/lib/s3-media";
-import { normalizeS2Media } from "../src/lib/s2-media";
 import { validateS3Collections, validateS3Graph } from "../src/lib/s3-persistence";
-import { createS3Client, S3Screen, type S3State as ClientS3State } from "../app/components/S3Client";
+import { createS3Client, S3Screen, S3StateView, type S3State as ClientS3State } from "../app/components/S3Client";
 import { compareClaimProofs, deriveClaimManifest } from "./s3-evidence-manifest";
 import { recordS3ClaimProof, S3_SOURCE_ELIGIBILITY_TEST_NAME } from "./s3-proof";
 import { cloneJson, sha256, jcs } from "../src/lib/utils";
@@ -1274,7 +1273,7 @@ test(MEDIA_PROOF_TEST, async () => {
     ].map(async ([width, height]) => ({ width, height, bytes: await sharp({ create: { width, height, channels: 4, background: { r: 43, g: 91, b: 134, alpha: 1 } } }).png().toBuffer() })));
     const boundaryCodes = new Map<string, string | null>();
     for (const item of wrongDimensions) boundaryCodes.set(item.width + "x" + item.height, await observedErrorCode(() => inspectExactS3Png(item.bytes)));
-    const animatedCode = await observedErrorCode(() => normalizeS2Media({ kind: "reference", fileName: "animated.png", mimeType: "image/png", bytes: animated }));
+    const animatedCode = await observedErrorCode(() => inspectExactS3Png(animated));
     assert.equal(boundaryCodes.get("1535x1024"), "S3_OUTPUT_DIMENSIONS_INVALID");
     assert.equal(boundaryCodes.get("1536x1023"), "S3_OUTPUT_DIMENSIONS_INVALID");
     assert.equal(boundaryCodes.get("1537x1024"), "S3_OUTPUT_DIMENSIONS_INVALID");
@@ -1324,6 +1323,7 @@ test(API_PROOF_TEST, async () => {
     assert.equal((await selectionReplay.json() as any).replayed, true);
     const wrongMethod = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", value.projectId, "s3", "selection"], dependencies);
     assert.equal(wrongMethod.status, 405);
+    assert.equal((await wrongMethod.json() as any).error.code, "METHOD_NOT_ALLOWED");
     const malformedBody = await handleApiRequest(new Request("http://localhost", { method: "POST", headers: { "Idempotency-Key": randomUUID(), "content-type": "application/json" }, body: JSON.stringify({ targetKind: "source_root", targetId: source.sourceRevisionId, expectedSelectionVersion: body.selectionVersion, unexpected: true }) }), ["projects", value.projectId, "s3", "selection"], dependencies);
     assert.equal(malformedBody.status, 400);
     const retryBody = new Request("http://localhost", { method: "POST", headers: { "Idempotency-Key": randomUUID(), "content-type": "application/json" }, body: "{}" });
@@ -1378,6 +1378,24 @@ test(API_PROOF_TEST, async () => {
       assert.equal(calls[index], "context");
       assert.equal(calls[index + 1], "authorize:" + value.projectId);
     }
+    const unsupportedSubpath = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", value.projectId, "s3", "unsupported-subpath"], dependencies);
+    assert.equal(unsupportedSubpath.status, 400);
+    const unsupportedBody = await unsupportedSubpath.json() as any;
+    assert.equal(unsupportedBody.error.code, "INVALID_REQUEST");
+    assert.equal(typeof unsupportedBody.error.referenceId, "string");
+    const throwingService = { s3: { getState: () => { throw new Error("private downstream failure"); } } } as unknown as WorkflowService;
+    const unexpectedFailure = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", value.projectId, "s3"], {
+      workflowService: throwingService,
+      s3Authorization: {
+        resolveContext: async () => ({ subjectId: "synthetic-test-subject" }),
+        authorizeProject: async () => true,
+      },
+    });
+    assert.equal(unexpectedFailure.status, 500);
+    const unexpectedBody = await unexpectedFailure.json() as any;
+    assert.equal(unexpectedBody.error.code, "S3_INTERNAL_ERROR");
+    assert.equal(unexpectedBody.error.message.includes("private downstream failure"), false);
+    assert.equal(typeof unexpectedBody.error.referenceId, "string");
     const denied = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", value.projectId, "s3"], { workflowService: value.service, s3Authorization: { resolveContext: () => null, authorizeProject: () => true } });
     assert.equal(denied.status, 404);
     assert.equal((await denied.json() as any).error.code, "PROJECT_NOT_FOUND");
@@ -1389,7 +1407,7 @@ test(API_PROOF_TEST, async () => {
     prove(API_PROOF_TEST, "ROUTE-001", "method-body", "The closed route family enforces exact methods and request bodies.", "GET selection returned 405, an unknown selection field returned 400, and a non-empty retry body returned 400.", ["getSelection=405", "unknownField=400", "retryBody=empty-required"]);
     prove(API_PROOF_TEST, "ROUTE-001", "idempotency", "Mutation routes replay the same idempotency key without duplicating the operation.", "Selection and refinement replays returned HTTP 200 with replayed=true after their initial mutation responses.", ["selectionReplay=true", "refinementReplay=true"]);
     prove(API_PROOF_TEST, "ROUTE-001", "statuses", "S3 mutation, detail, and replay statuses match the fixed API contract.", "Selection=200, refinement=202, refinement replay=200, cycle/revision detail=200.", ["selection=200", "refinement=202", "replay=200", "detail=200"]);
-    prove(API_PROOF_TEST, "ROUTE-001", "safe-envelope", "S3 errors use the safe error envelope with a reference and field errors but no internal detail.", "Malformed JSON returned the generic message, JSON_OBJECT_REQUIRED field error, and one safe log record.", ["message=generic", "fieldError=JSON_OBJECT_REQUIRED", "log=reference-safe"]);
+    prove(API_PROOF_TEST, "ROUTE-001", "safe-envelope", "S3 errors use the safe error envelope with a reference and field errors but no internal detail.", "Malformed JSON returned the generic message and JSON_OBJECT_REQUIRED field error; an authorised unsupported subpath returned 400 INVALID_REQUEST; an authorised downstream exception returned 500 S3_INTERNAL_ERROR without internal detail.", ["message=generic", "fieldError=JSON_OBJECT_REQUIRED", "unsupportedPath=400/INVALID_REQUEST", "unexpectedFailure=500/S3_INTERNAL_ERROR", "log=reference-safe"]);
     prove(API_PROOF_TEST, "ROUTE-001", "preview", "Revision preview returns the committed PNG with private no-store headers and exact length.", "Preview returned image/png, private/no-store, and content-length equal to response bytes.", ["contentType=image/png", "cacheControl=private,no-store", "lengthMatches=true"]);
     prove(API_PROOF_TEST, "ROUTE-001", "cross-project", "Cross-project S3 access is denied before project state is exposed.", "An existing second fixture project returned generic PROJECT_NOT_FOUND through the authorizer.", ["crossProject=404", "stateExposed=false"]);
     prove(API_PROOF_TEST, "AUTH-001", "ownership", "Only an authorized project owner reaches the S3 workflow service.", "The fixture owner was authorized while another project and a denied context both returned 404.", ["owner=allowed", "denied=PROJECT_NOT_FOUND"]);
@@ -1420,6 +1438,17 @@ test(UI_PROOF_TEST, async () => {
     const client = createS3Client({ projectId: value.projectId, fetcher });
     const refreshed = await client.refresh();
     assert.deepEqual(refreshed, base);
+    const renderState = (state: ClientS3State) => renderToStaticMarkup(createElement(S3StateView, {
+      projectId: value.projectId,
+      state,
+      intent: "",
+      busy: false,
+      onIntentChange: () => undefined,
+      onSelect: () => undefined,
+      onRefine: () => undefined,
+      onRetry: () => undefined,
+    }));
+    const baseMarkup = renderState(refreshed);
     assert.equal(requests[0].init?.cache, "no-store");
     assert.ok(refreshed.screenedCandidates.length > 0);
     assert.equal(refreshed.sources.some((source) => source.selected), true);
@@ -1451,31 +1480,48 @@ test(UI_PROOF_TEST, async () => {
       ["assessment-retry", "assessment_retry_available", "The client displays the persisted assessment-retry state."],
     ];
     for (const [variant, status, expected] of statusProofs) {
-      served = { ...cloneJson(base), cycles: [{ ...cycle, status }] } as ClientS3State;
+      served = { ...cloneJson(base), cycles: [{ ...cycle, status, imageRetryAvailable: status === "image_retry_available", assessmentRetryAvailable: status === "assessment_retry_available" }] } as ClientS3State;
       const observed = await client.refresh();
       assert.equal(observed.cycles[0].status, status);
-      prove(UI_PROOF_TEST, "UI-001", variant, expected, "refresh returned cycle status=" + status + " from persisted server state.", ["cycleStatus=" + status, "inference=false"]);
+      const rendered = renderState(observed);
+      assert.equal(rendered.includes("Cycle 1:"), true);
+      assert.equal(rendered.includes(status), true);
+      if (status === "image_retry_available") assert.equal(rendered.includes("Retry image"), true);
+      if (status === "assessment_retry_available") assert.equal(rendered.includes("Retry assessment"), true);
+      prove(UI_PROOF_TEST, "UI-001", variant, expected, "S3StateView rendered cycle status=" + status + " from the persisted server state.", ["renderSurface=S3StateView", "cycleStatus=" + status, "inference=false"]);
     }
     const historyRevision = { ...cloneJson(base.revisions[0]), revisionId: randomUUID(), active: false, usable: true, activationState: "usable_history" as const };
     served = { ...cloneJson(base), revisions: [...cloneJson(base.revisions), historyRevision] } as ClientS3State;
     const history = await client.refresh();
     assert.equal(history.revisions.length, base.revisions.length + 1);
-    prove(UI_PROOF_TEST, "UI-001", "history", "The client renders immutable revision history from persisted state.", "refresh returned the persisted source revision history without synthesizing a new entry.", ["revisionCount=" + history.revisions.length, "historySource=server"]);
+    const historyMarkup = renderState(history);
+    assert.equal(historyMarkup.includes("Immutable revision history"), true);
+    assert.equal(historyMarkup.includes("usable_history"), true);
+    prove(UI_PROOF_TEST, "UI-001", "history", "The client renders immutable revision history from persisted state.", "S3StateView rendered the persisted source revision history without synthesizing a new entry.", ["renderSurface=S3StateView", "revisionCount=" + history.revisions.length, "historySource=server"]);
     assert.equal(history.revisions.some((revision) => revision.usable && !revision.active), true);
-    prove(UI_PROOF_TEST, "UI-001", "rollback", "The client exposes rollback only for a persisted usable inactive revision.", "The projected history contained a usable inactive revision eligible for the rollback action.", ["usableInactiveRevision=true", "rollbackEligibility=projected"]);
+    assert.equal(historyMarkup.includes("Rollback pointer"), true);
+    prove(UI_PROOF_TEST, "UI-001", "rollback", "The client exposes rollback only for a persisted usable inactive revision.", "S3StateView exposed the rollback action for the persisted usable inactive revision.", ["renderSurface=S3StateView", "usableInactiveRevision=true", "rollbackEligibility=rendered"]);
     const secondCycle = { ...cycle, cycleNumber: 2 as const, status: "usable_pass" } as ClientS3State["cycles"][number];
     served = { ...cloneJson(base), cycleSlotsRemaining: 0, successfulRefinementCount: 2, cycles: [secondCycle] } as ClientS3State;
     const second = await client.refresh();
     assert.equal(second.cycles[0].cycleNumber, 2);
     assert.equal(second.cycleSlotsRemaining, 0);
-    prove(UI_PROOF_TEST, "UI-001", "second-cycle", "The client displays the persisted second-cycle and exhausted-slot state.", "refresh returned cycleNumber=2, successfulRefinementCount=2, and zero remaining slots.", ["cycleNumber=2", "slotsRemaining=0"]);
-    const markup = renderToStaticMarkup(createElement(S3Screen, { projectId: value.projectId }));
-    assert.equal(markup.includes("whole-concept refinement"), true);
-    assert.equal(/<button[^>]*>[^<]*mask/i.test(markup), false);
-    assert.equal(markup.includes('name="mask"'), false);
-    prove(UI_PROOF_TEST, "UI-001", "sources", "The client renders screened source choices from persisted S3 state.", "The refreshed state contained screened candidates and source projections used by the rendered screen.", ["screenedCandidates=projected", "sources=projected"]);
+    const secondMarkup = renderState(second);
+    assert.equal(secondMarkup.includes("Cycle 2:"), true);
+    assert.equal(secondMarkup.includes("usable_pass"), true);
+    assert.equal(secondMarkup.includes("0 whole-concept cycle slot(s) remaining"), true);
+    prove(UI_PROOF_TEST, "UI-001", "second-cycle", "The client displays the persisted second-cycle and exhausted-slot state.", "S3StateView rendered cycleNumber=2, successfulRefinementCount=2, and zero remaining slots.", ["renderSurface=S3StateView", "cycleNumber=2", "slotsRemaining=0"]);
+    assert.equal(baseMarkup.includes("Screened sources"), true);
+    assert.equal(baseMarkup.includes("Candidate"), true);
+    assert.equal(/<button[^>]*>[^<]*mask/i.test(baseMarkup), false);
+    assert.equal(baseMarkup.includes('name="mask"'), false);
+    const screenMarkup = renderToStaticMarkup(createElement(S3Screen, { projectId: value.projectId }));
+    assert.equal(screenMarkup.includes("whole-concept refinement"), true);
+    assert.equal(/<button[^>]*>[^<]*mask/i.test(screenMarkup), false);
+    assert.equal(screenMarkup.includes('name="mask"'), false);
+    prove(UI_PROOF_TEST, "UI-001", "sources", "The client renders screened source choices from persisted S3 state.", "S3StateView rendered the persisted screened candidates and source projections used by S3Screen.", ["renderSurface=S3StateView", "screenedCandidates=rendered", "sources=rendered"]);
     prove(UI_PROOF_TEST, "UI-001", "selection", "The client sends the exact selection body and uses the refreshed selection version.", "The client issued POST /selection with targetKind, targetId, and expectedSelectionVersion from persisted state.", ["selectionBody=exact", "selectionVersion=server"]);
-    prove(UI_PROOF_TEST, "UI-001", "no-mask", "The S3 client contains no mask or local-region editing control.", "Rendered S3Screen markup contained whole-concept controls and no mask control or mask field.", ["maskControl=absent", "localEdit=absent"]);
+    prove(UI_PROOF_TEST, "UI-001", "no-mask", "The S3 client contains no mask or local-region editing control.", "Rendered S3Screen and its production S3StateView contained whole-concept controls and no mask control or mask field.", ["renderSurface=S3Screen>S3StateView", "maskControl=absent", "localEdit=absent"]);
   } finally { cleanup(value); }
 });
 

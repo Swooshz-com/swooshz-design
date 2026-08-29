@@ -143,6 +143,50 @@ export function createS3Client(options: { projectId: string; operationKeys?: Ide
   return { refresh, select, refine, retry };
 }
 
+type S3StateViewProps = {
+  projectId: string;
+  state: S3State;
+  intent: string;
+  busy: boolean;
+  onIntentChange: (value: string) => void;
+  onSelect: (targetKind: "source_root" | "revision", targetId: string) => void;
+  onRefine: () => void;
+  onRetry: (cycleId: string, kind: "image" | "assessment") => void;
+};
+
+export function S3StateView({ projectId, state, intent, busy, onIntentChange, onSelect, onRefine, onRetry }: S3StateViewProps) {
+  return <>
+    <p className="muted">Selection version {state.selectionVersion} / {state.cycleSlotsRemaining} whole-concept cycle slot(s) remaining / {state.successfulRefinementCount} successful refinement(s)</p>
+    <section className="panel">
+      <h2>Screened sources</h2>
+      <div className="candidate-grid">{state.screenedCandidates.flatMap((candidate) => [
+        candidate.originalSourceId ? <article className="candidate" key={candidate.originalSourceId}><h3>Candidate {candidate.candidateIndex} / Original</h3><p>{candidate.sourceQaStatus}</p><button type="button" disabled={busy} onClick={() => onSelect("source_root", candidate.originalSourceId!)}>Select source</button></article> : null,
+        ...candidate.repairedSourceIds.map((sourceId) => <article className="candidate" key={sourceId}><h3>Candidate {candidate.candidateIndex} / Repaired</h3><p>{candidate.sourceQaStatus}</p><button type="button" disabled={busy} onClick={() => onSelect("source_root", sourceId)}>Select source</button></article>),
+      ])}</div>
+      <div className="candidate-grid">{state.sources.filter((source) => source.eligible).map((source) => <article className="candidate" key={source.sourceId}>
+        <h3>Candidate {source.candidateIndex} / {source.sourceKind === "s1_original" ? "Original" : "Repaired"}</h3>
+        <p>{source.qaStatus} / {source.selected ? "Selected" : "Eligible"}</p>
+        {source.previewAvailable ? <img src={apiPath(projectId, "/revisions/" + source.sourceRevisionId + "/preview")} alt={"Candidate " + source.candidateIndex + " source preview"} loading="lazy" style={{ maxWidth: "100%", height: "auto" }} /> : null}
+        <button type="button" disabled={busy || source.selected} onClick={() => onSelect("source_root", source.sourceRevisionId)}>Select source</button>
+      </article>)}</div>
+    </section>
+    <section className="panel">
+      <h2>Refine selected concept</h2>
+      <p>Describe a bounded preference. Confirmed geometry and requirements remain server-owned.</p>
+      <textarea value={intent} maxLength={600} disabled={busy || !state.activeRevisionId || state.cycleSlotsRemaining === 0} onChange={(event) => onIntentChange(event.target.value)} placeholder="Example: make the reception feel warmer while preserving the confirmed layout." />
+      <button type="button" disabled={busy || !intent.trim() || !state.activeRevisionId || state.cycleSlotsRemaining === 0} onClick={onRefine}>Start whole-concept refinement</button>
+    </section>
+    <section className="panel">
+      <h2>Cycles</h2>
+      {state.cycles.length === 0 ? <p>No refinement cycle admitted.</p> : state.cycles.map((cycle) => <article className="candidate" key={cycle.cycleId}><p>Cycle {cycle.cycleNumber}: <strong>{cycle.status}</strong> / assessment {cycle.assessmentStatus}</p>{cycle.imageRetryAvailable ? <button type="button" disabled={busy} onClick={() => onRetry(cycle.cycleId, "image")}>Retry image</button> : null}{cycle.assessmentRetryAvailable ? <button type="button" disabled={busy} onClick={() => onRetry(cycle.cycleId, "assessment")}>Retry assessment</button> : null}</article>)}
+    </section>
+    <section className="panel">
+      <h2>Immutable revision history</h2>
+      <ol>{state.revisions.map((revision) => <li key={revision.revisionId}>{revision.kind} / {revision.activationState} / assessment {revision.assessmentStatus}{revision.userIntentText ? " / " + revision.userIntentText : ""}{revision.usable && !revision.active ? <button type="button" disabled={busy} onClick={() => onSelect("revision", revision.revisionId)}>Rollback pointer</button> : null}</li>)}</ol>
+    </section>
+  </>;
+}
+
 export function S3Screen({ projectId }: { projectId: string }) {
   const [state, setState] = useState<S3State | null>(null);
   const [intent, setIntent] = useState("");
@@ -195,35 +239,15 @@ export function S3Screen({ projectId }: { projectId: string }) {
     <p className="disclaimer">The server-owned persisted state is authoritative. S3 performs whole-concept refinement only; masks and local-region editing are not available here.</p>
     {error ? <p className="error" role="alert">{error}</p> : null}
     <button type="button" disabled={busy} onClick={() => void refresh()}>Refresh persisted state</button>
-    {state ? <>
-      <p className="muted">Selection version {state.selectionVersion} / {state.cycleSlotsRemaining} whole-concept cycle slot(s) remaining / {state.successfulRefinementCount} successful refinement(s)</p>
-      <section className="panel">
-        <h2>Screened sources</h2>
-        <div className="candidate-grid">{state.screenedCandidates.flatMap((candidate) => [
-          candidate.originalSourceId ? <article className="candidate" key={candidate.originalSourceId}><h3>Candidate {candidate.candidateIndex} / Original</h3><p>{candidate.sourceQaStatus}</p><button type="button" disabled={busy} onClick={() => void select("source_root", candidate.originalSourceId!)}>Select source</button></article> : null,
-          ...candidate.repairedSourceIds.map((sourceId) => <article className="candidate" key={sourceId}><h3>Candidate {candidate.candidateIndex} / Repaired</h3><p>{candidate.sourceQaStatus}</p><button type="button" disabled={busy} onClick={() => void select("source_root", sourceId)}>Select source</button></article>),
-        ])}</div>
-        <div className="candidate-grid">{state.sources.filter((source) => source.eligible).map((source) => <article className="candidate" key={source.sourceId}>
-          <h3>Candidate {source.candidateIndex} / {source.sourceKind === "s1_original" ? "Original" : "Repaired"}</h3>
-          <p>{source.qaStatus} / {source.selected ? "Selected" : "Eligible"}</p>
-          {source.previewAvailable ? <img src={apiPath(projectId, "/revisions/" + source.sourceRevisionId + "/preview")} alt={"Candidate " + source.candidateIndex + " source preview"} loading="lazy" style={{ maxWidth: "100%", height: "auto" }} /> : null}
-          <button type="button" disabled={busy || source.selected} onClick={() => void select("source_root", source.sourceRevisionId)}>Select source</button>
-        </article>)}</div>
-      </section>
-      <section className="panel">
-        <h2>Refine selected concept</h2>
-        <p>Describe a bounded preference. Confirmed geometry and requirements remain server-owned.</p>
-        <textarea value={intent} maxLength={600} disabled={busy || !state.activeRevisionId || state.cycleSlotsRemaining === 0} onChange={(event) => setIntent(event.target.value)} placeholder="Example: make the reception feel warmer while preserving the confirmed layout." />
-        <button type="button" disabled={busy || !intent.trim() || !state.activeRevisionId || state.cycleSlotsRemaining === 0} onClick={() => void refine()}>Start whole-concept refinement</button>
-      </section>
-      <section className="panel">
-        <h2>Cycles</h2>
-        {state.cycles.length === 0 ? <p>No refinement cycle admitted.</p> : state.cycles.map((cycle) => <article className="candidate" key={cycle.cycleId}><p>Cycle {cycle.cycleNumber}: <strong>{cycle.status}</strong> / assessment {cycle.assessmentStatus}</p>{cycle.imageRetryAvailable ? <button type="button" disabled={busy} onClick={() => void retry(cycle.cycleId, "image")}>Retry image</button> : null}{cycle.assessmentRetryAvailable ? <button type="button" disabled={busy} onClick={() => void retry(cycle.cycleId, "assessment")}>Retry assessment</button> : null}</article>)}
-      </section>
-      <section className="panel">
-        <h2>Immutable revision history</h2>
-        <ol>{state.revisions.map((revision) => <li key={revision.revisionId}>{revision.kind} / {revision.activationState} / assessment {revision.assessmentStatus}{revision.userIntentText ? " / " + revision.userIntentText : ""}{revision.usable && !revision.active ? <button type="button" disabled={busy} onClick={() => void select("revision", revision.revisionId)}>Rollback pointer</button> : null}</li>)}</ol>
-      </section>
-    </> : <p aria-live="polite">Loading persisted S3 state.</p>}
+    {state ? <S3StateView
+      projectId={projectId}
+      state={state}
+      intent={intent}
+      busy={busy}
+      onIntentChange={setIntent}
+      onSelect={(targetKind, targetId) => void select(targetKind, targetId)}
+      onRefine={() => void refine()}
+      onRetry={(cycleId, kind) => void retry(cycleId, kind)}
+    /> : <p aria-live="polite">Loading persisted S3 state.</p>}
   </main>;
 }
