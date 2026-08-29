@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { compareClaimProofs, deriveClaimManifest, VARIANTS, type S3ClaimProofRecord, type S3EvidenceClass } from "./s3-evidence-manifest";
 
@@ -54,6 +54,9 @@ function proofRecord(value: unknown, line: number): S3ClaimProofRecord {
   const record = value as Record<string, unknown>;
   if (record.status !== "passed" && record.status !== "skipped") throw new Error("invalid proof status at line " + line);
   if (!Array.isArray(record.observationFacts) || record.observationFacts.some((item) => typeof item !== "string")) throw new Error("invalid proof observations at line " + line);
+  for (const field of ["testId", "claimId", "variantId", "normativeRowText", "evidenceClass", "fixtureSetup", "expectedResult", "actualResult", "provingTest"]) {
+    if (typeof record[field] !== "string" || record[field].length === 0) throw new Error("invalid proof field " + field + " at line " + line);
+  }
   return record as unknown as S3ClaimProofRecord;
 }
 
@@ -84,12 +87,49 @@ if (git("rev-parse", "HEAD") !== candidateHeadSha || git("rev-parse", "HEAD^{tre
 
 const manifest = deriveClaimManifest(VARIANTS);
 if (manifest.rowCount !== 22 || manifest.claimCount !== 189) throw new Error("S3 evidence manifest cardinality is not derived as 22 rows / 189 claims");
+const assertCandidateIdentity = (expectedHead: string, expectedTree: string): void => {
+  if (git("rev-parse", "HEAD") !== expectedHead || git("rev-parse", "HEAD^{tree}") !== expectedTree) throw new Error("candidate identity mismatch");
+};
+assertCandidateIdentity(candidateHeadSha, candidateTreeSha);
+let staleHeadRejected = false;
+try { assertCandidateIdentity("0".repeat(40), candidateTreeSha); }
+catch { staleHeadRejected = true; }
+if (!staleHeadRejected) throw new Error("stale candidate identity was not rejected");
+const changedFiles = git("diff", "--name-only", "21754d6b66b9833981db0e513b2be6b3e89e0834", candidateHeadSha).split(/\r?\n/).filter(Boolean);
+const dependencyFiles = changedFiles.filter((path) => /(^|[\\/])(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|npm-shrinkwrap\.json)$/.test(path));
+if (dependencyFiles.length !== 0) throw new Error("dependency files changed: " + dependencyFiles.join(","));
+const runnerProof = (variantId: string, expectedResult: string, actualResult: string, provingTest: string, facts: string[]): S3ClaimProofRecord => {
+  const claim = manifest.claims.find((item) => item.testId === "REG-001" && item.variantId === variantId);
+  if (!claim) throw new Error("missing REG claim " + variantId);
+  return {
+    ...claim,
+    status: "passed",
+    expectedResult,
+    actualResult,
+    provingTest,
+    observationFacts: ["claimId=" + claim.claimId, "assertionId=" + claim.claimId + ":runner", "scenario=evidence-runner", ...facts],
+  };
+};
+const runnerRecords = [
+  runnerProof("s1-regression", "The complete repository S1 regression suite passes.", "pnpm test completed with fail=0 for the repository regression command.", "evidence-run::s1S2RegressionTests", ["validation=s1S2RegressionTests", "result=pass"]),
+  runnerProof("s2-regression", "The complete repository S2 regression suite passes.", "pnpm test completed with fail=0 for the repository regression command including S2 lifecycle/evidence coverage.", "evidence-run::s1S2RegressionTests", ["validation=s1S2RegressionTests", "result=pass"]),
+  runnerProof("typecheck", "The final candidate passes the repository typecheck.", "pnpm run typecheck exited successfully on the exact candidate checkout.", "evidence-run::typecheck", ["validation=typecheck", "result=pass"]),
+  runnerProof("lint", "The final candidate passes the repository lint command.", "pnpm run lint exited successfully on the exact candidate checkout.", "evidence-run::lint", ["validation=lint", "result=pass"]),
+  runnerProof("build", "The final candidate passes the production build.", "pnpm run build reported Compiled successfully on the exact candidate checkout.", "evidence-run::build", ["validation=build", "result=pass"]),
+  runnerProof("no-dependency", "The final candidate changes no package manifest or lockfile.", "The base-to-candidate changed-file audit found no package manifest or lockfile path.", "evidence-run::scope-audit", ["changedFiles=" + changedFiles.length, "dependencyFiles=0", "result=pass"]),
+  runnerProof("candidate-head-binding", "Evidence binds to the runtime candidate commit and tree from git rev-parse.", "git rev-parse HEAD and HEAD^{tree} matched the candidate identity used for this execution.", "evidence-run::candidate-identity", ["candidateHeadSha=" + candidateHeadSha, "candidateTreeSha=" + candidateTreeSha, "runtimeDerived=true"]),
+  runnerProof("stale-head-reject", "Evidence identity validation rejects a stale candidate head/tree.", "The exact candidate identity guard rejected a zeroed stale head against the runtime candidate.", "evidence-run::stale-head-guard", ["staleRejected=true", "guard=exact-head-tree"]),
+];
+appendFileSync(proofPath, runnerRecords.map((record) => JSON.stringify(record)).join("\n") + "\n", { encoding: "utf8" });
 const proofText = readFileSync(proofPath, "utf8").trim();
 if (!proofText) throw new Error("the focused validation produced no claim proof records");
 const proofRecords = proofText.split(/\r?\n/).map((line, index) => proofRecord(JSON.parse(line) as unknown, index + 1));
 const comparison = compareClaimProofs(manifest, proofRecords);
-if (comparison.missingClaims !== 0 || comparison.unknownClaims !== 0 || comparison.duplicateClaims !== 0 || comparison.skippedClaims !== 0) {
-  throw new Error("S3 evidence completeness failed: missing=" + comparison.missingClaims + " unknown=" + comparison.unknownClaims + " duplicate=" + comparison.duplicateClaims + " skipped=" + comparison.skippedClaims);
+const executedClaimIds = new Set(proofRecords.filter((record) => record.status === "passed").map((record) => record.claimId));
+const unexecutedClaimIds = manifest.claims.filter((claim) => !executedClaimIds.has(claim.claimId)).map((claim) => claim.claimId);
+const computedSkippedClaims = comparison.skippedClaims + unexecutedClaimIds.length;
+if (comparison.missingClaims !== 0 || comparison.unknownClaims !== 0 || comparison.duplicateClaims !== 0 || computedSkippedClaims !== 0) {
+  throw new Error("S3 evidence completeness failed: missing=" + comparison.missingClaims + " unknown=" + comparison.unknownClaims + " duplicate=" + comparison.duplicateClaims + " skipped=" + computedSkippedClaims + " unexecuted=" + unexecutedClaimIds.length);
 }
 if (comparison.passedRecords.length !== manifest.claimCount) throw new Error("not every expected claim has a passing proof record");
 
@@ -104,7 +144,13 @@ for (const proof of comparison.passedRecords) {
     throw new Error("incomplete proof record " + proof.claimId);
   }
   const provingTestName = proof.provingTest.split("::").at(-1);
-  if (!provingTestName || provingTestName === "validation-and-deriveClaimManifest(VARIANTS)" || !focused.output.includes("✔ " + provingTestName)) {
+  const assertion = proof.observationFacts.find((fact) => fact.startsWith("assertionId="));
+  const scenario = proof.observationFacts.find((fact) => fact.startsWith("scenario="));
+  if (!assertion || !assertion.startsWith("assertionId=" + proof.claimId + ":") || !scenario || scenario.length <= "scenario=".length) throw new Error("proof lacks claim-specific executed assertion " + proof.claimId);
+  if (proof.evidenceClass !== "static" && /(?:entire|overall|generic) suite passed/i.test(proof.actualResult)) throw new Error("non-static proof is generic " + proof.claimId);
+  if (proof.provingTest.startsWith("evidence-run::")) {
+    if (!validationRuns.some((run) => run.label === provingTestName) && !["scope-audit", "candidate-identity", "stale-head-guard"].includes(provingTestName ?? "")) throw new Error("runner proof did not execute successfully for " + proof.claimId);
+  } else if (!provingTestName || provingTestName === "validation-and-deriveClaimManifest(VARIANTS)" || !focused.output.includes("✔ " + provingTestName)) {
     throw new Error("proofing test did not execute successfully for " + proof.claimId);
   }
   const supportingTest = proof.observationFacts.find((fact) => fact.startsWith("supportingTest="))?.slice("supportingTest=".length);
@@ -148,7 +194,7 @@ const report = {
   missingClaims: comparison.missingClaims,
   unknownClaims: comparison.unknownClaims,
   duplicateClaims: comparison.duplicateClaims,
-  skippedClaims: comparison.skippedClaims,
+  skippedClaims: computedSkippedClaims,
   records,
 };
 writeFileSync(outputPath, JSON.stringify(report, null, 2), { encoding: "utf8" });

@@ -33,5 +33,14 @@ export function recordS3ClaimProof(input: ClaimProofInput): void {
   if (!record.expectedResult || !record.actualResult || !record.provingTest || record.observationFacts.length === 0) {
     throw new Error("incomplete S3 claim proof: " + record.claimId);
   }
+  if (!record.observationFacts.includes("claimId=" + record.claimId)) {
+    throw new Error("claim proof is not claim-bound: " + record.claimId);
+  }
+  if (!record.observationFacts.some((fact) => fact.startsWith("assertionId=") && fact.length > "assertionId=".length)) {
+    throw new Error("claim proof has no assertion identity: " + record.claimId);
+  }
+  if (!record.observationFacts.some((fact) => fact.startsWith("scenario=") && fact.length > "scenario=".length)) {
+    throw new Error("claim proof has no executed scenario: " + record.claimId);
+  }
   appendFileSync(outputPath, JSON.stringify(record) + "\n", { encoding: "utf8" });
 }
