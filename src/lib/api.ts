@@ -372,6 +372,174 @@ function serviceForRequest(): WorkflowService {
   return createWorkflowService();
 }
 
+export type S3AccessContext = {
+  subjectId: string;
+};
+
+export type S3AccessContextResolver = (
+  request: Request,
+) => S3AccessContext | null | Promise<S3AccessContext | null>;
+
+export type S3ProjectAuthorizer = (
+  context: S3AccessContext,
+  projectId: UUID,
+) => boolean | Promise<boolean>;
+
+export type S3AuthorizationBoundary = {
+  resolveContext: S3AccessContextResolver;
+  authorizeProject: S3ProjectAuthorizer;
+};
+
+export const productionS3Authorization: S3AuthorizationBoundary = {
+  resolveContext: async () => null,
+  authorizeProject: async () => false,
+};
+
+export type ApiRequestDependencies = {
+  workflowService?: WorkflowService;
+  s3Authorization: S3AuthorizationBoundary;
+};
+
+function isApiRequestDependencies(
+  value: WorkflowService | ApiRequestDependencies | undefined,
+): value is ApiRequestDependencies {
+  return Boolean(value && typeof value === "object" && "s3Authorization" in value);
+}
+
+function isS3Path(segments: string[]): boolean {
+  return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s3";
+}
+
+async function authorizedS3Service(
+  request: Request,
+  segments: string[],
+  supplied: WorkflowService | ApiRequestDependencies | undefined,
+): Promise<WorkflowService> {
+  const projectId = segments[1];
+  if (typeof projectId !== "string" || !uuidV4Pattern.test(projectId)) {
+    throw new AppError(404, "PROJECT_NOT_FOUND");
+  }
+  const dependencies = isApiRequestDependencies(supplied)
+    ? supplied
+    : { workflowService: supplied, s3Authorization: productionS3Authorization };
+  let context: S3AccessContext | null;
+  try {
+    context = await dependencies.s3Authorization.resolveContext(request);
+  } catch {
+    throw new AppError(404, "PROJECT_NOT_FOUND");
+  }
+  if (!context || typeof context.subjectId !== "string" || context.subjectId.length === 0) {
+    throw new AppError(404, "PROJECT_NOT_FOUND");
+  }
+  try {
+    if (!(await dependencies.s3Authorization.authorizeProject(context, projectId))) {
+      throw new AppError(404, "PROJECT_NOT_FOUND");
+    }
+  } catch (error) {
+    if (error instanceof AppError && error.code === "PROJECT_NOT_FOUND") throw error;
+    throw new AppError(404, "PROJECT_NOT_FOUND");
+  }
+  return dependencies.workflowService ?? serviceForRequest();
+}
+
+async function handleS3(
+  request: Request,
+  method: string,
+  segments: string[],
+  service: WorkflowService,
+  referenceId: UUID,
+): Promise<NextResponse> {
+  const projectId = segments[1] as UUID;
+
+  if (segments.length === 3) {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s3.getState(projectId), { status: 200 });
+  }
+
+  if (segments.length === 4 && segments[3] === "selection") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    const body = await jsonBody(request);
+    exactKeys(body, ["targetKind", "targetId", "expectedSelectionVersion"]);
+    if (body.targetKind !== "source_root" && body.targetKind !== "revision") {
+      throw new AppError(400, "INVALID_REQUEST", [{ field: "targetKind", code: "INVALID_VALUE" }]);
+    }
+    assertUuid(body.targetId, "targetId");
+    const result = service.s3.selectSource(
+      projectId,
+      body.targetKind,
+      body.targetId,
+      body.expectedSelectionVersion as number,
+      s2IdempotencyKeyFromHeader(request),
+      referenceId,
+    );
+    return NextResponse.json(result, { status: 200 });
+  }
+
+  if (segments.length === 4 && segments[3] === "refinements") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    const body = await jsonBody(request);
+    exactKeys(body, ["baseRevisionId", "expectedSelectionVersion", "intentText"]);
+    assertUuid(body.baseRevisionId, "baseRevisionId");
+    const result = service.s3.refine(
+      projectId,
+      body.baseRevisionId,
+      body.expectedSelectionVersion as number,
+      body.intentText,
+      s2IdempotencyKeyFromHeader(request),
+      referenceId,
+    );
+    return NextResponse.json(result, { status: result.replayed ? 200 : 202 });
+  }
+
+  if (segments.length === 5 && segments[3] === "refinements") {
+    assertUuid(segments[4], "cycleId");
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s3.getCycle(projectId, segments[4]), { status: 200 });
+  }
+
+  if (segments.length === 6 && segments[3] === "refinements" && segments[5] === "image-retry") {
+    assertUuid(segments[4], "cycleId");
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    const result = service.s3.imageRetry(projectId, segments[4], s2IdempotencyKeyFromHeader(request), referenceId);
+    return NextResponse.json(result, { status: result.replayed ? 200 : 202 });
+  }
+
+  if (segments.length === 6 && segments[3] === "refinements" && segments[5] === "assessment-retry") {
+    assertUuid(segments[4], "cycleId");
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    const result = service.s3.assessmentRetry(projectId, segments[4], s2IdempotencyKeyFromHeader(request), referenceId);
+    return NextResponse.json(result, { status: result.replayed ? 200 : 202 });
+  }
+
+  if (segments.length === 5 && segments[3] === "revisions") {
+    assertUuid(segments[4], "revisionId");
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s3.getRevision(projectId, segments[4]), { status: 200 });
+  }
+
+  if (segments.length === 6 && segments[3] === "revisions" && segments[5] === "preview") {
+    assertUuid(segments[4], "revisionId");
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    const result = await service.s3.getPreview(projectId, segments[4]);
+    return new NextResponse(new Uint8Array(result.bytes), {
+      status: 200,
+      headers: {
+        "content-type": "image/png",
+        "cache-control": "private, no-store",
+        "content-length": String(result.contentLength),
+      },
+    });
+  }
+
+  throw new AppError(404, "NOT_FOUND");
+}
+
 async function handle(
   request: Request,
   method: string,
@@ -484,10 +652,17 @@ async function handle(
 export async function handleApiRequest(
   request: Request,
   path: string[],
-  service: WorkflowService = serviceForRequest(),
+  supplied?: WorkflowService | ApiRequestDependencies,
 ): Promise<NextResponse> {
   const referenceId = requestReferenceId(request);
   try {
+    if (isS3Path(path)) {
+      const service = await authorizedS3Service(request, path, supplied);
+      return await handleS3(request, request.method.toUpperCase(), path, service, referenceId);
+    }
+    const service = isApiRequestDependencies(supplied)
+      ? supplied.workflowService ?? serviceForRequest()
+      : supplied ?? serviceForRequest();
     return await handle(request, request.method.toUpperCase(), path, service, referenceId);
   } catch (error) {
     return jsonError(referenceId, error);

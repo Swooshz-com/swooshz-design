@@ -19,6 +19,7 @@ import { flockSync } from "fs-ext-extra-prebuilt";
 import { AppError, type StoreState } from "./types";
 import { codePointLength, uuidV4Pattern } from "./utils";
 import { validateS2Graph } from "./s2-persistence";
+import { validateS3Collections, validateS3Graph } from "./s3-persistence";
 
 const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
@@ -111,6 +112,17 @@ export function emptyStoreState(): StoreState {
     s2Operations: [],
     s2Publications: [],
     s2Transitions: [],
+    s3Sources: [],
+    s3Selections: [],
+    s3SelectionEvents: [],
+    s3Revisions: [],
+    s3Assets: [],
+    s3Cycles: [],
+    s3ImageOperations: [],
+    s3Assessments: [],
+    s3AssessmentAttempts: [],
+    s3Publications: [],
+    s3Transitions: [],
   };
 }
 
@@ -694,7 +706,9 @@ export class JsonRepository {
         merged.generationOperations = [];
       }
       validateS2Collections(parsedRecord, merged);
+      validateS3Collections(parsedRecord, merged);
       validateS2Graph(merged);
+      validateS3Graph(merged);
       return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
@@ -1045,6 +1059,7 @@ export class JsonRepository {
       const result = mutation(fresh);
       try {
         validateS2Graph(fresh);
+        validateS3Graph(fresh);
       } catch {
         throw new AppError(500, "PERSISTENCE_FAILED");
       }
