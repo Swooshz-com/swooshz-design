@@ -47,10 +47,47 @@ export type S3ClaimManifest = {
   claims: S3ClaimDefinition[];
   rowCount: number;
   claimCount: number;
+};
+
+export type S3ClaimProofRecord = S3ClaimDefinition & {
+  status: "passed" | "skipped";
+  expectedResult: string;
+  actualResult: string;
+  provingTest: string;
+  observationFacts: string[];
+};
+
+export type S3ClaimProofComparison = {
+  passedRecords: S3ClaimProofRecord[];
   missingClaims: number;
   unknownClaims: number;
   duplicateClaims: number;
   skippedClaims: number;
+};
+
+const NORMATIVE_ROW_TEXT: Record<string, string> = {
+  "MODEL-001": "The S3 StoreState model contains exactly the accepted eleven S3 collections and reuses the global idempotency collection.",
+  "SOURCE-001": "S1-original and S2-repaired source eligibility are separate, provenance-bound classes with immutable source snapshots and exact object integrity.",
+  "SELECT-001": "Selection, reselection, rollback, CAS, idempotency, busy fencing, and retry-waiver transitions preserve one authoritative selection pointer.",
+  "GRAPH-001": "Source and refinement revisions are immutable, parent-bound, generation-bound, and cannot form a branch or cross-project lineage.",
+  "CYCLE-001": "A project has exactly two lifetime whole-concept refinement slots; failed or replayed work cannot create a third or consume a slot twice.",
+  "IMAGE-001": "Each image operation uses the fixed provider request and bounded dispatch opportunities with no mask, hidden retry, or media transformation rescue.",
+  "ASSESS-001": "Every valid changed-pixel output receives an S3-owned assessment using the frozen canonical input, compiler, request, and strict schema.",
+  "ASSESS-RETRY-001": "Assessment retry is separately bounded, reuses the exact committed output bytes, and never redispatches the image provider.",
+  "ACTIVATE-001": "Only a current fenced PASS or WARNING assessment activates; failure, unavailability, and stale success remain history while the prior good tip remains authoritative.",
+  "INTENT-001": "Refinement intent is untrusted, normalized and bounded exactly at the server boundary; semantic claims and hard facts remain server-owned.",
+  "HASH-001": "Canonical JCS and SHA-256 identities bind source, intent, refinement input, prompt, assessment input, and assessment prompt without nondeterministic fields.",
+  "MEDIA-001": "Accepted S3 media is PNG with the existing integrity profile and exact 1536x1024 dimensions, with no crop, pad, resize, rotation, or re-encode rescue.",
+  "PUB-001": "Publication records intent before object writes, use the private staging/final key forms, preserve no-overwrite, and recover conservatively.",
+  "CONC-001": "Repository locks, idempotency, claims, fencing, liveness, and conservative dead-versus-unknown handling prevent duplicate or stale mutation.",
+  "RECOVERY-001": "Crash and ambiguity recovery never manufactures success and never redispatches an operation whose external dispatch outcome is unknown.",
+  "FAIL-001": "Provider, media, publication, assessment, and source failures produce the fixed safe states while preserving the last authoritative good state.",
+  "ROUTE-001": "The closed S3 API route, request, response, status, preview, idempotency, and safe-error contract is enforced after authorization.",
+  "DTO-001": "Public DTOs expose only the closed S3 state/history projection and exclude private storage, hashes, prompts, provider metadata, claims, and credentials.",
+  "UI-001": "The client renders persisted S3 truth states and retry/history controls without inferring completion or introducing masks or local-region editing.",
+  "PRIV-001": "Logs, payloads, bytes, credentials, provider identifiers, private objects, and cross-project data remain outside public or unsafe observability surfaces.",
+  "AUTH-001": "Authorization precedes workflow construction and every lookup or mutation; absent or failed production context collapses externally to PROJECT_NOT_FOUND.",
+  "REG-001": "The final candidate preserves S1/S2 regressions, passes repository quality gates, changes no dependency, and binds evidence to the exact candidate head/tree.",
 };
 
 function evidenceClass(testId: string, variantId: string): S3EvidenceClass {
@@ -81,19 +118,31 @@ export function deriveClaimManifest(variants: Record<string, readonly string[]> 
     testId,
     claimId: testId + ":" + variantId,
     variantId,
-    normativeRowText: testId,
+    normativeRowText: NORMATIVE_ROW_TEXT[testId] ?? "The accepted S3 contract obligation for " + testId + ".",
     evidenceClass: evidenceClass(testId, variantId),
     fixtureSetup: fixtureSetup(testId, variantId),
   })));
-  const unique = new Set(claims.map((claim) => claim.claimId));
   return {
     rows,
     claims,
     rowCount: rows.length,
     claimCount: claims.length,
-    missingClaims: 0,
-    unknownClaims: 0,
-    duplicateClaims: claims.length - unique.size,
-    skippedClaims: 0,
+  };
+}
+
+export function compareClaimProofs(manifest: S3ClaimManifest, records: S3ClaimProofRecord[]): S3ClaimProofComparison {
+  const expectedIds = new Set(manifest.claims.map((claim) => claim.claimId));
+  const counts = new Map<string, number>();
+  for (const record of records) counts.set(record.claimId, (counts.get(record.claimId) ?? 0) + 1);
+  const missingClaims = manifest.claims.filter((claim) => !counts.has(claim.claimId)).length;
+  const unknownClaims = records.filter((record) => !expectedIds.has(record.claimId)).length;
+  const duplicateClaims = Array.from(counts.values()).reduce((sum, count) => sum + (count > 1 ? count - 1 : 0), 0);
+  const skippedClaims = records.filter((record) => expectedIds.has(record.claimId) && record.status === "skipped").length;
+  return {
+    passedRecords: records.filter((record) => record.status === "passed"),
+    missingClaims,
+    unknownClaims,
+    duplicateClaims,
+    skippedClaims,
   };
 }

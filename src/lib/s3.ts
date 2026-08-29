@@ -343,6 +343,65 @@ export class S3WorkflowService {
     } catch { throw fail(409, "S3_SOURCE_INTEGRITY_MISMATCH"); }
   }
 
+  private storedSourceIsValid(option: EligibleSource, validateS2Media: boolean): boolean {
+    try {
+      const bytes = this.objects.read(option.selectedStorageKey);
+      if (bytes.byteLength !== option.selectedByteSize || sha256(bytes) !== option.selectedSha256) return false;
+      if (validateS2Media) {
+        assertS2Png(bytes);
+        if (bytes.readUInt32BE(16) !== option.selectedWidth || bytes.readUInt32BE(20) !== option.selectedHeight) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private repairedSourceOption(
+    state: StoreState,
+    projectId: UUID,
+    generationSetId: UUID,
+    input: S2InputVersion,
+    run: S2QaRun,
+    source: S2InputVersion["sourceCandidates"][number] | undefined,
+    candidate: ConceptCandidate | undefined,
+    qa: S2QaCandidateResult | undefined,
+    candidateIndex: 1 | 2 | 3 | 4,
+    repair: S2RepairAttempt,
+  ): EligibleSource | null {
+    if (!source || !candidate || !qa) return null;
+    if (candidate.projectId !== projectId || candidate.generationSetId !== generationSetId) return null;
+    if (input.projectId !== projectId || input.sourceGenerationSetId !== generationSetId) return null;
+    if (run.projectId !== projectId || run.inputVersionId !== input.id || run.sourceGenerationSetId !== generationSetId) return null;
+    if (qa.qaRunId !== run.id || qa.inputVersionId !== input.id || qa.candidateId !== candidate.candidateId || qa.candidateIndex !== candidateIndex) return null;
+    if (qa.sourceAssetId !== source.sourceAssetId || qa.sourceByteSize !== source.sourceByteSize || qa.sourceSha256 !== source.sourceSha256 || qa.repairAttemptId !== repair.id) return null;
+    if (repair.projectId !== projectId || repair.qaRunId !== run.id || repair.inputVersionId !== input.id || repair.candidateId !== candidate.candidateId) return null;
+    if (repair.sourceAssetId !== source.sourceAssetId || repair.sourceByteSize !== source.sourceByteSize || repair.sourceSha256 !== source.sourceSha256) return null;
+    if (repair.status !== "re_qa_pass" && repair.status !== "re_qa_warning") return null;
+    if (!repair.derivedCandidateId || !repair.reQaCandidateResultId || !repair.outputSha256) return null;
+
+    const derived = state.s2DerivedCandidates.find((item) => item.id === repair.derivedCandidateId);
+    const reQa = state.s2ReQaResults.find((item) => item.id === repair.reQaCandidateResultId);
+    if (!derived || !reQa) return null;
+    if (derived.projectId !== projectId || derived.sourceGenerationSetId !== generationSetId || derived.inputVersionId !== input.id || derived.qaRunId !== run.id) return null;
+    if (derived.sourceCandidateId !== candidate.candidateId || derived.repairAttemptId !== repair.id || derived.sourceAssetId !== source.sourceAssetId) return null;
+    if (derived.sourceByteSize !== source.sourceByteSize || derived.sourceSha256 !== source.sourceSha256 || derived.outputSha256 !== repair.outputSha256) return null;
+    if (derived.storageKeyNormalized !== `projects/${projectId}/s2/repairs/${repair.id}/output.png`) return null;
+    if (reQa.qaRunId !== run.id || reQa.inputVersionId !== input.id || reQa.candidateId !== candidate.candidateId || reQa.candidateIndex !== candidateIndex) return null;
+    if (reQa.sourceAssetId !== source.sourceAssetId || reQa.sourceByteSize !== source.sourceByteSize || reQa.sourceSha256 !== source.sourceSha256) return null;
+    if (reQa.derivedCandidateId !== derived.id || reQa.repairAttemptId !== repair.id || reQa.phase !== "re_qa") return null;
+    if (reQa.status !== "pass" && reQa.status !== "warning") return null;
+
+    const option: EligibleSource = {
+      sourceCandidateId: candidate.candidateId, candidate, candidateIndex, sourceKind: "s2_repaired",
+      selectedAssetKind: "s2_derived_candidate", selectedAssetId: derived.id, selectedStorageKey: derived.storageKeyNormalized,
+      selectedSha256: derived.outputSha256, selectedByteSize: derived.normalizedBytes, selectedWidth: derived.width,
+      selectedHeight: derived.height, selectedPixelCount: derived.width * derived.height, selectedDecodedRgbaBytes: derived.width * derived.height * 4,
+      sourceQaResult: qa, sourceS2RepairAttempt: repair, sourceS2ReQaResult: reQa, sourceS2DerivedCandidate: derived, input, qaRun: run,
+    };
+    return this.storedSourceIsValid(option, true) ? option : null;
+  }
+
   private sourceOptions(state: StoreState, projectId: UUID): { input: S2InputVersion; run: S2QaRun; options: EligibleSource[]; screened: PublicS3ScreenedCandidate[] } {
     const { generationSet } = this.generation(state, projectId);
     const input = this.inputFor(state, projectId, generationSet.generationSetId);
@@ -357,24 +416,12 @@ export class S3WorkflowService {
       const sourceQaStatus: PublicS3ScreenedCandidate["sourceQaStatus"] = qa?.status === "pass" ? "PASS" : qa?.status === "warning" ? "WARNING" : qa?.status === "material_fail" ? "MATERIAL_FAIL" : "QA_UNAVAILABLE";
       const originalSourceId = qa && (qa.status === "pass" || qa.status === "warning") && source && candidate ? candidate.candidateId : null;
       const repairedSourceIds: UUID[] = [];
-      if (source && candidate && qa && (qa.status === "pass" || qa.status === "warning")) {
+      if (source && candidate && qa) {
         const repairs = state.s2Repairs.filter((item) => item.projectId === projectId && item.candidateId === candidate.candidateId && (item.status === "re_qa_pass" || item.status === "re_qa_warning"));
         for (const repair of repairs) {
-          const derived = repair.derivedCandidateId ? state.s2DerivedCandidates.find((item) => item.id === repair.derivedCandidateId) : undefined;
-          const reQa = repair.reQaCandidateResultId ? state.s2ReQaResults.find((item) => item.id === repair.reQaCandidateResultId) : undefined;
-          if (!derived || !reQa || (reQa.status !== "pass" && reQa.status !== "warning")) continue;
-          const option: EligibleSource = {
-            sourceCandidateId: candidate.candidateId, candidate, candidateIndex: index, sourceKind: "s2_repaired",
-            selectedAssetKind: "s2_derived_candidate", selectedAssetId: derived.id, selectedStorageKey: derived.storageKeyNormalized,
-            selectedSha256: derived.outputSha256, selectedByteSize: derived.normalizedBytes, selectedWidth: derived.width,
-            selectedHeight: derived.height, selectedPixelCount: derived.width * derived.height, selectedDecodedRgbaBytes: derived.width * derived.height * 4,
-            sourceQaResult: qa, sourceS2RepairAttempt: repair, sourceS2ReQaResult: reQa, sourceS2DerivedCandidate: derived, input, qaRun: run,
-          };
-          try {
-            const bytes = this.objects.read(option.selectedStorageKey);
-            if (bytes.byteLength !== option.selectedByteSize || sha256(bytes) !== option.selectedSha256) continue;
-          } catch { continue; }
-          options.push(option); repairedSourceIds.push(derived.id);
+          const option = this.repairedSourceOption(state, projectId, generationSet.generationSetId, input, run, source, candidate, qa, index, repair);
+          if (!option) continue;
+          options.push(option); repairedSourceIds.push(option.selectedAssetId);
         }
       }
       if (source && candidate && qa && (qa.status === "pass" || qa.status === "warning")) {
@@ -387,12 +434,7 @@ export class S3WorkflowService {
             selectedHeight: source.sourceHeight, selectedPixelCount: source.sourcePixelCount, selectedDecodedRgbaBytes: source.sourceDecodedRgbaBytes,
             sourceQaResult: qa, sourceS2RepairAttempt: null, sourceS2ReQaResult: null, sourceS2DerivedCandidate: null, input, qaRun: run,
           };
-          try {
-            const bytes = this.objects.read(option.selectedStorageKey);
-            if (bytes.byteLength === option.selectedByteSize && sha256(bytes) === option.selectedSha256) {
-              options.push(option);
-            }
-          } catch { /* ineligible original source */ }
+          if (this.storedSourceIsValid(option, false)) options.push(option);
         }
       }
       screened.push({ candidateIndex: index, sourceQaStatus, originalSourceId, repairedSourceIds });
@@ -401,40 +443,7 @@ export class S3WorkflowService {
   }
 
   private sourceOptionsSync(state: StoreState, projectId: UUID): { input: S2InputVersion; run: S2QaRun; options: EligibleSource[]; screened: PublicS3ScreenedCandidate[] } {
-    // sourceOptions is intentionally side-effect free; this synchronous view
-    // mirrors its object-integrity checks without requiring async media decode.
-    const { generationSet } = this.generation(state, projectId);
-    const input = this.inputFor(state, projectId, generationSet.generationSetId);
-    const run = this.qaRunFor(state, input);
-    const latest = latestSourceQaResults(run.candidateResults);
-    const options: EligibleSource[] = [];
-    const screened: PublicS3ScreenedCandidate[] = [];
-    for (const index of [1, 2, 3, 4] as const) {
-      const source = input.sourceCandidates.find((item) => item.candidateIndex === index);
-      const candidate = state.candidates.find((item) => item.candidateId === source?.candidateId && item.projectId === projectId && item.generationSetId === generationSet.generationSetId);
-      const qa = latest.find((item) => item.candidateIndex === index && item.candidateId === source?.candidateId);
-      const sourceQaStatus: PublicS3ScreenedCandidate["sourceQaStatus"] = qa?.status === "pass" ? "PASS" : qa?.status === "warning" ? "WARNING" : qa?.status === "material_fail" ? "MATERIAL_FAIL" : "QA_UNAVAILABLE";
-      const originalSourceId = qa && (qa.status === "pass" || qa.status === "warning") && source && candidate ? candidate.candidateId : null;
-      const repairedSourceIds: UUID[] = [];
-      if (source && candidate && qa && (qa.status === "pass" || qa.status === "warning")) {
-        for (const repair of state.s2Repairs.filter((item) => item.projectId === projectId && item.candidateId === candidate.candidateId && (item.status === "re_qa_pass" || item.status === "re_qa_warning"))) {
-          const derived = repair.derivedCandidateId ? state.s2DerivedCandidates.find((item) => item.id === repair.derivedCandidateId) : undefined;
-          const reQa = repair.reQaCandidateResultId ? state.s2ReQaResults.find((item) => item.id === repair.reQaCandidateResultId) : undefined;
-          if (!derived || !reQa || (reQa.status !== "pass" && reQa.status !== "warning")) continue;
-          try { const bytes = this.objects.read(derived.storageKeyNormalized); if (bytes.byteLength !== derived.normalizedBytes || sha256(bytes) !== derived.outputSha256) continue; } catch { continue; }
-          options.push({ sourceCandidateId: candidate.candidateId, candidate, candidateIndex: index, sourceKind: "s2_repaired", selectedAssetKind: "s2_derived_candidate", selectedAssetId: derived.id, selectedStorageKey: derived.storageKeyNormalized, selectedSha256: derived.outputSha256, selectedByteSize: derived.normalizedBytes, selectedWidth: derived.width, selectedHeight: derived.height, selectedPixelCount: derived.width * derived.height, selectedDecodedRgbaBytes: derived.width * derived.height * 4, sourceQaResult: qa, sourceS2RepairAttempt: repair, sourceS2ReQaResult: reQa, sourceS2DerivedCandidate: derived, input, qaRun: run });
-          repairedSourceIds.push(derived.id);
-        }
-      }
-      if (source && candidate && qa && (qa.status === "pass" || qa.status === "warning")) {
-        const concept = state.conceptAssets.find((item) => item.assetId === candidate.assetId && item.projectId === projectId && item.generationSetId === generationSet.generationSetId);
-        if (concept) {
-          try { const bytes = this.objects.read(concept.storageKey); if (bytes.byteLength === concept.byteSize && sha256(bytes) === concept.sha256) options.push({ sourceCandidateId: candidate.candidateId, candidate, candidateIndex: index, sourceKind: "s1_original", selectedAssetKind: "s1_concept_asset", selectedAssetId: concept.assetId, selectedStorageKey: concept.storageKey, selectedSha256: concept.sha256, selectedByteSize: concept.byteSize, selectedWidth: source.sourceWidth, selectedHeight: source.sourceHeight, selectedPixelCount: source.sourcePixelCount, selectedDecodedRgbaBytes: source.sourceDecodedRgbaBytes, sourceQaResult: qa, sourceS2RepairAttempt: null, sourceS2ReQaResult: null, sourceS2DerivedCandidate: null, input, qaRun: run }); } catch { /* not eligible */ }
-        }
-      }
-      screened.push({ candidateIndex: index, sourceQaStatus, originalSourceId, repairedSourceIds });
-    }
-    return { input, run, options, screened };
+    return this.sourceOptions(state, projectId);
   }
 
   private findSourceTarget(state: StoreState, projectId: UUID, targetId: UUID): EligibleSource | null {

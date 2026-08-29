@@ -12,8 +12,9 @@ import { handleApiRequest, type ApiRequestDependencies } from "../src/lib/api";
 import { compileS3Assessment, compileS3Refinement, renderS3AssessmentPrompt, renderS3RefinementPrompt, S3_ASSESSMENT_JSON_SCHEMA } from "../src/lib/s3-compiler";
 import { buildS3AssessmentRequest, buildS3ImageRequest } from "../src/lib/s3-provider";
 import { inspectExactS3Png, createExactS3FixturePng } from "../src/lib/s3-media";
-import { deriveClaimManifest } from "./s3-evidence-manifest";
-import { sha256, jcs } from "../src/lib/utils";
+import { compareClaimProofs, deriveClaimManifest } from "./s3-evidence-manifest";
+import { recordS3ClaimProof, S3_SOURCE_ELIGIBILITY_TEST_NAME } from "./s3-proof";
+import { cloneJson, sha256, jcs } from "../src/lib/utils";
 
 const ONE_PIXEL_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -33,7 +34,7 @@ function briefData(): any {
   };
 }
 
-function qaPayload(input: any): any {
+function qaPayload(input: any, mode: "pass" | "warning" | "material_fail" = "pass"): any {
   return {
     requirements: input.requirements.map((item: any) => ({
       requirementId: item.requirementId,
@@ -44,7 +45,12 @@ function qaPayload(input: any): any {
       confidence: 0.99,
       evidence: "S3 local fixture observation",
     })),
-    designRules: input.designRules.map((item: any) => ({ ruleId: item.ruleId, observed: "compliant", confidence: 0.99, evidence: "S3 local fixture observation" })),
+    designRules: input.designRules.map((item: any) => ({
+      ruleId: item.ruleId,
+      observed: mode === "material_fail" && item.ruleId === "structure.overhead-support" || mode === "warning" && item.ruleId === "branding.style" ? "non_compliant" : "compliant",
+      confidence: 0.99,
+      evidence: "S3 local fixture observation",
+    })),
   };
 }
 
@@ -119,6 +125,130 @@ async function ready(fixtureValue: Fixture): Promise<{ sourceRevisionId: string;
 }
 
 function cleanup(value: Fixture): void { rmSync(value.root, { recursive: true, force: true }); }
+
+test(S3_SOURCE_ELIGIBILITY_TEST_NAME, async () => {
+  const qaCalls = new Map<number, number>();
+  const provider = new MockOpenAIProvider({
+    briefData: briefData(),
+    s2RepairResponses: [ONE_PIXEL_PNG, ONE_PIXEL_PNG],
+    s2QaResponseFactory: (input) => {
+      const call = qaCalls.get(input.candidateIndex) ?? 0;
+      qaCalls.set(input.candidateIndex, call + 1);
+      if (input.candidateIndex === 1 && call === 0) return qaPayload(input, "material_fail");
+      if (input.candidateIndex === 2 && call === 0) return qaPayload(input, "material_fail");
+      if (input.candidateIndex === 2 && call === 1) return qaPayload(input, "warning");
+      if (input.candidateIndex === 4 && call === 0) return qaPayload(input, "warning");
+      return qaPayload(input, "pass");
+    },
+  });
+  const value = fixture({ provider });
+  try {
+    value.service.s2.getReferenceDraft(value.projectId);
+    const bound = await value.service.s2.bindQa(value.projectId, value.generationSetId, 1, randomUUID(), randomUUID());
+    await waitFor(() => value.repository.state().s2QaRuns.find((item) => item.id === bound.qaRun.id)?.status, (status) => status === "completed");
+
+    const input = value.repository.state().s2Inputs.find((item) => item.id === bound.qaRun.inputVersionId);
+    assert.ok(input);
+    const sourceOne = input.sourceCandidates.find((item) => item.candidateIndex === 1);
+    const sourceTwo = input.sourceCandidates.find((item) => item.candidateIndex === 2);
+    assert.ok(sourceOne);
+    assert.ok(sourceTwo);
+    const initialRun = value.repository.state().s2QaRuns.find((item) => item.id === bound.qaRun.id);
+    assert.ok(initialRun);
+    assert.equal(initialRun.candidateResults.find((item) => item.candidateIndex === 1)?.status, "material_fail");
+    assert.equal(initialRun.candidateResults.find((item) => item.candidateIndex === 2)?.status, "material_fail");
+    assert.equal(initialRun.candidateResults.find((item) => item.candidateIndex === 3)?.status, "pass");
+    assert.equal(initialRun.candidateResults.find((item) => item.candidateIndex === 4)?.status, "warning");
+
+    await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, sourceOne.candidateId, bound.qaRun.inputVersionId, randomUUID(), randomUUID());
+    await waitFor(() => value.repository.state().s2Repairs.find((item) => item.candidateId === sourceOne.candidateId)?.status, (status) => status === "re_qa_pass");
+    await value.service.s2.repairCandidate(value.projectId, bound.qaRun.id, sourceTwo.candidateId, bound.qaRun.inputVersionId, randomUUID(), randomUUID());
+    await waitFor(() => value.repository.state().s2Repairs.find((item) => item.candidateId === sourceTwo.candidateId)?.status, (status) => status === "re_qa_warning");
+
+    const afterRepair = value.service.s3.getState(value.projectId);
+    const screenedOne = afterRepair.screenedCandidates.find((item) => item.candidateIndex === 1)!;
+    const screenedTwo = afterRepair.screenedCandidates.find((item) => item.candidateIndex === 2)!;
+    const screenedThree = afterRepair.screenedCandidates.find((item) => item.candidateIndex === 3)!;
+    const screenedFour = afterRepair.screenedCandidates.find((item) => item.candidateIndex === 4)!;
+    assert.equal(screenedOne.sourceQaStatus, "MATERIAL_FAIL");
+    assert.equal(screenedTwo.sourceQaStatus, "MATERIAL_FAIL");
+    assert.equal(screenedOne.originalSourceId, null);
+    assert.equal(screenedTwo.originalSourceId, null);
+    assert.ok(screenedOne.repairedSourceIds.length === 1);
+    assert.ok(screenedTwo.repairedSourceIds.length === 1);
+    assert.ok(screenedThree.originalSourceId);
+    assert.ok(screenedFour.originalSourceId);
+    assert.equal(screenedFour.sourceQaStatus, "WARNING");
+
+    const repairOne = value.repository.state().s2Repairs.find((item) => item.candidateId === sourceOne.candidateId)!;
+    const repairTwo = value.repository.state().s2Repairs.find((item) => item.candidateId === sourceTwo.candidateId)!;
+    const derivedOne = value.repository.state().s2DerivedCandidates.find((item) => item.id === repairOne.derivedCandidateId)!;
+    const derivedTwo = value.repository.state().s2DerivedCandidates.find((item) => item.id === repairTwo.derivedCandidateId)!;
+    const reQaOne = value.repository.state().s2ReQaResults.find((item) => item.id === repairOne.reQaCandidateResultId)!;
+    const reQaTwo = value.repository.state().s2ReQaResults.find((item) => item.id === repairTwo.reQaCandidateResultId)!;
+    assert.equal(reQaOne.status, "pass");
+    assert.equal(reQaTwo.status, "warning");
+
+    const selected = value.service.s3.selectSource(value.projectId, "source_root", derivedOne.id, 0, randomUUID(), randomUUID());
+    assert.equal(selected.replayed, false);
+    const selectedSource = value.repository.state().s3Sources[0];
+    assert.equal(selectedSource.sourceKind, "s2_repaired");
+    assert.equal(selectedSource.selectedAssetId, derivedOne.id);
+    assert.equal(selectedSource.canonicalSourceBinding.sourceKind, "s2_repaired");
+    assert.equal(selectedSource.canonicalSourceBinding.s2SourceQaResultId, value.repository.state().s2QaRuns.find((item) => item.id === bound.qaRun.id)!.candidateResults.find((item) => item.candidateIndex === 1)!.id);
+    assert.equal(selectedSource.canonicalSourceBinding.s2ReQaResultId, reQaOne.id);
+    assert.equal(selectedSource.canonicalSourceBinding.eligibilityResultId, reQaOne.id);
+    assert.equal(selectedSource.canonicalSourceBinding.eligibilityStatus, "pass");
+    assert.equal(selectedSource.canonicalSourceBinding.eligibilityVerdict, "PASS");
+
+    const invalidGeneration = cloneJson(value.repository.state());
+    invalidGeneration.s2DerivedCandidates.find((item) => item.id === derivedTwo.id)!.sourceGenerationSetId = randomUUID();
+    const invalidOptions = (value.service.s3 as any).sourceOptions(invalidGeneration, value.projectId);
+    assert.equal(invalidOptions.screened.find((item: any) => item.candidateIndex === 2).repairedSourceIds.includes(derivedTwo.id), false);
+
+    value.objects.remove(derivedOne.storageKeyNormalized);
+    const afterObjectLoss = value.service.s3.getState(value.projectId);
+    assert.equal(afterObjectLoss.screenedCandidates.find((item) => item.candidateIndex === 1)!.repairedSourceIds.includes(derivedOne.id), false);
+
+    const proofTest = "tests/s3.test.ts::" + S3_SOURCE_ELIGIBILITY_TEST_NAME;
+    const facts = (claim: string, ...items: string[]) => ["claimId=" + claim, "provingTest=" + proofTest, ...items];
+    recordS3ClaimProof({ testId: "SOURCE-001", variantId: "s1-pass", expectedResult: "A PASS original S1/S2 source is enumerated as an s1_original source.", actualResult: "Candidate 3 retained originalSourceId=" + screenedThree.originalSourceId + " with sourceQaStatus=PASS.", provingTest: proofTest, observationFacts: facts("SOURCE-001:s1-pass", "candidateIndex=3", "sourceKind=s1_original") });
+    recordS3ClaimProof({ testId: "SOURCE-001", variantId: "s1-warning", expectedResult: "A WARNING original S1/S2 source is eligible as an s1_original source.", actualResult: "Candidate 4 retained originalSourceId=" + screenedFour.originalSourceId + " with sourceQaStatus=WARNING.", provingTest: proofTest, observationFacts: facts("SOURCE-001:s1-warning", "candidateIndex=4", "sourceKind=s1_original") });
+    recordS3ClaimProof({ testId: "SOURCE-001", variantId: "s2-repaired-pass", expectedResult: "A valid repaired PASS is eligible even when the original QA was MATERIAL_FAIL.", actualResult: "Candidate 1 had original=MATERIAL_FAIL, reQa=pass, and repairedSourceId=" + derivedOne.id + ".", provingTest: proofTest, observationFacts: facts("SOURCE-001:s2-repaired-pass", "candidateIndex=1", "originalQa=MATERIAL_FAIL", "reQa=pass", "sourceKind=s2_repaired") });
+    recordS3ClaimProof({ testId: "SOURCE-001", variantId: "s2-repaired-warning", expectedResult: "A valid repaired WARNING is eligible even when the original QA was MATERIAL_FAIL.", actualResult: "Candidate 2 had original=MATERIAL_FAIL, reQa=warning, and repairedSourceId=" + derivedTwo.id + ".", provingTest: proofTest, observationFacts: facts("SOURCE-001:s2-repaired-warning", "candidateIndex=2", "originalQa=MATERIAL_FAIL", "reQa=warning", "sourceKind=s2_repaired") });
+    recordS3ClaimProof({ testId: "SOURCE-001", variantId: "original-retained", expectedResult: "Original eligible candidates remain available when other candidates are repaired.", actualResult: "Candidates 3 and 4 retained their original source IDs after repairs for candidates 1 and 2.", provingTest: proofTest, observationFacts: facts("SOURCE-001:original-retained", "candidateIndex=3,4", "repairedCandidates=1,2") });
+    recordS3ClaimProof({ testId: "SOURCE-001", variantId: "object-integrity", expectedResult: "A repaired source whose committed private object is missing is not enumerated as eligible.", actualResult: "Removing the derived object removed derivedOne.id from the screened repaired-source options.", provingTest: proofTest, observationFacts: facts("SOURCE-001:object-integrity", "removedKey=" + derivedOne.storageKeyNormalized, "repairedSourcePresent=false") });
+    recordS3ClaimProof({ testId: "SOURCE-001", variantId: "generation-binding", expectedResult: "A repaired candidate copied to another generation cannot satisfy source eligibility.", actualResult: "A cloned state with derivedTwo.sourceGenerationSetId changed to another UUID yielded no repaired option for candidate 2.", provingTest: proofTest, observationFacts: facts("SOURCE-001:generation-binding", "candidateIndex=2", "generationBinding=reject") });
+
+    const failedCalls = new Map<number, number>();
+    const failedProvider = new MockOpenAIProvider({
+      briefData: briefData(),
+      s2RepairResponses: [new ProviderFailure("PROVIDER_TIMEOUT")],
+      s2QaResponseFactory: (input) => {
+        const call = failedCalls.get(input.candidateIndex) ?? 0;
+        failedCalls.set(input.candidateIndex, call + 1);
+        return input.candidateIndex === 1 && call === 0 ? qaPayload(input, "material_fail") : qaPayload(input, "pass");
+      },
+    });
+    const failedValue = fixture({ provider: failedProvider });
+    try {
+      failedValue.service.s2.getReferenceDraft(failedValue.projectId);
+      const failedBound = await failedValue.service.s2.bindQa(failedValue.projectId, failedValue.generationSetId, 1, randomUUID(), randomUUID());
+      await waitFor(() => failedValue.repository.state().s2QaRuns.find((item) => item.id === failedBound.qaRun.id)?.status, (status) => status === "completed");
+      const failedInput = failedValue.repository.state().s2Inputs.find((item) => item.id === failedBound.qaRun.inputVersionId)!;
+      const failedSource = failedInput.sourceCandidates.find((item) => item.candidateIndex === 1)!;
+      await failedValue.service.s2.repairCandidate(failedValue.projectId, failedBound.qaRun.id, failedSource.candidateId, failedBound.qaRun.inputVersionId, randomUUID(), randomUUID());
+      await waitFor(() => failedValue.repository.state().s2Repairs.find((item) => item.candidateId === failedSource.candidateId)?.status, (status) => status === "failed");
+      const failedState = failedValue.service.s3.getState(failedValue.projectId);
+      assert.deepEqual(failedState.screenedCandidates.find((item) => item.candidateIndex === 1)!.repairedSourceIds, []);
+      recordS3ClaimProof({ testId: "SOURCE-001", variantId: "failed-reject", expectedResult: "A failed S2 repair cannot create an eligible repaired source.", actualResult: "The repair status was failed and candidate 1 exposed no repairedSourceIds.", provingTest: proofTest, observationFacts: facts("SOURCE-001:failed-reject", "repairStatus=failed", "repairedSourcePresent=false") });
+    } finally {
+      cleanup(failedValue);
+    }
+  } finally {
+    cleanup(value);
+  }
+});
 
 test("S3 compiler and provider requests preserve exact deterministic identities", async () => {
   const ids = { projectId: randomUUID(), generationSetId: randomUUID(), selectionStateId: randomUUID(), sourceSnapshotId: randomUUID(), baseRevisionId: randomUUID(), assetId: randomUUID() };
@@ -329,10 +459,13 @@ test("S3 fixed evidence manifest derives 22 rows and 189 unique claims", () => {
   const manifest = deriveClaimManifest();
   assert.equal(manifest.rowCount, 22);
   assert.equal(manifest.claimCount, 189);
-  assert.equal(manifest.missingClaims, 0);
-  assert.equal(manifest.unknownClaims, 0);
-  assert.equal(manifest.duplicateClaims, 0);
-  assert.equal(manifest.skippedClaims, 0);
+  assert.equal(new Set(manifest.claims.map((claim) => claim.claimId)).size, 189);
+  assert.match(manifest.claims[0].normativeRowText, /StoreState/);
+  const emptyComparison = compareClaimProofs(manifest, []);
+  assert.equal(emptyComparison.missingClaims, 189);
+  assert.equal(emptyComparison.unknownClaims, 0);
+  assert.equal(emptyComparison.duplicateClaims, 0);
+  assert.equal(emptyComparison.skippedClaims, 0);
   assert.equal(manifest.claims[0].claimId, "MODEL-001:defaults");
   assert.equal(manifest.claims.at(-1)?.claimId, "REG-001:stale-head-reject");
 });
