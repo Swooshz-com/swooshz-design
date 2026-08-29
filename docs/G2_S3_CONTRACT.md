@@ -15,13 +15,17 @@ Accepted G1 record: issue #8 comment 5454359060
 
 Controlling G2 acceptance: issue #8 comment 5460647059
 
-Repo-native persistence authority: issue #8 comment 5461041714
+Persistence fidelity AMEND 1/2: issue #8 comment 5461382494
 
 Exact compiler/schema durability appendix: issue #8 comment 5461110873
 
 Exact evidence/matrix durability appendix: issue #8 comment 5461112187
 
-Parent reconciliation: issue #1 comment 5461112799
+Recovered persisted-state/model appendix: issue #8 comment 5461596395
+
+Recovered auth/API/DTO/error appendix: issue #8 comment 5461598365
+
+Parent reconciliation: issue #1 comment 5461599313
 
 Canonical base SHA: 21754d6b66b9833981db0e513b2be6b3e89e0834
 
@@ -326,10 +330,10 @@ to the exact project, generation set, confirmed brief, S2 input, source
 snapshot, and source-root revision. The mutable current pointer is protected
 by a monotonic selection version and compare-and-swap.
 
-Selection history records the operation, prior selection version, resulting
-selection version, old and new source identities, source snapshot/root
-revision, actor and request identity, timestamp, and outcome. History records
-are immutable.
+Selection history records immutable event kind, prior and resulting selection
+versions, source snapshot/root revision identity, cycle and assessment identity
+when applicable, idempotency/request references, timestamp, and outcome. History
+records are append-only and immutable.
 
 The selected source and current refinement pointer are not inferred from
 browser state. All mutation requests MUST include the expected current version
@@ -384,9 +388,10 @@ exact current authorized tip and pass the same parent and lineage fences; the
 rollback event itself is never used to rewrite an immutable parent relation.
 
 The append-only history distinguishes rollback from activation and preserves
-the prior active pointer. The rollback target remains the authoritative active
-tip until a later valid, current, fenced PASS/WARNING refinement atomically
-activates.
+the prior active pointer. If rollback invalidates an unused retry right, the
+same transaction waives it with reason `rolled_back`. The rollback target remains
+the authoritative active tip until a later valid, current, fenced PASS/WARNING
+refinement atomically activates.
 
 ### 4.5 Activation
 
@@ -406,8 +411,8 @@ pointer. MATERIAL_FAIL, QA_UNAVAILABLE, provider-unavailable, invalid-media,
 publication failure, and ambiguous outcomes MUST NOT activate. The prior good
 tip remains active.
 
-Activation, revision status, assessment status, and current-pointer update
-are one transaction. Replays are idempotent and return the winning result.
+Activation, assessment disposition, activation event, and current-pointer
+update are one transaction. Replays are idempotent and return the winning result.
 
 ## 5. Bounded refinement cycles and retry accounting
 
@@ -621,15 +626,16 @@ const canonicalRefinementInput = {
 
 The exact refinement input hash is:
 
-    refinementInputHash =
-      sha256(UTF-8(jcs(canonicalRefinementInput)))
+~~~text
+refinementInputHash =
+sha256(UTF-8(jcs(canonicalRefinementInput)))
+~~~
 
 The following fields are mandatory bindings, not implementation suggestions:
 project/generation, selection, confirmed brief, S2 input, geometry and
 requirements, design rules, source snapshot and source binding, base revision
 and selection version, base asset identity, empty reference/logo arrays,
 normalized intent and intent hash, exact image request, and compiler version.
-
 
 ### 6.5 Exact refinement prompt
 
@@ -652,8 +658,10 @@ OUTPUT: Return one whole-image concept refinement at 1536x1024. Do not use a mas
 
 The prompt hash is:
 
-    refinementPromptHash =
-      sha256(UTF-8(exactRefinementPromptText))
+~~~text
+promptHash =
+sha256(UTF-8(exactPromptText))
+~~~
 
 No provider or SDK may append hidden instructions, change the literal,
 introduce a mask, add references or logos, or perform an undisclosed retry.
@@ -737,8 +745,7 @@ S3Assessment is an immutable S3-owned record. It retains:
 - sourceBindingHash, intentHash, refinementInputHash;
 - assessmentInputHash and assessmentPromptHash;
 - assessment compiler/schema/model identities;
-- provider dispatch and response disposition;
-- the normalized strict assessment object;
+- the linked assessment-attempt provider disposition and normalized observations;
 - the derived PASS, WARNING, MATERIAL_FAIL, or QA_UNAVAILABLE status.
 
 The assessment never reads mutable current project data in place of its frozen
@@ -822,8 +829,10 @@ const canonicalAssessmentInput = {
 
 The exact assessment input hash is:
 
-    assessmentInputHash =
-      sha256(UTF-8(jcs(canonicalAssessmentInput)))
+~~~text
+assessmentInputHash =
+sha256(UTF-8(jcs(canonicalAssessmentInput)))
+~~~
 
 The assessment input is bound to the exact revision output and its frozen
 upstream facts. It does not include operation IDs, leases, timestamps,
@@ -848,8 +857,10 @@ TASK: Return one strict s3-assessment-v1 object containing observations for ever
 
 The assessment prompt hash is exactly:
 
-    assessmentPromptHash =
-      sha256(UTF-8(exactAssessmentPromptText))
+~~~text
+assessmentPromptHash =
+sha256(UTF-8(exactAssessmentPromptText))
+~~~
 
 ### 8.5 Full strict assessment schema
 
@@ -943,19 +954,27 @@ an observation for every supplied requirement and applicable design rule.
 
 For every assessment dispatch, S3 MUST use exactly:
 
-| Field | Value |
-| --- | --- |
-| Endpoint | /v1/responses |
-| Model | gpt-5.4-mini-2026-03-17 |
-| Store | false |
-| Prompt | exact assessment prompt above |
-| Image input | exactly one normalized PNG, detail high |
-| References/logos | absent |
-| Predecessor image | absent |
-| Response format | json_schema |
-| Schema name | s3_assessment_v1 |
-| Strict | true |
-| Schema | S3_ASSESSMENT_JSON_SCHEMA |
+~~~text
+endpoint: /v1/responses
+model: gpt-5.4-mini-2026-03-17
+store: false
+~~~
+
+The provider receives exactly:
+1. the exact assessment prompt;
+2. one exact normalized S3 output PNG at `detail: "high"`;
+3. no references;
+4. no logos;
+5. no predecessor image.
+
+Response format:
+
+~~~text
+type: json_schema
+name: s3_assessment_v1
+strict: true
+schema: S3_ASSESSMENT_JSON_SCHEMA
+~~~
 
 No provider output is accepted unless it validates against the full strict
 schema and the exact assessment identity.
@@ -1010,154 +1029,667 @@ invalid image identity, or ambiguous response is never represented as PASS.
 Retryability is a server-owned classification and is separate from image
 dispatch accounting.
 
-## 9. State model and transition contract
+## 9. Persisted state and transition contract
 
-### 9.1 Discriminated transition values
+### 9.1 StoreState additions
 
-S3 transition values are discriminated and persisted. The transition value
-includes the S3 assessment attempt disposition and the retry-waiver reason:
+S3 adds exactly:
 
 ~~~ts
-type S3AssessmentAttemptDisposition =
-  | "not_started"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "stale";
-
-type S3RetryWaivedReason =
-  | "source_reselected"
-  | "cycle_exhausted"
-  | "lineage_replaced"
-  | "request_cancelled";
-
-type S3TransitionValue = {
-  imageAttemptDisposition: S3ImageAttemptDisposition;
-  publicationDisposition: S3PublicationDisposition;
-  assessmentAttemptDisposition: S3AssessmentAttemptDisposition;
-};
+s3Sources: S3SourceSnapshot[];
+s3Selections: S3SelectionState[];
+s3SelectionEvents: S3SelectionEvent[];
+s3Revisions: S3Revision[];
+s3Assets: S3GeneratedAsset[];
+s3Cycles: S3RefinementCycle[];
+s3ImageOperations: S3ImageOperation[];
+s3Assessments: S3Assessment[];
+s3AssessmentAttempts: S3AssessmentAttempt[];
+s3Publications: S3Publication[];
+s3Transitions: S3StateTransition[];
 ~~~
 
+The existing global collection is reused:
+
 ~~~ts
-type S3StateTransition = {
-  from: S3State;
-  to: S3State;
+idempotency: IdempotencyRecord[];
+~~~
+
+There is no `s3States`, `s3Activations`, or `s3Idempotency` collection.
+
+### 9.2 Exact persisted enums
+
+~~~ts
+export type S3SourceKind = "s1_original" | "s2_repaired";
+export type S3SourceAssetKind = "s1_concept_asset" | "s2_derived_candidate";
+export type S3SourceQualityStatus = "pass" | "warning";
+export type S3SourceVerdict = "PASS" | "WARNING";
+export type S3RevisionKind = "source_selection" | "refinement";
+export type S3OutputAssetKind = "s1_concept_asset" | "s2_derived_candidate" | "s3_refinement_asset";
+export type S3CycleStatus =
+  | "image_queued" | "image_running" | "image_retry_available"
+  | "publication_pending" | "assessment_pending" | "assessment_running"
+  | "assessment_retry_available" | "completed" | "material_fail"
+  | "qa_unavailable" | "image_failed" | "publication_failed" | "stale" | "waived";
+export type S3CycleRetryState = "none" | "image_available" | "assessment_available" | "waived";
+export type S3RetryWaivedReason = "reselected" | "rolled_back" | "later_cycle_started";
+export type S3ImageOperationStatus = "queued" | "running" | "succeeded" | "failed";
+export type S3AssessmentAggregateStatus =
+  | "pending" | "running" | "pass" | "warning" | "material_fail"
+  | "qa_unavailable_retryable" | "qa_unavailable_terminal";
+export type S3AssessmentAttemptStatus = "queued" | "running" | "succeeded" | "failed";
+export type S3AssessmentAttemptDisposition =
+  | "pending" | "running" | "pass" | "warning" | "material_fail"
+  | "qa_unavailable_retryable" | "qa_unavailable_terminal";
+export type S3AssessmentRetryState = "none" | "available" | "waived";
+export type S3PublicationStatus = "staged" | "promoted" | "committed" | "aborted";
+export type S3ProviderDispatchState = "not_started" | "may_have_started" | "consumed";
+export type S3SelectionEventKind = "select_source" | "reselect_source" | "activate_refinement" | "rollback";
+~~~
+
+No undeclared `terminal` pseudo-state exists.
+
+### 9.3 Exact transition value and record
+
+~~~ts
+export type S3TransitionValue =
+  | S3CycleStatus
+  | S3ImageOperationStatus
+  | S3AssessmentAggregateStatus
+  | S3AssessmentAttemptStatus
+  | S3AssessmentAttemptDisposition
+  | S3PublicationStatus
+  | S3CycleRetryState
+  | S3AssessmentRetryState
+  | S3SelectionEventKind;
+
+export type S3StateTransition = {
+  transitionId: UUID;
+  projectId: UUID;
+  cycleId: UUID | null;
+  operationId: UUID | null;
+  assessmentId: UUID | null;
+  assessmentAttemptId: UUID | null;
+  publicationId: UUID | null;
+  phase: "selection" | "cycle" | "image" | "publication" | "assessment";
+  attempt: 1 | 2 | null;
+  from: S3TransitionValue | null;
+  to: S3TransitionValue;
   reason: S3RetryWaivedReason | null;
-  operationId: UUID;
-  at: ISODateTime;
+  requestReferenceId: UUID;
+  at: Timestamp;
 };
 ~~~
 
-reason MUST be non-null only for a retry-waiver transition. A normal state
-change has reason null. The implementation MUST reject a transition whose
-reason does not match the allowed from/to and waiver condition.
+Transitions are append-only. `reason` is non-null only for retry-waiver
+transitions. The transition value is not a replacement for the underlying
+cycle, image-operation, publication, assessment, or attempt records.
 
-### 9.2 S3 operation states
+### 9.4 State and transition rules
 
-S3 distinguishes the following states as applicable:
+S3 persists each aggregate and attempt separately:
 
-- selection: pending, selected, superseded, rolled_back;
-- cycle: available, image_running, publication_pending,
-  assessment_pending, assessment_running, assessment_retry_available,
-  activated, failed, exhausted, stale;
-- image attempt: queued/not_started, running/not_started,
-  running/may_have_started, succeeded/consumed, failed/not_started,
-  failed/consumed, stale;
-- publication: not_started, staging, staged, promoted, committed, failed,
-  uncertain;
-- assessment: queued/not_started, running/not_started,
-  running/may_have_started, succeeded, failed/not_started,
-  failed/consumed, stale;
-- revision: source_root, output_pending, assessment_pending, assessed,
-  active, inactive, failed;
-- active pointer: absent, points to source root, points to a successful
-  PASS/WARNING revision.
+- cycle status uses the exact `S3CycleStatus` union and its `retryState`;
+- image operations use `S3ImageOperationStatus` plus
+  `S3ProviderDispatchState`;
+- assessments use `S3AssessmentAggregateStatus` plus
+  `S3AssessmentRetryState`;
+- assessment attempts use `S3AssessmentAttemptStatus`,
+  `S3AssessmentAttemptDisposition`, and
+  `S3ProviderDispatchState`;
+- publication uses `S3PublicationStatus`;
+- the active pointer is held by the versioned selection state and changed only
+  through append-only selection events and a fenced transaction.
 
-The actual image, publication, and assessment operation dispositions MUST be
-retained; an aggregate terminal status MUST NOT replace them.
+A queued operation has null claim, ownership, start, and completion fields. A
+running operation has a claimed owner, claim token, claimed timestamp,
+startedAt, and no completedAt. A terminal succeeded or failed operation has
+both startedAt and completedAt and retains its provider-dispatch state. A
+provider invocation that may have begun is `may_have_started` and is never
+reclassified as an unstarted attempt.
 
-### 9.3 Required publication transitions
+Source and refinement revisions are immutable after insertion. No mutable
+revision status, active flag, or usability flag is persisted; those public
+projections are derived from immutable records, assessments, append-only
+events,
+and current fenced selection state.
 
-Durable publication intent is created before any object write. The required
-state transitions are:
+The only allowed publication-cycle transitions are the exact transitions
+specified in Section 11.8:
+`image_running -> publication_pending`,
+`publication_pending -> assessment_pending`, and
+`publication_pending -> publication_failed`. A retry waiver has a
+`S3RetryWaivedReason`; normal transitions have a null reason. Invalid
+combinations are rejected and the containing transaction rolls back rather
+than guessing a state.
 
-    image_running -> publication_pending
-    publication_pending -> assessment_pending
-    publication_pending -> publication_failed
+## 10. Internal record types and identity bindings
 
-The first transition records publication intent before staging. A successful
-commit records the second transition only after the final private object has
-been verified and the repository transaction has bound it to the immutable
-revision. An abort or irrecoverable publication failure records the third
-transition. No implementation may jump directly from image running to a
-publicly visible object or from publication pending to assessment success.
+The following exact TypeScript-like records define the durable S3 fields. They
+reuse the existing repository aliases `UUID`, `Timestamp`, `Sha256`,
+`BoothGeometry`, `S2Requirement`, `S2DesignRuleSnapshot`,
+`S2RequirementObservation`, and `S2DesignObservation`.
 
-### 9.4 Assessment retry transition
+### 10.1 Source snapshot
 
-A valid committed output enters assessment_pending. Claiming it for provider
-work enters assessment_running. A retryable assessment failure enters
-assessment_retry_available. The explicit same-byte retry returns to the
-queued/running assessment states without changing the image operation,
-revision output, output SHA-256, output bytes, source snapshot, or
-refinement input.
+~~~ts
+export type S3SourceSnapshot = {
+  sourceSnapshotId: UUID;
+  sourceRootRevisionId: UUID;
 
-A non-retryable assessment failure closes the assessment path with its
-terminal disposition. It never dispatches the image provider again.
+  projectId: UUID;
+  generationSetId: UUID;
+  candidateIndex: 1 | 2 | 3 | 4;
+  sourceKind: S3SourceKind;
 
+  canonicalSourceBinding: CanonicalSourceBinding;
+  sourceBindingHash: Sha256;
 
-### 9.5 Invalid state combinations
+  selectedAssetKind: S3SourceAssetKind;
+  selectedAssetId: UUID;
+  selectedStorageKey: string;
+  selectedSha256: Sha256;
+  selectedByteSize: number;
+  selectedWidth: number;
+  selectedHeight: number;
+  selectedPixelCount: number;
+  selectedDecodedRgbaBytes: number;
 
-The following combinations are invalid and MUST be rejected rather than
-repaired silently:
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  s2InputVersionId: UUID;
+  s2InputBindingHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  canonicalRequirements: S2Requirement[];
+  requirementHash: Sha256;
+  designRulesVersion: "s2-design-rules-v1";
+  designRuleSnapshot: S2DesignRuleSnapshot[];
+  designRuleSnapshotHash: Sha256;
 
-| Invalid combination | Required result |
-| --- | --- |
-| queued with startedAt, completedAt, claimId, or fence non-null | reject persisted transition |
-| running/not_started with completedAt non-null | reject persisted transition |
-| running/may_have_started with startedAt null | reject persisted transition |
-| terminal succeeded/failed with completedAt null | reject persisted transition |
-| failed/not_started after provider begin | record failed/consumed instead |
-| failed/consumed with a retryable right but no terminal attempt record | reject |
-| image_retry_available with a valid durable output | reject and close as conflict |
-| assessment_retry_available without the same committed output identity | reject |
-| any retry-available state with retry state waived | reject |
-| a waived retry with a queued or running attempt | reject |
-| assessment_pending directly to stale | reject |
-| terminal assessment state with an outgoing transition | reject |
-| activation without current PASS/WARNING and all fences | reject |
-| refinement with null parentRevisionId | reject |
-| refinement whose parent is a failed, unavailable, stale, or material-fail revision | reject |
-| cycle number outside 1 or 2 | reject |
-| lifetime counter greater than 2 or dispatch counter greater than 4 | reject |
-| output dimensions other than 1536x1024 | reject before publication |
-| public projection containing an internal-only field | reject serialization |
+  createdAt: Timestamp;
+};
+~~~
 
-A transaction that encounters an invalid combination rolls back all fields,
-counters, claims, timestamps, objects, and pointer changes from that
-transaction. It does not guess a next state.
+The source snapshot retains the complete canonical source binding and frozen
+S2 facts. It is immutable and is not replaced by a later source or project
+lookup.
 
+### 10.2 Selection state and events
 
+~~~ts
+export type S3SelectionState = {
+  selectionStateId: UUID;
+  projectId: UUID;
+  generationSetId: UUID;
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  s2InputVersionId: UUID;
+  s2InputBindingHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  activeRevisionId: UUID | null;
+  lineageRootRevisionId: UUID | null;
+  selectionVersion: number;
+  cycleSlotsConsumed: 0 | 1 | 2;
+  successfulRefinementCount: 0 | 1 | 2;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+~~~
 
+~~~ts
+export type S3SelectionEvent = {
+  eventId: UUID;
+  projectId: UUID;
+  selectionStateId: UUID;
+  kind: S3SelectionEventKind;
+  fromRevisionId: UUID | null;
+  toRevisionId: UUID;
+  sourceSnapshotId: UUID;
+  cycleId: UUID | null;
+  assessmentId: UUID | null;
+  expectedSelectionVersion: number;
+  resultingSelectionVersion: number;
+  resultingSuccessfulRefinementCount: 0 | 1 | 2;
+  idempotencyKey: UUID | null;
+  requestReferenceId: UUID;
+  at: Timestamp;
+};
+~~~
+
+Selection state is mutable only through the guarded current-pointer
+transaction. Selection events are append-only. There is no second mutable
+successful-tip pointer; the successful tip is derived from append-only
+activation events.
+
+### 10.3 Provider metadata and immutable revisions
+
+~~~ts
+export type S3ImageProviderMetadata = {
+  provider: "openai";
+  api: "images";
+  model: "gpt-image-2";
+  modelSnapshot: "gpt-image-2-2026-04-21";
+  providerRequestId: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  receivedAt: Timestamp;
+};
+
+export type S3AssessmentProviderMetadata = {
+  provider: "openai";
+  api: "responses";
+  model: "gpt-5.4-mini";
+  modelSnapshot: "gpt-5.4-mini-2026-03-17";
+  providerRequestId: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  receivedAt: Timestamp;
+};
+~~~
+
+~~~ts
+export type S3RevisionCommon = {
+  revisionId: UUID;
+  projectId: UUID;
+  generationSetId: UUID;
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  s2InputVersionId: UUID;
+  s2InputBindingHash: Sha256;
+  sourceSnapshotId: UUID;
+  sourceBindingHash: Sha256;
+  ultimateS1CandidateId: UUID;
+  sourceS2QaResultId: UUID;
+  sourceS2RepairAttemptId: UUID | null;
+  sourceS2ReQaResultId: UUID | null;
+  sourceS2DerivedCandidateId: UUID | null;
+  outputAssetId: UUID;
+  outputSha256: Sha256;
+  outputByteSize: number;
+  outputWidth: number;
+  outputHeight: number;
+  outputPixelCount: number;
+  createdAt: Timestamp;
+};
+
+export type S3SourceRevision = S3RevisionCommon & {
+  kind: "source_selection";
+  lineageRootRevisionId: UUID;
+  parentRevisionId: null;
+  refinementCycleNumber: 0;
+  refinementIntentText: null;
+  refinementIntentHash: null;
+  refinementInputHash: null;
+  compilerVersion: null;
+  promptHash: null;
+  providerMetadata: null;
+  outputAssetKind: "s1_concept_asset" | "s2_derived_candidate";
+  assessmentId: null;
+};
+
+export type S3RefinementRevision = S3RevisionCommon & {
+  kind: "refinement";
+  lineageRootRevisionId: UUID;
+  parentRevisionId: UUID;
+  refinementCycleNumber: 1 | 2;
+  refinementIntentText: string;
+  refinementIntentHash: Sha256;
+  refinementInputHash: Sha256;
+  compilerVersion: "s3-refinement-v1";
+  promptHash: Sha256;
+  providerMetadata: S3ImageProviderMetadata;
+  outputAssetKind: "s3_refinement_asset";
+  assessmentId: UUID;
+};
+
+export type S3Revision = S3SourceRevision | S3RefinementRevision;
+~~~
+
+All revisions are immutable. A source revision has no provider output and a
+refinement revision has exactly one immutable parentRevisionId. No mutable
+revision status, active flag, or usability flag is persisted.
+
+### 10.4 Generated assets and refinement cycles
+
+~~~ts
+export type S3GeneratedAsset = {
+  assetId: UUID;
+  projectId: UUID;
+  revisionId: UUID;
+  generationSetId: UUID;
+  mediaProfile: "s2-media-v1";
+  providerOutputSha256: Sha256;
+  providerOutputBytes: number;
+  detectedMime: "image/png";
+  normalizedSha256: Sha256;
+  normalizedBytes: number;
+  width: 1536;
+  height: 1024;
+  pixelCount: 1_572_864;
+  hasAlpha: boolean;
+  storageKeyNormalized: string;
+  createdAt: Timestamp;
+};
+~~~
+
+~~~ts
+export type S3RefinementCycle = {
+  cycleId: UUID;
+  projectId: UUID;
+  selectionStateId: UUID;
+  generationSetId: UUID;
+  lineageRootRevisionId: UUID;
+  cycleNumber: 1 | 2;
+  baseRevisionId: UUID;
+  baseSelectionVersion: number;
+  refinementIntentText: string;
+  refinementIntentHash: Sha256;
+  refinementInputHash: Sha256;
+  compilerVersion: "s3-refinement-v1";
+  promptHash: Sha256;
+  status: S3CycleStatus;
+  retryState: S3CycleRetryState;
+  retryWaivedReason: S3RetryWaivedReason | null;
+  imageOperationIds: readonly [UUID] | readonly [UUID, UUID];
+  outputRevisionId: UUID | null;
+  assessmentId: UUID | null;
+  assessmentAttemptIds: readonly [] | readonly [UUID] | readonly [UUID, UUID];
+  createdAt: Timestamp;
+  admittedAt: Timestamp;
+  updatedAt: Timestamp;
+  terminalAt: Timestamp | null;
+};
+~~~
+
+~~~ts
+export type S3ImageOperation = {
+  operationId: UUID;
+  projectId: UUID;
+  cycleId: UUID;
+  generationSetId: UUID;
+  baseRevisionId: UUID;
+  baseSelectionVersion: number;
+  attempt: 1 | 2;
+  retryOfOperationId: UUID | null;
+  operationInputHash: Sha256;
+  refinementInputHash: Sha256;
+  promptHash: Sha256;
+  requestReferenceId: UUID;
+  status: S3ImageOperationStatus;
+  claimedBy: string | null;
+  claimedProcessId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  providerDispatchState: S3ProviderDispatchState;
+  providerMetadata: S3ImageProviderMetadata | null;
+  failureCode: S3OperationFailureCode | null;
+  publicationId: UUID | null;
+  outputRevisionId: UUID | null;
+  outputAssetId: UUID | null;
+  createdAt: Timestamp;
+};
+~~~
+
+Attempt 1 has null `retryOfOperationId`; attempt 2 links to attempt 1; no
+attempt 3 exists.
+
+### 10.5 Assessment records
+
+~~~ts
+export type S3Assessment = {
+  assessmentId: UUID;
+  projectId: UUID;
+  generationSetId: UUID;
+  sourceSnapshotId: UUID;
+  revisionId: UUID;
+  outputAssetId: UUID;
+  outputSha256: Sha256;
+  outputByteSize: number;
+  outputWidth: 1536;
+  outputHeight: 1024;
+  outputPixelCount: 1_572_864;
+  sourceS2QaResultId: UUID;
+  sourceS2ReQaResultId: UUID | null;
+  s2InputVersionId: UUID;
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  canonicalRequirements: S2Requirement[];
+  requirementHash: Sha256;
+  designRulesVersion: "s2-design-rules-v1";
+  designRuleSnapshot: S2DesignRuleSnapshot[];
+  designRuleSnapshotHash: Sha256;
+  sourceBindingHash: Sha256;
+  refinementInputHash: Sha256;
+  refinementIntentHash: Sha256;
+  assessmentCompilerVersion: "s3-assessment-v1";
+  assessmentSchema: "s3-assessment-v1";
+  assessmentSchemaName: "s3_assessment_v1";
+  assessmentInputHash: Sha256;
+  assessmentPromptHash: Sha256;
+  attemptIds: readonly [UUID] | readonly [UUID, UUID];
+  latestAttemptId: UUID;
+  status: S3AssessmentAggregateStatus;
+  retryState: S3AssessmentRetryState;
+  retryWaivedReason: S3RetryWaivedReason | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type S3AssessmentAttempt = {
+  assessmentAttemptId: UUID;
+  assessmentId: UUID;
+  projectId: UUID;
+  revisionId: UUID;
+  outputAssetId: UUID;
+  outputSha256: Sha256;
+  outputByteSize: number;
+  outputWidth: 1536;
+  outputHeight: 1024;
+  outputPixelCount: 1_572_864;
+  attempt: 1 | 2;
+  retryOfAttemptId: UUID | null;
+  operationInputHash: Sha256;
+  assessmentInputHash: Sha256;
+  assessmentPromptHash: Sha256;
+  assessmentCompilerVersion: "s3-assessment-v1";
+  assessmentSchema: "s3-assessment-v1";
+  assessmentSchemaName: "s3_assessment_v1";
+  requestReferenceId: UUID;
+  status: S3AssessmentAttemptStatus;
+  disposition: S3AssessmentAttemptDisposition;
+  claimedBy: string | null;
+  claimedProcessId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  providerDispatchState: S3ProviderDispatchState;
+  requirementObservations: S2RequirementObservation[];
+  designObservations: S2DesignObservation[];
+  materialFindingIds: string[];
+  warningFindingIds: string[];
+  uncertainFindingIds: string[];
+  failureCode: S3OperationFailureCode | null;
+  providerMetadata: S3AssessmentProviderMetadata | null;
+  createdAt: Timestamp;
+};
+~~~
+
+Assessment attempts are immutable after completion. Retry waiver never rewrites
+attempt-one truth. `sourceSnapshotId` and `canonicalRequirements` remain
+persisted on `S3Assessment` for independent assessment-input revalidation.
+
+### 10.6 Publication records
+
+~~~ts
+export type S3PublicationObject = {
+  key: string;
+  sha256: Sha256;
+  byteSize: number;
+  width: 1536;
+  height: 1024;
+  pixelCount: 1_572_864;
+};
+
+export type S3Publication = {
+  publicationId: UUID;
+  projectId: UUID;
+  cycleId: UUID;
+  operationId: UUID;
+  inputHash: Sha256;
+  providerOutputSha256: Sha256;
+  providerOutputBytes: number;
+  normalizedSha256: Sha256;
+  normalizedBytes: number;
+  width: 1536;
+  height: 1024;
+  pixelCount: 1_572_864;
+  hasAlpha: boolean;
+  intendedAssetId: UUID;
+  intendedRevisionId: UUID;
+  intendedAssessmentId: UUID;
+  intendedAssessmentAttemptId: UUID;
+  stagingObjects: readonly [S3PublicationObject];
+  finalObjects: readonly [S3PublicationObject];
+  ownerProcessId: number | null;
+  ownerClaimToken: UUID | null;
+  ownerClaimedAt: Timestamp | null;
+  state: S3PublicationStatus;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+~~~
+
+Publication intent and object records are private and are not public DTO
+fields. Transition records are defined exactly in Section 9.3.
+
+### 10.7 Exact operation identity hashes
+
+The content identity of each mutation is deterministic and separate from the
+global idempotency key. The exact canonical objects are:
+
+~~~ts
+const canonicalSelectionOperation = {
+  schemaVersion: "s3-selection-operation-v1",
+  projectId,
+  generationSetId,
+  selectionStateId,
+  expectedSelectionVersion,
+  sourceSnapshotId,
+  sourceRootRevisionId,
+  operation: selectionOperation
+};
+
+selectionOperationHash =
+  sha256(UTF-8(jcs(canonicalSelectionOperation)));
+~~~
+
+~~~ts
+const canonicalRefinementOperation = {
+  schemaVersion: "s3-refinement-operation-v1",
+  projectId,
+  generationSetId,
+  selectionStateId,
+  sourceSnapshotId,
+  sourceRootRevisionId,
+  cycleNumber,
+  baseRevisionId,
+  baseSelectionVersion,
+  intentHash,
+  refinementInputHash
+};
+
+refinementOperationHash =
+  sha256(UTF-8(jcs(canonicalRefinementOperation)));
+~~~
+
+~~~ts
+const canonicalImageRetryOperation = {
+  schemaVersion: "s3-image-retry-operation-v1",
+  projectId,
+  generationSetId,
+  selectionStateId,
+  sourceSnapshotId,
+  cycleId,
+  cycleNumber,
+  baseRevisionId,
+  baseSelectionVersion,
+  intentHash,
+  refinementInputHash,
+  attemptNumber: 2
+};
+
+imageRetryOperationHash =
+  sha256(UTF-8(jcs(canonicalImageRetryOperation)));
+~~~
+
+~~~ts
+const canonicalAssessmentRetryOperation = {
+  schemaVersion: "s3-assessment-retry-operation-v1",
+  projectId,
+  generationSetId,
+  selectionStateId,
+  sourceSnapshotId,
+  cycleId,
+  revisionId,
+  outputAssetId,
+  outputSha256,
+  outputByteSize,
+  outputWidth,
+  outputHeight,
+  outputPixelCount,
+  assessmentInputHash,
+  assessmentPromptHash,
+  attemptNumber: 2
+};
+
+assessmentRetryOperationHash =
+  sha256(UTF-8(jcs(canonicalAssessmentRetryOperation)));
+~~~
+
+The exact operation field names and schema versions above are fixed. Request
+IDs, idempotency keys, timestamps, claims, leases, provider IDs, object keys,
+and retry timing are excluded from these content hashes.
+
+A semantically identical operation submitted with a different idempotency key
+is a semantic duplicate. The server returns the corresponding closed
+duplicate/conflict error and creates no new slot, attempt, object, revision,
+assessment, or provider dispatch.
 
 ## 11. Durable dispatch, publication, and recovery
 
 ### 11.1 Admission order
 
-Every S3 mutation follows this order:
+Every S3 request follows this order:
 
-1. Resolve the request access context.
-2. Authorize the project through the exact seam in Section 15.
-3. Validate method, path, body, UUIDs, idempotency key, and bounded text.
-4. Enter the existing repository transaction lock.
-5. Check the global idempotency record for an exact replay or key reuse.
-6. Resolve the already-authorized project and S3 lineage.
-7. Validate the expected selection/current-pointer version and exact source,
-   root, base, cycle, revision, and output identity.
-8. Reject a live conflicting operation before any provider or object lookup.
-9. Persist the operation intent, counters, claimable attempt, and lifecycle
-   transition atomically.
-10. Commit the transaction.
-11. Only then claim and dispatch provider work.
+1. Parse the project path segment.
+2. A malformed project identifier returns generic `404 PROJECT_NOT_FOUND`.
+3. Resolve the access context through `S3AccessContextResolver`.
+4. Missing or failing context returns generic `404 PROJECT_NOT_FOUND`.
+5. Authorize the project through `S3ProjectAuthorizer`.
+6. Denial or authorizer failure returns generic `404 PROJECT_NOT_FOUND`.
+7. Only then construct or obtain the workflow service.
+8. Only then perform project, source, revision, cycle, assessment, or object
+   lookup.
+9. Only then validate the method, body, UUIDs, idempotency key, bounded text,
+   expected versions, and exact lineage bindings.
+10. Enter the existing repository transaction lock.
+11. Check the global idempotency record for an exact replay or key reuse.
+12. Resolve the already-authorized S3 lineage and reject live conflicts.
+13. Persist operation intent, counters, claimable attempt, and lifecycle
+    transition atomically.
+14. Commit the transaction.
+15. Only then claim and dispatch provider work.
 
 Authorization and request validation occur before private project, source,
 revision, cycle, assessment, or object lookup. A rejected request has no
@@ -1184,11 +1716,11 @@ including missing runtime provider configuration discovered inside that method,
 moves from may_have_started to failed/consumed. Invoked provider failures are
 consumed and are never treated as an unstarted retry.
 
-A queued attempt has startedAt null, completedAt null, claimId null, and fence
-null. A running attempt has startedAt non-null and completedAt null. A
-terminal succeeded/failed attempt has both timestamps non-null. Requeue of the
-same unstarted attempt clears claim and startedAt/completedAt to null without
-changing attempt identity.
+A queued attempt has claimedBy, claimedProcessId, claimToken, claimedAt,
+startedAt, and completedAt null. A running attempt has a claim token and
+startedAt non-null with completedAt null. A terminal succeeded/failed attempt
+has both timestamps non-null. Requeue of the same unstarted attempt clears the
+claim and timestamp fields to null without changing attempt identity.
 
 ### 11.3 Image operation transitions
 
@@ -1217,18 +1749,20 @@ The assessment aggregate and attempt transitions are exhaustive:
 | --- | --- | --- | --- |
 | assessment_pending / attempt queued-not_started | claim | assessment_running / running-not_started | no |
 | assessment_running / running-not_started | begin | assessment_running / running-may_have_started | starts |
-| assessment_running / running-not_started | stale pre-dispatch fence | stale / failed-not_started | no |
+| assessment_running / running-not_started | stale pre-dispatch fence | cycle stale; assessment aggregate qa_unavailable_terminal / failed-not_started | no |
 | assessment_running / running-may_have_started | valid schema result | pass, warning, or material_fail / succeeded-consumed | completed |
 | assessment_running / running-may_have_started | retryable provider unavailability | assessment_retry_available / failed-consumed | completed/attempted |
 | assessment_running / running-may_have_started | terminal failure | qa_unavailable_terminal / failed-consumed | completed/attempted |
 | assessment_retry_available | explicit retry admission | assessment_pending / attempt 2 queued-not_started | no |
 | assessment_retry_available | waiver | qa_unavailable_terminal / failed-consumed | no |
-| pass, warning, material_fail, qa_unavailable_terminal, stale | any event | same terminal state | no |
+| pass, warning, material_fail, qa_unavailable_terminal | any event | same terminal state | no |
 
 assessment_pending is not converted directly to stale. Stale pre-dispatch
 assessment work is first claimed as assessment_running, then the running
-claim/fence is terminalized as stated above. Terminal assessment states have
-no outgoing transitions.
+claim/fence is terminalized with cycle status stale, aggregate status
+qa_unavailable_terminal, and attempt status failed/not_started as stated above.
+`stale` is a cycle status, not an S3AssessmentAggregateStatus. Terminal
+assessment states have no outgoing transitions.
 
 ### 11.5 Closed retry classification
 
@@ -1300,38 +1834,48 @@ and not an assessment retry.
 
 Image retry admission is one atomic transaction:
 
-- verify cycle status image_retry_available;
-- verify imageRetryState available;
+- verify cycle status `image_retry_available`;
+- verify cycle `retryState` is `image_available`;
 - verify attempt 1 is failed/consumed and has no valid durable output;
-- verify the exact sourceSnapshotId, source root, base revision, selection
-  version, intentHash, and refinementInputHash;
+- verify the exact source snapshot, source root, base revision, selection
+  version, intent hash, refinement-input hash, and cycle identity;
 - verify no later selection, rollback, cycle, or live operation exists;
-- insert attempt 2 as queued/not_started with null claim/timestamps;
-- set imageRetryState to used;
-- set cycle status to image_queued;
-- clear retryWaivedReason;
+- insert attempt 2 as queued/not_started with null claim and timestamps;
+- set cycle `retryState` to `none`;
+- set cycle status to `image_queued`;
+- clear `retryWaivedReason`;
 - preserve the same cycle and canonical inputs.
+
+If the image attempt 2 later produces a valid output, the cycle advances through
+publication to assessment and its retry state is derived from the assessment
+path; it cannot create an image attempt 3.
 
 Assessment retry admission is one atomic transaction:
 
-- verify assessment status assessment_retry_available;
-- verify assessmentRetryState available;
+- verify assessment status `qa_unavailable_retryable` and cycle status
+  `assessment_retry_available`;
+- verify assessment `retryState` is `available` and cycle `retryState`
+  is `assessment_available`;
 - verify attempt 1 is failed/consumed;
-- verify the exact revision, outputAssetId, outputSha256, outputByteSize,
-  outputWidth, outputHeight, outputPixelCount, assessmentInputHash, and
-  assessmentPromptHash;
-- insert attempt 2 as queued/not_started with null claim/timestamps;
-- set assessmentRetryState to used;
-- set assessment status to pending;
-- set cycle status to assessment_pending;
-- clear retryWaivedReason.
+- verify the exact revision, output asset, output SHA-256, output byte size,
+  output dimensions, pixel count, assessment input hash, and assessment prompt
+  hash;
+- insert attempt 2 as queued/not_started with null claim and timestamps;
+- set assessment `retryState` to `none`;
+- set cycle `retryState` to `none`;
+- set assessment status to `pending`;
+- set cycle status to `assessment_pending`;
+- clear `retryWaivedReason`.
 
-No queued or running operation may be waived. If later cycle admission or
-source reselection is allowed, it must first atomically transition an existing
-retry-available terminal record to waived, set the related cycle retry state
-to waived, set retryWaivedReason, and leave the operation consumed and the
-history intact. A retry-available state cannot coexist with waived. A replay
-of the waiver returns the prior result and does not consume another slot.
+No queued or running operation may be waived. If later cycle admission,
+source reselection, or an allowed rollback invalidates a retry right, it must
+first atomically transition an existing retry-available record to `waived`, set
+the related cycle or assessment retry state to `waived`, set
+`retryWaivedReason` to exactly `later_cycle_started`, `reselected`, or
+`rolled_back` as applicable, and leave the consumed operation and history
+intact. A retry-available state cannot coexist with
+`waived`. A replay of the waiver returns the prior result and consumes no
+additional slot or dispatch.
 
 ### 11.7 Later cycle and rollback admission
 
@@ -1449,350 +1993,359 @@ The following invariants are checked on every mutation and recovery pass:
 15. No object key or storage path is a public identity or authorization
     credential.
 
-
 ## 13. Production authorization seam
 
-S3 routes use exactly one request access-context resolver followed by one
-project authorizer:
+The exact production authorization seam is:
 
 ~~~ts
-export type S3RequestAccessContext = {
-  principalId: string;
-  authenticationReference: string;
+export type S3AccessContext = {
+  subjectId: string;
 };
 
-export type S3RequestAccessContextResolver = (
+export type S3AccessContextResolver = (
   request: Request
-) => Promise<S3RequestAccessContext | null>;
+) => S3AccessContext | null | Promise<S3AccessContext | null>;
 
 export type S3ProjectAuthorizer = (
-  context: S3RequestAccessContext,
+  context: S3AccessContext,
   projectId: UUID
-) => Promise<boolean>;
+) => boolean | Promise<boolean>;
 
-export type S3AuthorizationDependencies = {
-  resolveRequestAccessContext: S3RequestAccessContextResolver;
+export type S3AuthorizationBoundary = {
+  resolveContext: S3AccessContextResolver;
   authorizeProject: S3ProjectAuthorizer;
 };
 ~~~
 
-The route adapter obtains request context first and passes that context and the
-path projectId to the project authorizer. The authorizer is the only
-production ownership/membership seam required by S3. No account,
-enterprise-permission, role, or multi-tenant subsystem is introduced.
+Current production construction is exactly:
 
-If either production dependency is absent, the resolver returns no context,
-or the authorizer cannot establish ownership, S3 is default-deny. Possession
-of a project UUID is not authentication. The existing S2 project-existence
-lookup alone is not an ownership check.
+~~~ts
+export const productionS3Authorization: S3AuthorizationBoundary = {
+  resolveContext: async () => null,
+  authorizeProject: async () => false,
+};
+~~~
 
-Authorization occurs before project existence, source, revision, cycle,
-assessment, object, or provider lookup. The following external cases all
-collapse to the same safe response with zero observable side effects:
+API dependency shape:
 
-- missing authentication;
-- unknown authentication;
-- denied project access;
-- unknown project;
-- cross-project ID;
-- cross-project source, revision, cycle, assessment, or object ID.
+~~~ts
+export type ApiRequestDependencies = {
+  workflowService?: WorkflowService;
+  s3Authorization: S3AuthorizationBoundary;
+};
+~~~
 
-The external result is HTTP 404 with code PROJECT_NOT_FOUND. Internally,
-authorization may retain a safe operation reference but MUST NOT expose which
-case occurred.
+For every S3 request, order is exact:
 
-Tests may inject a synthetic authorizer only through an explicit test-only
-dependency seam. Synthetic UUID possession or a test fixture must never
-enable production S3.
+1. Parse the project path segment.
+2. Malformed project identifier -> generic `404 PROJECT_NOT_FOUND`.
+3. Resolve access context.
+4. Missing/failing context -> generic `404 PROJECT_NOT_FOUND`.
+5. Authorize project.
+6. Denial/authorizer failure -> generic `404 PROJECT_NOT_FOUND`.
+7. Only then construct/obtain workflow service.
+8. Only then perform project/source/revision/cycle/assessment/object lookup.
+9. Only then mutate or dispatch.
+
+Zero repository, object-store, or provider side effects occur before
+authorization succeeds. There is no permissive fallback. Project UUID
+possession is not authorization.
+
+Tests may inject synthetic context resolver/project authorizer, temporary
+repository/object store, and mock provider. Synthetic authorization is test-only
+and is not a production fallback.
 
 ## 14. Public routes and request bodies
 
-All routes are under the existing API adapter and use the plural
-s3/refinements route family.
+The exact route family is:
 
-| Method | Route | Request body | New success | Exact replay |
-| --- | --- | --- | ---: | ---: |
-| GET | /api/projects/{projectId}/s3 | none | 200 | 200 |
-| POST | /api/projects/{projectId}/s3/selection | sourceCandidateId, expectedSelectionVersion | 201 | 200 |
-| POST | /api/projects/{projectId}/s3/selection/reselect | sourceCandidateId, expectedSelectionVersion | 201 | 200 |
-| POST | /api/projects/{projectId}/s3/selection/rollback | targetRevisionId, expectedSelectionVersion | 200 | 200 |
-| GET | /api/projects/{projectId}/s3/refinements | none | 200 | 200 |
-| POST | /api/projects/{projectId}/s3/refinements | expectedSelectionVersion, expectedBaseRevisionId, intentText | 202 | 200 |
-| GET | /api/projects/{projectId}/s3/refinements/{revisionId} | none | 200 | 200 |
-| GET | /api/projects/{projectId}/s3/refinements/{revisionId}/preview | none | 200 PNG | 200 PNG |
-| GET | /api/projects/{projectId}/s3/refinements/cycles/{cycleId} | none | 200 | 200 |
-| POST | /api/projects/{projectId}/s3/refinements/cycles/{cycleId}/image-retry | expectedSelectionVersion | 202 | 200 |
-| POST | /api/projects/{projectId}/s3/refinements/cycles/{cycleId}/assessment-retry | expectedSelectionVersion | 202 | 200 |
-
-The route matcher treats the literal cycles segment as a reserved route
-segment, not as a revisionId. No singular s3/refinement route and no
-top-level s3/cycles route exists.
-
-The selection body is exactly:
-
-~~~json
-{
-  "sourceCandidateId": "uuid",
-  "expectedSelectionVersion": 1
-}
+~~~text
+GET  /api/projects/{projectId}/s3
+POST /api/projects/{projectId}/s3/selection
+POST /api/projects/{projectId}/s3/refinements
+GET  /api/projects/{projectId}/s3/refinements/{cycleId}
+POST /api/projects/{projectId}/s3/refinements/{cycleId}/image-retry
+POST /api/projects/{projectId}/s3/refinements/{cycleId}/assessment-retry
+GET  /api/projects/{projectId}/s3/revisions/{revisionId}
+GET  /api/projects/{projectId}/s3/revisions/{revisionId}/preview
 ~~~
 
-The reselection body is exactly the same shape. The rollback body is exactly:
+No singular `/s3/refinement`, no `/s3/cycles` route, no
+`/selection/reselect` route, and no `/selection/rollback` route exists.
+Recognized wrong methods return `405 METHOD_NOT_ALLOWED`.
 
-~~~json
-{
-  "targetRevisionId": "uuid",
-  "expectedSelectionVersion": 2
-}
+`GET /api/projects/{projectId}/s3`: no body, no idempotency key, success
+`200 PublicS3State`.
+
+Selection:
+
+~~~text
+POST /api/projects/{projectId}/s3/selection
+Idempotency-Key: UUIDv4
 ~~~
 
-The refinement body is exactly:
-
-~~~json
-{
-  "expectedSelectionVersion": 2,
-  "expectedBaseRevisionId": "uuid",
-  "intentText": "bounded preference text"
-}
-~~~
-
-The image and assessment retry bodies are exactly:
-
-~~~json
-{
-  "expectedSelectionVersion": 2
-}
-~~~
-
-All mutation routes require the existing Idempotency-Key header. It is
-bounded by the existing S1 key character and length policy. No route accepts a
-client-supplied source binding, hash, prompt, verdict, assessment object,
-asset key, provider ID, claim, or lifecycle status.
-
-The POST refinement response is a queued public projection. It does not wait
-for provider work. An exact idempotent replay returns the original operation,
-cycle, and revision identifiers and the current safe projection without
-creating another attempt or dispatch.
-
-A retry response identifies only the cycle and safe public state. It does not
-expose the attempt's claim, fence, provider, or operation hash.
-
-The GET revision-detail route is mandatory. It returns the revision projection,
-source-kind label, parent revision ID, cycle status, safe assessment summary,
-history timestamps, and preview route. It does not return internal hashes or
-assessment evidence.
-
-## 15. Exact public DTOs
-
-The following TypeScript-like DTOs are closed allowlists. They are the only
-public S3 projection fields.
+Exact body:
 
 ~~~ts
-export type PublicS3Source = {
-  sourceId: UUID;
-  sourceCandidateId: UUID;
-  candidateIndex: 1 | 2 | 3 | 4;
-  sourceKind: "s1_original" | "s2_repaired";
-  status: "eligible";
-  previewPath: string;
-};
+{
+  targetKind: "source_root" | "revision";
+  targetId: UUID;
+  expectedSelectionVersion: number;
+}
+~~~
 
-export type PublicS3AssessmentSummary = {
-  status:
-    | "pending"
-    | "running"
-    | "pass"
-    | "warning"
-    | "material_fail"
-    | "qa_unavailable_retryable"
-    | "qa_unavailable_terminal"
-    | "stale";
-  requirementCount: number;
-  requirementPassCount: number;
-  requirementWarningCount: number;
-  requirementMaterialFailCount: number;
-  requirementUncertainCount: number;
-  designRuleCount: number;
-  designRulePassCount: number;
-  designRuleWarningCount: number;
-  designRuleMaterialFailCount: number;
-  designRuleUncertainCount: number;
-};
+The selection request contains exactly `targetKind`, `targetId`, and
+`expectedSelectionVersion`. `targetKind` is `source_root` or
+`revision`. Success is exactly `200 PublicS3Mutation<PublicS3SelectionResult>`.
+Selection does not invent `201`.
 
-export type PublicS3Revision = {
-  revisionId: UUID;
-  parentRevisionId: UUID | null;
-  kind: "source_selection" | "refinement";
-  cycleNumber: 1 | 2 | null;
-  status:
-    | "source_root"
-    | "pending_assessment"
-    | "assessed"
-    | "active"
-    | "inactive"
-    | "dead_end";
-  previewPath: string | null;
-  assessment: PublicS3AssessmentSummary | null;
-  createdAt: Timestamp;
-};
+Refinement admission:
 
-export type PublicS3Cycle = {
-  cycleId: UUID;
-  cycleNumber: 1 | 2;
+~~~text
+POST /api/projects/{projectId}/s3/refinements
+Idempotency-Key: UUIDv4
+~~~
+
+Exact body:
+
+~~~ts
+{
   baseRevisionId: UUID;
-  status:
-    | "image_queued"
-    | "image_running"
-    | "image_retry_available"
-    | "publication_pending"
-    | "assessment_pending"
-    | "assessment_running"
-    | "assessment_retry_available"
-    | "completed"
-    | "material_fail"
-    | "qa_unavailable"
-    | "image_failed"
-    | "publication_failed"
-    | "stale"
-    | "waived";
-  imageRetryAvailable: boolean;
-  assessmentRetryAvailable: boolean;
-  imageDispatchCount: 0 | 1 | 2;
-  assessmentDispatchCount: 0 | 1 | 2;
-  revisionId: UUID | null;
-  assessment: PublicS3AssessmentSummary | null;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-};
-
-export type PublicS3Selection = {
-  selectionStateId: UUID;
-  sourceId: UUID;
-  sourceRootRevisionId: UUID;
-  activeRevisionId: UUID;
-  selectionVersion: number;
-};
-
-export type PublicS3HistoryEntry = {
-  eventId: UUID;
-  kind: "select_source" | "reselect_source" | "activate_refinement" | "rollback";
-  revisionId: UUID | null;
-  sourceId: UUID;
-  createdAt: Timestamp;
-};
-
-export type PublicS3State = {
-  projectId: UUID;
-  generationSetId: UUID;
-  selection: PublicS3Selection | null;
-  sources: PublicS3Source[];
-  activeRevision: PublicS3Revision | null;
-  revisions: PublicS3Revision[];
-  cycles: PublicS3Cycle[];
-  history: PublicS3HistoryEntry[];
-  lifetimeCycleCount: 0 | 1 | 2;
-  lifetimeCycleLimit: 2;
-};
-~~~
-
-No public DTO contains:
-
-- source, output, or binding hashes;
-- private storage keys or object URLs;
-- prompts or compiler bytes;
-- canonical requirements or design-rule payloads;
-- provider request/response IDs or metadata;
-- assessment findings, requirement IDs, rule IDs, or evidence strings;
-- claims, fences, process IDs, worker IDs, or idempotency records;
-- authentication, authorization, or credential material.
-
-Public assessment data is summary counts only. It does not expose finding-ID
-arrays or raw observations. The server owns the underlying
-canonicalRequirements and S3 assessment records.
-
-### 15.1 Response envelopes
-
-State response:
-
-~~~json
-{
-  "s3": {
-    "projectId": "uuid",
-    "generationSetId": "uuid",
-    "selection": null,
-    "sources": [],
-    "activeRevision": null,
-    "revisions": [],
-    "cycles": [],
-    "history": [],
-    "lifetimeCycleCount": 0,
-    "lifetimeCycleLimit": 2
-  }
+  expectedSelectionVersion: number;
+  intentText: string;
 }
 ~~~
 
-Mutation responses use the same public allowlist:
+New admission is `202 PublicS3Mutation<PublicS3RefinementAdmission>`; the
+same-key replay is `200 PublicS3Mutation<PublicS3RefinementAdmission>`.
 
-~~~ts
-export type S3SelectionResponse = {
-  s3: PublicS3State;
-  selection: PublicS3Selection;
-  replayed: boolean;
-};
+Cycle detail is:
+`GET /api/projects/{projectId}/s3/refinements/{cycleId}`, success
+`200 PublicS3CycleDetail`; unknown or cross-project is
+`404 S3_CYCLE_NOT_FOUND`.
 
-export type S3RefinementResponse = {
-  s3: PublicS3State;
-  cycle: PublicS3Cycle;
-  revision: PublicS3Revision;
-  replayed: boolean;
-};
+Image retry:
 
-export type S3RetryResponse = {
-  s3: PublicS3State;
-  cycle: PublicS3Cycle;
-  replayed: boolean;
-};
-
-export type S3CycleDetailResponse = {
-  s3: PublicS3State;
-  cycle: PublicS3Cycle;
-  revision: PublicS3Revision | null;
-  assessment: PublicS3AssessmentSummary | null;
-};
+~~~text
+POST /api/projects/{projectId}/s3/refinements/{cycleId}/image-retry
+Idempotency-Key: UUIDv4
 ~~~
 
-The list route returns one state envelope. The revision-detail route returns
-one revision projection plus its public assessment summary. The cycle-detail
-route returns one cycle projection and the same summary counts.
+Body is exactly empty (zero bytes; no JSON fields). New retry is
+`202 PublicS3Mutation<PublicS3RetryAdmission>`; replay is `200`.
 
-### 15.2 Preview
+Assessment retry:
 
-The preview route performs authentication and project authorization before
-resolving its private object. It then verifies the revision belongs to the
-project and returns the exact committed normalized PNG bytes.
+~~~text
+POST /api/projects/{projectId}/s3/refinements/{cycleId}/assessment-retry
+Idempotency-Key: UUIDv4
+~~~
 
-The response is:
+Body is exactly empty (zero bytes; no JSON fields). New retry is
+`202 PublicS3Mutation<PublicS3RetryAdmission>` with result status exactly
+`assessment_pending`; replay is `200`. This route makes zero image-provider
+calls.
+
+Revision detail is:
+`GET /api/projects/{projectId}/s3/revisions/{revisionId}`, success
+`200 PublicS3RevisionDetail`; unknown or cross-project is
+`404 S3_REVISION_NOT_FOUND`.
+
+Revision preview is:
+`GET /api/projects/{projectId}/s3/revisions/{revisionId}/preview`.
+
+After authorization, resolve the revision in the project, resolve its private
+object, revalidate its SHA-256, exact byte size, and exact dimensions, and
+return the exact committed normalized PNG bytes. The response is:
 
 ~~~text
 200
 Content-Type: image/png
 Cache-Control: private, no-store
-Content-Length: exact committed byte size
+Content-Length: exact byte size
 ~~~
 
-It never redirects to an object-store or provider URL. It never returns an
-uncommitted, staged, mismatched, or non-private object. Missing, cross-project,
-unauthorized, and unknown access remain the generic 404 posture.
+An unexpected private-object failure returns `500 S3_INTERNAL_ERROR`. The
+route never redirects to an object-store or provider URL and never returns an
+uncommitted, staged, mismatched, or non-private object.
+
+## 15. Exact public DTOs
+
+These TypeScript-like DTOs are closed allowlists. They are the only public S3
+projection fields.
+
+~~~ts
+export type PublicS3ScreenedCandidate = {
+  candidateIndex: 1 | 2 | 3 | 4;
+  sourceQaStatus: "PASS" | "WARNING" | "MATERIAL_FAIL" | "QA_UNAVAILABLE";
+  originalSourceId: UUID | null;
+  repairedSourceIds: UUID[];
+};
+~~~
+
+Exactly four screened-candidate entries exist, ordered candidate 1 through 4.
+
+~~~ts
+export type PublicS3Source = {
+  sourceId: UUID;
+  sourceKind: "s1_original" | "s2_repaired";
+  candidateIndex: 1 | 2 | 3 | 4;
+  sourceRevisionId: UUID;
+  qaStatus: "PASS" | "WARNING";
+  selected: boolean;
+  eligible: boolean;
+  previewAvailable: boolean;
+};
+
+export type PublicS3AssessmentStatus =
+  | "NOT_REQUIRED"
+  | "PENDING"
+  | "RUNNING"
+  | "PASS"
+  | "WARNING"
+  | "MATERIAL_FAIL"
+  | "QA_UNAVAILABLE";
+
+export type PublicS3Revision = {
+  revisionId: UUID;
+  kind: "source_selection" | "refinement";
+  parentRevisionId: UUID | null;
+  cycleNumber: 0 | 1 | 2;
+  sourceKind: "s1_original" | "s2_repaired";
+  candidateIndex: 1 | 2 | 3 | 4;
+  userIntentText: string | null;
+  assessmentStatus: PublicS3AssessmentStatus;
+  assessmentRetryAvailable: boolean;
+  imageRetryAvailable: boolean;
+  successfulSequence: 1 | 2 | null;
+  activationState: "active_tip" | "usable_history" | "historical_non_activatable";
+  active: boolean;
+  usable: boolean;
+  previewAvailable: boolean;
+  createdAt: Timestamp;
+};
+~~~
+
+A stale PASS/WARNING is exactly:
+
+~~~text
+activationState = historical_non_activatable
+usable = false
+~~~
+
+~~~ts
+export type PublicS3CycleStatus =
+  | "generating"
+  | "image_retry_available"
+  | "publication_pending"
+  | "assessment_pending"
+  | "assessment_running"
+  | "assessment_retry_available"
+  | "usable_pass"
+  | "usable_warning"
+  | "material_fail"
+  | "qa_unavailable"
+  | "image_failed"
+  | "publication_failed"
+  | "stale"
+  | "waived";
+
+export type PublicS3Cycle = {
+  cycleId: UUID;
+  cycleNumber: 1 | 2;
+  status: PublicS3CycleStatus;
+  baseRevisionId: UUID;
+  outputRevisionId: UUID | null;
+  assessmentStatus:
+    | "NOT_STARTED" | "PENDING" | "RUNNING" | "PASS" | "WARNING"
+    | "MATERIAL_FAIL" | "QA_UNAVAILABLE";
+  imageRetryAvailable: boolean;
+  assessmentRetryAvailable: boolean;
+  slotConsumed: true;
+};
+
+export type PublicS3AssessmentSummary = {
+  status: "PENDING" | "RUNNING" | "PASS" | "WARNING" | "MATERIAL_FAIL" | "QA_UNAVAILABLE";
+  materialFindingCount: number;
+  warningFindingCount: number;
+  uncertainFindingCount: number;
+  retryAvailable: boolean;
+};
+
+export type PublicS3State = {
+  projectId: UUID;
+  generationSetId: UUID;
+  selectionVersion: number;
+  activeRevisionId: UUID | null;
+  cycleSlotsConsumed: 0 | 1 | 2;
+  cycleSlotsRemaining: 0 | 1 | 2;
+  successfulRefinementCount: 0 | 1 | 2;
+  screenedCandidates: PublicS3ScreenedCandidate[];
+  sources: PublicS3Source[];
+  revisions: PublicS3Revision[];
+  cycles: PublicS3Cycle[];
+};
+~~~
+
+~~~text
+cycleSlotsRemaining = 2 - cycleSlotsConsumed
+~~~
+
+~~~ts
+export type PublicS3Mutation<T> = {
+  replayed: boolean;
+  result: T;
+};
+
+export type PublicS3SelectionResult = {
+  selectionVersion: number;
+  activeRevisionId: UUID;
+  activeSourceId: UUID;
+  eventKind: "select_source" | "reselect_source" | "rollback" | null;
+};
+
+export type PublicS3RefinementAdmission = {
+  cycleId: UUID;
+  cycleNumber: 1 | 2;
+  status: "generating";
+  baseRevisionId: UUID;
+  selectionVersion: number;
+  cycleSlotsConsumed: 1 | 2;
+};
+
+export type PublicS3RetryAdmission = {
+  cycleId: UUID;
+  status: "generating" | "assessment_pending";
+  imageRetryAvailable: false;
+  assessmentRetryAvailable: false;
+};
+
+export type PublicS3CycleDetail = {
+  cycle: PublicS3Cycle;
+  revision: PublicS3Revision | null;
+  assessment: PublicS3AssessmentSummary | null;
+};
+
+export type PublicS3RevisionDetail = {
+  revision: PublicS3Revision;
+  assessment: PublicS3AssessmentSummary | null;
+};
+~~~
+
+No evidence strings, raw observations, finding IDs, hashes, prompts, provider
+metadata, storage data, private keys, claim details, worker details, or
+authorization context are public. `cycleSlotsRemaining` is derived exactly as
+`2 - cycleSlotsConsumed`.
 
 ## 16. Closed public error contract
 
-Every JSON error uses the existing safe envelope:
+Every JSON error uses exactly this safe envelope:
 
 ~~~json
 {
   "error": {
     "code": "SAFE_MACHINE_CODE",
-    "message": "The request could not be completed.",
+    "message": "The request could not be completed. Try again or contact support with the reference ID.",
     "referenceId": "uuid-v4",
     "fieldErrors": []
   }
@@ -1858,398 +2411,12 @@ HTTP mapping is:
 | METHOD_NOT_ALLOWED | 405 |
 | S3_INTERNAL_ERROR | 500 |
 
-Unauthorized, absent, unknown, and cross-project access is always the generic
-404 PROJECT_NOT_FOUND path. Asynchronous provider, media, publication, and
-assessment failure is represented by the persisted public lifecycle state;
-raw internal failure codes are never returned by these routes.
-
-
-
-
-
-
-## 10. Internal record types and identity bindings
-
-The following TypeScript-like records define the durable S3 fields. They are
-illustrative type notation for the locked storage contract; the existing
-repository serialization and transaction primitives remain authoritative.
-
-### 10.1 Source and selection records
-
-~~~ts
-type S3SourceSnapshot = {
-  sourceSnapshotId: UUID;
-  sourceRootRevisionId: UUID;
-
-  projectId: UUID;
-  generationSetId: UUID;
-  candidateIndex: 1 | 2 | 3 | 4;
-  sourceKind: S3SourceKind;
-
-  canonicalSourceBinding: CanonicalSourceBinding;
-  sourceBindingHash: Sha256;
-
-  selectedAssetKind: S3SourceAssetKind;
-  selectedAssetId: UUID;
-  selectedStorageKey: string;
-  selectedSha256: Sha256;
-  selectedByteSize: number;
-  selectedWidth: number;
-  selectedHeight: number;
-  selectedPixelCount: number;
-  selectedDecodedRgbaBytes: number;
-
-  confirmedBriefVersionId: UUID;
-  confirmedBriefContentHash: Sha256;
-  s2InputVersionId: UUID;
-  s2InputBindingHash: Sha256;
-  geometrySnapshot: GeometrySnapshot;
-  geometryHash: Sha256;
-  canonicalRequirements: S2Requirement[];
-  requirementHash: Sha256;
-  designRulesVersion: "s2-design-rules-v1";
-  designRuleSnapshot: DesignRuleSnapshot;
-  designRuleSnapshotHash: Sha256;
-
-  createdAt: Timestamp;
-};
-
-type S3SelectionState = {
-  selectionStateId: UUID;
-  projectId: UUID;
-  generationSetId: UUID;
-  sourceSnapshotId: UUID;
-  sourceRootRevisionId: UUID;
-  activeRevisionId: UUID;
-  selectionVersion: number;
-  successfulActivationCount: 0 | 1 | 2;
-  lifetimeCycleCount: 0 | 1 | 2;
-  status: "selected" | "rolled_back";
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-};
-
-type S3SelectionEvent = {
-  selectionEventId: UUID;
-  projectId: UUID;
-  generationSetId: UUID;
-  selectionStateId: UUID;
-  kind: S3SelectionEventKind;
-  previousSelectionVersion: number;
-  resultingSelectionVersion: number;
-  previousRevisionId: UUID | null;
-  resultingRevisionId: UUID | null;
-  sourceSnapshotId: UUID;
-  sourceRootRevisionId: UUID;
-  idempotencyKey: string;
-  requestReferenceId: UUID;
-  createdAt: Timestamp;
-};
-~~~
-
-activeRevisionId is a pointer to the source root or to the one current
-successful active refinement. The pointer is mutable only in a transaction.
-The records and events it points to are immutable.
-
-### 10.2 Revision and asset records
-
-~~~ts
-type S3Revision = {
-  revisionId: UUID;
-  projectId: UUID;
-  generationSetId: UUID;
-  sourceSnapshotId: UUID;
-  sourceRootRevisionId: UUID;
-  kind: S3RevisionKind;
-
-  parentRevisionId: UUID | null;
-  cycleId: UUID | null;
-  baseRevisionId: UUID | null;
-  baseSelectionVersion: number;
-
-  outputAssetId: UUID | null;
-  outputSha256: Sha256 | null;
-  outputByteSize: number | null;
-  outputWidth: number | null;
-  outputHeight: number | null;
-  outputPixelCount: number | null;
-
-  refinementInputHash: Sha256 | null;
-  intentHash: Sha256 | null;
-  assessmentId: UUID | null;
-
-  status: "source_root" | "pending_assessment" | "assessed" | "active" | "inactive" | "dead_end";
-  createdAt: Timestamp;
-};
-
-type S3GeneratedAsset = {
-  assetId: UUID;
-  projectId: UUID;
-  generationSetId: UUID;
-  revisionId: UUID;
-  sourceSnapshotId: UUID;
-  storageKey: string;
-  sha256: Sha256;
-  byteSize: number;
-  width: 1536;
-  height: 1024;
-  pixelCount: 1572864;
-  decodedRgbaBytes: 6291456;
-  mimeType: "image/png";
-  mediaProfile: "s2-media-v1";
-  createdAt: Timestamp;
-};
-~~~
-
-An S3Revision and S3GeneratedAsset are immutable after insertion. A
-revision's assessment reference is immutable. Assessment attempts, current
-selection, and activation eligibility are separate durable state, so pending
-or failed work cannot be rewritten into a usable revision.
-
-The source-root revision has kind source_selection, parentRevisionId null,
-and no output asset. Every refinement revision has kind refinement and exactly
-one non-null parentRevisionId captured from the authorized current tip.
-
-### 10.3 Cycle and operation records
-
-~~~ts
-type S3RefinementCycle = {
-  cycleId: UUID;
-  projectId: UUID;
-  generationSetId: UUID;
-  selectionStateId: UUID;
-  sourceSnapshotId: UUID;
-  sourceRootRevisionId: UUID;
-
-  cycleNumber: 1 | 2;
-  baseRevisionId: UUID;
-  baseSelectionVersion: number;
-  intentText: string;
-  intentHash: Sha256;
-  refinementInputHash: Sha256;
-
-  imageRetryState: "none" | "available" | "used" | "waived";
-  assessmentRetryState: "none" | "available" | "used" | "waived";
-  imageDispatchCount: 1 | 2;
-  assessmentDispatchCount: 0 | 1 | 2;
-
-  status: S3CycleStatus;
-  retryWaivedReason: S3RetryWaivedReason | null;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-};
-
-type S3ImageAttempt = {
-  imageAttemptId: UUID;
-  cycleId: UUID;
-  attemptNumber: 1 | 2;
-  status: "queued" | "running" | "succeeded" | "failed";
-  dispatchState: "not_started" | "may_have_started" | "consumed";
-  startedAt: Timestamp | null;
-  completedAt: Timestamp | null;
-  claimId: UUID | null;
-  fence: string | null;
-  failureCode: S3OperationFailureCode | null;
-  providerMetadata: S3ImageProviderMetadata | null;
-  outputAssetId: UUID | null;
-  outputSha256: Sha256 | null;
-  createdAt: Timestamp;
-};
-
-type S3ImageOperation = {
-  operationId: UUID;
-  projectId: UUID;
-  generationSetId: UUID;
-  cycleId: UUID;
-  idempotencyKey: string;
-  operationHash: Sha256;
-  attempt: S3ImageAttempt;
-};
-~~~
-
-The image attempt and cycle counters are updated in the repository transaction
-that admits the operation. A duplicate request never creates another attempt.
-
-### 10.4 Publication and assessment records
-
-~~~ts
-type S3Publication = {
-  publicationId: UUID;
-  operationId: UUID;
-  projectId: UUID;
-  generationSetId: UUID;
-  cycleId: UUID;
-  assetId: UUID;
-  stagingKey: string;
-  finalKey: string;
-  expectedSha256: Sha256;
-  expectedByteSize: number;
-  status: S3PublicationStatus;
-  promotedAt: Timestamp | null;
-  committedAt: Timestamp | null;
-  failureCode: S3OperationFailureCode | null;
-  createdAt: Timestamp;
-};
-
-type S3AssessmentAttempt = {
-  assessmentAttemptId: UUID;
-  assessmentId: UUID;
-  projectId: UUID;
-  generationSetId: UUID;
-  cycleId: UUID;
-  revisionId: UUID;
-  attemptNumber: 1 | 2;
-  status: S3AssessmentAttemptStatus;
-  dispatchState: "not_started" | "may_have_started" | "consumed";
-  startedAt: Timestamp | null;
-  completedAt: Timestamp | null;
-  claimId: UUID | null;
-  fence: string | null;
-  disposition: S3AssessmentAttemptDisposition;
-  failureCode: S3OperationFailureCode | null;
-  providerMetadata: S3AssessmentProviderMetadata | null;
-  createdAt: Timestamp;
-};
-
-type S3Assessment = {
-  assessmentId: UUID;
-  projectId: UUID;
-  generationSetId: UUID;
-  cycleId: UUID;
-  revisionId: UUID;
-
-  sourceSnapshotId: UUID;
-  canonicalRequirements: S2Requirement[];
-  geometrySnapshot: GeometrySnapshot;
-  geometryHash: Sha256;
-  designRuleSnapshot: DesignRuleSnapshot;
-  designRuleSnapshotHash: Sha256;
-
-  outputAssetId: UUID;
-  outputSha256: Sha256;
-  outputByteSize: number;
-  outputWidth: 1536;
-  outputHeight: 1024;
-  outputPixelCount: 1572864;
-
-  confirmedBriefVersionId: UUID;
-  confirmedBriefContentHash: Sha256;
-  s2InputVersionId: UUID;
-  sourceBindingHash: Sha256;
-  intentHash: Sha256;
-  refinementInputHash: Sha256;
-
-  assessmentInputHash: Sha256;
-  assessmentPromptHash: Sha256;
-  compilerVersion: "s3-assessment-v1";
-  schema: "s3-assessment-v1";
-  schemaName: "s3_assessment_v1";
-  modelSnapshot: "gpt-5.4-mini-2026-03-17";
-
-  result: S3AssessmentJson;
-  status: S3AssessmentAggregateStatus;
-  assessmentRetryState: S3AssessmentRetryState;
-  createdAt: Timestamp;
-};
-~~~
-
-S3Assessment retains sourceSnapshotId: UUID and
-canonicalRequirements: S2Requirement[] exactly. Its requirements and design
-rules are frozen server values, not provider-authored values.
-
-### 10.5 Exact operation identity hashes
-
-The content identity of each mutation is deterministic and separate from the
-global idempotency key. The exact canonical objects are:
-
-~~~ts
-const canonicalSelectionOperation = {
-  schemaVersion: "s3-selection-operation-v1",
-  projectId,
-  generationSetId,
-  selectionStateId,
-  expectedSelectionVersion,
-  sourceSnapshotId,
-  sourceRootRevisionId,
-  operation: selectionOperation
-};
-
-selectionOperationHash =
-  sha256(UTF-8(jcs(canonicalSelectionOperation)));
-~~~
-
-~~~ts
-const canonicalRefinementOperation = {
-  schemaVersion: "s3-refinement-operation-v1",
-  projectId,
-  generationSetId,
-  selectionStateId,
-  sourceSnapshotId,
-  sourceRootRevisionId,
-  cycleNumber,
-  baseRevisionId,
-  baseSelectionVersion,
-  intentHash,
-  refinementInputHash
-};
-
-refinementOperationHash =
-  sha256(UTF-8(jcs(canonicalRefinementOperation)));
-~~~
-
-~~~ts
-const canonicalImageRetryOperation = {
-  schemaVersion: "s3-image-retry-operation-v1",
-  projectId,
-  generationSetId,
-  selectionStateId,
-  sourceSnapshotId,
-  cycleId,
-  cycleNumber,
-  baseRevisionId,
-  baseSelectionVersion,
-  intentHash,
-  refinementInputHash,
-  attemptNumber: 2
-};
-
-imageRetryOperationHash =
-  sha256(UTF-8(jcs(canonicalImageRetryOperation)));
-~~~
-
-~~~ts
-const canonicalAssessmentRetryOperation = {
-  schemaVersion: "s3-assessment-retry-operation-v1",
-  projectId,
-  generationSetId,
-  selectionStateId,
-  sourceSnapshotId,
-  cycleId,
-  revisionId,
-  outputAssetId,
-  outputSha256,
-  outputByteSize,
-  outputWidth,
-  outputHeight,
-  outputPixelCount,
-  assessmentInputHash,
-  assessmentPromptHash,
-  attemptNumber: 2
-};
-
-assessmentRetryOperationHash =
-  sha256(UTF-8(jcs(canonicalAssessmentRetryOperation)));
-~~~
-
-The exact operation field names and schema versions above are fixed. Request
-IDs, idempotency keys, timestamps, claims, leases, provider IDs, object keys,
-and retry timing are excluded from these content hashes.
-
-A semantically identical operation submitted with a different idempotency key
-is a semantic duplicate. The server returns the corresponding closed
-duplicate/conflict error and creates no new slot, attempt, object, revision,
-assessment, or provider dispatch.
-
+Authorization denial, absent context, unknown project, and every cross-project
+access all collapse externally to `404 PROJECT_NOT_FOUND`. No stack, path,
+provider, credential, prompt, or private-object detail appears. Asynchronous
+provider, media, publication, and assessment failure is represented by the
+persisted public lifecycle state; raw internal failure codes are never
+returned by these routes.
 
 ## 17. Privacy, secrets, and safe logging
 
@@ -2676,6 +2843,9 @@ The exact deterministic count is:
 = 189
 ~~~
 
+The runtime MUST call `deriveClaimManifest(VARIANTS)` and it MUST derive exactly
+189 claims; a hardcoded total is insufficient.
+
 Each claim has claimId equal to the testId and variantId joined by a colon.
 A test execution is complete only when every one of the 189 derived claims has
 one evidence record and no claim is missing, unknown, duplicated, or skipped.
@@ -2735,7 +2905,8 @@ part of this contract-persistence change.
 
 This file is the durable repository surface for accepted
 DL-SD-S3-G2-001. It incorporates the accepted G1 lock, controlling G2
-acceptance, Web normalizations, compiler/schema appendix, evidence/matrix
+acceptance, Web normalizations, recovered persisted-state/model and
+auth/API/DTO/error appendices, compiler/schema appendix, evidence/matrix
 appendix, and reused S2 primitives named above.
 
 This is not a persistence acceptance, G3 authorization, S3 completion,
@@ -2743,7 +2914,6 @@ Ready/merge decision, canonical finality, or programme finality decision.
 Web must independently review the exact GitHub document and PR.
 
 PARENT_RECONCILIATION_INCOMPLETE: NO
-
 
 ## 24. Canonical durability appendix literals
 
