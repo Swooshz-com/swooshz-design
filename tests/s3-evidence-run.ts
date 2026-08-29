@@ -31,7 +31,9 @@ function git(...args: string[]): string {
 function runValidation(command: string, args: string[], label: string, expectedOutput?: RegExp): string {
   let output: string;
   try {
-    output = execFileSync(command, args, {
+    const executable = command === "pnpm.cmd" ? (process.env.ComSpec ?? "cmd.exe") : command;
+    const invocation = command === "pnpm.cmd" ? ["/d", "/s", "/c", ["pnpm", ...args].join(" ")] : args;
+    output = execFileSync(executable, invocation, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 16 * 1024 * 1024,
