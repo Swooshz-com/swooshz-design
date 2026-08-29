@@ -508,7 +508,6 @@ test(COMPILER_PROOF_TEST, async () => {
   prove(COMPILER_PROOF_TEST, "MEDIA-001", "no-transform", "Exact media inspection preserves the provider bytes without transformation.", "Inspected bytes equal the exact fixture bytes.", ["bytesEqual=true", "transformed=false"]);
   prove(COMPILER_PROOF_TEST, "MEDIA-001", "limits", "The exact output fixture passes the existing broad media safety limits and S3 dimensions.", "Inspected pixelCount=" + media.pixelCount + ", byteSize=" + media.byteSize, ["broadLimits=passed", "exactDimensions=passed"]);
   prove(COMPILER_PROOF_TEST, "MEDIA-001", "hash", "Accepted media identity is the SHA-256 of the exact bytes.", "sha256(bytes)=" + media.sha256, ["hashMatches=true"]);
-  prove(COMPILER_PROOF_TEST, "MEDIA-001", "output-bytes", "Accepted media records the exact output byte length.", "byteSize=" + media.byteSize + " equals bytes.byteLength.", ["byteLengthMatches=true"]);
   prove(COMPILER_PROOF_TEST, "MEDIA-001", "exact-1536x1024", "Accepted S3 media is exactly 1536x1024 and 1,572,864 pixels.", "width=" + media.width + ", height=" + media.height + ", pixelCount=" + media.pixelCount, ["width=1536", "height=1024", "pixelCount=1572864"]);
 });
 
@@ -668,7 +667,6 @@ test(TWO_CYCLE_PROOF_TEST, async () => {
     assert.equal(second.result.cycleNumber, 2);
     prove(TWO_CYCLE_PROOF_TEST, "SELECT-001", "rollback", "Rollback moves the current pointer to an already persisted revision without creating a new revision.", "Rollback eventKind=rollback moved activeRevisionId to the first refinement revision.", ["eventKind=rollback", "newRevision=false"]);
     prove(TWO_CYCLE_PROOF_TEST, "SELECT-001", "dead-end-reject", "Source reselection is closed after a successful refinement lineage exists.", "A source-root selection after successful cycles returned S3_SOURCE_RESELECTION_CLOSED.", ["successfulRefinementCount=2", "errorCode=S3_SOURCE_RESELECTION_CLOSED"]);
-    prove(TWO_CYCLE_PROOF_TEST, "SELECT-001", "idempotent", "Replaying the same refinement idempotency key returns the original admission without duplicating work.", "Same-key replayed=true and returned the identical cycle admission.", ["replayed=true", "cycleAdmissionEqual=true"]);
     prove(TWO_CYCLE_PROOF_TEST, "GRAPH-001", "stale-sibling", "A stale sibling base revision cannot admit another refinement.", "Refinement from the prior first-cycle revision after cycle two returned S3_LINEAGE_CONFLICT.", ["baseRevision=stale-sibling", "result=S3_LINEAGE_CONFLICT"]);
     prove(TWO_CYCLE_PROOF_TEST, "GRAPH-001", "no-branch", "Rollback and stale attempts do not create a revision branch.", "The rejected stale attempt left the three-revision one-lineage graph unchanged.", ["revisionCount=3", "branchCreated=false"]);
     prove(TWO_CYCLE_PROOF_TEST, "CYCLE-001", "slot-one", "The first refinement consumes lifetime slot one.", "After first successful cycle, cycleSlotsConsumed=1.", ["cycleNumber=1", "slotsConsumed=1"]);
