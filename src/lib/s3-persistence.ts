@@ -425,6 +425,7 @@ export function validateS3Graph(state: StoreState): void {
   const projects = new Set(state.projects.map((item) => item.projectId));
   const sourceMap = new Map(state.s3Sources.map((item) => [item.sourceSnapshotId, item]));
   const revisionMap = new Map(state.s3Revisions.map((item) => [item.revisionId, item]));
+  const s4RevisionMap = new Map(state.s4Revisions.map((item) => [item.revisionId, item]));
   const selectionMap = new Map(state.s3Selections.map((item) => [item.selectionStateId, item]));
   const cycleMap = new Map(state.s3Cycles.map((item) => [item.cycleId, item]));
   const operationMap = new Map(state.s3ImageOperations.map((item) => [item.operationId, item]));
@@ -438,7 +439,7 @@ export function validateS3Graph(state: StoreState): void {
   for (const item of state.s3Selections) {
     if (!projects.has(item.projectId)) return invalid();
     if (item.activeRevisionId !== null) {
-      const revision = revisionMap.get(item.activeRevisionId);
+      const revision = revisionMap.get(item.activeRevisionId) ?? s4RevisionMap.get(item.activeRevisionId);
       if (!revision || revision.projectId !== item.projectId) return invalid();
     }
     if (item.lineageRootRevisionId !== null && !revisionMap.has(item.lineageRootRevisionId)) return invalid();

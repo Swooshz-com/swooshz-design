@@ -20,6 +20,7 @@ import { AppError, type StoreState } from "./types";
 import { codePointLength, uuidV4Pattern } from "./utils";
 import { validateS2Graph } from "./s2-persistence";
 import { validateS3Collections, validateS3Graph } from "./s3-persistence";
+import { validateS4Collections, validateS4Graph } from "./s4-persistence";
 
 const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
@@ -123,6 +124,17 @@ export function emptyStoreState(): StoreState {
     s3AssessmentAttempts: [],
     s3Publications: [],
     s3Transitions: [],
+    s4Stages: [],
+    s4Masks: [],
+    s4Edits: [],
+    s4Revisions: [],
+    s4Assets: [],
+    s4ImageOperations: [],
+    s4PreservationChecks: [],
+    s4Assessments: [],
+    s4AssessmentAttempts: [],
+    s4Publications: [],
+    s4Transitions: [],
   };
 }
 
@@ -628,6 +640,28 @@ export class PrivateObjectStore {
     }
   }
 
+  putExact(key: string, bytes: Uint8Array): void {
+    const expected = Buffer.from(bytes);
+    if (this.exists(key)) {
+      let actual: Buffer;
+      try { actual = this.read(key); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
+      if (!actual.equals(expected)) throw new AppError(500, "PERSISTENCE_FAILED");
+      return;
+    }
+    this.put(key, expected);
+  }
+
+  promoteExact(stagingKey: string, finalKey: string, expected: Uint8Array): void {
+    const bytes = Buffer.from(expected);
+    if (this.exists(finalKey)) {
+      let actual: Buffer;
+      try { actual = this.read(finalKey); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
+      if (!actual.equals(bytes)) throw new AppError(500, "PERSISTENCE_FAILED");
+      return;
+    }
+    this.promote(stagingKey, finalKey);
+  }
+
   read(key: string): Buffer {
     try {
       return readFileSync(this.pathFor(key));
@@ -707,8 +741,10 @@ export class JsonRepository {
       }
       validateS2Collections(parsedRecord, merged);
       validateS3Collections(parsedRecord, merged);
+      validateS4Collections(parsedRecord, merged);
       validateS2Graph(merged);
       validateS3Graph(merged);
+      validateS4Graph(merged);
       return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
@@ -1060,6 +1096,7 @@ export class JsonRepository {
       try {
         validateS2Graph(fresh);
         validateS3Graph(fresh);
+        validateS4Graph(fresh);
       } catch {
         throw new AppError(500, "PERSISTENCE_FAILED");
       }
