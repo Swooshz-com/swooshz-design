@@ -5,40 +5,55 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import sharp from "sharp";
-import { AppError, type BoothGeometry, type ProviderMetadata, type S4MaskPrimitive } from "../src/lib/types";
+import { AppError, type BoothGeometry, type ProviderMetadata, type S4MaskPrimitive, type UUID } from "../src/lib/types";
 import { MockOpenAIProvider, ProviderFailure } from "../src/lib/openai";
-import { JsonRepository, PrivateObjectStore } from "../src/lib/store";
+import { JsonRepository, PrivateObjectStore, type RepositoryLockPhase, type RepositoryLockRecord } from "../src/lib/store";
 import { createWorkflowService, type WorkflowService, type WorkflowServiceOptions } from "../src/lib/workflow";
 import { handleApiRequest, type ApiRequestDependencies } from "../src/lib/api";
 import { createExactS3FixturePng } from "../src/lib/s3-media";
 import { materializeS4Mask } from "../src/lib/s4-mask";
 import { evaluateS4Preservation } from "../src/lib/s4-preservation";
 import type { S4ProviderContract } from "../src/lib/s4-provider";
-import { resolveActiveVisualRevision } from "../src/lib/revision-resolver";
+import { resolveActiveVisualRevision, resolveVisualRevision } from "../src/lib/revision-resolver";
 import { validateS4Collections, validateS4Graph } from "../src/lib/s4-persistence";
-import { sha256 } from "../src/lib/utils";
+import { cloneJson, sha256 } from "../src/lib/utils";
 import { createS4Client, S4Screen } from "../app/components/S4Client";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { VARIANTS } from "./s4-evidence-manifest";
-import { recordS4ClaimProof } from "./s4-proof";
+import { proveS4Claims } from "./s4-proof";
 
 const WIDTH = 1536;
 const HEIGHT = 1024;
 const PIXELS = WIDTH * HEIGHT;
+const FOREIGN_UUID = "11111111-1111-4111-8111-111111111111" as UUID;
 
-function proveS4Row<K extends keyof typeof VARIANTS>(testId: K, provingTest: string, actualResult: string, extraFacts: string[] = []): void {
-  for (const variantId of VARIANTS[testId]) {
-    const claimId = testId + ":" + variantId;
-    recordS4ClaimProof({
-      testId,
-      variantId,
-      expectedResult: "The accepted S4 contract claim " + claimId + " passes in the executed local scenario.",
-      actualResult,
-      provingTest,
-      observationFacts: ["claimId=" + claimId, "assertionId=" + claimId + ":runtime", "scenario=" + testId + "/" + variantId, ...extraFacts],
-    });
-  }
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function errorCode(error: unknown): string | null {
+  return error instanceof AppError ? error.code : error instanceof Error ? error.message : null;
+}
+
+async function proveS4Variants(
+  testId: string,
+  provingTest: string,
+  scenario: string,
+  actualResult: string,
+  assertions: Record<string, () => void | Promise<void>>,
+  observationFacts: string[] = [],
+): Promise<void> {
+  await proveS4Claims(testId, provingTest, Object.entries(assertions).map(([variantId, assertion]) => ({
+    variantId,
+    assertionId: testId + "." + variantId + ".assertion",
+    scenario: scenario + "/" + variantId,
+    expectedResult: "The frozen " + testId + " variant is established by its executed lifecycle assertion.",
+    actualResult,
+    observationFacts,
+    assertion,
+  })));
 }
 
 function briefData(): any {
@@ -100,27 +115,73 @@ async function editedFixturePng(): Promise<Buffer> {
     .png({ compressionLevel: 9, adaptiveFiltering: false }).toBuffer();
 }
 
+async function mutateFixturePng(
+  input: Uint8Array,
+  x: number,
+  y: number,
+  channel: 0 | 1 | 2 | 3,
+  delta: number,
+): Promise<Buffer> {
+  const raw = await sharp(input).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const offset = (y * WIDTH + x) * 4 + channel;
+  raw.data[offset] = Math.max(0, Math.min(255, raw.data[offset] + delta));
+  return sharp(raw.data, { raw: { width: WIDTH, height: HEIGHT, channels: 4 } })
+    .png({ compressionLevel: 9, adaptiveFiltering: false }).toBuffer();
+}
+
+async function protectedFixtureMutation(source: Uint8Array, output: Uint8Array): Promise<Buffer> {
+  const sourceRaw = await sharp(source).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const outputRaw = await sharp(output).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const offset = (100 * WIDTH + 100) * 4;
+  outputRaw.data[offset] = (sourceRaw.data[offset] + 128) % 256;
+  return sharp(outputRaw.data, { raw: { width: WIDTH, height: HEIGHT, channels: 4 } })
+    .png({ compressionLevel: 9, adaptiveFiltering: false }).toBuffer();
+}
+
+function warningAssessmentPayload(repository: JsonRepository): any {
+  const payload = s4AssessmentPayload(repository);
+  return {
+    ...payload,
+    requirements: payload.requirements.map((item: any) => ({ ...item, confidence: 0.74 })),
+    designRules: payload.designRules.map((item: any) => ({ ...item, confidence: 0.74 })),
+  };
+}
+
+function materialAssessmentPayload(repository: JsonRepository): any {
+  return { ...s4AssessmentPayload(repository), requestedEdit: { outcome: "not_satisfied", evidence: "The deterministic material-failure fixture rejects the requested edit." } };
+}
+
+function unavailableAssessmentPayload(repository: JsonRepository): any {
+  return { ...s4AssessmentPayload(repository), requestedEdit: { outcome: "uncertain", evidence: "The deterministic QA fixture cannot verify the requested edit." } };
+}
+
 type S4Fixture = {
   root: string;
   repository: JsonRepository;
   objects: PrivateObjectStore;
   service: WorkflowService;
+  provider: MockOpenAIProvider;
+  s4Provider: S4ProviderContract;
   projectId: string;
   generationSetId: string;
   sourceBytes: Buffer;
   outputBytes: Buffer;
-  imageCalls: number;
-  assessmentCalls: number;
+  imageCallCount: () => number;
+  assessmentCallCount: () => number;
+  imageInputs: unknown[];
+  assessmentInputs: unknown[];
 };
 
 type S4FixtureOptions = Pick<WorkflowServiceOptions, "processId" | "isProcessAlive" | "onS4ProviderDispatchPhase" | "onS4PublicationPhase"> & {
   imageResults?: Array<Buffer | ProviderFailure>;
   assessmentResults?: Array<any | ProviderFailure>;
+  beforeCommit?: () => void;
+  onLockPhase?: (phase: RepositoryLockPhase, record: RepositoryLockRecord, path: string) => void;
 };
 
 async function fixture(options: S4FixtureOptions = {}): Promise<S4Fixture> {
   const root = mkdtempSync(join(tmpdir(), "swooshz-s4-g3-"));
-  const repository = new JsonRepository(root);
+  const repository = new JsonRepository(root, { beforeCommit: options.beforeCommit, onLockPhase: options.onLockPhase });
   const objects = new PrivateObjectStore(join(root, "objects"));
   const projectId = randomUUID();
   const generationSetId = randomUUID();
@@ -155,17 +216,21 @@ async function fixture(options: S4FixtureOptions = {}): Promise<S4Fixture> {
   });
   let imageCalls = 0;
   let assessmentCalls = 0;
+  const imageInputs: unknown[] = [];
+  const assessmentInputs: unknown[] = [];
   const imageResults = [...(options.imageResults ?? [outputBytes])];
   const assessmentResults = [...(options.assessmentResults ?? [null])];
   const s4Provider: S4ProviderContract = {
-    runS4ImageEdit: async () => {
+    runS4ImageEdit: async (input) => {
       imageCalls += 1;
+      imageInputs.push(input);
       const next = imageResults.shift() ?? outputBytes;
       if (next instanceof ProviderFailure) throw next;
       return { pngBytes: next, providerRequestId: "s4-image-fixture-" + String(imageCalls) };
     },
-    runS4Assessment: async () => {
+    runS4Assessment: async (input) => {
       assessmentCalls += 1;
+      assessmentInputs.push(input);
       const next = assessmentResults.shift() ?? null;
       if (next instanceof ProviderFailure) throw next;
       return { payload: next ?? s4AssessmentPayload(repository), providerRequestId: "s4-assessment-fixture-" + String(assessmentCalls) };
@@ -174,7 +239,13 @@ async function fixture(options: S4FixtureOptions = {}): Promise<S4Fixture> {
   const provider = new MockOpenAIProvider({ briefData: briefData(), s2QaResponseFactory: (input) => s2QaPayload(input) });
   const { imageResults: _images, assessmentResults: _assessments, ...workflowOptions } = options;
   const service = createWorkflowService({ repository, objects, provider, s4Provider, ...workflowOptions });
-  return { root, repository, objects, service, projectId, generationSetId, sourceBytes, outputBytes, imageCalls, assessmentCalls };
+  return { root, repository, objects, service, provider, s4Provider, projectId, generationSetId, sourceBytes, outputBytes, imageCallCount: () => imageCalls, assessmentCallCount: () => assessmentCalls, imageInputs, assessmentInputs };
+}
+
+function restart(value: S4Fixture, options: Pick<WorkflowServiceOptions, "processId" | "isProcessAlive" | "onS4ProviderDispatchPhase" | "onS4PublicationPhase"> = {}): WorkflowService {
+  const repository = new JsonRepository(value.root, options.processId === undefined ? {} : { processId: options.processId, isProcessAlive: options.isProcessAlive });
+  const objects = new PrivateObjectStore(join(value.root, "objects"));
+  return createWorkflowService({ repository, objects, provider: value.provider, s4Provider: value.s4Provider, ...options });
 }
 
 async function waitFor<T>(read: () => T, done: (value: T) => boolean, timeoutMs = 30_000): Promise<T> {
@@ -203,13 +274,25 @@ function cleanup(value: S4Fixture): void { rmSync(value.root, { recursive: true,
 
 const EDIT_PRIMITIVES: S4MaskPrimitive[] = [{ kind: "rectangle", xQ16: 13_107, yQ16: 13_107, widthQ16: 19_661, heightQ16: 19_661 }];
 
-function admit(value: S4Fixture, selected: { sourceRevisionId: string; selectionVersion: number }, instructionText = "Replace the marked counter finish.") {
+function admit(
+  value: S4Fixture,
+  selected: { sourceRevisionId: string; selectionVersion: number },
+  instructionText = "Replace the marked counter finish.",
+  key = randomUUID(),
+  referenceId = randomUUID(),
+) {
   return value.service.s4.admitEdit(value.projectId, {
     baseRevisionId: selected.sourceRevisionId,
     expectedSelectionVersion: selected.selectionVersion,
     primitives: EDIT_PRIMITIVES,
     instructionText,
-  }, randomUUID(), randomUUID());
+  }, key, referenceId);
+}
+
+function expectErrorCode(action: () => unknown, expected: string): void {
+  let actual: string | null = null;
+  try { action(); } catch (error) { actual = errorCode(error); }
+  assert.equal(actual, expected);
 }
 
 test("S4 mask and preservation fixtures use deterministic exact geometry", async () => {
@@ -277,9 +360,22 @@ test("S4 successful edit persists one stage, one cycle, and activates through th
     assert.equal(resolved?.revisionId, state.activeRevisionId);
     const preview = await value.service.s3.getPreview(value.projectId, state.activeRevisionId!);
     assert.equal(preview.bytes.equals(value.outputBytes), true);
-    proveS4Row("REVISION-001", "S4 successful edit persists one stage, one cycle, and activates through the shared pointer", "The successful lifecycle persisted one immutable S4-owned revision and asset with exact parent and lineage identity, resolved it through the shared pointer, and returned the same committed preview object.", [
-      "s4Revisions=" + value.repository.state().s4Revisions.length,
-      "s4Assets=" + value.repository.state().s4Assets.length,
+    const persisted = value.repository.state();
+    const revision = persisted.s4Revisions[0];
+    const asset = persisted.s4Assets[0];
+    assert.ok(revision && asset);
+    await proveS4Variants("REVISION-001", "S4 successful edit persists one stage, one cycle, and activates through the shared pointer", "successful-s4-revision", "The executed lifecycle assertion established one immutable S4 revision identity or projection.", {
+      "s4-own": () => { assert.equal(state.activeRevisionKind, "s4"); assert.equal(revision.kind, "s4_local_edit"); },
+      "immutable": () => { assert.equal(persisted.s4Revisions.length, 1); assert.equal(persisted.s4Assets.length, 1); },
+      "parent-exact": () => { assert.equal(revision.parentRevisionId, admission.result.baseRevisionId); assert.equal(revision.parentRevisionKind, "s3"); },
+      "lineage": () => assert.equal(revision.lineageRootRevisionId, persisted.s4Stages[0].lineageRootRevisionId),
+      "no-copy": () => assert.notEqual(revision.sourceAssetId, revision.outputAssetId),
+      "derived-activation": () => assert.equal(persisted.s4Transitions.some((item) => item.phase === "activation" && item.resultingRevisionId === revision.revisionId), true),
+      "historical-projection": () => assert.equal(state.edits[0].activationState, "active_tip"),
+      "asset-link": () => { assert.equal(asset.revisionId, revision.revisionId); assert.equal(preview.bytes.byteLength, asset.normalizedBytes); },
+    }, [
+      "s4Revisions=" + persisted.s4Revisions.length,
+      "s4Assets=" + persisted.s4Assets.length,
       "activeRevisionKind=" + state.activeRevisionKind,
       "previewHash=" + sha256(preview.bytes),
     ]);
@@ -288,7 +384,70 @@ test("S4 successful edit persists one stage, one cycle, and activates through th
     assert.equal(handoff.activeRevisionKind, "s4");
     assert.equal(handoff.quality, "PASS");
     assert.equal(handoff.s4CyclesConsumed, 1);
+    await proveS4Variants("S5-001", "S4 successful edit persists one stage, one cycle, and activates through the shared pointer", "s5-handoff", "The executed handoff assertion established one optional S5 projection boundary without an S5 write.", {
+      "optional": () => assert.equal(handoff.s4StageStatus, "started"),
+      "active-s3": () => assert.equal(handoff.activeRevisionKind === "s3", false),
+      "active-s4": () => assert.equal(handoff.activeRevisionKind, "s4"),
+      "quality": () => assert.equal(handoff.quality, "PASS"),
+      "selection-version": () => assert.equal(handoff.selectionVersion, state.selectionVersion),
+      "projection": () => assert.equal(handoff.activeRevisionId, state.activeRevisionId),
+      "no-s5": () => assert.equal(Object.keys(value.repository.state()).some((key) => key.startsWith("s5")), false),
+    });
     assert.throws(() => value.service.s3.refine(value.projectId, state.activeRevisionId!, state.selectionVersion, "S3 must be closed", randomUUID(), randomUUID()), (error: unknown) => error instanceof AppError && error.code === "S3_LINEAGE_CONFLICT");
+  } finally { cleanup(value); }
+});
+
+test("S4 high-risk resolver matrix resolves exact S3 and S4 identities", async () => {
+  const value = await fixture();
+  try {
+    const sourceSelected = await ready(value);
+    const sourceResolved = resolveVisualRevision(value.repository.state(), value.projectId, sourceSelected.sourceRevisionId, value.objects);
+    const refinementAdmission = value.service.s3.refine(value.projectId, sourceSelected.sourceRevisionId, sourceSelected.selectionVersion, "resolver refinement fixture", randomUUID(), randomUUID());
+    await waitFor(() => value.service.s3.getState(value.projectId), (state) => state.cycles[0]?.status === "usable_pass");
+    const afterRefinement = value.service.s3.getState(value.projectId);
+    assert.ok(afterRefinement.activeRevisionId);
+    const refinementResolved = resolveVisualRevision(value.repository.state(), value.projectId, afterRefinement.activeRevisionId, value.objects);
+    const selected = { sourceRevisionId: afterRefinement.activeRevisionId, selectionVersion: afterRefinement.selectionVersion };
+    const admission = admit(value, selected, "resolver S4 revision fixture");
+    const completed = await waitFor(() => value.service.s4.getState(value.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const persisted = value.repository.state();
+    const revision = persisted.s4Revisions[0];
+    assert.ok(revision);
+    const s4Resolved = resolveVisualRevision(persisted, value.projectId, revision.revisionId, value.objects);
+    assert.equal(sourceResolved.kind, "s3");
+    assert.equal(refinementResolved.kind, "s3");
+    assert.equal(s4Resolved.kind, "s4");
+
+    const duplicate = cloneJson(persisted);
+    duplicate.s4Revisions.push(cloneJson(revision));
+    const foreignProject = cloneJson(persisted);
+    foreignProject.s4Revisions[0].projectId = FOREIGN_UUID;
+    const foreignGeneration = cloneJson(persisted);
+    foreignGeneration.s4Revisions[0].generationSetId = FOREIGN_UUID;
+    const foreignLineage = cloneJson(persisted);
+    foreignLineage.s4Revisions[0].lineageRootRevisionId = FOREIGN_UUID;
+    const badQuality = cloneJson(persisted);
+    badQuality.s4Assessments[0].status = "material_fail";
+    const pointerOnly = cloneJson(persisted);
+    pointerOnly.s3Selections[0].activeRevisionId = null;
+
+    await proveS4Variants("RESOLVE-001", "S4 high-risk resolver matrix resolves exact S3 and S4 identities", "resolver-matrix", "The executed resolver scenarios established exact positive resolution and fail-closed identity fences.", {
+      "s3-source": () => assert.equal(sourceResolved.kind, "s3"),
+      "s3-refinement": () => { assert.equal(refinementAdmission.result.cycleNumber, 1); assert.equal(refinementResolved.kind, "s3"); assert.notEqual(refinementResolved.revisionId, sourceResolved.revisionId); },
+      "s4-revision": () => { assert.equal(s4Resolved.kind, "s4"); assert.equal(completed.activeRevisionId, revision.revisionId); },
+      "duplicate-id-fail": () => assert.throws(() => resolveVisualRevision(duplicate, value.projectId, revision.revisionId, value.objects)),
+      "foreign-project": () => assert.throws(() => resolveVisualRevision(foreignProject, value.projectId, revision.revisionId, value.objects)),
+      "foreign-generation": () => assert.throws(() => resolveVisualRevision(foreignGeneration, value.projectId, revision.revisionId, value.objects)),
+      "lineage": () => assert.throws(() => resolveVisualRevision(foreignLineage, value.projectId, revision.revisionId, value.objects)),
+      "quality": () => assert.throws(() => resolveVisualRevision(badQuality, value.projectId, revision.revisionId, value.objects)),
+      "pointer-only": () => assert.equal(resolveActiveVisualRevision(pointerOnly, value.projectId, value.objects), null),
+      "public-kind": () => assert.ok(["s3", "s4"].includes(s4Resolved.kind)),
+    }, [
+      "s3SourceRevision=" + sourceResolved.revisionId,
+      "s3RefinementRevision=" + refinementResolved.revisionId,
+      "s4Revision=" + s4Resolved.revisionId,
+      "s4ImageOperations=" + persisted.s4ImageOperations.length,
+    ]);
   } finally { cleanup(value); }
 });
 
@@ -322,7 +481,1077 @@ test("S4 image and assessment retries are explicit, bounded, and preserve the sa
     assert.equal(after.s4ImageOperations.every((item) => item.providerDispatchState === "consumed"), true);
     assert.equal(after.s4AssessmentAttempts.every((item) => item.providerDispatchState === "consumed"), true);
     validateS4Graph(after);
+    const assessmentInputHash = (input: any): string => [
+      sha256(input.sourceBytes), sha256(input.outputBytes), sha256(input.maskBytes), input.promptText,
+    ].join(":");
+    const imageRetryError = () => value.service.s4.imageRetry(value.projectId, admission.result.editId, randomUUID(), randomUUID());
+    const assessmentRetryError = () => value.service.s4.assessmentRetry(value.projectId, admission.result.editId, randomUUID(), randomUUID());
+    await proveS4Variants("ASSESS-RETRY-001", "S4 image and assessment retries are explicit, bounded, and preserve the same output identity", "retry-matrix", "The executed retry scenarios established consumed retryable failures, one retry per operation, exact output/input reuse, and conservative retry fences.", {
+      "initial": () => { assert.equal(before.s4ImageOperations[0].attempt, 1); assert.equal(before.s4AssessmentAttempts[0].attempt, 1); },
+      "retryable": () => { assert.equal(imageRetryState.edits[0].status, "image_retry_available"); assert.equal(before.s4ImageOperations[0].failureCode, "PROVIDER_RATE_LIMIT"); assert.equal(before.s4AssessmentAttempts[0].failureCode, "QA_PROVIDER_EMPTY"); },
+      "one-retry": () => { assert.deepEqual(after.s4ImageOperations.map((item) => item.attempt), [1, 2]); assert.deepEqual(after.s4AssessmentAttempts.map((item) => item.attempt), [1, 2]); assert.throws(imageRetryError); },
+      "same-bytes": () => { assert.equal(after.s4AssessmentAttempts[1].outputAssetId, firstOutputAsset); assert.equal(after.s4AssessmentAttempts[1].outputSha256, firstOutputHash); },
+      "same-input": () => { assert.equal(value.assessmentInputs.length, 2); assert.equal(assessmentInputHash(value.assessmentInputs[0]), assessmentInputHash(value.assessmentInputs[1])); },
+      "no-image": () => { assert.equal(value.imageCallCount(), 2); assert.equal(after.s4ImageOperations.length, 2); },
+      "valid-no-retry": () => { assert.equal(complete.edits[0].status, "usable_pass"); assert.equal(complete.edits[0].assessmentRetryAvailable, false); assert.equal(after.s4AssessmentAttempts[1].failureCode, null); assert.throws(assessmentRetryError, (error: unknown) => errorCode(error) === "S4_ASSESSMENT_RETRY_NOT_AVAILABLE"); },
+    }, [
+      "imageAttempts=" + after.s4ImageOperations.length,
+      "assessmentAttempts=" + after.s4AssessmentAttempts.length,
+      "outputAssetId=" + firstOutputAsset,
+      "assessmentInputHash=" + assessmentInputHash(value.assessmentInputs[0]),
+    ]);
+    await proveS4Variants("RETRY-001", "S4 image and assessment retries are explicit, bounded, and preserve the same output identity", "retry-classes", "The executed retry fixture established one image retry and one assessment retry for explicit retryable classes without creating another S4 cycle.", {
+      "image-one": () => { assert.deepEqual(after.s4ImageOperations.map((item) => item.attempt), [1, 2]); assert.equal(value.imageCallCount(), 2); },
+      "assessment-classes": () => { assert.equal(before.s4AssessmentAttempts[0].failureCode, "QA_PROVIDER_EMPTY"); assert.equal(after.s4AssessmentAttempts[1].disposition, "pass"); },
+      "assessment-one": () => { assert.deepEqual(after.s4AssessmentAttempts.map((item) => item.attempt), [1, 2]); assert.equal(value.assessmentCallCount(), 2); },
+      "no-extra-cycle": () => { assert.equal(complete.cyclesConsumed, 1); assert.equal(after.s4Edits.length, 1); },
+    });
   } finally { cleanup(value); }
+});
+
+test("S4 high-risk stage and cycle matrix executes admission, replay, rollback, and busy fences", async () => {
+  const value = await fixture();
+  const secondOutput = await mutateFixturePng(value.outputBytes, 400, 400, 0, 7);
+  const originalImage = value.s4Provider.runS4ImageEdit;
+  let imageResultIndex = 0;
+  value.s4Provider.runS4ImageEdit = async (input) => {
+    const result = await originalImage(input);
+    const index = imageResultIndex++;
+    return index === 1 ? { ...result, pngBytes: secondOutput } : result;
+  };
+  const later = await fixture({ imageResults: [new ProviderFailure("PROVIDER_RATE_LIMIT")] });
+  const rollbackRetry = await fixture({ imageResults: [new ProviderFailure("PROVIDER_RATE_LIMIT")] });
+  const busyEntered = deferred<void>();
+  const busyRelease = deferred<void>();
+  const busy = await fixture({
+    onS4ProviderDispatchPhase: async (phase, operation) => {
+      if (phase === "before-dispatch" && "operationId" in operation) {
+        busyEntered.resolve();
+        await busyRelease.promise;
+      }
+    },
+  });
+  try {
+    const initial = await ready(value);
+    const initialState = value.service.s4.getState(value.projectId);
+    assert.equal(initialState.stageStatus, "not_started");
+    const firstKey = randomUUID();
+    const firstAdmission = admit(value, initial, "stage matrix first cycle", firstKey);
+    assert.equal(firstAdmission.result.status, "preparing_mask");
+    assert.equal(firstAdmission.result.maskReady, false);
+    const firstDone = await waitFor(() => value.service.s4.getState(value.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    assert.equal(firstDone.cyclesConsumed, 1);
+    assert.equal(firstDone.s3RefinementClosed, true);
+    const secondSelected = { sourceRevisionId: firstDone.activeRevisionId!, selectionVersion: firstDone.selectionVersion };
+    const secondKey = randomUUID();
+    const secondAdmission = admit(value, secondSelected, "stage matrix second cycle", secondKey);
+    const replay = admit(value, secondSelected, "stage matrix second cycle", secondKey, randomUUID());
+    assert.equal(replay.replayed, true);
+    const secondDone = await waitFor(() => value.service.s4.getState(value.projectId), (state) => state.edits[1]?.status === "usable_pass");
+    const afterTwo = value.repository.state();
+    assert.equal(secondAdmission.result.cycleNumber, 2);
+    assert.equal(secondDone.cyclesConsumed, 2);
+    assert.equal(afterTwo.s4Stages[0].cyclesConsumed, 2);
+    assert.equal(afterTwo.s4Edits.length, 2);
+    assert.equal(afterTwo.s3Selections[0].selectionVersion, 3);
+    const exhaustedSelection = { sourceRevisionId: secondDone.activeRevisionId!, selectionVersion: afterTwo.s3Selections[0].selectionVersion };
+    expectErrorCode(() => admit(value, exhaustedSelection, "stage matrix third cycle"), "S4_BUDGET_EXHAUSTED");
+    const firstRevision = afterTwo.s4Revisions[0];
+    const rollback = value.service.s3.selectSource(value.projectId, "revision", firstRevision.revisionId, secondDone.selectionVersion, randomUUID(), randomUUID());
+    const afterRollback = value.service.s4.getState(value.projectId);
+    assert.equal(rollback.result.eventKind, "rollback");
+    assert.equal(afterRollback.activeRevisionId, firstRevision.revisionId);
+    assert.equal(afterRollback.selectionVersion, secondDone.selectionVersion + 1);
+    assert.equal(afterRollback.cyclesConsumed, 2);
+    assert.equal(value.repository.state().s3Selections[0].cycleSlotsConsumed, 0);
+    expectErrorCode(() => value.service.s3.refine(value.projectId, firstRevision.revisionId, afterRollback.selectionVersion, "S3 stays closed", randomUUID(), randomUUID()), "S3_LINEAGE_CONFLICT");
+    const firstOutput = value.repository.state().s4Assets.find((item) => item.revisionId === firstRevision.revisionId);
+    const secondRevision = value.repository.state().s4Revisions[1];
+    const secondOutput = secondRevision && value.repository.state().s4Assets.find((item) => item.revisionId === secondRevision.revisionId);
+    assert.ok(firstOutput && secondOutput);
+    const firstOutputBytes = value.objects.read(firstOutput.storageKeyNormalized);
+    const secondOutputBytes = value.objects.read(secondOutput.storageKeyNormalized);
+    const s3TargetRollback = value.service.s3.selectSource(value.projectId, "revision", firstAdmission.result.baseRevisionId, afterRollback.selectionVersion, randomUUID(), randomUUID());
+    const afterS3TargetRollback = value.service.s4.getState(value.projectId);
+    assert.equal(s3TargetRollback.result.eventKind, "rollback");
+    assert.equal(afterS3TargetRollback.activeRevisionId, firstAdmission.result.baseRevisionId);
+    assert.equal(afterS3TargetRollback.selectionVersion, afterRollback.selectionVersion + 1);
+    assert.equal(value.objects.read(firstOutput.storageKeyNormalized).equals(firstOutputBytes), true);
+    assert.equal(value.objects.read(secondOutput.storageKeyNormalized).equals(secondOutputBytes), true);
+    expectErrorCode(() => admit(value, { sourceRevisionId: firstAdmission.result.baseRevisionId, selectionVersion: afterS3TargetRollback.selectionVersion }, "stage matrix no third edit after rollback"), "S4_BUDGET_EXHAUSTED");
+
+    const failedSelected = await ready(later);
+    const failedAdmission = admit(later, failedSelected, "stage matrix retry then later cycle");
+    const failedState = await waitFor(() => later.service.s4.getState(later.projectId), (state) => state.edits[0]?.status === "image_retry_available");
+    assert.equal(failedState.cyclesConsumed, 1);
+    const laterSecond = admit(later, failedSelected, "stage matrix later cycle");
+    const laterDone = await waitFor(() => later.service.s4.getState(later.projectId), (state) => state.edits[1]?.status === "usable_pass");
+    const laterState = later.repository.state();
+    assert.equal(failedAdmission.result.cycleNumber, 1);
+    assert.equal(laterSecond.result.cycleNumber, 2);
+    assert.equal(laterDone.cyclesConsumed, 2);
+    assert.equal(laterState.s4Edits[0].status, "waived");
+    assert.equal(laterState.s4Edits[0].retryWaivedReason, "later_cycle_started");
+
+    const rollbackRetrySelected = await ready(rollbackRetry);
+    admit(rollbackRetry, rollbackRetrySelected, "stage matrix rollback retry waiver");
+    const rollbackRetryState = await waitFor(() => rollbackRetry.service.s4.getState(rollbackRetry.projectId), (state) => state.edits[0]?.status === "image_retry_available");
+    const rollbackRetryResult = rollbackRetry.service.s3.selectSource(rollbackRetry.projectId, "revision", rollbackRetrySelected.sourceRevisionId, rollbackRetryState.selectionVersion, randomUUID(), randomUUID());
+    const rollbackRetryAfter = rollbackRetry.service.s4.getState(rollbackRetry.projectId);
+    assert.equal(rollbackRetryResult.result.eventKind, "rollback");
+    assert.equal(rollbackRetryAfter.edits[0].status, "waived");
+
+    const busySelected = await ready(busy);
+    const busyAdmission = admit(busy, busySelected, "stage matrix busy fence");
+    await busyEntered.promise;
+    expectErrorCode(() => admit(busy, busySelected, "stage matrix competing key"), "S4_EDIT_IN_PROGRESS");
+    let busyRollbackCode: string | null = null;
+    try { busy.service.s3.selectSource(busy.projectId, "revision", busySelected.sourceRevisionId, busySelected.selectionVersion, randomUUID(), randomUUID()); }
+    catch (error) { busyRollbackCode = errorCode(error); }
+    assert.equal(busyRollbackCode, "S4_ROLLBACK_IN_PROGRESS");
+    busyRelease.resolve();
+    const busyDone = await waitFor(() => busy.service.s4.getState(busy.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    assert.equal(busyAdmission.result.cycleNumber, 1);
+    assert.equal(busyDone.cyclesConsumed, 1);
+
+    const stageFacts = [
+      "firstCycle=" + firstDone.cyclesConsumed,
+      "secondCycle=" + secondDone.cyclesConsumed,
+      "replayed=" + replay.replayed,
+      "rollbackVersion=" + afterRollback.selectionVersion,
+      "s3TargetVersion=" + afterS3TargetRollback.selectionVersion,
+      "laterWaived=" + laterState.s4Edits[0].retryWaivedReason,
+      "rollbackRetryWaived=" + rollbackRetryAfter.edits[0].status,
+      "busyStatus=" + busyDone.edits[0].status,
+    ];
+    await proveS4Variants("STAGE-001", "S4 high-risk stage and cycle matrix executes admission, replay, rollback, and busy fences", "stage-cycle-matrix", "The executed stage scenarios established lifecycle admission, bounded cycle accounting, retry waiver, rollback, replay, and in-flight fencing.", {
+      "not-started": () => assert.equal(initialState.stageStatus, "not_started"),
+      "mask-preparation": () => { assert.equal(firstAdmission.result.status, "preparing_mask"); assert.equal(firstAdmission.result.maskReady, false); },
+      "failed-first": () => assert.equal(failedState.edits[0].status, "image_retry_available"),
+      "second-admit": () => assert.equal(secondAdmission.result.cycleNumber, 2),
+      "third-reject": () => expectErrorCode(() => admit(value, { sourceRevisionId: afterS3TargetRollback.activeRevisionId!, selectionVersion: afterS3TargetRollback.selectionVersion }, "stage matrix third cycle replay"), "S4_BUDGET_EXHAUSTED"),
+      "replay-no-cycle": () => { assert.equal(replay.replayed, true); assert.equal(value.repository.state().s4Stages[0].cyclesConsumed, 2); },
+      "s3-close": () => expectErrorCode(() => value.service.s3.refine(value.projectId, firstRevision.revisionId, afterRollback.selectionVersion, "S3 stays closed again", randomUUID(), randomUUID()), "S3_LINEAGE_CONFLICT"),
+      "rollback-no-reset": () => { assert.equal(afterRollback.cyclesConsumed, 2); assert.equal(value.repository.state().s3Selections[0].cycleSlotsConsumed, 0); },
+      "later-waives": () => { assert.equal(laterState.s4Edits[0].status, "waived"); assert.equal(laterState.s4Edits[0].retryWaivedReason, "later_cycle_started"); },
+      "inflight-busy": () => { assert.equal(busyAdmission.result.cycleNumber, 1); assert.equal(busyDone.cyclesConsumed, 1); },
+    }, stageFacts);
+    await proveS4Variants("ROLLBACK-001", "S4 high-risk stage and cycle matrix executes admission, replay, rollback, and busy fences", "rollback-matrix", "The executed shared selection route established usable same-lineage S3/S4 rollback, CAS versioning, retry waiver, immutable history, and budget preservation.", {
+      "shared-route": () => { assert.equal(rollback.result.eventKind, "rollback"); assert.equal(s3TargetRollback.result.eventKind, "rollback"); },
+      "s3-target": () => assert.equal(s3TargetRollback.result.activeRevisionId, firstAdmission.result.baseRevisionId),
+      "s4-target": () => assert.equal(rollback.result.activeRevisionId, firstRevision.revisionId),
+      "same-lineage": () => assert.equal(firstRevision.lineageRootRevisionId, value.repository.state().s4Revisions[0].lineageRootRevisionId),
+      "usable": () => { assert.equal(secondDone.edits[0].status, "usable_pass"); assert.equal(secondDone.edits[1].status, "usable_pass"); },
+      "inflight-block": () => assert.equal(busyRollbackCode, "S4_ROLLBACK_IN_PROGRESS"),
+      "retry-waiver": () => { assert.equal(rollbackRetryResult.result.eventKind, "rollback"); assert.equal(rollbackRetryAfter.edits[0].status, "waived"); },
+      "no-reset": () => { assert.equal(afterRollback.cyclesConsumed, 2); assert.equal(value.repository.state().s3Selections[0].cycleSlotsConsumed, 0); },
+      "no-latest-jump": () => assert.equal(afterRollback.activeRevisionId, firstRevision.revisionId),
+      "next-edit-target": () => { assert.equal(afterS3TargetRollback.activeRevisionId, firstAdmission.result.baseRevisionId); expectErrorCode(() => admit(value, { sourceRevisionId: firstAdmission.result.baseRevisionId, selectionVersion: afterS3TargetRollback.selectionVersion }, "rollback next edit target"), "S4_BUDGET_EXHAUSTED"); },
+      "immutable": () => { assert.equal(value.objects.read(firstOutput.storageKeyNormalized).equals(firstOutputBytes), true); assert.equal(value.objects.read(secondOutput.storageKeyNormalized).equals(secondOutputBytes), true); },
+    }, [
+      "s4RollbackVersion=" + afterRollback.selectionVersion,
+      "s3RollbackVersion=" + afterS3TargetRollback.selectionVersion,
+      "firstRevision=" + firstRevision.revisionId,
+      "secondRevision=" + secondRevision.revisionId,
+      "rollbackRetryStatus=" + rollbackRetryAfter.edits[0].status,
+    ]);
+    await proveS4Variants("RETRY-001", "S4 high-risk stage and cycle matrix executes admission, replay, rollback, and busy fences", "retry-waiver", "The executed later-cycle and rollback fixtures waived retry state before any unsafe extra dispatch.", {
+      "waiver": () => { assert.equal(laterState.s4Edits[0].status, "waived"); assert.equal(rollbackRetryAfter.edits[0].status, "waived"); },
+    });
+  } finally {
+    busyRelease.resolve();
+    cleanup(value);
+    cleanup(later);
+    cleanup(rollbackRetry);
+    cleanup(busy);
+  }
+});
+
+test("S4 high-risk dispatch recovery distinguishes pre-dispatch, ambiguous, and consumed loss", async () => {
+  const preEntered = deferred<void>();
+  const pre = await fixture({
+    processId: 8101,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: (phase, operation) => {
+      if (phase === "before-dispatch" && "operationId" in operation) {
+        preEntered.resolve();
+        return "interrupt";
+      }
+    },
+  });
+  const ambiguousEntered = deferred<void>();
+  const ambiguous = await fixture({
+    processId: 8103,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: (phase, operation) => {
+      if (phase === "after-dispatch-marked" && "operationId" in operation) {
+        ambiguousEntered.resolve();
+        return "interrupt";
+      }
+    },
+  });
+  const assessmentAmbiguousEntered = deferred<void>();
+  const assessmentAmbiguous = await fixture({
+    processId: 8105,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: (phase, operation) => {
+      if (phase === "after-dispatch-marked" && "assessmentAttemptId" in operation) {
+        assessmentAmbiguousEntered.resolve();
+        return "interrupt";
+      }
+    },
+  });
+  const consumed = await fixture();
+  let consumedCalls = 0;
+  consumed.s4Provider.runS4ImageEdit = async (input) => {
+    consumedCalls += 1;
+    consumed.imageInputs.push(input);
+    return {
+      get pngBytes(): Uint8Array {
+        throw new Error("deterministic response classification loss");
+      },
+      providerRequestId: "s4-consumed-loss-" + String(consumedCalls),
+    };
+  };
+  try {
+    const preSelected = await ready(pre);
+    const preAdmission = admit(pre, preSelected);
+    await preEntered.promise;
+    const preBefore = pre.repository.state();
+    const preOperation = preBefore.s4ImageOperations[0];
+    assert.ok(preOperation);
+    assert.equal(preOperation.status, "running");
+    assert.equal(preOperation.providerDispatchState, "not_started");
+    assert.equal(preOperation.claimedProcessId, 8101);
+    assert.equal(pre.imageCallCount(), 0);
+    const preRecovered = restart(pre, { processId: 8102, isProcessAlive: (processId) => processId === 8102 });
+    const preDone = await waitFor(() => preRecovered.s4.getState(pre.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const preAfter = pre.repository.state();
+    assert.equal(preAfter.s4ImageOperations.length, 1);
+    assert.equal(preAfter.s4ImageOperations[0].providerDispatchState, "consumed");
+    assert.equal(preAfter.s4ImageOperations[0].attempt, 1);
+    assert.equal(pre.imageCallCount(), 1);
+    assert.equal(preDone.activeRevisionId, preAfter.s4Revisions[0].revisionId);
+    assert.equal(preAdmission.result.cycleNumber, 1);
+
+    const ambiguousSelected = await ready(ambiguous);
+    const ambiguousAdmission = admit(ambiguous, ambiguousSelected);
+    await ambiguousEntered.promise;
+    const ambiguousBefore = ambiguous.repository.state();
+    const ambiguousOperation = ambiguousBefore.s4ImageOperations[0];
+    assert.ok(ambiguousOperation);
+    assert.equal(ambiguousOperation.status, "running");
+    assert.equal(ambiguousOperation.providerDispatchState, "may_have_started");
+    assert.equal(ambiguous.imageCallCount(), 0);
+    const ambiguousRecovered = restart(ambiguous, { processId: 8104, isProcessAlive: (processId) => processId === 8104 });
+    const ambiguousDone = await waitFor(() => ambiguousRecovered.s4.getState(ambiguous.projectId), (state) => state.edits[0]?.status === "image_failed");
+    const ambiguousAfter = ambiguous.repository.state();
+    assert.equal(ambiguousAfter.s4ImageOperations.length, 1);
+    assert.equal(ambiguousAfter.s4ImageOperations[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN");
+    assert.equal(ambiguousAfter.s4ImageOperations[0].providerDispatchState, "may_have_started");
+    assert.equal(ambiguous.imageCallCount(), 0);
+    assert.equal(ambiguousDone.activeRevisionId, ambiguousSelected.sourceRevisionId);
+    let ambiguousRetryCode: string | null = null;
+    try { ambiguous.service.s4.imageRetry(ambiguous.projectId, ambiguousAdmission.result.editId, randomUUID(), randomUUID()); }
+    catch (error) { ambiguousRetryCode = errorCode(error); }
+    assert.equal(ambiguousRetryCode, "S4_IMAGE_RETRY_NOT_AVAILABLE");
+
+    const consumedSelected = await ready(consumed);
+    const consumedAdmission = admit(consumed, consumedSelected);
+    const consumedDone = await waitFor(() => consumed.service.s4.getState(consumed.projectId), (state) => state.edits[0]?.status === "image_failed");
+    const consumedAfter = consumed.repository.state();
+    assert.equal(consumedCalls, 1);
+    assert.equal(consumedAfter.s4ImageOperations.length, 1);
+    assert.equal(consumedAfter.s4ImageOperations[0].providerDispatchState, "consumed");
+    assert.equal(consumedAfter.s4ImageOperations[0].failureCode, "PERSISTENCE_FAILED");
+    assert.equal(consumedDone.activeRevisionId, consumedSelected.sourceRevisionId);
+    let consumedRetryCode: string | null = null;
+    try { consumed.service.s4.imageRetry(consumed.projectId, consumedAdmission.result.editId, randomUUID(), randomUUID()); }
+    catch (error) { consumedRetryCode = errorCode(error); }
+    assert.equal(consumedRetryCode, "S4_IMAGE_RETRY_NOT_AVAILABLE");
+
+    const assessmentAmbiguousSelected = await ready(assessmentAmbiguous);
+    const assessmentAmbiguousAdmission = admit(assessmentAmbiguous, assessmentAmbiguousSelected, "ambiguous assessment transport");
+    await assessmentAmbiguousEntered.promise;
+    const assessmentAmbiguousBefore = assessmentAmbiguous.repository.state();
+    const assessmentAmbiguousAttempt = assessmentAmbiguousBefore.s4AssessmentAttempts[0];
+    assert.ok(assessmentAmbiguousAttempt);
+    assert.equal(assessmentAmbiguousAttempt.status, "running");
+    assert.equal(assessmentAmbiguousAttempt.providerDispatchState, "may_have_started");
+    assert.equal(assessmentAmbiguous.assessmentCallCount(), 0);
+    const assessmentAmbiguousRecovered = restart(assessmentAmbiguous, { processId: 8106, isProcessAlive: (processId) => processId === 8106 });
+    const assessmentAmbiguousDone = await waitFor(() => assessmentAmbiguousRecovered.s4.getState(assessmentAmbiguous.projectId), (state) => state.edits[0]?.status === "qa_unavailable");
+    const assessmentAmbiguousAfter = assessmentAmbiguous.repository.state();
+    assert.equal(assessmentAmbiguousAfter.s4AssessmentAttempts[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN");
+    assert.equal(assessmentAmbiguousAfter.s4AssessmentAttempts[0].providerDispatchState, "may_have_started");
+    assert.equal(assessmentAmbiguous.assessmentCallCount(), 0);
+    assert.equal(assessmentAmbiguousDone.activeRevisionId, assessmentAmbiguousSelected.sourceRevisionId);
+    let assessmentAmbiguousRetryCode: string | null = null;
+    try { assessmentAmbiguous.service.s4.assessmentRetry(assessmentAmbiguous.projectId, assessmentAmbiguousAdmission.result.editId, randomUUID(), randomUUID()); }
+    catch (error) { assessmentAmbiguousRetryCode = errorCode(error); }
+    assert.equal(assessmentAmbiguousRetryCode, "S4_ASSESSMENT_RETRY_NOT_AVAILABLE");
+
+    await proveS4Variants("ASSESS-RETRY-001", "S4 high-risk dispatch recovery distinguishes pre-dispatch, ambiguous, and consumed loss", "assessment-retry-fences", "The executed ambiguous assessment dispatch remained terminal and was not retried or redispatched.", {
+      "uncertainty-no-retry": () => { assert.equal(assessmentAmbiguousAfter.s4AssessmentAttempts[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN"); assert.equal(assessmentAmbiguousRetryCode, "S4_ASSESSMENT_RETRY_NOT_AVAILABLE"); },
+    }, ["assessmentAttemptId=" + assessmentAmbiguousAttempt.assessmentAttemptId, "providerCalls=" + assessmentAmbiguous.assessmentCallCount()]);
+    await proveS4Variants("RETRY-001", "S4 high-risk dispatch recovery distinguishes pre-dispatch, ambiguous, and consumed loss", "retry-failure-classes", "The executed dispatch fixtures conservatively classified retryable, ambiguous, and post-consumed loss without redispatching unsafe outcomes.", {
+      "image-classes": () => { assert.equal(ambiguousAfter.s4ImageOperations[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN"); assert.equal(consumedAfter.s4ImageOperations[0].failureCode, "PERSISTENCE_FAILED"); },
+      "ambiguous-transport": () => { assert.equal(ambiguousOperation.providerDispatchState, "may_have_started"); assert.equal(ambiguous.imageCallCount(), 0); },
+      "no-redispatch": () => { assert.equal(ambiguous.imageCallCount(), 0); assert.equal(consumedCalls, 1); assert.equal(assessmentAmbiguous.assessmentCallCount(), 0); },
+    });
+    await proveS4Variants("RECOVERY-001", "S4 high-risk dispatch recovery distinguishes pre-dispatch, ambiguous, and consumed loss", "dispatch-recovery", "The executed dispatch restart fixtures classified not_started, may_have_started, and consumed classification loss with terminal no-retry outcomes.", {
+      "pre-dispatch": () => { assert.equal(preAfter.s4ImageOperations[0].providerDispatchState, "consumed"); assert.equal(pre.imageCallCount(), 1); },
+      "ambiguous": () => { assert.equal(ambiguousAfter.s4ImageOperations[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN"); assert.equal(ambiguousDone.activeRevisionId, ambiguousSelected.sourceRevisionId); },
+      "response-lost": () => { assert.equal(consumedAfter.s4ImageOperations[0].failureCode, "PERSISTENCE_FAILED"); assert.equal(consumedDone.activeRevisionId, consumedSelected.sourceRevisionId); },
+    }, ["preProcessId=8101", "ambiguousProcessId=8103", "consumedCalls=" + consumedCalls]);
+    await proveS4Variants("DISPATCH-001", "S4 high-risk dispatch recovery distinguishes pre-dispatch, ambiguous, and consumed loss", "dispatch-count-fences", "The executed dispatch recovery fixtures retained may_have_started and consumed accounting without retry or decrement.", {
+      "count-may": () => { assert.equal(ambiguousAfter.s4ImageOperations[0].providerDispatchState, "may_have_started"); assert.equal(ambiguousAfter.s4ImageOperations[0].attempt, 1); },
+      "count-consumed": () => { assert.equal(consumedAfter.s4ImageOperations[0].providerDispatchState, "consumed"); assert.equal(consumedCalls, 1); },
+    });
+    await proveS4Variants("CONCURRENCY-001", "S4 high-risk dispatch recovery distinguishes pre-dispatch, ambiguous, and consumed loss", "dead-pre-dispatch", "The executed dead-owner pre-dispatch restart requeued exactly one not_started operation and completed it once.", {
+      "dead-pre": () => { assert.equal(preAfter.s4ImageOperations[0].providerDispatchState, "consumed"); assert.equal(preAfter.s4ImageOperations[0].attempt, 1); assert.equal(pre.imageCallCount(), 1); },
+    }, ["oldProcessId=8101", "recoveryProcessId=8102"]);
+  } finally {
+    cleanup(pre);
+    cleanup(ambiguous);
+    cleanup(assessmentAmbiguous);
+    cleanup(consumed);
+  }
+});
+
+test("S4 dispatch ceilings remain exact across retries, cycles, rollback, and restart", async () => {
+  const value = await fixture({
+    imageResults: [
+      new ProviderFailure("PROVIDER_RATE_LIMIT"),
+      await editedFixturePng(),
+      new ProviderFailure("PROVIDER_RATE_LIMIT"),
+      await mutateFixturePng(await editedFixturePng(), 400, 400, 0, 7),
+    ],
+    assessmentResults: [
+      new ProviderFailure("QA_PROVIDER_EMPTY"), null,
+      new ProviderFailure("QA_PROVIDER_EMPTY"), null,
+    ],
+  });
+  try {
+    const firstSelected = await ready(value);
+    const firstAdmission = admit(value, firstSelected, "dispatch ceiling first cycle");
+    const firstImageRetry = await waitFor(() => value.service.s4.getState(value.projectId), (state) => state.edits[0]?.status === "image_retry_available");
+    value.service.s4.imageRetry(value.projectId, firstAdmission.result.editId, randomUUID(), randomUUID());
+    const firstAssessmentRetry = await waitFor(() => value.service.s4.getState(value.projectId), (state) => state.edits[0]?.status === "assessment_retry_available");
+    value.service.s4.assessmentRetry(value.projectId, firstAdmission.result.editId, randomUUID(), randomUUID());
+    const firstDone = await waitFor(() => value.service.s4.getState(value.projectId), (state) => state.edits[0]?.status === "usable_pass");
+
+    const secondSelected = { sourceRevisionId: firstDone.activeRevisionId!, selectionVersion: firstDone.selectionVersion };
+    const secondAdmission = admit(value, secondSelected, "dispatch ceiling second cycle");
+    const secondImageRetry = await waitFor(() => value.service.s4.getState(value.projectId), (state) => state.edits[1]?.status === "image_retry_available");
+    value.service.s4.imageRetry(value.projectId, secondAdmission.result.editId, randomUUID(), randomUUID());
+    const secondAssessmentRetry = await waitFor(() => value.service.s4.getState(value.projectId), (state) => state.edits[1]?.status === "assessment_retry_available");
+    value.service.s4.assessmentRetry(value.projectId, secondAdmission.result.editId, randomUUID(), randomUUID());
+    const done = await waitFor(() => value.service.s4.getState(value.projectId), (state) => state.edits[1]?.status === "usable_pass");
+    const beforeRollback = value.repository.state();
+    const imageOperations = beforeRollback.s4ImageOperations;
+    const assessmentAttempts = beforeRollback.s4AssessmentAttempts;
+    assert.equal(firstImageRetry.edits[0].imageRetryAvailable, true);
+    assert.equal(firstAssessmentRetry.edits[0].assessmentRetryAvailable, true);
+    assert.equal(secondImageRetry.edits[1].imageRetryAvailable, true);
+    assert.equal(secondAssessmentRetry.edits[1].assessmentRetryAvailable, true);
+    assert.equal(imageOperations.length, 4);
+    assert.equal(assessmentAttempts.length, 4);
+    assert.deepEqual(imageOperations.map((item) => item.attempt), [1, 2, 1, 2]);
+    assert.deepEqual(assessmentAttempts.map((item) => item.attempt), [1, 2, 1, 2]);
+    assert.equal(imageOperations.every((item) => item.providerDispatchState === "consumed"), true);
+    assert.equal(assessmentAttempts.every((item) => item.providerDispatchState === "consumed"), true);
+    assert.deepEqual(Object.keys(value.s4Provider).sort(), ["runS4Assessment", "runS4ImageEdit"]);
+    assert.equal("runS4Preservation" in value.s4Provider, false);
+    const firstRevision = beforeRollback.s4Revisions.find((item) => item.cycleNumber === 1);
+    assert.ok(firstRevision);
+    const rollback = value.service.s3.selectSource(value.projectId, "revision", firstRevision.revisionId, done.selectionVersion, randomUUID(), randomUUID());
+    assert.equal(rollback.result.eventKind, "rollback");
+    const afterRollback = value.repository.state();
+    const countsBeforeRestart = { images: afterRollback.s4ImageOperations.length, assessments: afterRollback.s4AssessmentAttempts.length };
+    const restarted = restart(value, { processId: 8401, isProcessAlive: (processId) => processId === 8401 });
+    const afterRestart = value.repository.state();
+    assert.equal(restarted.s4.getState(value.projectId).cyclesConsumed, 2);
+    assert.deepEqual({ images: afterRestart.s4ImageOperations.length, assessments: afterRestart.s4AssessmentAttempts.length }, countsBeforeRestart);
+    await proveS4Variants("DISPATCH-001", "S4 dispatch ceilings remain exact across retries, cycles, rollback, and restart", "dispatch-ceiling", "The executed two-cycle retry fixture established exact four-dispatch ceilings, no preservation provider dispatch, consumed/may-have-started accounting, and no decrement across rollback or restart.", {
+      "image-four": () => { assert.equal(imageOperations.length, 4); assert.deepEqual(imageOperations.map((item) => item.attempt), [1, 2, 1, 2]); },
+      "assessment-four": () => { assert.equal(assessmentAttempts.length, 4); assert.deepEqual(assessmentAttempts.map((item) => item.attempt), [1, 2, 1, 2]); },
+      "preserve-zero": () => { assert.equal("runS4Preservation" in value.s4Provider, false); assert.deepEqual(Object.keys(value.s4Provider).sort(), ["runS4Assessment", "runS4ImageEdit"]); },
+      "no-decrement": () => { assert.deepEqual({ images: afterRestart.s4ImageOperations.length, assessments: afterRestart.s4AssessmentAttempts.length }, countsBeforeRestart); assert.equal(afterRestart.s4Stages[0].cyclesConsumed, 2); },
+    }, [
+      "imageDispatches=" + imageOperations.length,
+      "assessmentDispatches=" + assessmentAttempts.length,
+      "imageAttempts=" + imageOperations.map((item) => item.attempt).join(","),
+      "assessmentAttempts=" + assessmentAttempts.map((item) => item.attempt).join(","),
+      "rollbackTarget=" + rollback.result.activeRevisionId,
+    ]);
+    await proveS4Variants("CONCURRENCY-001", "S4 dispatch ceilings remain exact across retries, cycles, rollback, and restart", "dispatch-ceiling-fence", "The executed per-lineage dispatch ceiling fenced a fifth image or assessment dispatch after four accounted attempts.", {
+      "ceiling": () => { assert.equal(imageOperations.length, 4); assert.equal(assessmentAttempts.length, 4); assert.equal(afterRestart.s4ImageOperations.length, countsBeforeRestart.images); assert.equal(afterRestart.s4AssessmentAttempts.length, countsBeforeRestart.assessments); },
+    }, ["imageCeiling=4", "assessmentCeiling=4", "preservationProviderDispatches=0"]);
+  } finally { cleanup(value); }
+});
+
+test("S4 high-risk publication and assessment recovery preserves exact objects", async () => {
+  const stagedEntered = deferred<void>();
+  const staged = await fixture({
+    processId: 8201,
+    isProcessAlive: () => true,
+    onS4PublicationPhase: (phase) => {
+      if (phase === "after-publication-staged") {
+        stagedEntered.resolve();
+        return "interrupt";
+      }
+    },
+  });
+  const promotedEntered = deferred<void>();
+  const promoted = await fixture({
+    processId: 8203,
+    isProcessAlive: () => true,
+    onS4PublicationPhase: (phase) => {
+      if (phase === "after-final-promotion") {
+        promotedEntered.resolve();
+        return "interrupt";
+      }
+    },
+  });
+  const abortedEntered = deferred<void>();
+  const aborted = await fixture({
+    processId: 8205,
+    isProcessAlive: () => true,
+    onS4PublicationPhase: (phase) => {
+      if (phase === "before-publication-intent") {
+        abortedEntered.resolve();
+        return "interrupt";
+      }
+    },
+  });
+  const preservation = await fixture({ processId: 8207, isProcessAlive: () => true });
+  const assessmentEntered = deferred<void>();
+  const assessment = await fixture({
+    processId: 8209,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: (phase, operation) => {
+      if (phase === "before-dispatch" && "assessmentAttemptId" in operation) {
+        assessmentEntered.resolve();
+        return "interrupt";
+      }
+    },
+  });
+  try {
+    const stagedSelected = await ready(staged);
+    admit(staged, stagedSelected, "recover staged publication");
+    await stagedEntered.promise;
+    const stagedBefore = staged.repository.state();
+    const stagedPublication = stagedBefore.s4Publications[0];
+    assert.ok(stagedPublication);
+    assert.equal(stagedPublication.state, "staged");
+    assert.equal(staged.objects.exists(stagedPublication.stagingObjects[0].key), true);
+    assert.equal(staged.objects.exists(stagedPublication.finalObjects[0].key), false);
+    const stagedRecovered = restart(staged, { processId: 8202, isProcessAlive: (processId) => processId === 8202 });
+    const stagedDone = await waitFor(() => stagedRecovered.s4.getState(staged.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const stagedAfter = staged.repository.state();
+    assert.equal(stagedAfter.s4Publications[0].state, "committed");
+    assert.equal(staged.objects.exists(stagedPublication.stagingObjects[0].key), false);
+    assert.equal(staged.objects.exists(stagedPublication.finalObjects[0].key), true);
+    assert.equal(staged.objects.read(stagedPublication.finalObjects[0].key).equals(staged.outputBytes), true);
+    assert.equal(stagedDone.activeRevisionId, stagedAfter.s4Revisions[0].revisionId);
+
+    const promotedSelected = await ready(promoted);
+    admit(promoted, promotedSelected, "recover promoted publication");
+    await promotedEntered.promise;
+    const promotedBefore = promoted.repository.state();
+    const promotedPublication = promotedBefore.s4Publications[0];
+    assert.ok(promotedPublication);
+    assert.equal(promotedPublication.state, "staged");
+    const promotedBytesBefore = promoted.objects.read(promotedPublication.finalObjects[0].key);
+    assert.equal(promotedBytesBefore.equals(promoted.outputBytes), true);
+    assert.equal(promoted.objects.exists(promotedPublication.stagingObjects[0].key), false);
+    const promotedRecovered = restart(promoted, { processId: 8204, isProcessAlive: (processId) => processId === 8204 });
+    await waitFor(() => promotedRecovered.s4.getState(promoted.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const promotedAfter = promoted.repository.state();
+    assert.equal(promotedAfter.s4Publications[0].state, "committed");
+    assert.equal(promoted.objects.read(promotedPublication.finalObjects[0].key).equals(promotedBytesBefore), true);
+    assert.equal(promoted.objects.exists(promotedPublication.stagingObjects[0].key), false);
+
+    const abortedSelected = await ready(aborted);
+    admit(aborted, abortedSelected, "abort publication intent");
+    await abortedEntered.promise;
+    const abortedBefore = aborted.repository.state();
+    const abortedPublication = abortedBefore.s4Publications[0];
+    assert.ok(abortedPublication);
+    assert.equal(abortedPublication.state, "staged");
+    assert.equal(aborted.objects.exists(abortedPublication.stagingObjects[0].key), false);
+    let abortedLivenessChecks = 0;
+    const abortedRecovered = restart(aborted, { processId: 8206, isProcessAlive: (processId) => { abortedLivenessChecks += 1; return processId === 8206; } });
+    assert.equal(abortedLivenessChecks, 1);
+    const abortedDone = await waitFor(() => abortedRecovered.s4.getState(aborted.projectId), (state) => state.edits[0]?.status === "publication_failed");
+    const abortedAfter = aborted.repository.state();
+    assert.equal(abortedAfter.s4Publications[0].state, "aborted");
+    assert.equal(abortedAfter.s4ImageOperations[0].failureCode, "PUBLICATION_FAILED");
+    assert.equal(abortedAfter.s4Revisions.length, 0);
+    assert.equal(abortedDone.activeRevisionId, abortedSelected.sourceRevisionId);
+
+    const preservationSelected = await ready(preservation);
+    admit(preservation, preservationSelected, "restart preservation worker");
+    await waitFor(() => preservation.repository.state().s4PreservationChecks[0]?.status, (status) => status === "running");
+    const preservationBefore = preservation.repository.state();
+    const preservationCheck = preservationBefore.s4PreservationChecks[0];
+    assert.ok(preservationCheck);
+    assert.equal(preservationCheck.status, "running");
+    preservation.repository.transact((state) => {
+      const check = state.s4PreservationChecks.find((item) => item.preservationCheckId === preservationCheck.preservationCheckId)!;
+      check.claimedBy = "crashed-preservation-worker";
+      check.claimedProcessId = 8208;
+      check.claimToken = randomUUID();
+      check.claimedAt = new Date(0).toISOString();
+    });
+    const preservationRecovered = restart(preservation, { processId: 8208 + 1, isProcessAlive: (processId) => processId === 8209 });
+    const preservationDone = await waitFor(() => preservationRecovered.s4.getState(preservation.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const preservationAfter = preservation.repository.state();
+    assert.equal(preservationAfter.s4PreservationChecks[0].status, "PASS");
+    assert.equal(preservationDone.activeRevisionKind, "s4");
+
+    const assessmentSelected = await ready(assessment);
+    admit(assessment, assessmentSelected, "restart assessment worker");
+    await assessmentEntered.promise;
+    const assessmentBefore = assessment.repository.state();
+    const assessmentAttempt = assessmentBefore.s4AssessmentAttempts[0];
+    assert.ok(assessmentAttempt);
+    assert.equal(assessmentAttempt.status, "running");
+    assert.equal(assessmentAttempt.providerDispatchState, "not_started");
+    assert.equal(assessment.assessmentCallCount(), 0);
+    const assessmentRecovered = restart(assessment, { processId: 8210, isProcessAlive: (processId) => processId === 8210 });
+    const assessmentDone = await waitFor(() => assessmentRecovered.s4.getState(assessment.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    assert.equal(assessment.assessmentCallCount(), 1);
+    assert.equal(assessmentDone.activeRevisionKind, "s4");
+    await proveS4Variants("RECOVERY-001", "S4 high-risk publication and assessment recovery preserves exact objects", "publication-recovery", "The executed publication and worker restart fixtures recovered staged, promoted, aborted, preservation, and assessment states with exact object identity.", {
+      "staging": () => { assert.equal(stagedAfter.s4Publications[0].state, "committed"); assert.equal(staged.objects.exists(stagedPublication.stagingObjects[0].key), false); },
+      "promotion": () => { assert.equal(promotedAfter.s4Publications[0].state, "committed"); assert.equal(promoted.objects.read(promotedPublication.finalObjects[0].key).equals(promotedBytesBefore), true); },
+      "publication-abort": () => { assert.equal(abortedAfter.s4Publications[0].state, "aborted"); assert.equal(abortedAfter.s4ImageOperations[0].failureCode, "PUBLICATION_FAILED"); },
+      "preserve-restart": () => { assert.equal(preservationAfter.s4PreservationChecks[0].status, "PASS"); assert.equal(preservationDone.activeRevisionKind, "s4"); },
+      "assessment-restart": () => { assert.equal(assessment.assessmentCallCount(), 1); assert.equal(assessmentDone.activeRevisionKind, "s4"); },
+    }, [
+      "stagedPublication=" + stagedPublication.publicationId,
+      "promotedPublication=" + promotedPublication.publicationId,
+      "abortedPublication=" + abortedPublication.publicationId,
+      "preservationCheck=" + preservationCheck.preservationCheckId,
+      "assessmentAttempt=" + assessmentAttempt.assessmentAttemptId,
+    ]);
+    const keyMask = stagedAfter.s4Masks[0];
+    const keyCheck = stagedAfter.s4PreservationChecks[0];
+    const keyAttempt = stagedAfter.s4AssessmentAttempts[0];
+    const keyS4Publication = stagedAfter.s4Publications[0];
+    assert.ok(keyMask && keyCheck && keyAttempt && keyS4Publication);
+    const s4Keys = [
+      keyMask.rasterStorageKey,
+      keyMask.providerPngStorageKey,
+      keyS4Publication.stagingObjects[0].key,
+      keyS4Publication.finalObjects[0].key,
+      keyCheck.evidenceObject?.key,
+      keyAttempt.evidenceObject?.key,
+    ].filter((key): key is string => typeof key === "string");
+    await proveS4Variants("KEYS-001", "S4 high-risk publication and assessment recovery preserves exact objects", "private-key-matrix", "The executed publication, mask, preservation, and assessment fixtures established deterministic private key identity with no user-controlled path material.", {
+      "mask-raster": () => { assert.match(keyMask.rasterStorageKey, /\/mask\/[^/]+\/raster\.bin$/); assert.equal(staged.objects.exists(keyMask.rasterStorageKey), true); },
+      "mask-provider": () => { assert.match(keyMask.providerPngStorageKey, /\/mask\/[^/]+\/provider\.png$/); assert.equal(staged.objects.exists(keyMask.providerPngStorageKey), true); },
+      "staged": () => { assert.match(keyS4Publication.stagingObjects[0].key, /\/s4\/staging\/[^/]+\/[^/]+\/output\.png$/); assert.equal(staged.objects.exists(keyS4Publication.stagingObjects[0].key), false); },
+      "committed": () => { assert.match(keyS4Publication.finalObjects[0].key, /\/s4\/edits\/[^/]+\/revisions\/[^/]+\/normalized\.png$/); assert.equal(staged.objects.exists(keyS4Publication.finalObjects[0].key), true); },
+      "preserve-evidence": () => { assert.match(keyCheck.evidenceObject!.key, /\/preservation\/[^/]+\/evidence\.json$/); assert.equal(staged.objects.exists(keyCheck.evidenceObject!.key), true); },
+      "assessment-evidence": () => { assert.match(keyAttempt.evidenceObject!.key, /\/assessment\/[^/]+\/attempts\/[^/]+\/evidence\.json$/); assert.equal(staged.objects.exists(keyAttempt.evidenceObject!.key), true); },
+      "private": () => { assert.equal(s4Keys.length, 6); assert.equal(s4Keys.every((key) => key.startsWith("projects/" + staged.projectId + "/s4/")), true); },
+      "no-user-key": () => { assert.equal(s4Keys.some((key) => key.includes("recover") || key.includes("publication") || key.includes("..") || key.includes("?")), false); },
+    }, [
+      "s4KeyCount=" + s4Keys.length,
+      "stagingKey=" + keyS4Publication.stagingObjects[0].key,
+      "finalKey=" + keyS4Publication.finalObjects[0].key,
+      "preservationEvidenceKey=" + keyCheck.evidenceObject!.key,
+      "assessmentEvidenceKey=" + keyAttempt.evidenceObject!.key,
+    ]);
+  } finally {
+    cleanup(staged);
+    cleanup(promoted);
+    cleanup(aborted);
+    cleanup(preservation);
+    cleanup(assessment);
+  }
+});
+
+test("S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", async () => {
+  const pass = await fixture();
+  const warning = await fixture();
+  const preservationFail = await fixture();
+  const materialFail = await fixture();
+  const qaUnavailable = await fixture({ assessmentResults: [new ProviderFailure("QA_PROVIDER_REFUSED")] });
+  const stalePassEntered = deferred<void>();
+  const stalePassRelease = deferred<void>();
+  let stalePassPaused = false;
+  const stalePass = await fixture({
+    processId: 8301,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: async (phase, operation) => {
+      if (phase === "after-dispatch-marked" && "assessmentAttemptId" in operation && !stalePassPaused) {
+        stalePassPaused = true;
+        stalePassEntered.resolve();
+        await stalePassRelease.promise;
+      }
+    },
+  });
+  const staleWarningEntered = deferred<void>();
+  const staleWarningRelease = deferred<void>();
+  let staleWarningPaused = false;
+  const staleWarning = await fixture({
+    processId: 8303,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: async (phase, operation) => {
+      if (phase === "after-dispatch-marked" && "assessmentAttemptId" in operation && !staleWarningPaused) {
+        staleWarningPaused = true;
+        staleWarningEntered.resolve();
+        await staleWarningRelease.promise;
+      }
+    },
+  });
+  const noOp = await fixture();
+  let maskCommitCount = 0;
+  let maskCrashTarget: number | null = null;
+  const maskCrash = await fixture({
+    processId: 8305,
+    isProcessAlive: () => true,
+    beforeCommit: () => {
+      maskCommitCount += 1;
+      if (maskCrashTarget !== null && maskCommitCount === maskCrashTarget) throw new Error("deterministic mask intent interruption");
+    },
+  });
+  let assessmentResponseReturned = false;
+  let assessmentPostResponseCommits = 0;
+  const activationCrash = await fixture({
+    processId: 8307,
+    isProcessAlive: () => true,
+    beforeCommit: () => {
+      if (assessmentResponseReturned && ++assessmentPostResponseCommits === 2) throw new Error("deterministic activation interruption");
+    },
+  });
+  try {
+    const passSelected = await ready(pass);
+    const passBefore = pass.service.s4.getState(pass.projectId);
+    const passAdmission = admit(pass, passSelected, "activation pass fixture");
+    const passDone = await waitFor(() => pass.service.s4.getState(pass.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const passAfter = pass.repository.state();
+    const passActivation = passAfter.s4Transitions.filter((item) => item.phase === "activation" && item.editId === passAdmission.result.editId);
+    assert.equal(passDone.activeQuality, "PASS");
+    assert.equal(passDone.activeRevisionKind, "s4");
+    assert.equal(passActivation.length, 1);
+    assert.equal(passAfter.s3Selections[0].selectionVersion, passBefore.selectionVersion + 1);
+    const passS3Counters = { slots: passAfter.s3Selections[0].cycleSlotsConsumed, refinements: passAfter.s3Selections[0].successfulRefinementCount };
+
+    const warningSelected = await ready(warning);
+    const warningAssessment = warning.s4Provider.runS4Assessment;
+    warning.s4Provider.runS4Assessment = async (input) => {
+      const result = await warningAssessment(input);
+      return { ...result, payload: warningAssessmentPayload(warning.repository) };
+    };
+    const warningBefore = warning.service.s4.getState(warning.projectId);
+    const warningAdmission = admit(warning, warningSelected, "activation warning fixture");
+    const warningDone = await waitFor(() => warning.service.s4.getState(warning.projectId), (state) => state.edits[0]?.status === "usable_warning");
+    const warningAfter = warning.repository.state();
+    const warningActivation = warningAfter.s4Transitions.filter((item) => item.phase === "activation" && item.editId === warningAdmission.result.editId);
+    assert.equal(warningDone.activeQuality, "WARNING");
+    assert.equal(warningDone.activeRevisionKind, "s4");
+    assert.equal(warningActivation.length, 1);
+
+    const preservationSelected = await ready(preservationFail);
+    preservationFail.s4Provider.runS4ImageEdit = async () => ({ pngBytes: await protectedFixtureMutation(preservationFail.sourceBytes, preservationFail.outputBytes), providerRequestId: "s4-preservation-failure" });
+    const preservationAdmission = admit(preservationFail, preservationSelected, "activation preservation fence");
+    const preservationDone = await waitFor(() => preservationFail.service.s4.getState(preservationFail.projectId), (state) => state.edits[0]?.status === "material_fail");
+    const preservationAfter = preservationFail.repository.state();
+    assert.equal(preservationDone.edits[0].preservationStatus, "MATERIAL_FAIL");
+    assert.equal(preservationAfter.s4AssessmentAttempts.length, 0);
+    assert.equal(preservationAfter.s3Selections[0].activeRevisionId, preservationSelected.sourceRevisionId);
+    assert.equal(preservationAdmission.result.cycleNumber, 1);
+
+    const materialSelected = await ready(materialFail);
+    const materialAssessment = materialFail.s4Provider.runS4Assessment;
+    materialFail.s4Provider.runS4Assessment = async (input) => {
+      const result = await materialAssessment(input);
+      return { ...result, payload: materialAssessmentPayload(materialFail.repository) };
+    };
+    admit(materialFail, materialSelected, "activation material assessment fence");
+    const materialDone = await waitFor(() => materialFail.service.s4.getState(materialFail.projectId), (state) => state.edits[0]?.status === "material_fail");
+    const materialAfter = materialFail.repository.state();
+    assert.equal(materialDone.edits[0].assessment?.status, "MATERIAL_FAIL");
+    assert.equal(materialAfter.s3Selections[0].activeRevisionId, materialSelected.sourceRevisionId);
+    assert.equal(materialAfter.s3Selections[0].selectionVersion, materialSelected.selectionVersion);
+
+    const qaSelected = await ready(qaUnavailable);
+    admit(qaUnavailable, qaSelected, "activation unavailable assessment fence");
+    const qaDone = await waitFor(() => qaUnavailable.service.s4.getState(qaUnavailable.projectId), (state) => state.edits[0]?.status === "qa_unavailable");
+    const qaAfter = qaUnavailable.repository.state();
+    assert.equal(qaDone.edits[0].assessment?.status, "QA_UNAVAILABLE");
+    assert.equal(qaAfter.s3Selections[0].activeRevisionId, qaSelected.sourceRevisionId);
+    assert.equal(qaAfter.s3Selections[0].selectionVersion, qaSelected.selectionVersion);
+    let qaRetryCode: string | null = null;
+    try { qaUnavailable.service.s4.assessmentRetry(qaUnavailable.projectId, qaDone.edits[0].editId, randomUUID(), randomUUID()); }
+    catch (error) { qaRetryCode = errorCode(error); }
+    assert.equal(qaRetryCode, "S4_ASSESSMENT_RETRY_NOT_AVAILABLE");
+
+    const stalePassSelected = await ready(stalePass);
+    admit(stalePass, stalePassSelected, "activation stale pass fence");
+    await stalePassEntered.promise;
+    const stalePassBefore = stalePass.repository.state();
+    const stalePassAttempt = stalePassBefore.s4AssessmentAttempts[0];
+    assert.ok(stalePassAttempt);
+    stalePass.repository.transact((state) => {
+      const selection = state.s3Selections.find((item) => item.selectionStateId === stalePassAttempt.selectionStateId)!;
+      selection.selectionVersion += 1;
+    });
+    stalePassRelease.resolve();
+    const stalePassDone = await waitFor(() => stalePass.service.s4.getState(stalePass.projectId), (state) => state.edits[0]?.status === "stale");
+    const stalePassAfter = stalePass.repository.state();
+    assert.equal(stalePassDone.activeRevisionId, stalePassSelected.sourceRevisionId);
+    assert.equal(stalePassAfter.s3Selections[0].activeRevisionId, stalePassSelected.sourceRevisionId);
+    assert.equal(stalePassAfter.s3Selections[0].selectionVersion, stalePassSelected.selectionVersion + 1);
+    assert.equal(stalePassAfter.s4Transitions.some((item) => item.phase === "activation" && item.reason === "activation_stale"), true);
+
+    const staleWarningSelected = await ready(staleWarning);
+    const staleWarningAssessment = staleWarning.s4Provider.runS4Assessment;
+    staleWarning.s4Provider.runS4Assessment = async (input) => {
+      const result = await staleWarningAssessment(input);
+      return { ...result, payload: warningAssessmentPayload(staleWarning.repository) };
+    };
+    admit(staleWarning, staleWarningSelected, "activation stale warning fence");
+    await staleWarningEntered.promise;
+    const staleWarningBefore = staleWarning.repository.state();
+    const staleWarningAttempt = staleWarningBefore.s4AssessmentAttempts[0];
+    assert.ok(staleWarningAttempt);
+    staleWarning.repository.transact((state) => {
+      const selection = state.s3Selections.find((item) => item.selectionStateId === staleWarningAttempt.selectionStateId)!;
+      selection.selectionVersion += 1;
+    });
+    staleWarningRelease.resolve();
+    const staleWarningDone = await waitFor(() => staleWarning.service.s4.getState(staleWarning.projectId), (state) => state.edits[0]?.status === "stale");
+    const staleWarningAfter = staleWarning.repository.state();
+    assert.equal(staleWarningDone.activeRevisionId, staleWarningSelected.sourceRevisionId);
+    assert.equal(staleWarningAfter.s3Selections[0].selectionVersion, staleWarningSelected.selectionVersion + 1);
+    assert.equal(staleWarningAfter.s4Transitions.some((item) => item.phase === "activation" && item.reason === "activation_stale"), true);
+
+    const noOpSelected = await ready(noOp);
+    noOp.s4Provider.runS4ImageEdit = async () => ({ pngBytes: noOp.sourceBytes, providerRequestId: "s4-no-op" });
+    admit(noOp, noOpSelected, "activation no-op fence");
+    const noOpDone = await waitFor(() => noOp.service.s4.getState(noOp.projectId), (state) => state.edits[0]?.status === "material_fail");
+    const noOpAfter = noOp.repository.state();
+    assert.equal(noOpDone.edits[0].preservationStatus, "PASS");
+    assert.equal(noOpAfter.s4PreservationChecks[0].noOpDetected, true);
+    assert.equal(noOpAfter.s3Selections[0].activeRevisionId, noOpSelected.sourceRevisionId);
+
+    const maskSelected = await ready(maskCrash);
+    const maskBaselineCommits = maskCommitCount;
+    maskCrashTarget = maskBaselineCommits + 2;
+    const maskAdmission = admit(maskCrash, maskSelected, "recovery mask intent crash");
+    await waitFor(() => maskCommitCount, (count) => count >= maskCrashTarget!);
+    const maskInterrupted = maskCrash.repository.state();
+    assert.equal(maskInterrupted.s4Edits[0].maskMaterializationStatus, "pending");
+    const maskRecovered = restart(maskCrash, { processId: 8306, isProcessAlive: (processId) => processId === 8306 });
+    const maskDone = await waitFor(() => maskRecovered.s4.getState(maskCrash.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    assert.equal(maskDone.edits[0].maskReady, true);
+    assert.equal(maskAdmission.result.cycleNumber, 1);
+
+    const crashSelected = await ready(activationCrash);
+    const crashAssessment = activationCrash.s4Provider.runS4Assessment;
+    activationCrash.s4Provider.runS4Assessment = async (input) => {
+      const result = await crashAssessment(input);
+      assessmentResponseReturned = true;
+      return result;
+    };
+    admit(activationCrash, crashSelected, "recovery activation crash");
+    await waitFor(() => assessmentPostResponseCommits, (count) => count >= 2);
+    const crashBefore = activationCrash.repository.state();
+    const crashAttempt = crashBefore.s4AssessmentAttempts[0];
+    const crashAsset = crashBefore.s4Assets[0];
+    assert.ok(crashAttempt && crashAsset);
+    assert.equal(crashAttempt.status, "running");
+    assert.equal(crashAttempt.providerDispatchState, "consumed");
+    assert.equal(crashBefore.s4Edits[0].status, "assessment_running");
+    const crashBytesBefore = activationCrash.objects.read(crashAsset.storageKeyNormalized);
+    const crashRecovered = restart(activationCrash, { processId: 8308, isProcessAlive: (processId) => processId === 8308 });
+    const crashDone = await waitFor(() => crashRecovered.s4.getState(activationCrash.projectId), (state) => state.edits[0]?.status === "qa_unavailable");
+    const crashAfter = activationCrash.repository.state();
+    assert.equal(crashAfter.s4AssessmentAttempts[0].failureCode, "PERSISTENCE_FAILED");
+    assert.equal(crashDone.activeRevisionId, crashSelected.sourceRevisionId);
+    assert.equal(activationCrash.objects.read(crashAsset.storageKeyNormalized).equals(crashBytesBefore), true);
+
+    await proveS4Variants("ACTIVATE-001", "S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", "activation-matrix", "The executed activation fixtures established PASS/WARNING activation and every frozen negative, CAS, atomicity, version, and S3-counter fence.", {
+      "pass": () => { assert.equal(passDone.activeQuality, "PASS"); assert.equal(passDone.edits[0].status, "usable_pass"); },
+      "warning": () => { assert.equal(warningDone.activeQuality, "WARNING"); assert.equal(warningDone.edits[0].status, "usable_warning"); },
+      "preserve-fail": () => { assert.equal(preservationDone.edits[0].preservationStatus, "MATERIAL_FAIL"); assert.equal(preservationAfter.s3Selections[0].activeRevisionId, preservationSelected.sourceRevisionId); },
+      "material-no": () => { assert.equal(materialDone.edits[0].assessment?.status, "MATERIAL_FAIL"); assert.equal(materialAfter.s3Selections[0].selectionVersion, materialSelected.selectionVersion); },
+      "qa-no": () => { assert.equal(qaDone.edits[0].assessment?.status, "QA_UNAVAILABLE"); assert.equal(qaAfter.s3Selections[0].activeRevisionId, qaSelected.sourceRevisionId); },
+      "stale-pass": () => { assert.equal(stalePassDone.edits[0].status, "stale"); assert.equal(stalePassAfter.s4Transitions.some((item) => item.reason === "activation_stale"), true); },
+      "stale-warning": () => { assert.equal(staleWarningDone.edits[0].status, "stale"); assert.equal(staleWarningAfter.s4Transitions.some((item) => item.reason === "activation_stale"), true); },
+      "no-op-no": () => { assert.equal(noOpDone.edits[0].status, "material_fail"); assert.equal(noOpAfter.s4PreservationChecks[0].noOpDetected, true); },
+      "cas": () => { assert.equal(passActivation[0].expectedSelectionVersion, passBefore.selectionVersion); assert.equal(passActivation[0].resultingSelectionVersion, passBefore.selectionVersion + 1); },
+      "atomic": () => { const active = passAfter.s3Selections[0].activeRevisionId; assert.equal(active, passAfter.s4Revisions[0].revisionId); assert.equal(passAfter.s4Edits[0].status, "completed"); assert.equal(passAfter.s4AssessmentAttempts[0].status, "succeeded"); },
+      "version-increment": () => { assert.equal(passAfter.s3Selections[0].selectionVersion - passBefore.selectionVersion, 1); assert.equal(passActivation.length, 1); },
+      "s3-counters": () => { assert.deepEqual({ slots: passAfter.s3Selections[0].cycleSlotsConsumed, refinements: passAfter.s3Selections[0].successfulRefinementCount }, passS3Counters); },
+    }, [
+      "passActivationCount=" + passActivation.length,
+      "warningQuality=" + warningDone.activeQuality,
+      "passSelectionVersion=" + passAfter.s3Selections[0].selectionVersion,
+      "warningSelectionVersion=" + warningAfter.s3Selections[0].selectionVersion,
+    ]);
+    await proveS4Variants("RECOVERY-001", "S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", "recovery-matrix", "The executed restart fixtures established mask-intent and activation interruption recovery without fabricated success or object overwrite.", {
+      "mask-intent-crash": () => { assert.equal(maskInterrupted.s4Edits[0].maskMaterializationStatus, "pending"); assert.equal(maskDone.edits[0].maskReady, true); },
+      "activation-crash": () => { assert.equal(crashAttempt.status, "running"); assert.equal(crashAfter.s4AssessmentAttempts[0].failureCode, "PERSISTENCE_FAILED"); },
+      "no-fake": () => { assert.equal(crashDone.edits[0].status, "qa_unavailable"); assert.equal(crashDone.activeRevisionId, crashSelected.sourceRevisionId); },
+      "no-overwrite": () => assert.equal(activationCrash.objects.read(crashAsset.storageKeyNormalized).equals(crashBytesBefore), true),
+    }, [
+      "maskCommitInterruptions=" + (maskCommitCount - maskBaselineCommits),
+      "activationCommitInterruptions=" + assessmentPostResponseCommits,
+      "crashFailure=" + crashAfter.s4AssessmentAttempts[0].failureCode,
+      "crashOutputHash=" + sha256(crashBytesBefore),
+    ]);
+    await proveS4Variants("ASSESS-RETRY-001", "S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", "terminal-retry-fence", "The executed terminal assessment failure remained QA unavailable and rejected any retry admission.", {
+      "terminal-no-retry": () => { assert.equal(qaDone.edits[0].assessment?.status, "QA_UNAVAILABLE"); assert.equal(qaRetryCode, "S4_ASSESSMENT_RETRY_NOT_AVAILABLE"); },
+    }, ["qaFailure=QA_PROVIDER_REFUSED", "retryCode=" + qaRetryCode]);
+    await proveS4Variants("CONCURRENCY-001", "S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", "pointer-race", "The executed assessment completion lost its selection-version race and remained historical without changing the active pointer.", {
+      "pointer-race": () => { assert.equal(stalePassDone.edits[0].status, "stale"); assert.equal(stalePassAfter.s3Selections[0].activeRevisionId, stalePassSelected.sourceRevisionId); assert.equal(stalePassAfter.s3Selections[0].selectionVersion, stalePassSelected.selectionVersion + 1); },
+    }, ["stalePassSelectionVersion=" + stalePassAfter.s3Selections[0].selectionVersion, "activeRevision=" + stalePassAfter.s3Selections[0].activeRevisionId]);
+  } finally {
+    stalePassRelease.resolve();
+    staleWarningRelease.resolve();
+    cleanup(pass);
+    cleanup(warning);
+    cleanup(preservationFail);
+    cleanup(materialFail);
+    cleanup(qaUnavailable);
+    cleanup(stalePass);
+    cleanup(staleWarning);
+    cleanup(noOp);
+    cleanup(maskCrash);
+    cleanup(activationCrash);
+  }
+});
+
+test("S4 concurrency and fencing matrix exercises locks, claims, stale work, and liveness holds", async () => {
+  const lockPhases: RepositoryLockPhase[] = [];
+  const keyValue = await fixture({ onLockPhase: (phase) => lockPhases.push(phase) });
+  const busyEntered = deferred<void>();
+  const busyRelease = deferred<void>();
+  const busy = await fixture({
+    processId: 8501,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: async (phase, operation) => {
+      if (phase === "before-dispatch" && "operationId" in operation) {
+        busyEntered.resolve();
+        await busyRelease.promise;
+      }
+    },
+  });
+  const imageStaleEntered = deferred<void>();
+  const imageStaleRelease = deferred<void>();
+  let imageStalePaused = false;
+  const imageStale = await fixture({
+    processId: 8503,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: async (phase, operation) => {
+      if (phase === "after-dispatch-marked" && "operationId" in operation && !imageStalePaused) {
+        imageStalePaused = true;
+        imageStaleEntered.resolve();
+        await imageStaleRelease.promise;
+      }
+    },
+  });
+  const preserveStale = await fixture();
+  const assessmentStaleEntered = deferred<void>();
+  const assessmentStaleRelease = deferred<void>();
+  let assessmentStalePaused = false;
+  const assessmentStale = await fixture({
+    processId: 8505,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: async (phase, operation) => {
+      if (phase === "after-dispatch-marked" && "assessmentAttemptId" in operation && !assessmentStalePaused) {
+        assessmentStalePaused = true;
+        assessmentStaleEntered.resolve();
+        await assessmentStaleRelease.promise;
+      }
+    },
+  });
+  const unknownEntered = deferred<void>();
+  const unknown = await fixture({
+    processId: 8507,
+    isProcessAlive: () => true,
+    onS4ProviderDispatchPhase: (phase, operation) => {
+      if (phase === "before-dispatch" && "operationId" in operation) {
+        unknownEntered.resolve();
+        return "interrupt";
+      }
+    },
+  });
+  try {
+    const keySelected = await ready(keyValue);
+    const key = randomUUID();
+    const first = admit(keyValue, keySelected, "same key original", key);
+    const replay = admit(keyValue, keySelected, "same key original", key, randomUUID());
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.result.editId, first.result.editId);
+    let reuseCode: string | null = null;
+    try { admit(keyValue, keySelected, "same key changed instruction", key, randomUUID()); }
+    catch (error) { reuseCode = errorCode(error); }
+    assert.equal(reuseCode, "S4_IDEMPOTENCY_KEY_REUSE");
+    const keyState = await waitFor(() => keyValue.service.s4.getState(keyValue.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    assert.ok(lockPhases.includes("canonical-claimed"));
+    assert.ok(lockPhases.includes("before-canonical-release"));
+    const lockWorker = createWorkflowService({
+      repository: new JsonRepository(keyValue.root, { processId: 8509, isProcessAlive: () => true, onLockPhase: (phase) => lockPhases.push(phase) }),
+      objects: new PrivateObjectStore(join(keyValue.root, "objects")),
+      provider: keyValue.provider,
+      s4Provider: keyValue.s4Provider,
+      processId: 8509,
+      isProcessAlive: () => true,
+    });
+    assert.equal(lockWorker.s4.getState(keyValue.projectId).activeRevisionId, keyState.activeRevisionId);
+
+    const busySelected = await ready(busy);
+    const busyAdmission = admit(busy, busySelected, "different key busy");
+    await busyEntered.promise;
+    const busyBefore = busy.repository.state();
+    const busyOperation = busyBefore.s4ImageOperations[0];
+    assert.ok(busyOperation);
+    assert.equal(busyOperation.status, "running");
+    assert.equal(busyOperation.claimedProcessId, 8501);
+    let busyCode: string | null = null;
+    try { admit(busy, busySelected, "different key busy competing", randomUUID(), randomUUID()); }
+    catch (error) { busyCode = errorCode(error); }
+    assert.equal(busyCode, "S4_EDIT_IN_PROGRESS");
+    const claimWorker = createWorkflowService({
+      repository: new JsonRepository(busy.root, { processId: 8510, isProcessAlive: () => true }),
+      objects: new PrivateObjectStore(join(busy.root, "objects")),
+      provider: busy.provider,
+      s4Provider: busy.s4Provider,
+      processId: 8510,
+      isProcessAlive: () => true,
+    });
+    assert.equal(claimWorker.s4.getState(busy.projectId).edits[0].status, "generating");
+    busyRelease.resolve();
+    const busyDone = await waitFor(() => busy.service.s4.getState(busy.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const busyAfter = busy.repository.state();
+    assert.equal(busyAfter.s4ImageOperations.length, 1);
+    assert.equal(busyAfter.s4ImageOperations[0].claimedBy, null);
+    assert.equal(busyDone.edits[0].status, "usable_pass");
+
+    const imageStaleSelected = await ready(imageStale);
+    admit(imageStale, imageStaleSelected, "stale image completion");
+    await imageStaleEntered.promise;
+    const imageStaleBefore = imageStale.repository.state();
+    const staleImageOperation = imageStaleBefore.s4ImageOperations[0];
+    assert.ok(staleImageOperation);
+    const staleImageToken = staleImageOperation.claimToken;
+    imageStale.repository.transact((state) => {
+      const operation = state.s4ImageOperations.find((item) => item.operationId === staleImageOperation.operationId)!;
+      operation.claimToken = randomUUID();
+    });
+    imageStaleRelease.resolve();
+    await waitFor(() => imageStale.imageCallCount(), (count) => count === 1);
+    const imageStaleRecovered = restart(imageStale, { processId: 8504, isProcessAlive: (processId) => processId === 8504 });
+    const imageStaleDone = await waitFor(() => imageStaleRecovered.s4.getState(imageStale.projectId), (state) => state.edits[0]?.status === "image_failed");
+    const imageStaleAfter = imageStale.repository.state();
+    assert.notEqual(imageStaleAfter.s4ImageOperations[0].claimToken, staleImageToken);
+    assert.equal(imageStaleAfter.s4ImageOperations[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN");
+    assert.equal(imageStaleAfter.s4Revisions.length, 0);
+    assert.equal(imageStaleDone.activeRevisionId, imageStaleSelected.sourceRevisionId);
+
+    const preserveSelected = await ready(preserveStale);
+    admit(preserveStale, preserveSelected, "stale preservation completion");
+    const preserveClaimMutated = deferred<void>();
+    let preserveCompletionCalled = false;
+    let preserveCompletionResult: unknown = undefined;
+    const preserveService = preserveStale.service.s4 as any;
+    const originalClaimPreservation = preserveService.claimPreservation;
+    const originalCompletePreservation = preserveService.completePreservation;
+    preserveService.claimPreservation = function (preservationCheckId: UUID) {
+      const result = originalClaimPreservation.call(this, preservationCheckId);
+      if (result) {
+        preserveStale.repository.transact((state) => {
+          const check = state.s4PreservationChecks.find((item) => item.preservationCheckId === preservationCheckId)!;
+          check.claimToken = randomUUID();
+        });
+        preserveClaimMutated.resolve();
+      }
+      return result;
+    };
+    preserveService.completePreservation = function (...args: any[]) {
+      preserveCompletionCalled = true;
+      preserveCompletionResult = originalCompletePreservation.apply(this, args);
+      return preserveCompletionResult;
+    };
+    await preserveClaimMutated.promise;
+    await waitFor(() => preserveCompletionCalled, (called) => called);
+    const preserveAfter = preserveStale.repository.state();
+    assert.equal(preserveCompletionResult, null);
+    assert.equal(preserveAfter.s4PreservationChecks[0].status, "running");
+    assert.equal(preserveAfter.s4Edits[0].status, "preservation_running");
+    assert.equal(preserveAfter.s4AssessmentAttempts.length, 0);
+
+    const assessmentStaleSelected = await ready(assessmentStale);
+    admit(assessmentStale, assessmentStaleSelected, "stale assessment completion");
+    await assessmentStaleEntered.promise;
+    const assessmentStaleBefore = assessmentStale.repository.state();
+    const staleAssessmentAttempt = assessmentStaleBefore.s4AssessmentAttempts[0];
+    assert.ok(staleAssessmentAttempt);
+    const staleAssessmentToken = staleAssessmentAttempt.claimToken;
+    assessmentStale.repository.transact((state) => {
+      const attempt = state.s4AssessmentAttempts.find((item) => item.assessmentAttemptId === staleAssessmentAttempt.assessmentAttemptId)!;
+      attempt.claimToken = randomUUID();
+    });
+    assessmentStaleRelease.resolve();
+    await waitFor(() => assessmentStale.assessmentCallCount(), (count) => count === 1);
+    const assessmentStaleRecovered = restart(assessmentStale, { processId: 8506, isProcessAlive: (processId) => processId === 8506 });
+    const assessmentStaleDone = await waitFor(() => assessmentStaleRecovered.s4.getState(assessmentStale.projectId), (state) => state.edits[0]?.status === "qa_unavailable");
+    const assessmentStaleAfter = assessmentStale.repository.state();
+    assert.notEqual(assessmentStaleAfter.s4AssessmentAttempts[0].claimToken, staleAssessmentToken);
+    assert.equal(assessmentStaleAfter.s4AssessmentAttempts[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN");
+    assert.equal(assessmentStaleAfter.s3Selections[0].activeRevisionId, assessmentStaleSelected.sourceRevisionId);
+    assert.equal(assessmentStaleDone.activeRevisionId, assessmentStaleSelected.sourceRevisionId);
+
+    const unknownSelected = await ready(unknown);
+    admit(unknown, unknownSelected, "unknown live owner hold");
+    await unknownEntered.promise;
+    const unknownBefore = unknown.repository.state();
+    const unknownOperation = unknownBefore.s4ImageOperations[0];
+    assert.ok(unknownOperation);
+    const unknownRecovered = restart(unknown, { processId: 8508, isProcessAlive: () => true });
+    const unknownAfter = unknown.repository.state();
+    assert.equal(unknownAfter.s4ImageOperations[0].status, "running");
+    assert.equal(unknownAfter.s4ImageOperations[0].providerDispatchState, "not_started");
+    assert.equal(unknownAfter.s4ImageOperations[0].claimedProcessId, 8507);
+    assert.equal(unknownRecovered.s4.getState(unknown.projectId).edits[0].status, "generating");
+    assert.equal(unknown.imageCallCount(), 0);
+
+    await proveS4Variants("CONCURRENCY-001", "S4 concurrency and fencing matrix exercises locks, claims, stale work, and liveness holds", "concurrency-matrix", "The executed concurrent-worker fixtures established repository locking, idempotency, claims, stale-result fencing, pointer ownership, and unknown-owner holds.", {
+      "repo-lock": () => { assert.ok(lockPhases.includes("canonical-claimed")); assert.ok(lockPhases.includes("before-canonical-release")); assert.equal(lockWorker.s4.getState(keyValue.projectId).activeRevisionId, keyState.activeRevisionId); },
+      "same-key": () => { assert.equal(replay.replayed, true); assert.equal(replay.result.editId, first.result.editId); },
+      "s4-idempotency-reuse": () => assert.equal(reuseCode, "S4_IDEMPOTENCY_KEY_REUSE"),
+      "different-key-busy": () => { assert.equal(busyCode, "S4_EDIT_IN_PROGRESS"); assert.equal(busyDone.edits[0].status, "usable_pass"); },
+      "claims": () => { assert.equal(busyOperation.claimedProcessId, 8501); assert.equal(busyAfter.s4ImageOperations[0].claimedBy, null); assert.equal(busyAfter.s4ImageOperations.length, 1); },
+      "image-stale": () => { assert.equal(imageStaleAfter.s4ImageOperations[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN"); assert.equal(imageStaleAfter.s4Revisions.length, 0); },
+      "preserve-stale": () => { assert.equal(preserveCompletionResult, null); assert.equal(preserveAfter.s4PreservationChecks[0].status, "running"); },
+      "assessment-stale": () => { assert.equal(assessmentStaleAfter.s4AssessmentAttempts[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN"); assert.equal(assessmentStaleAfter.s4Revisions.length, 1); },
+      "unknown-hold": () => { assert.equal(unknownAfter.s4ImageOperations[0].status, "running"); assert.equal(unknownAfter.s4ImageOperations[0].providerDispatchState, "not_started"); assert.equal(unknown.imageCallCount(), 0); },
+    }, [
+      "lockEvents=" + lockPhases.length,
+      "sameKeyReplay=" + replay.replayed,
+      "imageStaleCalls=" + imageStale.imageCallCount(),
+      "assessmentStaleCalls=" + assessmentStale.assessmentCallCount(),
+      "unknownOwnerProcessId=" + unknownAfter.s4ImageOperations[0].claimedProcessId,
+    ]);
+  } finally {
+    busyRelease.resolve();
+    imageStaleRelease.resolve();
+    assessmentStaleRelease.resolve();
+    cleanup(keyValue);
+    cleanup(busy);
+    cleanup(imageStale);
+    cleanup(preserveStale);
+    cleanup(assessmentStale);
+    cleanup(unknown);
+  }
 });
 
 test("S4 API enforces auth-first access, exact JSON routes, safe errors, and S3 rollback to S4 history", async () => {

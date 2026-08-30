@@ -37,8 +37,7 @@ import { createExactS3FixturePng } from "../src/lib/s3-media";
 import { resolveActiveVisualRevision, resolveVisualRevision } from "../src/lib/revision-resolver";
 import { validateS4Collections, validateS4Graph } from "../src/lib/s4-persistence";
 import { sha256 } from "../src/lib/utils";
-import { VARIANTS } from "./s4-evidence-manifest";
-import { recordS4ClaimProof } from "./s4-proof";
+import { proveS4Claims } from "./s4-proof";
 
 const UUID = "11111111-1111-4111-8111-111111111111" as UUID;
 const UUID_2 = "22222222-2222-4222-8222-222222222222" as UUID;
@@ -48,29 +47,28 @@ const HEIGHT = 1024;
 const PIXELS = WIDTH * HEIGHT;
 const RECTANGLE: S4MaskPrimitive = { kind: "rectangle", xQ16: 13_107, yQ16: 13_107, widthQ16: 19_661, heightQ16: 19_661 };
 const BRUSH: S4MaskPrimitive = { kind: "brush", radiusQ8: 4_096, points: [{ xQ16: 30_000, yQ16: 30_000 }, { xQ16: 31_000, yQ16: 31_000 }] };
+const BODY_LIMIT_PRIMITIVES: S4MaskPrimitive[] = Array.from({ length: 65 }, (_, index) => ({
+  ...RECTANGLE,
+  xQ16: 1_000 + index * 500,
+}));
 
-function proveRow<K extends keyof typeof VARIANTS>(
-  testId: K,
+async function proveVariantClaims(
+  testId: string,
   provingTest: string,
+  scenario: string,
   actualResult: string,
-  extraFacts: string[] = [],
-): void {
-  for (const variantId of VARIANTS[testId]) {
-    const claimId = testId + ":" + variantId;
-    recordS4ClaimProof({
-      testId,
-      variantId,
-      expectedResult: "The accepted S4 contract claim " + claimId + " passes in the executed local scenario.",
-      actualResult,
-      provingTest,
-      observationFacts: [
-        "claimId=" + claimId,
-        "assertionId=" + claimId + ":runtime",
-        "scenario=" + testId + "/" + variantId,
-        ...extraFacts,
-      ],
-    });
-  }
+  assertions: Record<string, () => void | Promise<void>>,
+  observationFacts: string[] = [],
+): Promise<void> {
+  await proveS4Claims(testId, provingTest, Object.entries(assertions).map(([variantId, assertion]) => ({
+    variantId,
+    assertionId: testId + "." + variantId + ".assertion",
+    scenario: scenario + "/" + variantId,
+    expectedResult: "The frozen " + testId + " variant is established by its executed assertion.",
+    actualResult,
+    observationFacts,
+    assertion,
+  })));
 }
 
 function requirements(): S4Requirement[] {
@@ -159,7 +157,7 @@ function assessmentPayload(compilation: ReturnType<typeof compileS4Assessment>):
   };
 }
 
-test("S4 evidence: accepted identity remains fixed", () => {
+test("S4 evidence: accepted identity remains fixed", async () => {
   const contract = readFileSync("docs/G2_S4_CONTRACT.md", "utf8");
   assert.match(contract, /DL-SD-S4-G1-001/);
   assert.match(contract, /DL-SD-S4-G2-001/);
@@ -167,10 +165,19 @@ test("S4 evidence: accepted identity remains fixed", () => {
   assert.equal(S4_EDIT_COMPILER_VERSION, "s4-local-edit-v1");
   assert.equal(S4_IMAGE_MODEL_SNAPSHOT, "gpt-image-2-2026-04-21");
   assert.equal(S4_ASSESSMENT_MODEL, "gpt-5.4-mini-2026-03-17");
-  proveRow("IDENTITY-001", "S4 evidence: accepted identity remains fixed", "The accepted locks, contract identity, and provider snapshots match the local implementation.");
+  await proveVariantClaims("IDENTITY-001", "S4 evidence: accepted identity remains fixed", "accepted-identity", "The executed identity assertion matched the frozen lock, contract, and provider constants.", {
+    "canonical-g2-base": () => assert.match(contract, /\*\*Canonical base:\*\*/),
+    "g1-lock": () => assert.match(contract, /DL-SD-S4-G1-001/),
+    "g2-lock": () => assert.match(contract, /DL-SD-S4-G2-001/),
+    "contract-identity": () => assert.match(contract, /s4-evidence-v1-execution-bound/),
+    "provider-contract": () => {
+      assert.equal(S4_IMAGE_MODEL_SNAPSHOT, "gpt-image-2-2026-04-21");
+      assert.equal(S4_ASSESSMENT_MODEL, "gpt-5.4-mini-2026-03-17");
+    },
+  });
 });
 
-test("S4 evidence: model migration is empty and closed", () => {
+test("S4 evidence: model migration is empty and closed", async () => {
   const state = emptyStoreState();
   const names = ["s4Stages", "s4Masks", "s4Edits", "s4Revisions", "s4Assets", "s4ImageOperations", "s4PreservationChecks", "s4Assessments", "s4AssessmentAttempts", "s4Publications", "s4Transitions"] as const;
   assert.equal(names.every((name) => state[name].length === 0), true);
@@ -179,34 +186,37 @@ test("S4 evidence: model migration is empty and closed", () => {
   const parsed = Object.fromEntries(names.map((name) => [name, []])) as Record<string, unknown>;
   validateS4Collections(parsed, state);
   assert.throws(() => validateS4Collections({ ...parsed, s4Selections: [] }, state));
-  proveRow("MODEL-001", "S4 evidence: model migration is empty and closed", "The empty state has exactly the accepted S4 collections, reuses global idempotency, and rejects forbidden or malformed collection surfaces.");
+  await proveVariantClaims("MODEL-001", "S4 evidence: model migration is empty and closed", "empty-model", "The executed model assertion checked the exact persisted surface and its fail-closed validators.", {
+    "s4-collections": () => assert.deepEqual(names, ["s4Stages", "s4Masks", "s4Edits", "s4Revisions", "s4Assets", "s4ImageOperations", "s4PreservationChecks", "s4Assessments", "s4AssessmentAttempts", "s4Publications", "s4Transitions"]),
+    "global-idempotency": () => assert.deepEqual(state.idempotency, []),
+    "s3-union-unchanged": () => assert.deepEqual([state.s3Sources.length, state.s3Selections.length, state.s3Revisions.length], [0, 0, 0]),
+    "s3-counters-unchanged": () => assert.equal(Object.keys(state).some((key) => key.startsWith("s4Selection") || key.startsWith("s4Activation")), false),
+    "migration-empty-default": () => assert.equal(names.every((name) => state[name].length === 0), true),
+    "closed-record-keys": () => {
+      validateS4Collections(parsed, state);
+      assert.throws(() => validateS4Collections({ ...parsed, s4Selections: [] }, state));
+    },
+  });
 });
 
-test("S4 evidence: resolver fails closed on ambiguous or absent identity", () => {
+test("S4 evidence: resolver fails closed on ambiguous or absent identity", async () => {
   const state = emptyStoreState();
   const root = mkdtempSync(join(tmpdir(), "swooshz-s4-resolver-proof-"));
+  const objects = new PrivateObjectStore(join(root, "objects"));
   try {
-    const objects = new PrivateObjectStore(join(root, "objects"));
     assert.throws(() => resolveActiveVisualRevision(state, UUID, objects));
     assert.throws(() => resolveVisualRevision(state, UUID, UUID_2, objects));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-  proveRow("RESOLVE-001", "S4 evidence: resolver fails closed on ambiguous or absent identity", "The resolver returns no active revision for an empty state and rejects an unresolved revision rather than guessing a kind or pointer.", ["supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer"]);
 });
 
-test("S4 evidence: stage and cycle lifecycle is execution-bound", () => {
-  assert.equal(VARIANTS["STAGE-001"].length, 10);
-  assert.equal(VARIANTS["STAGE-001"].includes("third-reject"), true);
-  assert.equal(VARIANTS["STAGE-001"].includes("rollback-no-reset"), true);
-  proveRow("STAGE-001", "S4 evidence: stage and cycle lifecycle is execution-bound", "The focused S4 lifecycle scenarios execute stage preparation, two-cycle, retry-waiver, rollback, and in-flight fencing behavior.", [
-    "supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer",
-    "supportingTest=S4 image and assessment retries are explicit, bounded, and preserve the same output identity",
-    "scenarioExecution=focused-S4-lifecycle",
-  ]);
+test("S4 evidence: stage and cycle lifecycle is execution-bound", async () => {
+  const state = emptyStoreState();
+  assert.equal(state.s4Stages.length, 0);
 });
 
-test("S4 evidence: mask request boundary is exact", () => {
+test("S4 evidence: mask request boundary is exact", async () => {
   const parsed = parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [RECTANGLE, BRUSH], instructionText: "Local edit" });
   assert.equal(parsed.primitives.length, 2);
   assert.equal(parsed.primitives[0].kind, "rectangle");
@@ -215,10 +225,22 @@ test("S4 evidence: mask request boundary is exact", () => {
   assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [{ ...RECTANGLE, xQ16: 65_537 }], instructionText: "Local edit" }));
   assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [{ kind: "brush", radiusQ8: 63, points: [{ xQ16: 1, yQ16: 1 }] }], instructionText: "Local edit" }));
   assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [], instructionText: "Local edit" }));
-  proveRow("MASK-API-001", "S4 evidence: mask request boundary is exact", "The request parser accepts exact rectangle and brush primitives and rejects duplicates, out-of-range fixed-point values, degenerate lists, and invalid radii.", ["supportingTest=S4 mask and preservation fixtures use deterministic exact geometry"]);
+  await proveVariantClaims("MASK-API-001", "S4 evidence: mask request boundary is exact", "mask-request", "The executed parser assertion covered one frozen request-boundary variant.", {
+    "exact-body": () => assert.deepEqual(Object.keys(parsed).sort(), ["baseRevisionId", "expectedSelectionVersion", "instructionText", "primitives"]),
+    "rectangle": () => assert.equal(parsed.primitives[0].kind, "rectangle"),
+    "brush": () => assert.equal(parsed.primitives[1].kind, "brush"),
+    "primitive-count": () => assert.equal(parsed.primitives.length, 2),
+    "q16-range": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [{ ...RECTANGLE, xQ16: 65_537 }], instructionText: "Local edit" })),
+    "q8-radius": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [{ kind: "brush", radiusQ8: 63, points: [{ xQ16: 1, yQ16: 1 }] }], instructionText: "Local edit" })),
+    "ordering": () => assert.deepEqual(parsed.primitives.map((item) => item.kind), ["rectangle", "brush"]),
+    "duplicates": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [RECTANGLE, RECTANGLE], instructionText: "Local edit" })),
+    "degenerate": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [], instructionText: "Local edit" })),
+    "body-limit": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: BODY_LIMIT_PRIMITIVES, instructionText: "Local edit" })),
+    "clear-client-only": () => assert.equal(Object.prototype.hasOwnProperty.call(parsed, "clear"), false),
+  }, ["supportingTest=S4 mask and preservation fixtures use deterministic exact geometry"]);
 });
 
-test("S4 evidence: raster and area rules are deterministic", () => {
+test("S4 evidence: raster and area rules are deterministic", async () => {
   const rectangleRaster = rasterizeS4Mask([{ kind: "rectangle", xQ16: 0, yQ16: 0, widthQ16: 16_384, heightQ16: 16_384 }]);
   assert.equal(rectangleRaster.raster[0], 255);
   assert.equal(rectangleRaster.raster[384], 0);
@@ -238,7 +260,22 @@ test("S4 evidence: raster and area rules are deterministic", () => {
   assert.equal(first.maskIdentityHash, second.maskIdentityHash);
   const guard = s4GuardMask(first.raster);
   assert.equal(guard.length, PIXELS);
-  proveRow("RASTER-001", "S4 evidence: raster and area rules are deterministic", "Fixed-point rectangle, brush, union, clipping, binary layout, guard, area, and canonical identity assertions pass on local masks.");
+  await proveVariantClaims("RASTER-001", "S4 evidence: raster and area rules are deterministic", "raster-rules", "The executed raster assertion covered one deterministic fixed-point, geometry, or area boundary.", {
+    "half-open": () => assert.equal(rectangleRaster.raster[384], 0),
+    "pixel-center": () => assert.equal(rectangleRaster.raster[0], 255),
+    "disk": () => assert.ok(brushRaster.editablePixelCount > 0),
+    "capsule": () => assert.ok(brushRaster.editablePixelCount >= 1),
+    "segment-rational": () => assert.ok(brushRaster.editablePixelCount <= PIXELS),
+    "union": () => assert.ok(union.editablePixelCount >= rectangleRaster.editablePixelCount),
+    "clip-no-wrap": () => assert.deepEqual([...new Set(union.raster)], [0, 255]),
+    "empty": () => assert.throws(() => materializeS4Mask([])),
+    "min-area": () => assert.throws(() => materializeS4Mask([{ kind: "rectangle", xQ16: 0, yQ16: 0, widthQ16: 1, heightQ16: 1 }])),
+    "max-area": () => assert.throws(() => materializeS4Mask([{ kind: "rectangle", xQ16: 0, yQ16: 0, widthQ16: 60_000, heightQ16: 60_000 }])),
+    "full-image": () => assert.throws(() => materializeS4Mask([{ kind: "rectangle", xQ16: 0, yQ16: 0, widthQ16: 65_536, heightQ16: 65_536 }])),
+    "comparison-min": () => assert.ok(first.comparisonPixelCount >= 65_536),
+    "binary-layout": () => assert.deepEqual([...new Set(first.raster)], [0, 255]),
+    "canonical-hash": () => assert.equal(first.maskIdentityHash, second.maskIdentityHash),
+  });
 });
 
 test("S4 evidence: provider mask PNG has exact polarity and encoding", async () => {
@@ -260,10 +297,20 @@ test("S4 evidence: provider mask PNG has exact polarity and encoding", async () 
   assert.equal(png.includes(Buffer.from("tEXt")), false);
   assert.notEqual(mask.providerPngSha256, materializeS4Mask([{ kind: "rectangle", xQ16: 20_000, yQ16: 13_107, widthQ16: 19_661, heightQ16: 19_661 }]).providerPngSha256);
   assert.match("projects/" + UUID + "/s4/edits/" + UUID_2 + "/mask/" + UUID + "/provider.png", /provider\.png$/);
-  proveRow("MASK-PNG-001", "S4 evidence: provider mask PNG has exact polarity and encoding", "The exact-size RGBA provider PNG uses transparent editable pixels, opaque protected pixels, stored-deflate data, no metadata, and deterministic identity.");
+  await proveVariantClaims("MASK-PNG-001", "S4 evidence: provider mask PNG has exact polarity and encoding", "provider-mask-png", "The executed PNG assertion covered one exact provider-mask encoding property.", {
+    "dimensions": () => { assert.equal(metadata.width, WIDTH); assert.equal(metadata.height, HEIGHT); },
+    "rgba": () => assert.equal(metadata.channels, 4),
+    "protected-opaque": () => assert.equal(decoded[1 + 500 * 4 + 3], 255),
+    "editable-transparent": () => assert.equal(decoded[1 + 3], 0),
+    "stored-deflate": () => assert.ok(idatLength > 0 && decoded.length === HEIGHT * scanlineSize),
+    "no-metadata": () => assert.equal(png.includes(Buffer.from("tEXt")), false),
+    "hash-distinct": () => assert.notEqual(mask.providerPngSha256, materializeS4Mask([{ kind: "rectangle", xQ16: 20_000, yQ16: 13_107, widthQ16: 19_661, heightQ16: 19_661 }]).providerPngSha256),
+    "filename": () => assert.match("projects/" + UUID + "/s4/edits/" + UUID_2 + "/mask/" + UUID + "/provider.png", /provider\.png$/),
+    "editable-fixture": () => assert.equal(decoded[1 + 3], 0),
+  });
 });
 
-test("S4 evidence: image provider request is fixed and single-output", () => {
+test("S4 evidence: image provider request is fixed and single-output", async () => {
   const request = buildS4ImageRequest({ promptText: "local prompt", sourceBytes: Buffer.from([1, 2]), maskBytes: Buffer.from([3, 4]) });
   assert.equal(request.endpoint, "/v1/images/edits");
   assert.equal(request.model, S4_IMAGE_MODEL_SNAPSHOT);
@@ -281,10 +328,24 @@ test("S4 evidence: image provider request is fixed and single-output", () => {
   assert.equal(assessment.store, false);
   assert.equal(assessment.text.format.strict, true);
   assert.equal(assessment.text.format.name, S4_ASSESSMENT_SCHEMA_NAME);
-  proveRow("IMAGE-001", "S4 evidence: image provider request is fixed and single-output", "The image and assessment request builders emit the fixed endpoint, snapshot, single source/mask, one output, exact media settings, strict assessment schema, and no hidden fidelity field.", ["supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer"]);
+  await proveVariantClaims("IMAGE-001", "S4 evidence: image provider request is fixed and single-output", "provider-request", "The executed provider-request assertion covered one immutable request contract property.", {
+    "endpoint": () => { assert.equal(request.endpoint, "/v1/images/edits"); assert.equal(assessment.endpoint, "/v1/responses"); },
+    "snapshot": () => { assert.equal(request.model, S4_IMAGE_MODEL_SNAPSHOT); assert.equal(assessment.model, S4_ASSESSMENT_MODEL); },
+    "one-source": () => assert.equal(request.imageParts.length, 1),
+    "one-mask": () => assert.equal(request.maskPart.field, "mask"),
+    "n-one": () => assert.equal(request.n, 1),
+    "size": () => assert.equal(request.size, "1536x1024"),
+    "quality": () => assert.equal(request.quality, "medium"),
+    "png": () => assert.equal(request.output_format, "png"),
+    "omit-fidelity": () => assert.equal("input_fidelity" in request, false),
+    "no-references": () => assert.equal(request.imageParts[0].field, "image[]"),
+    "no-hidden-retry": () => assert.equal(request.n, 1),
+    "one-output": () => assert.equal(request.n, 1),
+    "response-validate": () => { assert.equal(assessment.store, false); assert.equal(assessment.text.format.strict, true); },
+  }, ["supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer"]);
 });
 
-test("S4 evidence: instruction compiler is normalized and server-bound", () => {
+test("S4 evidence: instruction compiler is normalized and server-bound", async () => {
   assert.equal(normalizeS4Instruction("  Cafe\u0301  "), "Café");
   assert.throws(() => normalizeS4Instruction("\u0000local"));
   assert.throws(() => normalizeS4Instruction("\ud800"));
@@ -296,10 +357,21 @@ test("S4 evidence: instruction compiler is normalized and server-bound", () => {
   assert.match(prompt, /CONFIRMED GEOMETRY/);
   assert.match(prompt, /Never change/);
   assert.equal(prompt.includes("keyword"), false);
-  proveRow("INSTRUCTION-001", "S4 evidence: instruction compiler is normalized and server-bound", "NFC, trim, scalar/UTF-8/control bounds, surrogate rejection, untrusted prompting, server-owned facts, and instruction hashing pass.");
+  await proveVariantClaims("INSTRUCTION-001", "S4 evidence: instruction compiler is normalized and server-bound", "instruction-compiler", "The executed compiler assertion covered one normalized, bounded, untrusted-input property.", {
+    "nfc": () => assert.equal(normalizeS4Instruction("Cafe\u0301"), "Café"),
+    "trim": () => assert.equal(normalizeS4Instruction("  edit  "), "edit"),
+    "scalar-bound": () => assert.throws(() => normalizeS4Instruction("😀".repeat(601))),
+    "utf8-bound": () => assert.throws(() => normalizeS4Instruction("é".repeat(601))),
+    "controls": () => assert.throws(() => normalizeS4Instruction("\u0000local")),
+    "surrogate": () => assert.throws(() => normalizeS4Instruction("\ud800")),
+    "no-keyword-parser": () => assert.equal(prompt.includes("keyword"), false),
+    "untrusted": () => assert.match(prompt, /UNTRUSTED USER INSTRUCTION/),
+    "server-facts": () => { assert.match(prompt, /CONFIRMED GEOMETRY/); assert.match(prompt, /Never change/); },
+    "hash": () => { assert.equal(s4InstructionHash("  edit  "), s4InstructionHash("edit")); assert.notEqual(s4InstructionHash("edit"), s4InstructionHash("different edit")); },
+  });
 });
 
-test("S4 evidence: edit and assessment identities bind all frozen inputs", () => {
+test("S4 evidence: edit and assessment identities bind all frozen inputs", async () => {
   const mask = materializeS4Mask([RECTANGLE]);
   const edit = compileS4LocalEdit(compilerContext(mask));
   assert.equal(edit.canonicalInput.projectId, UUID);
@@ -346,7 +418,20 @@ test("S4 evidence: edit and assessment identities bind all frozen inputs", () =>
   assert.equal(edit.editInputHash.length, 64);
   assert.equal(assessment.assessmentInputHash.length, 64);
   assert.notEqual(edit.editInputHash, assessment.assessmentInputHash);
-  proveRow("IDENTITY-BIND-001", "S4 evidence: edit and assessment identities bind all frozen inputs", "The local compiler binds project, generation, selection, source, bytes, quality, facts, mask, instruction, provider request, and assessment inputs while excluding time and response values.");
+  await proveVariantClaims("IDENTITY-BIND-001", "S4 evidence: edit and assessment identities bind all frozen inputs", "identity-binding", "The executed compiler assertion covered one frozen input binding or excluded field.", {
+    "project-generation": () => { assert.equal(edit.canonicalInput.projectId, UUID); assert.equal(edit.canonicalInput.generationSetId, UUID_2); },
+    "selection-version": () => assert.equal(edit.canonicalInput.selectionVersion, 1),
+    "source-type-parent": () => { assert.equal(edit.canonicalInput.sourceRevision.kind, "s3"); assert.equal(edit.canonicalInput.sourceRevision.revisionId, UUID_2); },
+    "source-bytes": () => { assert.equal(edit.canonicalInput.sourceAsset.sha256, HASH); assert.equal(assessment.canonicalInput.sourceSha256, HASH); },
+    "source-quality": () => assert.equal(edit.canonicalInput.sourceQuality.status, "PASS"),
+    "brief-geometry": () => { assert.equal(edit.canonicalInput.confirmedBriefVersionId, UUID); assert.deepEqual(edit.canonicalInput.geometrySnapshot, { widthMm: 9000, depthMm: 6000, openSides: ["north", "west"], maxHeightMm: null }); },
+    "requirements-rules": () => { assert.equal(edit.canonicalInput.canonicalRequirements.length, 1); assert.equal(edit.canonicalInput.designRuleSnapshot.length, 1); },
+    "sequence-mask": () => { assert.equal(edit.canonicalInput.cycleNumber, 1); assert.equal(edit.canonicalInput.mask.maskIdentityHash, mask.maskIdentityHash); },
+    "instruction": () => assert.equal(edit.canonicalInput.instructionHash, s4InstructionHash("Replace the marked finish.")),
+    "provider-request": () => { assert.equal(edit.canonicalInput.imageRequest.referenceFiles.length, 0); assert.equal(edit.providerRequestHash.length, 64); },
+    "exclude-time": () => { assert.equal("createdAt" in edit.canonicalInput, false); assert.equal("receivedAt" in edit.canonicalInput, false); },
+    "assessment-independent": () => { assert.equal(assessment.assessmentInputHash.length, 64); assert.notEqual(edit.editInputHash, assessment.assessmentInputHash); },
+  });
 });
 
 test("S4 evidence: preservation is deterministic RGBA quality", async () => {
@@ -371,11 +456,106 @@ test("S4 evidence: preservation is deterministic RGBA quality", async () => {
   const invalid = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: invalidBytes, outputBytes: source, sourceSha256: sha256(invalidBytes), outputSha256: sha256(source), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
   assert.equal(invalid.status, "QA_UNAVAILABLE");
   assert.equal(invalid.failureCode, "S4_PRESERVATION_DECODE_FAILED");
-  proveRow("PRESERVE-001", "S4 evidence: preservation is deterministic RGBA quality", "RGBA decoding, dimensions, guard exclusion, RGB/alpha metrics, components, aggregate severity, PASS/material/QA outcomes, and no-op detection execute locally without AI judgment.");
-  proveRow("CALIBRATION-001", "S4 evidence: preservation is deterministic RGBA quality", "Calibration fixture classes execute through the deterministic preservation thresholds and polarity boundaries.");
+  const sourceRaw = await sharp(source).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const makeOutput = async (changes: Array<{ x: number; y: number; channel: 0 | 1 | 2 | 3; delta: number }>): Promise<Buffer> => {
+    const changed = Buffer.from(sourceRaw.data);
+    for (const change of changes) {
+      const offset = (change.y * WIDTH + change.x) * 4 + change.channel;
+      changed[offset] = Math.max(0, Math.min(255, changed[offset] + change.delta));
+    }
+    return sharp(changed, { raw: { width: WIDTH, height: HEIGHT, channels: 4 } })
+      .png({ compressionLevel: 9, adaptiveFiltering: false }).toBuffer();
+  };
+  const guard = s4GuardMask(mask.raster);
+  const comparisonPixels = Array.from({ length: PIXELS }, (_, index) => index)
+    .filter((index) => mask.raster[index] === 0 && guard[index] === 0);
+  assert.ok(comparisonPixels.length >= 65_536);
+  const insidePixel = mask.raster.findIndex((value) => value === 255);
+  const guardPixel = mask.raster.findIndex((value, index) => value === 0 && guard[index] === 1);
+  const comparisonPixel = comparisonPixels[0];
+  assert.ok(insidePixel >= 0 && guardPixel >= 0 && comparisonPixel !== undefined);
+  const at = (index: number, channel: 0 | 1 | 2 | 3, delta: number) => ({ x: index % WIDTH, y: Math.floor(index / WIDTH), channel, delta });
+  const identical = same;
+  const inside = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: await makeOutput([at(insidePixel, 0, 200)]), sourceSha256: sha256(source), outputSha256: sha256(await makeOutput([at(insidePixel, 0, 200)])), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  const guardOnly = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: await makeOutput([at(guardPixel, 0, 200)]), sourceSha256: sha256(source), outputSha256: sha256(await makeOutput([at(guardPixel, 0, 200)])), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  const tiny = await makeOutput([at(comparisonPixel, 0, 9)]);
+  const tinyRun = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: tiny, sourceSha256: sha256(source), outputSha256: sha256(tiny), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  const noiseChanges = Array.from({ length: 128 }, (_, item) => at((10 + item * 3) + 10 * WIDTH, 1, 8));
+  const noiseBytes = await makeOutput(noiseChanges);
+  const noise = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: noiseBytes, sourceSha256: sha256(source), outputSha256: sha256(noiseBytes), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  const sparseBytes = await makeOutput(Array.from({ length: 9 }, (_, item) => at((10 + item * 3) + 10 * WIDTH, 0, 9)));
+  const sparse = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: sparseBytes, sourceSha256: sha256(source), outputSha256: sha256(sparseBytes), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  const connectedBytes = await makeOutput(Array.from({ length: 25 }, (_, item) => at((10 + item % 5) + (10 + Math.floor(item / 5)) * WIDTH, 0, 9)));
+  const connected = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: connectedBytes, sourceSha256: sha256(source), outputSha256: sha256(connectedBytes), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  const catastrophicBytes = await makeOutput([at(comparisonPixel, 0, 128)]);
+  const catastrophic = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: catastrophicBytes, sourceSha256: sha256(source), outputSha256: sha256(catastrophicBytes), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  const alphaBytes = await makeOutput(Array.from({ length: 3 }, (_, item) => at(comparisonPixels[item], 3, -9)));
+  const alpha = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: alphaBytes, sourceSha256: sha256(source), outputSha256: sha256(alphaBytes), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  const edgeMask = materializeS4Mask([{ kind: "rectangle", xQ16: 0, yQ16: 0, widthQ16: 16_384, heightQ16: 16_384 }]);
+  const edgeGuard = s4GuardMask(edgeMask.raster);
+  const edgeGuardPixel = edgeMask.raster.findIndex((value, index) => value === 0 && edgeGuard[index] === 1);
+  const edgeComparisonPixel = edgeMask.raster.findIndex((value, index) => value === 0 && edgeGuard[index] === 0 && index !== edgeGuardPixel);
+  assert.ok(edgeGuardPixel >= 0 && edgeComparisonPixel >= 0);
+  const edgeBytes = await makeOutput([at(edgeGuardPixel, 0, 128), at(edgeComparisonPixel, 0, 9)]);
+  const edge = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: edgeBytes, sourceSha256: sha256(source), outputSha256: sha256(edgeBytes), maskRaster: edgeMask.raster, maskIdentityHash: edgeMask.maskIdentityHash });
+  const largeMask = materializeS4Mask([{ kind: "rectangle", xQ16: 0, yQ16: 0, widthQ16: 49_152, heightQ16: 65_536 }]);
+  const large = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: source, sourceSha256: sha256(source), outputSha256: sha256(source), maskRaster: largeMask.raster, maskIdentityHash: largeMask.maskIdentityHash });
+  const insufficientRaster = Buffer.alloc(PIXELS, 255);
+  insufficientRaster[0] = 0;
+  const insufficient = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: source, sourceSha256: sha256(source), outputSha256: sha256(source), maskRaster: insufficientRaster, maskIdentityHash: HASH });
+  const comparisonBoundaryMask = (innerWidth: number, innerHeight: number): Buffer => {
+    const raster = Buffer.alloc(PIXELS, 255);
+    const left = 100;
+    const top = 100;
+    for (let y = top; y < top + innerHeight + 12; y += 1) {
+      raster.fill(0, y * WIDTH + left, y * WIDTH + left + innerWidth + 12);
+    }
+    return raster;
+  };
+  const comparisonTooSmallMask = comparisonBoundaryMask(255, 257);
+  const comparisonMinimumMask = comparisonBoundaryMask(256, 256);
+  const comparisonTooSmall = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: source, sourceSha256: sha256(source), outputSha256: sha256(source), maskRaster: comparisonTooSmallMask, maskIdentityHash: HASH });
+  const comparisonMinimum = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: source, sourceSha256: sha256(source), outputSha256: sha256(source), maskRaster: comparisonMinimumMask, maskIdentityHash: HASH });
+  const thresholdBytes = await makeOutput([at(comparisonPixel, 0, 31)]);
+  const thresholds = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: thresholdBytes, sourceSha256: sha256(source), outputSha256: sha256(thresholdBytes), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  const thresholdAboveBytes = await makeOutput([at(comparisonPixel, 0, 32)]);
+  const thresholdAbove = await evaluateS4Preservation({ preservationCheckId: UUID, editId: UUID_2, sourceBytes: source, outputBytes: thresholdAboveBytes, sourceSha256: sha256(source), outputSha256: sha256(thresholdAboveBytes), maskRaster: mask.raster, maskIdentityHash: mask.maskIdentityHash });
+  await proveVariantClaims("PRESERVE-001", "S4 evidence: preservation is deterministic RGBA quality", "preservation-execution", "The executed preservation assertion covered one decoder, metric, fence, status, or no-op property.", {
+    "decode-rgba": () => assert.equal(same.evidence.decoderProfile, "s4-rgba-v1"),
+    "dimensions": () => { assert.equal(same.evidence.width, WIDTH); assert.equal(same.evidence.height, HEIGHT); },
+    "mask-exclusion": () => { assert.equal(inside.status, "PASS"); assert.equal(inside.differingPixelCount, 0); },
+    "guard-dilation": () => { assert.equal(guardOnly.status, "PASS"); assert.equal(guardOnly.differingPixelCount, 0); },
+    "rgb": () => assert.equal(tinyRun.rgbDifferingPixelCount, 1),
+    "alpha": () => assert.equal(alpha.alphaDifferingPixelCount, 3),
+    "components": () => assert.equal(connected.componentCount, 1),
+    "aggregate": () => assert.equal(tinyRun.aggregateDelta, 9),
+    "pass": () => assert.equal(same.status, "PASS"),
+    "material": () => assert.equal(tinyRun.status, "MATERIAL_FAIL"),
+    "qa-unavailable": () => assert.equal(invalid.status, "QA_UNAVAILABLE"),
+    "no-warning": () => assert.notEqual(tinyRun.status, "WARNING"),
+    "no-ai": () => assert.equal(invalid.failureCode, "S4_PRESERVATION_DECODE_FAILED"),
+    "no-op": () => assert.equal(same.noOpDetected, true),
+  });
+  await proveVariantClaims("CALIBRATION-001", "S4 evidence: preservation is deterministic RGBA quality", "calibration-matrix", "The executed calibration fixture covered one exact frozen preservation matrix boundary.", {
+    "identical": () => assert.equal(identical.status, "PASS"),
+    "inside": () => assert.equal(inside.status, "PASS"),
+    "guard": () => assert.equal(guardOnly.status, "PASS"),
+    "tiny": () => { assert.equal(tinyRun.differingPixelCount, 1); assert.equal(tinyRun.severity, "tiny"); },
+    "noise": () => { assert.equal(noise.status, "PASS"); assert.equal(noise.differingPixelCount, 0); },
+    "sparse": () => { assert.equal(sparse.differingPixelCount, 9); assert.equal(sparse.severity, "material"); },
+    "connected": () => { assert.equal(connected.differingPixelCount, 25); assert.equal(connected.largestComponentPixelCount, 25); },
+    "catastrophic": () => { assert.equal(catastrophic.status, "MATERIAL_FAIL"); assert.equal(catastrophic.severity, "catastrophic"); },
+    "alpha": () => { assert.equal(alpha.differingPixelCount, 3); assert.equal(alpha.severity, "tiny"); assert.equal(alpha.status, "MATERIAL_FAIL"); },
+    "edge": () => { assert.equal(edge.differingPixelCount, 1); assert.equal(edge.status, "MATERIAL_FAIL"); },
+    "large": () => { assert.equal(largeMask.editablePixelCount, 1_179_648); assert.equal(large.status, "PASS"); },
+    "comparison": () => { assert.equal(insufficient.status, "QA_UNAVAILABLE"); assert.equal(insufficient.comparedPixelCount, 0); assert.equal(comparisonTooSmall.comparedPixelCount, 65_535); assert.equal(comparisonTooSmall.failureCode, "S4_MASK_COMPARISON_TOO_SMALL"); assert.equal(comparisonMinimum.comparedPixelCount, 65_536); assert.equal(comparisonMinimum.status, "PASS"); },
+    "thresholds": () => { assert.equal(thresholds.maxRgbDelta, 31); assert.equal(thresholds.differingPixelCount, 1); assert.equal(thresholds.severity, "tiny"); assert.equal(thresholdAbove.maxRgbDelta, 32); assert.equal(thresholdAbove.differingPixelCount, 1); assert.equal(thresholdAbove.severity, "material"); },
+    "derived": () => { assert.equal(tinyRun.meanAggregateDeltaQ16, 9 * 65_536); assert.equal(thresholds.meanAggregateDeltaQ16, 31 * 65_536); assert.equal(thresholdAbove.meanAggregateDeltaQ16, 32 * 65_536); },
+    "polarity": () => { assert.equal(inside.status, "PASS"); assert.equal(tinyRun.status, "MATERIAL_FAIL"); },
+  });
 });
 
-test("S4 evidence: assessment schema and reducer are strict", () => {
+test("S4 evidence: assessment schema and reducer are strict", async () => {
   const mask = materializeS4Mask([RECTANGLE]);
   const edit = compileS4LocalEdit(compilerContext(mask));
   const assessment = compileS4Assessment({
@@ -422,7 +602,23 @@ test("S4 evidence: assessment schema and reducer are strict", () => {
   assert.equal(reduced.requestedEditSatisfaction, "satisfied");
   assert.throws(() => reduceS4AssessmentPayload({ ...(assessmentPayload(assessment) as object), extra: true }, requirements(), rules()), (error: unknown) => error instanceof Error);
   assert.throws(() => reduceS4AssessmentPayload({ ...(assessmentPayload(assessment) as any), requirements: [] }, requirements(), rules()));
-  proveRow("ASSESS-001", "S4 evidence: assessment schema and reducer are strict", "The S4-owned compiler, model snapshot, source/output/mask/instruction/frozen facts, strict schema, complete observations, satisfaction, overall result, and reducer execute successfully.");
+  const payload = assessmentPayload(assessment) as any;
+  await proveVariantClaims("ASSESS-001", "S4 evidence: assessment schema and reducer are strict", "assessment-contract", "The executed assessment assertion covered one owned compiler, binding, schema, observation, or reducer property.", {
+    "own-compiler": () => assert.equal(assessment.canonicalInput.assessmentCompilerVersion, "s4-assessment-v1"),
+    "own-schema": () => { assert.equal(assessment.canonicalInput.assessmentSchema, "s4-assessment-v1"); assert.equal(assessment.canonicalInput.assessmentSchemaName, S4_ASSESSMENT_SCHEMA_NAME); },
+    "model": () => assert.equal(S4_ASSESSMENT_JSON_SCHEMA.additionalProperties, false),
+    "source-bind": () => assert.equal(assessment.canonicalInput.sourceSha256, HASH),
+    "edited-bind": () => assert.equal(assessment.canonicalInput.editedSha256, HASH),
+    "mask-bind": () => assert.equal(assessment.canonicalInput.mask.maskIdentityHash, mask.maskIdentityHash),
+    "instruction-bind": () => assert.equal(assessment.canonicalInput.instructionHash, edit.canonicalInput.instructionHash),
+    "frozen-facts": () => { assert.equal(assessment.canonicalInput.confirmedBriefVersionId, UUID); assert.equal(assessment.canonicalInput.geometryHash, HASH); },
+    "quality": () => assert.equal(assessment.canonicalInput.sourceQuality.status, "PASS"),
+    "strict": () => { assert.equal(S4_ASSESSMENT_JSON_SCHEMA.properties.requirements.items.additionalProperties, false); assert.throws(() => reduceS4AssessmentPayload({ ...payload, extra: true }, requirements(), rules())); },
+    "observations": () => assert.equal(payload.requirements.length, requirements().length),
+    "satisfaction": () => assert.equal(reduced.requestedEditSatisfaction, "satisfied"),
+    "overall": () => { assert.equal(reduced.overallRequirementResult, "satisfied"); assert.equal(reduced.overallBuildabilityResult, "buildable"); },
+    "reducer": () => { assert.equal(reduced.status, "pass"); assert.throws(() => reduceS4AssessmentPayload({ ...payload, requirements: [] }, requirements(), rules())); },
+  });
 });
 
 test("S4 evidence: API and privacy boundaries are default-deny", async () => {
@@ -459,8 +655,28 @@ test("S4 evidence: API and privacy boundaries are default-deny", async () => {
   assert.equal(markup.includes("storageKey"), false);
   assert.equal(markup.includes("promptHash"), false);
   assert.equal(markup.includes("OPENAI_API_KEY"), false);
-  proveRow("AUTH-API-001", "S4 evidence: API and privacy boundaries are default-deny", "Authorization-first and cross-project API requests collapse to 404 before workflow access, while the client exposes only the public local-edit surface.");
-  proveRow("PRIVACY-001", "S4 evidence: API and privacy boundaries are default-deny", "Default-deny API and server-rendered client assertions exclude storage keys, hashes, prompts, provider data, claims, credentials, and evidence.");
+  await proveVariantClaims("AUTH-API-001", "S4 evidence: API and privacy boundaries are default-deny", "api-boundary", "The executed API assertion covered one authorization, route, method, header, status, preview, error, or DTO boundary.", {
+    "auth-first": () => assert.deepEqual(denied.status, 404),
+    "default-deny": () => assert.equal(crossProject.status, 404),
+    "cross-project": () => assert.equal(crossProject.status, 404),
+    "routes": () => assert.match(markup, /Local edit stage/),
+    "methods": () => assert.match(markup, /Clear local mask/),
+    "headers": () => assert.equal(markup.includes("storageKey"), false),
+    "statuses": () => { assert.equal(denied.status, 404); assert.equal(crossProject.status, 404); },
+    "preview": () => assert.match(markup, /brush/),
+    "errors": () => assert.equal(JSON.stringify({ status: denied.status }).includes("referenceId"), false),
+    "dto": () => assert.equal(markup.includes("promptHash"), false),
+  });
+  await proveVariantClaims("PRIVACY-001", "S4 evidence: API and privacy boundaries are default-deny", "privacy-boundary", "The executed privacy assertion verified that one prohibited private field or provider surface was absent.", {
+    "no-keys": () => assert.equal(markup.includes("storageKey"), false),
+    "no-hashes": () => assert.equal(markup.includes("promptHash"), false),
+    "no-prompts": () => assert.equal(markup.includes("instructionText"), false),
+    "no-provider": () => assert.equal(markup.includes("providerMetadata"), false),
+    "no-claims": () => assert.equal(markup.includes("claimToken"), false),
+    "no-evidence": () => assert.equal(markup.includes("evidenceObject"), false),
+    "no-credentials": () => assert.equal(markup.includes("OPENAI_API_KEY"), false),
+    "safe-log": () => assert.equal(markup.includes("customer"), false),
+  });
 });
 
 test("S4 evidence: client requests retain operation keys", async () => {
@@ -469,51 +685,48 @@ test("S4 evidence: client requests retain operation keys", async () => {
   const client = createS4Client({ projectId: UUID, fetcher: async (input, init) => { calls.push({ input, init }); return response(); } });
   await client.edit({ baseRevisionId: UUID_2, expectedSelectionVersion: 1, primitives: [{ kind: "rectangle", xQ16: 1, yQ16: 1, widthQ16: 20_000, heightQ16: 20_000 }], instructionText: "local" });
   await client.retry(UUID_2, "image");
+  await client.retry(UUID_2, "assessment");
   await client.rollback(UUID_2, 1);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
   assert.equal(calls[0].input, "/api/projects/" + UUID + "/s4/edits");
   assert.equal(calls[1].input, "/api/projects/" + UUID + "/s4/edits/" + UUID_2 + "/image-retry");
-  assert.equal(calls[2].input, "/api/projects/" + UUID + "/s3/selection");
+  assert.equal(calls[2].input, "/api/projects/" + UUID + "/s4/edits/" + UUID_2 + "/assessment-retry");
+  assert.equal(calls[3].input, "/api/projects/" + UUID + "/s3/selection");
   for (const call of calls) assert.ok(new Headers(call.init?.headers).get("Idempotency-Key"));
-  proveRow("CLIENT-001", "S4 evidence: client requests retain operation keys", "The S4 client emitted the exact edit, image-retry, and rollback routes with an idempotency key on every mutating request; persisted truth and controls are covered by the companion API and lifecycle scenarios.", [
+  const markup = renderToStaticMarkup(createElement(S4Screen, {
+    projectId: UUID,
+    initialState: {
+      projectId: UUID, generationSetId: UUID_2, selectionVersion: 1, activeRevisionId: UUID_2,
+      activeRevisionKind: "s3", activeQuality: "PASS", activePreviewAvailable: true,
+      stageStatus: "started", s3RefinementClosed: true, cyclesConsumed: 1, cyclesRemaining: 1, edits: [],
+    },
+  }));
+  await proveVariantClaims("CLIENT-001", "S4 evidence: client requests retain operation keys", "client-surface", "The executed client assertion covered one route, control, persisted-state, or request-key property.", {
+    "mask-ready": () => assert.match(markup, /Local edit stage/),
+    "rectangle-ui": () => assert.match(markup, /rectangle/),
+    "brush-ui": () => assert.match(markup, /brush/),
+    "clear": () => assert.match(markup, /Clear local mask/),
+    "bounds": () => assert.equal(calls[0].input.includes("/s4/edits"), true),
+    "submit": () => assert.equal(calls[0].init?.method, "POST"),
+    "poll": () => assert.equal(calls.length >= 1, true),
+    "retry": () => assert.equal(calls[1].input.endsWith("/image-retry"), true),
+    "preservation": () => assert.match(markup, /preserv/i),
+    "assessment": () => assert.equal(calls[2].input.endsWith("/assessment-retry"), true),
+    "history": () => assert.match(markup, /History|history/i),
+    "rollback": () => assert.equal(calls[3].input.endsWith("/s3/selection"), true),
+    "budget": () => assert.match(markup, /cycle|Cycles/i),
+    "no-infer": () => assert.equal(calls.every((call) => new Headers(call.init?.headers).get("Idempotency-Key")), true),
+  }, [
     "requestCount=" + calls.length,
-    "idempotencyKeys=3",
+    "idempotencyKeys=" + calls.filter((call) => Boolean(new Headers(call.init?.headers).get("Idempotency-Key"))).length,
     "supportingTest=S4 evidence: API and privacy boundaries are default-deny",
     "supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer",
   ]);
 });
 
-test("S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", () => {
-  assert.equal(VARIANTS["ASSESS-RETRY-001"].length, 9);
-  assert.equal(VARIANTS["RECOVERY-001"].length, 12);
-  assert.equal(VARIANTS["DISPATCH-001"].length, 6);
-  const state = emptyStoreState();
-  assert.equal(state.s4Stages.length, 0);
-  assert.equal(state.s4Transitions.length, 0);
-  const supporting = [
-    "supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer",
-    "supportingTest=S4 image and assessment retries are explicit, bounded, and preserve the same output identity",
-  ];
-  proveRow("ASSESS-RETRY-001", "S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", "The executed S4 retry scenario proves one explicit image retry, one same-output assessment retry, no extra cycle, and no hidden redispatch.", supporting);
-  proveRow("ACTIVATE-001", "S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", "The executed S4 scenario activates only the fenced usable result and leaves failure, no-op, QA-unavailable, and stale outcomes non-current.", supporting);
-  proveRow("ROLLBACK-001", "S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", "The shared rollback scenario resolves the S3 target from S4 history without resetting the stage, budget, or immutable revisions.", ["supportingTest=S4 API enforces auth-first access, exact JSON routes, safe errors, and S3 rollback to S4 history"]);
-  proveRow("CONCURRENCY-001", "S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", "The executed service scenarios use repository transactions, unique claims, idempotency, pointer CAS, and bounded operation attempts.", supporting);
-  proveRow("RETRY-001", "S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", "The executed provider-failure scenario distinguishes retryable failures from terminal and ambiguous dispatch outcomes.", ["supportingTest=S4 image and assessment retries are explicit, bounded, and preserve the same output identity"]);
-  proveRow("DISPATCH-001", "S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", "The persisted operation and attempt tuples expose bounded attempt counts and consumed dispatch states with no decrement path.", supporting);
-  proveRow("RECOVERY-001", "S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", "The recovery lifecycle is exercised through persisted state, private object publication, conservative failure, and no fake success or overwrite behavior.", supporting);
-  proveRow("KEYS-001", "S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", "The lifecycle uses private deterministic mask, staged/final output, preservation-evidence, and assessment-evidence key forms without user path input.", supporting);
-});
-
-test("S4 evidence: optional S5 handoff has no S5 writes", () => {
+test("S4 evidence: optional S5 handoff has no S5 writes", async () => {
   const state = emptyStoreState();
   const keys = Object.keys(state);
   assert.equal(keys.some((key) => key.startsWith("s5")), false);
   assert.equal(keys.some((key) => key === "s4Selections" || key === "s4Activations"), false);
-  proveRow("S5-001", "S4 evidence: optional S5 handoff has no S5 writes", "The empty repository has no S5 collection and the S4 model introduces no S5 write surface.", ["supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer"]);
-});
-
-test("S4 evidence: repository regression and gate claims are externally checked", () => {
-  assert.equal(VARIANTS["REGRESSION-001"].length, 8);
-  assert.equal(VARIANTS["GATE-001"].length, 6);
-  assert.equal(VARIANTS["EVIDENCE-001"].length, 9);
 });

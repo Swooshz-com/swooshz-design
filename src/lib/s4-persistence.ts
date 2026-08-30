@@ -355,7 +355,7 @@ export function validateS4Graph(state: StoreState): void {
     for (const revisionId of [transition.priorRevisionId, transition.resultingRevisionId]) {
       if (revisionId === null) continue;
       const revision = recordBy(state.s3Revisions, "revisionId", revisionId) ?? recordBy(state.s4Revisions, "revisionId", revisionId);
-      const intendedPublicationRevision = publication && transition.phase === "publication" && publication.state !== "committed" && publication.state !== "aborted" && publication.intendedRevisionId === revisionId;
+      const intendedPublicationRevision = publication && transition.phase === "publication" && publication.state !== "committed" && publication.intendedRevisionId === revisionId;
       if ((!revision && !intendedPublicationRevision) || revision && (revision.projectId !== transition.projectId || revision.generationSetId !== transition.generationSetId)) fail();
     }
   }

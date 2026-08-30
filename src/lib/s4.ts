@@ -3001,8 +3001,8 @@ export class S4WorkflowService {
       this.recoverImageTerminal(state, operation, edit, "PROVIDER_DISPATCH_UNCERTAIN");
       return;
     }
-    if (operation.providerDispatchState === "consumed" &&
-        ((operation.status !== "succeeded" && dead) || (noClaim && operation.status !== "succeeded"))) {
+    if (operation.providerDispatchState === "consumed" && operation.status === "running" &&
+        (dead || noClaim)) {
       const publication = operation.publicationId
         ? state.s4Publications.find((item) => item.publicationId === operation.publicationId)
         : undefined;
