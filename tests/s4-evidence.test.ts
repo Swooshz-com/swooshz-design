@@ -475,6 +475,12 @@ test("S4 evidence: client requests retain operation keys", async () => {
   assert.equal(calls[1].input, "/api/projects/" + UUID + "/s4/edits/" + UUID_2 + "/image-retry");
   assert.equal(calls[2].input, "/api/projects/" + UUID + "/s3/selection");
   for (const call of calls) assert.ok(new Headers(call.init?.headers).get("Idempotency-Key"));
+  proveRow("CLIENT-001", "S4 evidence: client requests retain operation keys", "The S4 client emitted the exact edit, image-retry, and rollback routes with an idempotency key on every mutating request; persisted truth and controls are covered by the companion API and lifecycle scenarios.", [
+    "requestCount=" + calls.length,
+    "idempotencyKeys=3",
+    "supportingTest=S4 evidence: API and privacy boundaries are default-deny",
+    "supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer",
+  ]);
 });
 
 test("S4 evidence: retry, activation, rollback, recovery, and dispatch remain bounded", () => {

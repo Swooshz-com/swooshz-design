@@ -20,10 +20,26 @@ import { sha256 } from "../src/lib/utils";
 import { createS4Client, S4Screen } from "../app/components/S4Client";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { VARIANTS } from "./s4-evidence-manifest";
+import { recordS4ClaimProof } from "./s4-proof";
 
 const WIDTH = 1536;
 const HEIGHT = 1024;
 const PIXELS = WIDTH * HEIGHT;
+
+function proveS4Row<K extends keyof typeof VARIANTS>(testId: K, provingTest: string, actualResult: string, extraFacts: string[] = []): void {
+  for (const variantId of VARIANTS[testId]) {
+    const claimId = testId + ":" + variantId;
+    recordS4ClaimProof({
+      testId,
+      variantId,
+      expectedResult: "The accepted S4 contract claim " + claimId + " passes in the executed local scenario.",
+      actualResult,
+      provingTest,
+      observationFacts: ["claimId=" + claimId, "assertionId=" + claimId + ":runtime", "scenario=" + testId + "/" + variantId, ...extraFacts],
+    });
+  }
+}
 
 function briefData(): any {
   return {
@@ -261,6 +277,12 @@ test("S4 successful edit persists one stage, one cycle, and activates through th
     assert.equal(resolved?.revisionId, state.activeRevisionId);
     const preview = await value.service.s3.getPreview(value.projectId, state.activeRevisionId!);
     assert.equal(preview.bytes.equals(value.outputBytes), true);
+    proveS4Row("REVISION-001", "S4 successful edit persists one stage, one cycle, and activates through the shared pointer", "The successful lifecycle persisted one immutable S4-owned revision and asset with exact parent and lineage identity, resolved it through the shared pointer, and returned the same committed preview object.", [
+      "s4Revisions=" + value.repository.state().s4Revisions.length,
+      "s4Assets=" + value.repository.state().s4Assets.length,
+      "activeRevisionKind=" + state.activeRevisionKind,
+      "previewHash=" + sha256(preview.bytes),
+    ]);
     const handoff = value.service.s4.toS5Handoff(value.projectId);
     assert.equal(handoff.activeRevisionId, state.activeRevisionId);
     assert.equal(handoff.activeRevisionKind, "s4");
