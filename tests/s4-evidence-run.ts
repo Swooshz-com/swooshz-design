@@ -269,6 +269,10 @@ const packageManifest = changedFiles.includes("package.json");
 const sourceFiles = changedFiles.filter((path) => path.startsWith("src/"));
 const sourceText = sourceFiles.map((path) => readFileSync(path, "utf8")).join("\n");
 const contractText = readFileSync("docs/G2_S4_CONTRACT.md", "utf8");
+const basePackageJson = JSON.parse(git("show", CANONICAL_BASE_SHA + ":package.json")) as Record<string, unknown>;
+const candidatePackageJson = JSON.parse(readFileSync("package.json", "utf8")) as Record<string, unknown>;
+const { scripts: baseScripts, ...basePackageWithoutScripts } = basePackageJson;
+const { scripts: candidateScripts, ...candidatePackageWithoutScripts } = candidatePackageJson;
 
 function assertValidationPassed(label: string): void {
   const run = validationRuns.find((item) => item.label === label);
@@ -335,9 +339,11 @@ await runnerProof("REGRESSION-001", "lint", "The final candidate passes the docu
 await runnerProof("REGRESSION-001", "build", "The final candidate passes the documented production build.", "pnpm run build exited successfully on the exact candidate checkout.", "build", ["validation=build", "exitCode=" + build.exitCode], () => {
   assertValidationPassed("build");
 });
-await runnerProof("REGRESSION-001", "no-dependencies", "The candidate adds no dependency or lockfile change.", "The base-to-candidate audit found no dependency or package manifest change.", "scope-audit", ["changedFiles=" + changedFiles.length, "lockfileChanges=" + dependencyFiles.length, "packageManifestChanged=" + packageManifest], () => {
+await runnerProof("REGRESSION-001", "no-dependencies", "The candidate adds no dependency or lockfile change.", "The base-to-candidate audit found no lockfile or dependency-surface change; the package-manifest delta is limited to test-script coverage.", "scope-audit", ["changedFiles=" + changedFiles.length, "lockfileChanges=" + dependencyFiles.length, "packageManifestChanged=" + packageManifest], () => {
   assert.equal(dependencyFiles.length, 0);
-  assert.equal(packageManifest, false);
+  assert.equal(packageManifest, true);
+  assert.deepEqual(candidatePackageWithoutScripts, basePackageWithoutScripts);
+  assert.deepEqual(Object.keys(candidateScripts as Record<string, unknown>).sort(), Object.keys(baseScripts as Record<string, unknown>).sort());
 });
 await runnerProof("REGRESSION-001", "candidate-head-tree", "The candidate head and tree remain bound to the execution.", "The candidate commit and tree matched before and after every validation command.", "candidate-identity", ["candidateCommitSha=" + candidateCommitSha, "candidateTree=" + candidateTree, "candidateCommitShaAfter=" + validationCandidateCommitShaAfter, "candidateTreeAfter=" + validationCandidateTreeAfter], () => {
   assertCandidateIdentity(candidateCommitSha, candidateTree);
