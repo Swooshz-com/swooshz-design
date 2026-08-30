@@ -244,6 +244,8 @@ type S4EditAdmission = {
 
 Admission identity, base identity, mask identity, instruction, compiler hashes, cycle number, and timestamps are immutable. `maskMaterializationStatus` is mutable only from `pending` to `ready` after both private mask objects pass exact key/hash/size verification in the readiness transaction. Lifecycle status, retry fields, operation tuple, output foreign keys, assessment foreign keys, and terminal timestamps are mutable only through the transitions in sections O, R, S, and U. While mask materialization is pending, `imageOperationIds` is empty and no image operation exists; after readiness it contains attempt 1, and an explicit image retry may append attempt 2.
 
+An edit terminalized by the consumed-response recovery rule in section U.6 has status `image_failed` or `qa_unavailable`, `retryState: "none"`, and a `terminalAt`; it remains the already admitted cycle. Recovery never refunds, decrements, replaces, or reallocates that cycle.
+
 ### B.8 `S4LocalEditRevision`
 
 This is an immutable S4 revision. It is not a member of `S3Revision` and MUST NOT be written to `s3Revisions`.
@@ -357,6 +359,8 @@ type S4ImageOperation = {
 ~~~
 
 Claims, status, timestamps, provider metadata, failure, and result foreign keys are mutable under the claim/fence rules. `operationInputHash`, attempt, retry parent, and all input hashes are immutable. An operation with `providerDispatchState: "may_have_started"` is counted conservatively as a possible provider dispatch.
+
+`providerDispatchState: "consumed"` remains the durable dispatch-accounting state even when recovery sets `status: "failed"` with `failureCode: PERSISTENCE_FAILED` because a definitive response/outcome was received but the normal result classification was not durable. Such an operation is not eligible for image retry and is never reclassified as `not_started` or `may_have_started`.
 
 ### B.11 `S4PreservationCheck`
 
@@ -480,6 +484,8 @@ type S4Assessment = {
 
 The frozen input fields are immutable. Attempt tuple, latest attempt, reducer outputs, retry fields, and lifecycle status are mutable until terminal. `not_started` and `skipped_preservation_fail` have an empty attempt tuple and null provider result fields. A no-op has `noOpDetected: true`, `status: "material_fail"`, and no provider assessment attempt.
 
+If a consumed assessment attempt has no durable reduced result or failure after a crash, the aggregate uses `status: "qa_unavailable_terminal"` and `retryState: "none"` under U.6; no result or observations are fabricated.
+
 ### B.13 `S4AssessmentAttempt`
 
 ~~~ts
@@ -540,6 +546,8 @@ type S4AssessmentAttempt = {
 ~~~
 
 Attempt input identity, attempt number, and retry parent are immutable. Claim, status, disposition, observations, reducer fields, failure, provider metadata, evidence, and timestamps are mutable until the attempt is terminal. The raw provider payload is never placed in the state JSON; the strict reduced payload may be stored only at the private evidence key in section V.
+
+A consumed attempt may be terminalized by recovery as `status: "failed"`, `disposition: "qa_unavailable_terminal"`, and `failureCode: "PERSISTENCE_FAILED"` when its definitive response/outcome exists but its strict reduction/result classification is absent or incomplete. It retains `providerDispatchState: "consumed"`; the fallback writes empty observation and finding-ID arrays and null requested/overall result fields, and it cannot be redispatched or retried.
 
 ### B.14 `S4Publication`
 
@@ -829,6 +837,8 @@ PERSISTENCE_FAILED
 ~~~
 
 The internal set is never emitted directly unless its code is also in the public union in section Y. Unknown internal errors are recorded as `PERSISTENCE_FAILED` and exposed as `S4_INTERNAL_ERROR`.
+
+For consumed-result recovery, `PERSISTENCE_FAILED` is the existing internal fail-closed classification; it is not provider dispatch uncertainty and is not in either explicit retry list.
 
 ## C. Unified visual revision resolver
 
@@ -1174,7 +1184,7 @@ The provider response MUST be parsed as one data item containing strict base64 b
 
 ### H.3 Transport and metadata
 
-The adapter uses the existing S3/S2 provider transport conventions: authorization is supplied only by the server runtime, timeouts are bounded, a definitive HTTP 429 maps to `PROVIDER_RATE_LIMIT`, a definitive HTTP 5xx maps to `PROVIDER_SERVER_ERROR`, and definitive client responses are classified as consumed failures. Provider request IDs and usage metadata may be stored only in the private operation record and server-safe logs; they are never public or part of deterministic identity.
+The adapter uses the existing S3/S2 provider transport conventions: authorization is supplied only by the server runtime, timeouts are bounded, a definitive HTTP 429 maps to `PROVIDER_RATE_LIMIT`, a definitive HTTP 5xx maps to `PROVIDER_SERVER_ERROR`, and definitive client responses are classified as consumed failures. The consumed marker may commit before parsing or reduction; if it commits and the required normal classification is absent after a crash, section U.6 supplies the exact terminal fallback. Provider request IDs and usage metadata may be stored only in the private operation record and server-safe logs; they are never public or part of deterministic identity.
 
 For every S4 image call, dispatch certainty is exactly:
 
@@ -1197,6 +1207,8 @@ response. If a failure is proven before the external-dispatch boundary, the
 same attempt remains `not_started`; if the boundary may have been crossed and
 no definitive response exists, it remains `may_have_started`, is classified as
 `PROVIDER_DISPATCH_UNCERTAIN`, and is never redispatched.
+
+`consumed` proves that the provider response or outcome occurred and permanently consumes the possible dispatch; it does not permit recovery to infer or invent a normal result. A consumed operation with missing or incomplete normal classification takes the terminal `PERSISTENCE_FAILED` path in U.6, never `PROVIDER_DISPATCH_UNCERTAIN`.
 
 There is one network dispatch per image operation. No provider SDK retry,
 HTTP-agent retry, queue retry, or catch-and-continue path may create an
@@ -1799,6 +1811,8 @@ after `may_have_started` leaves that state as `may_have_started`, maps the
 attempt to `PROVIDER_DISPATCH_UNCERTAIN`, preserves the possible dispatch
 count, and cannot be silently reissued.
 
+If the `consumed` transition commits before strict parsing and a crash leaves no durable reduced result or failure, the attempt is not ambiguous: recovery uses the terminal `PERSISTENCE_FAILED` assessment posture in U.6 and retains the consumed dispatch state.
+
 ### O.2 Retryable assessment failures
 
 Only these known definitive consumed failures make attempt 1 eligible for one
@@ -1817,6 +1831,8 @@ leaves the same attempt `not_started` for recovery and does not create attempt
 2. A post-mark timeout, connection interruption, reset, process interruption,
 or other ambiguous transport outcome is `PROVIDER_DISPATCH_UNCERTAIN`, not an
 ordinary retryable timeout or unavailable result, and has no assessment retry.
+
+`PERSISTENCE_FAILED` from consumed-result recovery is not a provider result class and has no assessment retry.
 
 A valid WARNING, valid MATERIAL_FAIL, valid uncertainty or not_verifiable
 result, provider refusal, definitive `PROVIDER_HTTP_ERROR`, definitive
@@ -1850,6 +1866,8 @@ Activation is automatic only after an output is published, preservation complete
 | any | any | any | source, mask, assessment, or output identity mismatch | Fail closed; keep current pointer |
 
 Preservation PASS is mandatory. There is no path in which preservation WARNING activates. A valid assessment cannot override a deterministic preservation MATERIAL_FAIL or QA_UNAVAILABLE result.
+
+The consumed-result recovery posture `qa_unavailable_terminal` is a non-activatable `QA_UNAVAILABLE` result with no retry exception; it never changes the prior active pointer.
 
 ### P.2 Atomic activation order
 
@@ -1971,6 +1989,7 @@ All state transitions, idempotency checks, cycle allocation, claim changes, publ
 - an incomplete or uncheckable process identity is treated as live/unknown;
 - a dead owner may be recovered only when the operation is definitely pre-dispatch;
 - an operation marked may_have_started remains in that state when no definitive provider response exists, counts as a possible dispatch, and is never redispatched; only a definitive response or outcome transitions it to consumed;
+- a consumed operation or attempt is not a dead-owner pre-dispatch case; if its durable normal result or failure is missing after a crash, recovery applies the U.6 `PERSISTENCE_FAILED` fallback while retaining `consumed` and never requeues or redispatches it;
 - persistence or invariant failure is not a dead-owner signal;
 - a stale worker may clean only its own staging objects.
 
@@ -2006,6 +2025,8 @@ post-mark timeout or transport failure is `PROVIDER_DISPATCH_UNCERTAIN` and
 remains `may_have_started`. An ambiguous operation is never redispatched
 automatically or through image-retry.
 
+`PERSISTENCE_FAILED` from consumed-result recovery, or any consumed operation whose normal result classification is absent, has no image retry.
+
 ### S.2 Explicit retry transaction
 
 POST image-retry checks the project, edit, selection lineage, first operation, first attempt, failure code, dispatch state, retry state, current pointer, and absence of a later cycle. It then atomically inserts attempt 2, sets the edit to image_queued, records the retry transition, and stores the idempotency result. It does not increment cyclesConsumed. The worker starts only the newly inserted operation.
@@ -2033,6 +2054,8 @@ assessment dispatches. A counter is derived from durable operation records,
 not a mutable free-form counter.
 
 Before marking may_have_started, the worker checks the derived ceiling under the repository lock. If the ceiling is already reached, it records a terminal failure and does not call the provider. A possible-dispatch count is never decremented after failure, crash, rollback, or stale completion.
+
+This includes an operation or attempt terminalized with `PERSISTENCE_FAILED` after a consumed-result classification crash; its provider dispatch remains counted.
 
 ## U. Publication and recovery
 
@@ -2064,6 +2087,8 @@ authorized request
   -> assessment reduction
   -> activation CAS, if eligible
 ~~~
+
+The consumed step establishes durable dispatch accounting before normal response, output, or assessment classification. If the process crashes after `consumed` commits and before that classification is durable, recovery follows the exact fail-closed branches in U.6 and never calls the provider again.
 
 The first admission transaction persists stage start, the immutable mask intent,
 the edit in `mask_materialization_pending`, the selection/pointer fence,
@@ -2108,9 +2133,10 @@ A failure before the first commit writes no object because object
 materialization has not begun and creates no S4 record, cycle, or idempotency
 result. A crash after that commit may leave zero, one, or both referenced
 private mask objects while the edit remains pending; recovery reconciles the
-same bytes and never changes the mask identity or consumes another cycle. A
-successful admission consumes its cycle even if materialization or all later
-work fails.
+same bytes and never changes the mask identity. The cycle allocated by the
+committed admission remains consumed: recovery consumes no additional cycle
+and never refunds, decrements, replaces, or reallocates it. A successful
+admission consumes its cycle even if materialization or all later work fails.
 
 ### U.3 Image claim and dispatch
 
@@ -2121,13 +2147,21 @@ dispatch boundary, it leaves the same operation `not_started` and recovery may
 requeue it. It then durably changes status to running and dispatch state to
 `may_have_started` before making exactly one provider call. On a definitive
 provider response or outcome, a repository transaction changes the dispatch
-state to `consumed` before parsing/reducing that response and records the
-resulting success or exact consumed failure. A timeout, connection interruption,
-reset, process interruption, or any other outcome after the boundary where
-provider execution cannot be excluded leaves the state `may_have_started`,
-records `PROVIDER_DISPATCH_UNCERTAIN`, and cannot be retried or redispatched.
-A response received after the claim is stale is discarded and its own
-temporary data is removed; it does not create another dispatch.
+state to `consumed` before parsing/reducing that response. The normal
+parser/reducer then records the resulting success or exact consumed failure.
+If the process crashes after that `consumed` commit but before the normal
+result, failure, or publication classification is durable, recovery applies
+the image fallback in U.6: the operation is `failed` with
+`PERSISTENCE_FAILED`, the edit is `image_failed` with no retry, the dispatch
+state remains `consumed`, no publication or usable revision is fabricated, and
+the prior pointer remains authoritative. A complete durable normal result may
+continue through its existing no-dispatch recovery path. A timeout, connection
+interruption, reset, process interruption, or any other outcome after the
+boundary where provider execution cannot be excluded leaves the state
+`may_have_started`, records `PROVIDER_DISPATCH_UNCERTAIN`, and cannot be
+retried or redispatched. A response received after the claim is stale is
+discarded and its own temporary data is removed; it does not create another
+dispatch.
 
 ### U.4 Exact output and publication
 
@@ -2161,25 +2195,36 @@ transport outcome leaves `may_have_started`, records
 attempt 2 with the same assessment input and image bytes, never a new image
 operation, and only for the definitive consumed failures in O.2.
 
+If the `consumed` marker commits but the strict reduced result or failure is
+absent or incomplete after a crash, recovery applies the assessment fallback
+in U.6: the attempt is `failed` with disposition
+`qa_unavailable_terminal` and `PERSISTENCE_FAILED`, the aggregate is
+`qa_unavailable_terminal` with retry state `none`, the edit is
+`qa_unavailable` with retry state `none`, and the prior pointer remains
+authoritative. No observations, result, retry, or redispatch is fabricated.
+
 ### U.6 Crash recovery
 
 Recovery runs through the existing repository lock and uses the existing S2/S3 liveness semantics:
 
-- A committed edit with `maskMaterializationStatus: "pending"` is recovered by regenerating the exact raster and provider PNG from its persisted primitives and frozen mask identities, writing/verifying both intended keys with no-overwrite semantics, and then performing the readiness transaction. A crash after either object write leaves a referenced but non-ready object; no such object is authoritative, no mask identity changes, no cycle is consumed, and no provider call is allowed until both objects verify.
+- A committed edit with `maskMaterializationStatus: "pending"` is recovered by regenerating the exact raster and provider PNG from its persisted primitives and frozen mask identities, writing/verifying both intended keys with no-overwrite semantics, and then performing the readiness transaction. A crash after either object write leaves a referenced but non-ready object; no such object is authoritative, no mask identity changes, the cycle allocated by the committed admission remains consumed, and recovery consumes no additional cycle and never refunds, decrements, replaces, or reallocates it. No provider call is allowed until both objects verify and readiness commits.
 - A queued or running image operation with a verifiably dead owner and dispatch state not_started is returned to queued with its claim cleared and may be started.
-- A queued or running image operation with dispatch state may_have_started and no definitive response is marked failed with PROVIDER_DISPATCH_UNCERTAIN while retaining `may_have_started`; its possible dispatch remains counted and it is not redispatched. An operation with `consumed` retains that state and its definitive failure/result; it is never reclassified as unstarted.
-- A provider response lost before publication intent is treated as uncertain; the returned bytes are not reconstructed or faked. The old pointer remains current.
+- A queued or running image operation with dispatch state may_have_started and no definitive response is marked failed with PROVIDER_DISPATCH_UNCERTAIN while retaining `may_have_started`; its possible dispatch remains counted and it is not redispatched.
+- If a response is lost before the `consumed` transition commits, the durable record has no definitive response/outcome and remains `may_have_started`; it is classified as `PROVIDER_DISPATCH_UNCERTAIN` and never redispatched. If the `consumed` transition has committed, loss of subsequent result classification is the distinct terminal `PERSISTENCE_FAILED` case below, not dispatch uncertainty.
+- For an image operation with `providerDispatchState: "consumed"`, recovery first follows the existing no-dispatch path when a complete durable normal success/failure/publication result and all existing integrity links are present. Otherwise, when the normal result or failure classification is absent or incomplete because the process crashed after the consumed commit, recovery atomically sets the operation to `status: "failed"` with `failureCode: "PERSISTENCE_FAILED"` and `completedAt`, sets the edit to `status: "image_failed"` with `retryState: "none"`, `retryWaivedReason: null`, and `terminalAt`, retains `providerDispatchState: "consumed"`, and leaves the active pointer and selectionVersion unchanged. The fallback creates or promotes no publication, asset, revision, preservation, or assessment from missing bytes or classification; any partial publication is subject only to the exact-object recovery rules below and cannot be committed unless every normal publication invariant is proven. `PERSISTENCE_FAILED` is not an image retry class, so no image retry, requeue, or redispatch is allowed. This operation is never reclassified as `not_started` or `PROVIDER_DISPATCH_UNCERTAIN`.
 - A staged or promoted publication whose owner is dead is recovered only by verifying exact staging and final objects. Exact staging may be promoted to an absent final key. An exact final object may be committed. Missing or mismatched objects cause abort and cleanup of only the publication's own staging key.
 - A publication with a live or unknown owner is held for that owner or later operator recovery; unknown is never treated as dead.
 - A preservation check with a verifiably dead local owner and no external dispatch may be returned to pending. An unknown owner is held. Its deterministic run may be repeated only with the same identities.
-- A queued or running assessment attempt with dispatch state not_started and a verifiably dead owner may be requeued. A may_have_started attempt with no definitive response becomes terminal QA_UNAVAILABLE with PROVIDER_DISPATCH_UNCERTAIN while retaining `may_have_started` and no redispatch. A consumed attempt retains its definitive result/failure and state. A known retryable consumed failure exposes one explicit assessment retry if the selection remains current and no later cycle or rollback waived it.
+- A queued or running assessment attempt with dispatch state not_started and a verifiably dead owner may be requeued. A may_have_started attempt with no definitive response becomes terminal QA_UNAVAILABLE with PROVIDER_DISPATCH_UNCERTAIN while retaining `may_have_started` and no redispatch. For a consumed assessment attempt, recovery follows the existing normal path only when a complete durable reduced result/failure is present. If that result or failure classification is absent or incomplete after the consumed commit, recovery atomically retains `providerDispatchState: "consumed"`, sets the attempt to `status: "failed"`, `disposition: "qa_unavailable_terminal"`, and `failureCode: "PERSISTENCE_FAILED"`, clears reducer observations/finding IDs to empty arrays and requested/overall result fields to null, sets the aggregate to `status: "qa_unavailable_terminal"`, `retryState: "none"`, and `latestAttemptId` to that attempt, and sets the edit to `status: "qa_unavailable"`, `retryState: "none"`, `retryWaivedReason: null`, and `terminalAt`. The existing attempt tuple remains; no assessment retry or redispatch is allowed, the prior pointer remains authoritative, and no assessment result is fabricated. Only a known retryable consumed failure already durably classified under O.2 exposes one explicit assessment retry; `PERSISTENCE_FAILED` does not.
 - A completed output, preservation result, or assessment result whose claim token no longer matches is stale. It is discarded or marked stale and cannot change the pointer.
 
-Persistence, invariant, hash, or object verification failures are not recovery signals. They produce a safe failure and operator-visible internal diagnostics without a fake success.
+Persistence, invariant, hash, or object verification failures are not dead-owner recovery signals. They produce a safe failure and operator-visible internal diagnostics without a fake success. The consumed-result fallback above is the explicit terminal recovery classification for the specific post-consumed missing-result crash window.
 
 ### U.7 Activation recovery
 
 Activation is a single transaction as specified in P. If the process crashes before its commit, the old active pointer remains. If it crashes after commit, the new pointer, selectionVersion, edit status, and S4 activation transition are all present. A restart never infers activation from an output object alone, from a provider response, from a completed assessment without a pointer transaction, or from a latest timestamp.
+
+A consumed-result recovery fallback is terminal and non-activatable: it leaves the prior active pointer authoritative and does not change selectionVersion, even when provider bytes or a partial object are present without a proven normal result.
 
 ## V. Private object keys
 
@@ -2464,6 +2509,8 @@ A public DTO MUST NOT expose private object keys or URLs, raw mask bytes or prim
 
 An edit with `maskMaterializationStatus: "pending"` projects as `preparing_mask` with `maskReady: false` and has no image operation. After readiness commits, it projects as `generating` with `maskReady: true` until later lifecycle states apply. An edit with a committed output and current-quality PASS/WARNING records projects as usable_history unless its revision is the active pointer, in which case it projects active_tip. A failed, stale, no-op, preservation-failing, or QA-unavailable edit projects historical_non_activatable. These values are derived; no active or usable flag is added to the immutable revision.
 
+The internal `qa_unavailable_terminal` assessment posture from U.6 projects as public `QA_UNAVAILABLE` with `retryAvailable: false`. An image consumed-result fallback projects as `image_failed` with `imageRetryAvailable: false` and `assessmentRetryAvailable: false`. Neither fallback is a usable revision or a permission to retry the provider dispatch.
+
 ## AA. Client contract
 
 ### AA.1 Draft mask state
@@ -2663,9 +2710,9 @@ The matrix below is the sole source of the row and claim count. Each row is one 
 | ACTIVATE-001 | concurrency | PASS/WARNING, every non-activation result, stale, no-op, CAS, atomicity, version, S3 counters | 12 |
 | ROLLBACK-001 | concurrency | shared route, S3/S4 targets, lineage/usability, in-flight, waiver, no reset/latest jump, next parent | 11 |
 | CONCURRENCY-001 | concurrency | lock, idempotency, S4 idempotency reuse, busy, claims, stale completions, pointer race, liveness, ceiling | 12 |
-| RETRY-001 | failure-injection | image classes, ambiguous transport, bounds, assessment classes, no extra cycle/redispatch, waiver | 8 |
+| RETRY-001 | failure-injection | image classes, ambiguous transport, bounds, assessment classes, consumed-result failure no retry, no extra cycle/redispatch, waiver | 8 |
 | DISPATCH-001 | boundary | image and assessment ceilings, preservation zero, possible/consumed accounting, no decrement | 6 |
-| RECOVERY-001 | persistence/restart | admission crash, pre-dispatch, ambiguity, lost response, publication, preservation, assessment, activation, no fake/overwrite | 12 |
+| RECOVERY-001 | persistence/restart | admission crash, pre-dispatch, ambiguity, consumed-response classification loss, publication, preservation, assessment, activation, no fake/overwrite | 12 |
 | KEYS-001 | persistence/restart | mask, staged/committed output, preservation/assessment evidence, privacy, user-key exclusion | 8 |
 | AUTH-API-001 | client/API | auth, default deny, isolation, routes, methods, headers, statuses, preview, errors, DTO | 10 |
 | PRIVACY-001 | behavioral | keys, hashes, prompts, provider IDs, claims, evidence, credentials, safe logs | 8 |
@@ -2724,6 +2771,7 @@ The matrix MUST eventually prove, with the applicable evidence class:
 - preservation PASS, guard behavior, material leakage, catastrophic leakage, alpha leakage, no-op failure, and fail-closed QA;
 - requested-edit satisfaction, S4 assessment, PASS/WARNING activation, and non-activation for preservation failure, MATERIAL_FAIL, QA-unavailable, and stale PASS/WARNING;
 - prior-tip preservation, image/assessment retry bounds, same-byte assessment retry, idempotent replay, unique claims, pointer races, crash recovery, and private publication;
+- pre-consumed response loss as dispatch uncertainty versus post-consumed result-classification loss as terminal `PERSISTENCE_FAILED`, with no retry or redispatch;
 - authorization, cross-project isolation, closed API/errors/DTO privacy, persisted-truth client behavior, optional S4/S5 handoff, and S1/S2/S3 regressions;
 - runtime exact-head and exact-tree binding.
 
