@@ -8,6 +8,8 @@ import {
 import type { S2ProviderContract, S2QaProviderInput, S2QaProviderResult, S2RepairProviderInput, S2RepairProviderResult } from "./s2-provider";
 import { buildS2QaRequest, buildS2RepairRequest } from "./s2-provider";
 import { assertS2Png } from "./s2-media";
+import { createExactS3FixturePng } from "./s3-media";
+import type { S3AssessmentProviderInput, S3AssessmentProviderResult, S3ImageProviderInput, S3ImageProviderResult } from "./s3-provider";
 import { nowUtc } from "./utils";
 
 export const EXTRACTION_MODEL = "gpt-5.4-mini" as const;
@@ -351,6 +353,11 @@ export type MockProviderOptions = {
   s2RepairResponses?: Array<Uint8Array | Error>;
   onS2QaRequest?: (input: S2QaProviderInput, callIndex: number) => void;
   onS2RepairRequest?: (input: S2RepairProviderInput, callIndex: number) => void;
+  s3ImageFailures?: Map<number, string>;
+  s3ImageResponses?: Array<Uint8Array | Error>;
+  s3AssessmentResponses?: Array<unknown | Error>;
+  onS3ImageRequest?: (input: S3ImageProviderInput, callIndex: number) => void;
+  onS3AssessmentRequest?: (input: S3AssessmentProviderInput, callIndex: number) => void;
 };
 
 /** Explicit test/local adapter. It simulates OpenAI and is never a runtime fallback. */
@@ -360,6 +367,8 @@ export class MockOpenAIProvider implements OpenAIProviderContract {
   imageCalls = 0;
   s2QaCalls = 0;
   s2RepairCalls = 0;
+  s3ImageCalls = 0;
+  s3AssessmentCalls = 0;
 
   constructor(options: MockProviderOptions) {
     this.options = options;
@@ -437,6 +446,49 @@ export class MockOpenAIProvider implements OpenAIProviderContract {
         totalTokens: null,
         receivedAt: nowUtc(),
       },
+    };
+  }
+
+  async runS3ImageEdit(input: S3ImageProviderInput): Promise<S3ImageProviderResult> {
+    const index = this.s3ImageCalls;
+    this.s3ImageCalls += 1;
+    this.options.onS3ImageRequest?.(input, index);
+    const failure = this.options.s3ImageFailures?.get(index);
+    if (failure) throw new ProviderFailure(failure);
+    const configured = this.options.s3ImageResponses?.[index];
+    if (configured instanceof Error) throw configured;
+    return {
+      pngBytes: configured ? new Uint8Array(configured) : await createExactS3FixturePng(),
+      providerRequestId: `mock-s3-image-${index + 1}`,
+    };
+  }
+
+  async runS3Assessment(input: S3AssessmentProviderInput): Promise<S3AssessmentProviderResult> {
+    const index = this.s3AssessmentCalls;
+    this.s3AssessmentCalls += 1;
+    this.options.onS3AssessmentRequest?.(input, index);
+    const configured = this.options.s3AssessmentResponses?.[index];
+    if (configured instanceof Error) throw configured;
+    if (configured !== undefined) return { payload: configured, providerRequestId: `mock-s3-assessment-${index + 1}` };
+    return {
+      payload: {
+        requirements: (input.requirements ?? []).map((item) => ({
+          requirementId: item.requirementId,
+          expected: item.expected,
+          expectedCount: item.expectedCount,
+          observed: item.expected === "absent" ? "absent" : "present",
+          observedCount: item.expected === "exact_count" ? item.expectedCount : null,
+          confidence: 0.99,
+          evidence: "local synthetic S3 assessment observation",
+        })),
+        designRules: (input.designRules ?? []).filter((item) => item.applicability === "applicable").map((item) => ({
+          ruleId: item.ruleId,
+          observed: "compliant",
+          confidence: 0.99,
+          evidence: "local synthetic S3 assessment observation",
+        })),
+      },
+      providerRequestId: `mock-s3-assessment-${index + 1}`,
     };
   }
 }

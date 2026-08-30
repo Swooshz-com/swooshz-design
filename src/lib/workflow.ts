@@ -37,6 +37,8 @@ import {
 import { JsonRepository, PrivateObjectStore, defaultDataRoot } from "./store";
 import { assertUuid, cloneJson, jcs, newUuid, nowUtc, privateStorageKey, sha256 } from "./utils";
 import { S2WorkflowService, type S2WorkflowServiceOptions } from "./s2";
+import { S3WorkflowService, type S3WorkflowServiceOptions } from "./s3";
+import type { S3ProviderContract } from "./s3-provider";
 
 
 export type WorkflowServiceOptions = {
@@ -44,6 +46,7 @@ export type WorkflowServiceOptions = {
   objects?: PrivateObjectStore;
   dataRoot?: string;
   provider?: OpenAIProviderContract;
+  s3Provider?: S3ProviderContract;
   clock?: () => string;
   uuid?: () => UUID;
   workerId?: string;
@@ -51,6 +54,8 @@ export type WorkflowServiceOptions = {
   isProcessAlive?: (processId: number) => boolean;
   onProviderDispatchPhase?: S2WorkflowServiceOptions["onProviderDispatchPhase"];
   onPublicationPhase?: S2WorkflowServiceOptions["onPublicationPhase"];
+  onS3ProviderDispatchPhase?: S3WorkflowServiceOptions["onProviderDispatchPhase"];
+  onS3PublicationPhase?: S3WorkflowServiceOptions["onPublicationPhase"];
 };
 
 export type PublicGeneration = {
@@ -155,6 +160,7 @@ export class WorkflowService {
   readonly objects: PrivateObjectStore;
   readonly provider: OpenAIProviderContract;
   readonly s2: S2WorkflowService;
+  readonly s3: S3WorkflowService;
   private readonly clock: () => string;
   private readonly uuid: () => UUID;
   private readonly workerId: string;
@@ -187,6 +193,24 @@ export class WorkflowService {
       isProcessAlive: this.isProcessAlive,
       onProviderDispatchPhase: options.onProviderDispatchPhase,
       onPublicationPhase: options.onPublicationPhase,
+    });
+    const providerWithS3 = this.provider as unknown as S3ProviderContract;
+    const s3Provider = options.s3Provider ?? (
+      typeof providerWithS3.runS3ImageEdit === "function" && typeof providerWithS3.runS3Assessment === "function"
+        ? providerWithS3
+        : undefined
+    );
+    this.s3 = new S3WorkflowService({
+      repository: this.repository,
+      objects: this.objects,
+      provider: s3Provider,
+      clock: this.clock,
+      uuid: this.uuid,
+      workerId: this.workerId,
+      processId: this.processId,
+      isProcessAlive: this.isProcessAlive,
+      onProviderDispatchPhase: options.onS3ProviderDispatchPhase,
+      onPublicationPhase: options.onS3PublicationPhase,
     });
   }
 

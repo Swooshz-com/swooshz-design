@@ -293,6 +293,17 @@ export type StoreState = {
   s2Operations: S2Operation[];
   s2Publications: S2Publication[];
   s2Transitions: S2StateTransition[];
+  s3Sources: S3SourceSnapshot[];
+  s3Selections: S3SelectionState[];
+  s3SelectionEvents: S3SelectionEvent[];
+  s3Revisions: S3Revision[];
+  s3Assets: S3GeneratedAsset[];
+  s3Cycles: S3RefinementCycle[];
+  s3ImageOperations: S3ImageOperation[];
+  s3Assessments: S3Assessment[];
+  s3AssessmentAttempts: S3AssessmentAttempt[];
+  s3Publications: S3Publication[];
+  s3Transitions: S3StateTransition[];
 };
 
 export type FieldError = {
@@ -640,6 +651,496 @@ export type S2StateTransition = {
   from: string;
   to: string;
   referenceId: UUID;
+  at: Timestamp;
+};
+
+export type S3SourceKind = "s1_original" | "s2_repaired";
+export type S3SourceAssetKind = "s1_concept_asset" | "s2_derived_candidate";
+export type S3SourceQualityStatus = "pass" | "warning";
+export type S3SourceVerdict = "PASS" | "WARNING";
+export type S3RevisionKind = "source_selection" | "refinement";
+export type S3OutputAssetKind = "s1_concept_asset" | "s2_derived_candidate" | "s3_refinement_asset";
+export type S3CycleStatus =
+  | "image_queued"
+  | "image_running"
+  | "image_retry_available"
+  | "publication_pending"
+  | "assessment_pending"
+  | "assessment_running"
+  | "assessment_retry_available"
+  | "completed"
+  | "material_fail"
+  | "qa_unavailable"
+  | "image_failed"
+  | "publication_failed"
+  | "stale"
+  | "waived";
+export type S3CycleRetryState = "none" | "image_available" | "assessment_available" | "waived";
+export type S3RetryWaivedReason = "reselected" | "rolled_back" | "later_cycle_started";
+export type S3ImageOperationStatus = "queued" | "running" | "succeeded" | "failed";
+export type S3AssessmentAggregateStatus =
+  | "pending"
+  | "running"
+  | "pass"
+  | "warning"
+  | "material_fail"
+  | "qa_unavailable_retryable"
+  | "qa_unavailable_terminal";
+export type S3AssessmentAttemptStatus = "queued" | "running" | "succeeded" | "failed";
+export type S3AssessmentAttemptDisposition =
+  | "pending"
+  | "running"
+  | "pass"
+  | "warning"
+  | "material_fail"
+  | "qa_unavailable_retryable"
+  | "qa_unavailable_terminal";
+export type S3AssessmentRetryState = "none" | "available" | "waived";
+export type S3PublicationStatus = "staged" | "promoted" | "committed" | "aborted";
+export type S3ProviderDispatchState = "not_started" | "may_have_started" | "consumed";
+export type S3SelectionEventKind = "select_source" | "reselect_source" | "activate_refinement" | "rollback";
+
+export type S3OperationFailureCode =
+  | "PROVIDER_TIMEOUT"
+  | "PROVIDER_UNAVAILABLE"
+  | "PROVIDER_RATE_LIMIT"
+  | "PROVIDER_SERVER_ERROR"
+  | "PROVIDER_HTTP_ERROR"
+  | "PROVIDER_MALFORMED_RESPONSE"
+  | "PROVIDER_NOT_CONFIGURED"
+  | "PROVIDER_CLIENT_ERROR"
+  | "PROVIDER_DISPATCH_UNCERTAIN"
+  | "IMAGE_EMPTY"
+  | "IMAGE_MALFORMED"
+  | "MEDIA_CORRUPT"
+  | "MEDIA_NORMALIZATION_FAILED"
+  | "S3_OUTPUT_DIMENSIONS_INVALID"
+  | "IMAGE_INPUT_INTEGRITY_MISMATCH"
+  | "MEDIA_TOO_LARGE"
+  | "MEDIA_ANIMATED_NOT_ALLOWED"
+  | "MEDIA_DIMENSIONS_EXCEEDED"
+  | "MEDIA_PIXEL_LIMIT_EXCEEDED"
+  | "MEDIA_SIGNATURE_MISMATCH"
+  | "PUBLICATION_FAILED"
+  | "PUBLICATION_OBJECT_MISMATCH"
+  | "S3_FENCE_STALE"
+  | "QA_PROVIDER_EMPTY"
+  | "QA_PROVIDER_INCOMPLETE"
+  | "QA_PROVIDER_REFUSED"
+  | "QA_SCHEMA_INVALID"
+  | "QA_RESULT_INCOMPLETE"
+  | "QA_INPUT_INTEGRITY_MISMATCH"
+  | "PERSISTENCE_FAILED";
+
+export type CanonicalSourceBinding = {
+  schemaVersion: "s3-source-binding-v1";
+  projectId: UUID;
+  generationSetId: UUID;
+  candidateIndex: 1 | 2 | 3 | 4;
+  sourceKind: S3SourceKind;
+  sourceCandidateId: UUID;
+  ultimateS1CandidateId: UUID;
+  ultimateS1AssetId: UUID;
+  selectedAssetKind: S3SourceAssetKind;
+  selectedAssetId: UUID;
+  selectedSha256: Sha256;
+  selectedByteSize: number;
+  selectedWidth: number;
+  selectedHeight: number;
+  selectedPixelCount: number;
+  selectedDecodedRgbaBytes: number;
+  s1CompilerVersion: "g2-booth-v1";
+  s1DirectionKey: CandidateDirection;
+  s1CanonicalInputHash: Sha256;
+  s1PromptHash: Sha256;
+  s1Provider: "openai";
+  s1ImageModelSnapshot: "gpt-image-2-2026-04-21";
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  s2InputVersionId: UUID;
+  s2InputBindingHash: Sha256;
+  s2QaRunId: UUID;
+  s2SourceQaResultId: UUID;
+  s2QaModelSnapshot: "gpt-5.4-mini-2026-03-17";
+  s2RepairAttemptId: UUID | null;
+  s2ReQaResultId: UUID | null;
+  s2DerivedCandidateId: UUID | null;
+  s2RepairInputHash: Sha256 | null;
+  s2RepairPromptHash: Sha256 | null;
+  s2RepairModelSnapshot: "gpt-image-2-2026-04-21" | null;
+  eligibilityResultId: UUID;
+  eligibilityStatus: S3SourceQualityStatus;
+  eligibilityVerdict: S3SourceVerdict;
+};
+
+export type S3SourceSnapshot = {
+  sourceSnapshotId: UUID;
+  sourceRootRevisionId: UUID;
+  projectId: UUID;
+  generationSetId: UUID;
+  candidateIndex: 1 | 2 | 3 | 4;
+  sourceKind: S3SourceKind;
+  canonicalSourceBinding: CanonicalSourceBinding;
+  sourceBindingHash: Sha256;
+  selectedAssetKind: S3SourceAssetKind;
+  selectedAssetId: UUID;
+  selectedStorageKey: string;
+  selectedSha256: Sha256;
+  selectedByteSize: number;
+  selectedWidth: number;
+  selectedHeight: number;
+  selectedPixelCount: number;
+  selectedDecodedRgbaBytes: number;
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  s2InputVersionId: UUID;
+  s2InputBindingHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  canonicalRequirements: S2Requirement[];
+  requirementHash: Sha256;
+  designRulesVersion: "s2-design-rules-v1";
+  designRuleSnapshot: S2DesignRuleSnapshot[];
+  designRuleSnapshotHash: Sha256;
+  createdAt: Timestamp;
+};
+
+export type S3SelectionState = {
+  selectionStateId: UUID;
+  projectId: UUID;
+  generationSetId: UUID;
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  s2InputVersionId: UUID;
+  s2InputBindingHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  activeRevisionId: UUID | null;
+  lineageRootRevisionId: UUID | null;
+  selectionVersion: number;
+  cycleSlotsConsumed: 0 | 1 | 2;
+  successfulRefinementCount: 0 | 1 | 2;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type S3SelectionEvent = {
+  eventId: UUID;
+  projectId: UUID;
+  selectionStateId: UUID;
+  kind: S3SelectionEventKind;
+  fromRevisionId: UUID | null;
+  toRevisionId: UUID;
+  sourceSnapshotId: UUID;
+  cycleId: UUID | null;
+  assessmentId: UUID | null;
+  expectedSelectionVersion: number;
+  resultingSelectionVersion: number;
+  resultingSuccessfulRefinementCount: 0 | 1 | 2;
+  idempotencyKey: UUID | null;
+  requestReferenceId: UUID;
+  at: Timestamp;
+};
+
+export type S3ImageProviderMetadata = {
+  provider: "openai";
+  api: "images";
+  model: "gpt-image-2";
+  modelSnapshot: "gpt-image-2-2026-04-21";
+  providerRequestId: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  receivedAt: Timestamp;
+};
+
+export type S3AssessmentProviderMetadata = {
+  provider: "openai";
+  api: "responses";
+  model: "gpt-5.4-mini";
+  modelSnapshot: "gpt-5.4-mini-2026-03-17";
+  providerRequestId: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  receivedAt: Timestamp;
+};
+
+export type S3RevisionCommon = {
+  revisionId: UUID;
+  projectId: UUID;
+  generationSetId: UUID;
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  s2InputVersionId: UUID;
+  s2InputBindingHash: Sha256;
+  sourceSnapshotId: UUID;
+  sourceBindingHash: Sha256;
+  ultimateS1CandidateId: UUID;
+  sourceS2QaResultId: UUID;
+  sourceS2RepairAttemptId: UUID | null;
+  sourceS2ReQaResultId: UUID | null;
+  sourceS2DerivedCandidateId: UUID | null;
+  outputAssetId: UUID;
+  outputSha256: Sha256;
+  outputByteSize: number;
+  outputWidth: number;
+  outputHeight: number;
+  outputPixelCount: number;
+  createdAt: Timestamp;
+};
+
+export type S3SourceRevision = S3RevisionCommon & {
+  kind: "source_selection";
+  lineageRootRevisionId: UUID;
+  parentRevisionId: null;
+  refinementCycleNumber: 0;
+  refinementIntentText: null;
+  refinementIntentHash: null;
+  refinementInputHash: null;
+  compilerVersion: null;
+  promptHash: null;
+  providerMetadata: null;
+  outputAssetKind: "s1_concept_asset" | "s2_derived_candidate";
+  assessmentId: null;
+};
+
+export type S3RefinementRevision = S3RevisionCommon & {
+  kind: "refinement";
+  lineageRootRevisionId: UUID;
+  parentRevisionId: UUID;
+  refinementCycleNumber: 1 | 2;
+  refinementIntentText: string;
+  refinementIntentHash: Sha256;
+  refinementInputHash: Sha256;
+  compilerVersion: "s3-refinement-v1";
+  promptHash: Sha256;
+  providerMetadata: S3ImageProviderMetadata;
+  outputAssetKind: "s3_refinement_asset";
+  assessmentId: UUID;
+};
+
+export type S3Revision = S3SourceRevision | S3RefinementRevision;
+
+export type S3GeneratedAsset = {
+  assetId: UUID;
+  projectId: UUID;
+  revisionId: UUID;
+  generationSetId: UUID;
+  mediaProfile: "s2-media-v1";
+  providerOutputSha256: Sha256;
+  providerOutputBytes: number;
+  detectedMime: "image/png";
+  normalizedSha256: Sha256;
+  normalizedBytes: number;
+  width: 1536;
+  height: 1024;
+  pixelCount: 1_572_864;
+  hasAlpha: boolean;
+  storageKeyNormalized: string;
+  createdAt: Timestamp;
+};
+
+export type S3RefinementCycle = {
+  cycleId: UUID;
+  projectId: UUID;
+  selectionStateId: UUID;
+  generationSetId: UUID;
+  lineageRootRevisionId: UUID;
+  cycleNumber: 1 | 2;
+  baseRevisionId: UUID;
+  baseSelectionVersion: number;
+  refinementIntentText: string;
+  refinementIntentHash: Sha256;
+  refinementInputHash: Sha256;
+  compilerVersion: "s3-refinement-v1";
+  promptHash: Sha256;
+  status: S3CycleStatus;
+  retryState: S3CycleRetryState;
+  retryWaivedReason: S3RetryWaivedReason | null;
+  imageOperationIds: readonly [UUID] | readonly [UUID, UUID];
+  outputRevisionId: UUID | null;
+  assessmentId: UUID | null;
+  assessmentAttemptIds: readonly [] | readonly [UUID] | readonly [UUID, UUID];
+  createdAt: Timestamp;
+  admittedAt: Timestamp;
+  updatedAt: Timestamp;
+  terminalAt: Timestamp | null;
+};
+
+export type S3ImageOperation = {
+  operationId: UUID;
+  projectId: UUID;
+  cycleId: UUID;
+  generationSetId: UUID;
+  baseRevisionId: UUID;
+  baseSelectionVersion: number;
+  attempt: 1 | 2;
+  retryOfOperationId: UUID | null;
+  operationInputHash: Sha256;
+  refinementInputHash: Sha256;
+  promptHash: Sha256;
+  requestReferenceId: UUID;
+  status: S3ImageOperationStatus;
+  claimedBy: string | null;
+  claimedProcessId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  providerDispatchState: S3ProviderDispatchState;
+  providerMetadata: S3ImageProviderMetadata | null;
+  failureCode: S3OperationFailureCode | null;
+  publicationId: UUID | null;
+  outputRevisionId: UUID | null;
+  outputAssetId: UUID | null;
+  createdAt: Timestamp;
+};
+
+export type S3Assessment = {
+  assessmentId: UUID;
+  projectId: UUID;
+  generationSetId: UUID;
+  sourceSnapshotId: UUID;
+  revisionId: UUID;
+  outputAssetId: UUID;
+  outputSha256: Sha256;
+  outputByteSize: number;
+  outputWidth: 1536;
+  outputHeight: 1024;
+  outputPixelCount: 1_572_864;
+  sourceS2QaResultId: UUID;
+  sourceS2ReQaResultId: UUID | null;
+  s2InputVersionId: UUID;
+  confirmedBriefVersionId: UUID;
+  confirmedBriefContentHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  canonicalRequirements: S2Requirement[];
+  requirementHash: Sha256;
+  designRulesVersion: "s2-design-rules-v1";
+  designRuleSnapshot: S2DesignRuleSnapshot[];
+  designRuleSnapshotHash: Sha256;
+  sourceBindingHash: Sha256;
+  refinementInputHash: Sha256;
+  refinementIntentHash: Sha256;
+  assessmentCompilerVersion: "s3-assessment-v1";
+  assessmentSchema: "s3-assessment-v1";
+  assessmentSchemaName: "s3_assessment_v1";
+  assessmentInputHash: Sha256;
+  assessmentPromptHash: Sha256;
+  attemptIds: readonly [UUID] | readonly [UUID, UUID];
+  latestAttemptId: UUID;
+  status: S3AssessmentAggregateStatus;
+  retryState: S3AssessmentRetryState;
+  retryWaivedReason: S3RetryWaivedReason | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type S3AssessmentAttempt = {
+  assessmentAttemptId: UUID;
+  assessmentId: UUID;
+  projectId: UUID;
+  revisionId: UUID;
+  outputAssetId: UUID;
+  outputSha256: Sha256;
+  outputByteSize: number;
+  outputWidth: 1536;
+  outputHeight: 1024;
+  outputPixelCount: 1_572_864;
+  attempt: 1 | 2;
+  retryOfAttemptId: UUID | null;
+  operationInputHash: Sha256;
+  assessmentInputHash: Sha256;
+  assessmentPromptHash: Sha256;
+  assessmentCompilerVersion: "s3-assessment-v1";
+  assessmentSchema: "s3-assessment-v1";
+  assessmentSchemaName: "s3_assessment_v1";
+  requestReferenceId: UUID;
+  status: S3AssessmentAttemptStatus;
+  disposition: S3AssessmentAttemptDisposition;
+  claimedBy: string | null;
+  claimedProcessId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  providerDispatchState: S3ProviderDispatchState;
+  requirementObservations: S2RequirementObservation[];
+  designObservations: S2DesignObservation[];
+  materialFindingIds: string[];
+  warningFindingIds: string[];
+  uncertainFindingIds: string[];
+  failureCode: S3OperationFailureCode | null;
+  providerMetadata: S3AssessmentProviderMetadata | null;
+  createdAt: Timestamp;
+};
+
+export type S3PublicationObject = {
+  key: string;
+  sha256: Sha256;
+  byteSize: number;
+  width: 1536;
+  height: 1024;
+  pixelCount: 1_572_864;
+};
+
+export type S3Publication = {
+  publicationId: UUID;
+  projectId: UUID;
+  cycleId: UUID;
+  operationId: UUID;
+  inputHash: Sha256;
+  providerOutputSha256: Sha256;
+  providerOutputBytes: number;
+  normalizedSha256: Sha256;
+  normalizedBytes: number;
+  width: 1536;
+  height: 1024;
+  pixelCount: 1_572_864;
+  hasAlpha: boolean;
+  intendedAssetId: UUID;
+  intendedRevisionId: UUID;
+  intendedAssessmentId: UUID;
+  intendedAssessmentAttemptId: UUID;
+  stagingObjects: readonly [S3PublicationObject];
+  finalObjects: readonly [S3PublicationObject];
+  ownerProcessId: number | null;
+  ownerClaimToken: UUID | null;
+  ownerClaimedAt: Timestamp | null;
+  state: S3PublicationStatus;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type S3TransitionValue =
+  | S3CycleStatus
+  | S3ImageOperationStatus
+  | S3AssessmentAggregateStatus
+  | S3AssessmentAttemptStatus
+  | S3AssessmentAttemptDisposition
+  | S3PublicationStatus
+  | S3CycleRetryState
+  | S3AssessmentRetryState
+  | S3SelectionEventKind;
+
+export type S3StateTransition = {
+  transitionId: UUID;
+  projectId: UUID;
+  cycleId: UUID | null;
+  operationId: UUID | null;
+  assessmentId: UUID | null;
+  assessmentAttemptId: UUID | null;
+  publicationId: UUID | null;
+  phase: "selection" | "cycle" | "image" | "publication" | "assessment";
+  attempt: 1 | 2 | null;
+  from: S3TransitionValue | null;
+  to: S3TransitionValue;
+  reason: S3RetryWaivedReason | null;
+  requestReferenceId: UUID;
   at: Timestamp;
 };
 
