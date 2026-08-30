@@ -1,6 +1,6 @@
 # S4 G2 implementation contract
 
-**Status:** PROPOSED candidate for Web G2 review. This document is not an acceptance, an implementation authorization, or a release decision.
+**Status:** S4 G2 contract candidate. Its normative authority is controlled by Web's exact-head G2 adjudication on issue #9; this document does not self-accept. When its exact commit is accepted and canonically merged, this same document becomes the normative G2 implementation contract.
 
 **Programme item:** `Swooshz-com/swooshz-design` issue #9, S4 masked local editing and preservation validation.
 
@@ -44,7 +44,7 @@ This contract excludes product implementation, tests, package or lockfile change
 
 ### A.5 Gate boundary
 
-This document remains a proposal until Web accepts `DL-SD-S4-G2-001`. G3 may implement only after an explicit Web G3 decision. If the canonical base, accepted authority, OpenAI mask semantics, single-pointer resolution, terminal S3 compatibility, or calibration envelope materially changes, work MUST stop with `PARENT_RECONCILIATION_INCOMPLETE` or `GATE_REENTRY_REQUIRED` as applicable.
+Web controls acceptance of `DL-SD-S4-G2-001` at the exact candidate head. G3 may implement only after an explicit Web G3 decision. If the canonical base, accepted authority, OpenAI mask semantics, single-pointer resolution, terminal S3 compatibility, or calibration envelope materially changes, work MUST stop with `PARENT_RECONCILIATION_INCOMPLETE` or `GATE_REENTRY_REQUIRED` as applicable.
 
 ### A.6 S5 boundary
 
@@ -60,9 +60,12 @@ The S4 records use the terminal repository scalar conventions:
 UUID       = RFC 4122 version-4 UUID string, lowercase or existing repository UUID spelling
 Timestamp  = UTC RFC3339 with exactly millisecond precision and trailing Z
 Sha256     = lowercase hexadecimal SHA-256 string of exactly 64 characters
+GitObjectId = lowercase hexadecimal Git commit or tree object ID matching ^[0-9a-f]{40}$
 Json       = UTF-8 JSON with camelCase field names; null is explicit, never omission
 Jcs        = the repository's existing deterministic JCS serializer
 ~~~
+
+Normatively, type GitObjectId = string; and every GitObjectId is validated against ^[0-9a-f]{40}$. Sha256 remains a distinct lowercase 64-hex SHA-256 identity validated against ^[0-9a-f]{64}$.
 
 All persisted arrays are real typed arrays, not opaque maps. Array order is meaningful wherever this contract says it is meaningful and is preserved in JCS. IDs are generated server-side with the repository UUID generator. A client-supplied UUID is data, not an authority claim.
 
@@ -175,7 +178,7 @@ type S4MaskRecord = {
 };
 ~~~
 
-The primitive array is the exact parsed request order. `primitiveHash` is `sha256(UTF8(JCS({schemaVersion:"s4-mask-primitives-v1",primitives})))`. `rasterSha256` hashes the one-byte raster. `maskIdentityHash` is `sha256(UTF8(JCS({schemaVersion, width, height, protectedValue, editableValue, layout, primitiveHash, rasterSha256, editablePixelCount, comparisonPixelCount})))`. The private storage keys contain the exact raster and provider PNG bytes and are never public.
+The primitive array is the exact parsed request order. `primitiveHash` is `sha256(UTF8(JCS({schemaVersion:"s4-mask-primitives-v1",primitives})))`. `rasterSha256` hashes the one-byte raster. `maskIdentityHash` is `sha256(UTF8(JCS({schemaVersion, width, height, protectedValue, editableValue, layout, primitiveHash, rasterSha256, editablePixelCount, comparisonPixelCount})))`. `rasterStorageKey` and `providerPngStorageKey` are deterministic private destinations and, while mask materialization is pending, are persisted intents rather than proof that objects exist. After readiness, both keys contain the exact verified bytes and are never public.
 
 ### B.7 `S4EditAdmission`
 
@@ -183,6 +186,7 @@ This is the mutable lifecycle record for one admitted local-edit cycle. One edit
 
 ~~~ts
 type S4EditStatus =
+  | "mask_materialization_pending"
   | "image_queued"
   | "image_running"
   | "image_retry_available"
@@ -216,13 +220,14 @@ type S4EditAdmission = {
   baseSelectionVersion: number;
   maskId: UUID;
   maskIdentityHash: Sha256;
+  maskMaterializationStatus: "pending" | "ready";
   instructionText: string;
   instructionHash: Sha256;
   compilerVersion: "s4-local-edit-v1";
   editInputHash: Sha256;
   promptHash: Sha256;
   providerRequestHash: Sha256;
-  imageOperationIds: readonly [UUID] | readonly [UUID, UUID];
+  imageOperationIds: readonly [] | readonly [UUID] | readonly [UUID, UUID];
   outputRevisionId: UUID | null;
   preservationCheckId: UUID | null;
   assessmentId: UUID | null;
@@ -237,7 +242,7 @@ type S4EditAdmission = {
 };
 ~~~
 
-Admission identity, base identity, mask identity, instruction, compiler hashes, cycle number, and timestamps are immutable. Lifecycle status, retry fields, operation tuple, output foreign keys, assessment foreign keys, and terminal timestamps are mutable only through the transitions in sections O, R, S, and U.
+Admission identity, base identity, mask identity, instruction, compiler hashes, cycle number, and timestamps are immutable. `maskMaterializationStatus` is mutable only from `pending` to `ready` after both private mask objects pass exact key/hash/size verification in the readiness transaction. Lifecycle status, retry fields, operation tuple, output foreign keys, assessment foreign keys, and terminal timestamps are mutable only through the transitions in sections O, R, S, and U. While mask materialization is pending, `imageOperationIds` is empty and no image operation exists; after readiness it contains attempt 1, and an explicit image retry may append attempt 2.
 
 ### B.8 `S4LocalEditRevision`
 
@@ -611,6 +616,7 @@ type S4TransitionValue =
   | "publication_failed"
   | "stale"
   | "waived"
+  | "mask_materialization_pending"
   | "queued"
   | "running"
   | "succeeded"
@@ -638,6 +644,7 @@ type S4TransitionReason =
   | "publication_started"
   | "publication_committed"
   | "publication_aborted"
+  | "mask_materialization_verified"
   | "preservation_started"
   | "preservation_pass"
   | "preservation_material_fail"
@@ -923,7 +930,7 @@ The following are mandatory:
 
 ### D.3 S3 closure boundary
 
-The first successful admission sets s3RefinementClosed: true in the same transaction that creates the stage and edit. From that point, an S3 whole-concept refinement request for the selection lineage MUST return S3_REFINEMENT_CLOSED_BY_S4 through the existing S3 safe error adapter; the S3 record schemas remain unchanged. S3 source selection and rollback may still be called only when their target is allowed by section Q. A source re-selection to a different lineage is not allowed after S4 starts.
+The first successful admission sets s3RefinementClosed: true in the same transaction that creates the stage and edit. From that point, an S3 whole-concept refinement request for the selection lineage MUST return the existing terminal S3 code `S3_LINEAGE_CONFLICT` through the existing S3 safe error adapter, with the existing terminal S3 status semantics; the S3 public error union and record schemas remain unchanged. S3 source selection and rollback may still be called only when their target is allowed by section Q. A source re-selection to a different lineage is not allowed after S4 starts.
 
 A failed first S4 edit therefore has this exact posture: S3 refinement is closed, S4 cycle 1 is consumed, the old active S3 revision remains current, and a second S4 edit may be admitted against that current revision if all fences pass.
 
@@ -1167,9 +1174,34 @@ The provider response MUST be parsed as one data item containing strict base64 b
 
 ### H.3 Transport and metadata
 
-The adapter uses the existing S3/S2 provider transport conventions: authorization is supplied only by the server runtime, timeouts are bounded, HTTP 429 maps to rate-limit, 5xx maps to server error, transport failure maps to unavailable or timeout, and client errors are terminal. Provider request IDs and usage metadata may be stored only in the private operation record and server-safe logs; they are never public or part of deterministic identity.
+The adapter uses the existing S3/S2 provider transport conventions: authorization is supplied only by the server runtime, timeouts are bounded, a definitive HTTP 429 maps to `PROVIDER_RATE_LIMIT`, a definitive HTTP 5xx maps to `PROVIDER_SERVER_ERROR`, and definitive client responses are classified as consumed failures. Provider request IDs and usage metadata may be stored only in the private operation record and server-safe logs; they are never public or part of deterministic identity.
 
-There is one network dispatch per image operation. No provider SDK retry, HTTP-agent retry, queue retry, or catch-and-continue path may create an unrecorded dispatch. An explicit image retry creates attempt 2 as a new persisted operation after the rules in section S pass.
+For every S4 image call, dispatch certainty is exactly:
+
+~~~text
+not_started
+    | durable pre-dispatch mark
+    v
+may_have_started
+    | definitive provider response/outcome received and consumed state committed
+    v
+consumed
+~~~
+
+`not_started` means no external dispatch may have occurred. `may_have_started`
+means the external dispatch boundary may have been crossed and the outcome is
+uncertain. `consumed` means a definitive provider response or outcome was
+obtained for that attempt and the possible dispatch was durably consumed. The
+consumed transition is committed before parsing or reducing a definitive
+response. If a failure is proven before the external-dispatch boundary, the
+same attempt remains `not_started`; if the boundary may have been crossed and
+no definitive response exists, it remains `may_have_started`, is classified as
+`PROVIDER_DISPATCH_UNCERTAIN`, and is never redispatched.
+
+There is one network dispatch per image operation. No provider SDK retry,
+HTTP-agent retry, queue retry, or catch-and-continue path may create an
+unrecorded dispatch. An explicit image retry creates attempt 2 as a new
+persisted operation only after the consumed-failure rules in section S pass.
 
 ## I. Local instruction
 
@@ -1747,23 +1779,51 @@ A valid S4 WARNING is activatable under section P. A preservation failure is nev
 
 An S4 assessment starts with one attempt in queued, then running, then succeeded or failed. The aggregate starts pending and follows the result disposition. There may be at most two assessment attempts total: attempt 1 and one explicit retry attempt 2. The attempt tuple in S4Assessment is empty for no-op or preservation-fail, one item after initial creation, or two items after a retry admission.
 
-An assessment attempt with providerDispatchState not_started has not consumed a possible provider dispatch. Once it is marked may_have_started, it is conservatively consumed and cannot be silently reissued.
+Assessment attempts use the same exact certainty transitions as image
+operations:
+
+~~~text
+not_started
+    | durable pre-dispatch mark
+    v
+may_have_started
+    | definitive provider response/outcome received and consumed state committed
+    v
+consumed
+~~~
+
+An assessment attempt with `not_started` has not consumed a possible provider
+dispatch. A definitive response or outcome transitions it to `consumed` before
+strict parsing/reduction. A timeout, reset, interruption, or process failure
+after `may_have_started` leaves that state as `may_have_started`, maps the
+attempt to `PROVIDER_DISPATCH_UNCERTAIN`, preserves the possible dispatch
+count, and cannot be silently reissued.
 
 ### O.2 Retryable assessment failures
 
-Only these known failures make attempt 1 eligible for one explicit retry:
+Only these known definitive consumed failures make attempt 1 eligible for one
+explicit retry:
 
 ~~~text
-PROVIDER_TIMEOUT
-PROVIDER_UNAVAILABLE
 PROVIDER_RATE_LIMIT
 PROVIDER_SERVER_ERROR
-PROVIDER_HTTP_ERROR
 QA_PROVIDER_EMPTY
 QA_PROVIDER_INCOMPLETE
 ~~~
 
-A valid WARNING, valid MATERIAL_FAIL, valid uncertainty or not_verifiable result, provider refusal, malformed strict JSON, schema-invalid output, input-integrity mismatch, dispatch uncertainty, no-op, preservation failure, and terminal publication failure has no assessment retry. A retry is never implicit, and no image operation is recreated or redispatched.
+A definitive response is durably marked `consumed` before any of the listed
+failures is recorded. A failure proven before the external-dispatch boundary
+leaves the same attempt `not_started` for recovery and does not create attempt
+2. A post-mark timeout, connection interruption, reset, process interruption,
+or other ambiguous transport outcome is `PROVIDER_DISPATCH_UNCERTAIN`, not an
+ordinary retryable timeout or unavailable result, and has no assessment retry.
+
+A valid WARNING, valid MATERIAL_FAIL, valid uncertainty or not_verifiable
+result, provider refusal, definitive `PROVIDER_HTTP_ERROR`, definitive
+`PROVIDER_MALFORMED_RESPONSE`, malformed strict JSON, schema-invalid output,
+input-integrity mismatch, dispatch uncertainty, no-op, preservation failure,
+and terminal publication failure has no assessment retry. A retry is never
+implicit, and no image operation is recreated or redispatched.
 
 ### O.3 Same-byte retry identity
 
@@ -1876,7 +1936,7 @@ sha256(UTF8(JCS({
 })))
 ~~~
 
-The idempotency key MUST be a UUIDv4 supplied in the Idempotency-Key header. A matching key, operation, project, and requestHash returns the stored result without any new record, dispatch, cycle, or pointer increment. The same key with a different operation, project, or requestHash returns IDEMPOTENCY_KEY_REUSE. The key and result are stored only after the corresponding transaction has committed.
+The idempotency key MUST be a UUIDv4 supplied in the Idempotency-Key header. A matching key, operation, project, and requestHash returns the stored result without any new record, dispatch, cycle, or pointer increment. For an S4 route, the same key with a different operation, project, or requestHash returns the exact public code `S4_IDEMPOTENCY_KEY_REUSE`. The existing global idempotency persistence mechanism is reused; no S4-specific idempotency collection is added. The key and result are stored only after the corresponding transaction has committed.
 
 ### R.2 Semantic uniqueness
 
@@ -1910,7 +1970,7 @@ All state transitions, idempotency checks, cycle allocation, claim changes, publ
 - a running claim with a verifiable live process is held;
 - an incomplete or uncheckable process identity is treated as live/unknown;
 - a dead owner may be recovered only when the operation is definitely pre-dispatch;
-- an operation marked may_have_started is consumed and is never redispatched;
+- an operation marked may_have_started remains in that state when no definitive provider response exists, counts as a possible dispatch, and is never redispatched; only a definitive response or outcome transitions it to consumed;
 - persistence or invariant failure is not a dead-owner signal;
 - a stale worker may clean only its own staging objects.
 
@@ -1918,14 +1978,13 @@ All state transitions, idempotency checks, cycle allocation, claim changes, publ
 
 ### S.1 Eligible image failures
 
-An admitted edit has at most one explicit image retry. Attempt 2 is eligible only when attempt 1 is terminal with one of these known retryable failures and its dispatch outcome is known:
+An admitted edit has at most one explicit image retry. Attempt 2 is eligible
+only when attempt 1 is terminal, its `providerDispatchState` is `consumed`, and
+it has one of these known definitive consumed retryable failures:
 
 ~~~text
-PROVIDER_TIMEOUT
-PROVIDER_UNAVAILABLE
 PROVIDER_RATE_LIMIT
 PROVIDER_SERVER_ERROR
-PROVIDER_HTTP_ERROR
 PROVIDER_MALFORMED_RESPONSE
 IMAGE_EMPTY
 IMAGE_MALFORMED
@@ -1934,13 +1993,24 @@ MEDIA_NORMALIZATION_FAILED
 S4_OUTPUT_DIMENSIONS_INVALID
 ~~~
 
-A provider client error, missing provider configuration, dispatch uncertainty, input-integrity mismatch, publication failure, no-op, preservation failure, valid assessment result, terminal assessment unavailability, or stale fence has no image retry. An operation with may_have_started is treated as consumed and ambiguous; it is never redispatched automatically or through image-retry.
+A definitive response or output is marked `consumed` before its malformed,
+empty, or media-validation failure is recorded, so those listed failures are
+retryable only after the first dispatch is durably consumed. A provider client
+error, missing provider configuration, definitive `PROVIDER_HTTP_ERROR`,
+dispatch uncertainty, input-integrity mismatch, publication failure, no-op,
+preservation failure, valid assessment result, terminal assessment
+unavailability, or stale fence has no image retry. `PROVIDER_TIMEOUT` and
+`PROVIDER_UNAVAILABLE` are not explicit retry classes: a failure proven before
+the boundary leaves the same operation `not_started` for recovery, while a
+post-mark timeout or transport failure is `PROVIDER_DISPATCH_UNCERTAIN` and
+remains `may_have_started`. An ambiguous operation is never redispatched
+automatically or through image-retry.
 
 ### S.2 Explicit retry transaction
 
 POST image-retry checks the project, edit, selection lineage, first operation, first attempt, failure code, dispatch state, retry state, current pointer, and absence of a later cycle. It then atomically inserts attempt 2, sets the edit to image_queued, records the retry transition, and stores the idempotency result. It does not increment cyclesConsumed. The worker starts only the newly inserted operation.
 
-A definite pre-dispatch dead-worker recovery may requeue the same operation because no provider dispatch occurred. That is recovery of an unstarted operation, not an unrecorded retry. No provider or queue layer may add an implicit retry.
+A definite pre-dispatch dead-worker recovery may requeue the same operation because no provider dispatch occurred. That is recovery of the same unstarted attempt, not an unrecorded retry. No provider or queue layer may add an implicit retry.
 
 ## T. Dispatch ceilings
 
@@ -1952,7 +2022,15 @@ assessment provider dispatches  <= 4
 preservation external dispatches = 0
 ~~~
 
-A possible dispatch is counted when the corresponding operation or attempt has providerDispatchState equal to may_have_started or consumed. An operation still not_started is not counted. The image count is at most two attempts for each of the two admitted cycles. The assessment count is at most two attempts for each assessment that actually reaches the provider; no-op and preservation-fail outputs have zero assessment dispatches. A counter is derived from durable operation records, not a mutable free-form counter.
+A possible dispatch is counted when the corresponding operation or attempt has
+`providerDispatchState` equal to `may_have_started` or `consumed`. An operation
+still `not_started` is not counted. Both an ambiguous `may_have_started` attempt
+and a definitively `consumed` attempt count conservatively toward the lifetime
+ceiling. The image count is at most two attempts for each of the two admitted
+cycles. The assessment count is at most two attempts for each assessment that
+actually reaches the provider; no-op and preservation-fail outputs have zero
+assessment dispatches. A counter is derived from durable operation records,
+not a mutable free-form counter.
 
 Before marking may_have_started, the worker checks the derived ceiling under the repository lock. If the ceiling is already reached, it records a terminal failure and does not call the provider. A possible-dispatch count is never decremented after failure, crash, rollback, or stale completion.
 
@@ -1964,7 +2042,13 @@ The exact normal order is:
 
 ~~~text
 authorized request
-  -> admission transaction
+  -> parse/authorize and resolve/fence active source
+  -> in-memory canonical raster and provider PNG generation
+  -> admission transaction with pending mask intent
+  -> repository commit before object writes or provider dispatch
+  -> no-overwrite materialization of both private mask objects
+  -> exact key/hash/size verification of both mask objects
+  -> readiness transaction: mask ready and image attempt 1 queued/not_started
   -> image operation claim
   -> pre-dispatch fence
   -> may_have_started mark
@@ -1981,27 +2065,69 @@ authorized request
   -> activation CAS, if eligible
 ~~~
 
-The admission transaction persists stage start, mask, edit, image operation, initial transition, and global idempotency result before any network dispatch. The image response cannot activate directly. The output must pass exact media validation and publication before preservation or assessment.
+The first admission transaction persists stage start, the immutable mask intent,
+the edit in `mask_materialization_pending`, the selection/pointer fence,
+semantic uniqueness, the allocated cycle, the initial transitions, and the
+global idempotency result before any object write or network dispatch. The
+readiness transaction is the only transaction that may change the edit to
+`image_queued` and create image attempt 1. The image response cannot activate
+directly. The output must pass exact media validation and publication before
+preservation or assessment.
 
 ### U.2 Admission transaction
 
-Under the existing repository lock, the server:
+The lifecycle uses two repository transactions and keeps all mask bytes in
+memory until the first transaction commits.
+
+First, under the existing repository lock, the server:
 
 1. verifies the authorized project and active generation;
 2. resolves the active revision and verifies exact source PNG bytes, dimensions, quality, and lineage;
-3. parses the exact body, normalizes instruction, rasterizes the mask, checks area limits, writes private mask objects, and computes all identities;
-4. checks global idempotency and semantic uniqueness;
-5. checks S4 stage state, current pointer, selectionVersion, no in-flight edit, and remaining budget;
-6. creates the stage if this is the first admission, increments its cycle count, creates the immutable mask, creates the edit and operation, and appends transitions;
-7. commits the transaction and only then starts the queued image worker.
+3. parses the exact body, normalizes instruction, canonically rasterizes the mask, deterministically generates the provider PNG, checks area limits, computes all mask/edit identities, and computes the intended private keys entirely in memory;
+4. performs global idempotency and semantic-uniqueness checks;
+5. validates and binds the selection/pointer compare-and-swap fence, S4 stage state, no in-flight edit, and remaining budget without moving the active pointer;
+6. creates or updates the S4 stage, increments its cycle count, persists the immutable mask intent, creates the edit with `maskMaterializationStatus: "pending"`, `status: "mask_materialization_pending"`, and `imageOperationIds: []`, and appends the stage/edit transitions;
+7. stores the matching global idempotency result and commits the transaction before any private object write or provider dispatch.
 
-A failure before commit creates no stage, mask, edit, operation, object, cycle, or idempotency result. A successful admission consumes its cycle even if all later work fails.
+After that commit, the post-commit materializer writes the exact in-memory mask
+bytes (or regenerates them from the persisted primitive list and frozen mask
+identities during recovery) to both intended private keys using no-overwrite
+semantics. It verifies each object's exact key, SHA-256, and byte size. An
+existing object is accepted only when all exact values match; a mismatch is a
+fail-closed integrity error and never a reason to overwrite or dispatch.
+
+Only after both objects verify, a second repository transaction revalidates
+the pending edit, mask identity, selection/pointer fence, and both object
+identities, then changes `maskMaterializationStatus` to `"ready"`, changes the
+edit status to `image_queued`, creates image attempt 1 with
+`providerDispatchState: "not_started"`, sets `imageOperationIds` to `[operationId]`,
+appends the readiness transition, and commits. The image worker may claim an
+operation only after this readiness transaction.
+
+A failure before the first commit writes no object because object
+materialization has not begun and creates no S4 record, cycle, or idempotency
+result. A crash after that commit may leave zero, one, or both referenced
+private mask objects while the edit remains pending; recovery reconciles the
+same bytes and never changes the mask identity or consumes another cycle. A
+successful admission consumes its cycle even if materialization or all later
+work fails.
 
 ### U.3 Image claim and dispatch
 
-A worker claims one queued image operation with a unique worker/process/token tuple. Before the external call it verifies the claim, edit, stage, source object hash, mask object hashes, input hashes, current pointer, base version, and dispatch ceiling. It atomically changes status to running and dispatch state to may_have_started before making the call.
+A worker claims one queued image operation with a unique worker/process/token tuple. Such an operation exists only after the mask readiness transaction. Before the external call it verifies the claim, edit, stage, `maskMaterializationStatus: "ready"`, both exact private mask objects, source object hash, mask object hashes, input hashes, current pointer, base version, and dispatch ceiling.
 
-Known provider failure after the mark is terminal or explicitly retryable under section S. A transport interruption after the mark is ambiguous even if the HTTP request might not have left the process. Recovery never sends that operation again. A response received after the claim is stale is discarded and its own temporary data is removed.
+If the implementation proves that a local failure occurred before the external
+dispatch boundary, it leaves the same operation `not_started` and recovery may
+requeue it. It then durably changes status to running and dispatch state to
+`may_have_started` before making exactly one provider call. On a definitive
+provider response or outcome, a repository transaction changes the dispatch
+state to `consumed` before parsing/reducing that response and records the
+resulting success or exact consumed failure. A timeout, connection interruption,
+reset, process interruption, or any other outcome after the boundary where
+provider execution cannot be excluded leaves the state `may_have_started`,
+records `PROVIDER_DISPATCH_UNCERTAIN`, and cannot be retried or redispatched.
+A response received after the claim is stale is discarded and its own
+temporary data is removed; it does not create another dispatch.
 
 ### U.4 Exact output and publication
 
@@ -2024,19 +2150,29 @@ If a final key exists with a different hash or size, publication aborts with PUB
 
 A committed publication creates a preservation check in pending and an assessment in not_started. The local preservation worker claims the check, re-verifies source/output/mask identity, runs section L, writes private evidence, and commits its terminal metrics. It uses no external dispatch. If preservation is MATERIAL_FAIL or QA_UNAVAILABLE, the assessment becomes skipped_preservation_fail, the edit becomes material_fail or qa_unavailable, and no assessment provider call is made.
 
-If preservation PASS and the output is not a no-op, the assessment worker creates attempt 1 and dispatches once after the exact source, output, mask, prompt, and strict schema are bound. It reduces only a strict response. A retry creates attempt 2 with the same assessment input and image bytes, never a new image operation.
+If preservation PASS and the output is not a no-op, the assessment worker
+creates attempt 1 and dispatches once after the exact source, output, mask,
+prompt, and strict schema are bound. It durably changes the attempt from
+`not_started` to `may_have_started` before the call. A definitive provider
+response/outcome is durably changed to `consumed` before strict parsing and
+reduction. An ambiguous post-mark timeout, interruption, reset, or unknown
+transport outcome leaves `may_have_started`, records
+`PROVIDER_DISPATCH_UNCERTAIN`, and is never redispatched. A retry creates
+attempt 2 with the same assessment input and image bytes, never a new image
+operation, and only for the definitive consumed failures in O.2.
 
 ### U.6 Crash recovery
 
 Recovery runs through the existing repository lock and uses the existing S2/S3 liveness semantics:
 
+- A committed edit with `maskMaterializationStatus: "pending"` is recovered by regenerating the exact raster and provider PNG from its persisted primitives and frozen mask identities, writing/verifying both intended keys with no-overwrite semantics, and then performing the readiness transaction. A crash after either object write leaves a referenced but non-ready object; no such object is authoritative, no mask identity changes, no cycle is consumed, and no provider call is allowed until both objects verify.
 - A queued or running image operation with a verifiably dead owner and dispatch state not_started is returned to queued with its claim cleared and may be started.
-- A queued or running image operation with dispatch state may_have_started or consumed is marked failed with PROVIDER_DISPATCH_UNCERTAIN, its possible dispatch remains counted, and it is not redispatched.
+- A queued or running image operation with dispatch state may_have_started and no definitive response is marked failed with PROVIDER_DISPATCH_UNCERTAIN while retaining `may_have_started`; its possible dispatch remains counted and it is not redispatched. An operation with `consumed` retains that state and its definitive failure/result; it is never reclassified as unstarted.
 - A provider response lost before publication intent is treated as uncertain; the returned bytes are not reconstructed or faked. The old pointer remains current.
 - A staged or promoted publication whose owner is dead is recovered only by verifying exact staging and final objects. Exact staging may be promoted to an absent final key. An exact final object may be committed. Missing or mismatched objects cause abort and cleanup of only the publication's own staging key.
 - A publication with a live or unknown owner is held for that owner or later operator recovery; unknown is never treated as dead.
 - A preservation check with a verifiably dead local owner and no external dispatch may be returned to pending. An unknown owner is held. Its deterministic run may be repeated only with the same identities.
-- A queued or running assessment attempt with dispatch state not_started and a verifiably dead owner may be requeued. A may_have_started attempt becomes terminal QA_UNAVAILABLE with PROVIDER_DISPATCH_UNCERTAIN and no redispatch. A known retryable failed attempt exposes one explicit assessment retry if the selection remains current and no later cycle or rollback waived it.
+- A queued or running assessment attempt with dispatch state not_started and a verifiably dead owner may be requeued. A may_have_started attempt with no definitive response becomes terminal QA_UNAVAILABLE with PROVIDER_DISPATCH_UNCERTAIN while retaining `may_have_started` and no redispatch. A consumed attempt retains its definitive result/failure and state. A known retryable consumed failure exposes one explicit assessment retry if the selection remains current and no later cycle or rollback waived it.
 - A completed output, preservation result, or assessment result whose claim token no longer matches is stale. It is discarded or marked stale and cannot change the pointer.
 
 Persistence, invariant, hash, or object verification failures are not recovery signals. They produce a safe failure and operator-visible internal diagnostics without a fake success.
@@ -2129,7 +2265,7 @@ The server rejects unknown body keys, missing keys, non-JSON bodies, non-empty G
 
 ### X.3 Status and response rules
 
-A newly admitted edit or retry returns 202 with a PublicS4Mutation whose replayed field is false. A matching idempotent replay returns 200 with the stored result and replayed true. GET state, GET edit, successful rollback, and successful preview return 200. S4 admission validation and concurrency failures use the status mapping in section Y; accepted asynchronous provider or preservation work is represented by persisted state, not a synchronous fake success.
+A newly admitted edit returns 202 with a PublicS4Mutation whose replayed field is false, result status `preparing_mask`, and `maskReady: false`; this means the admission and mask intent are persisted, not that a provider dispatch is ready. A newly admitted retry returns 202 with the applicable retry status. A matching idempotent replay returns 200 with the stored result and replayed true. GET state, GET edit, successful rollback, and successful preview return 200. S4 admission validation and concurrency failures use the status mapping in section Y; accepted asynchronous mask materialization, provider, or preservation work is represented by persisted state, not a synchronous fake success.
 
 Known route with an unsupported method returns 405 METHOD_NOT_ALLOWED after the authorization boundary. An unknown /s4 path returns 400 INVALID_REQUEST after authorization. A malformed or unauthorized project path is generic 404 PROJECT_NOT_FOUND before route-specific lookup. The existing S3 route keeps its terminal S3 method/body behavior while using the S4 resolver for an S4 revision target.
 
@@ -2146,7 +2282,8 @@ type PublicS4Mutation<T> = {
 type PublicS4EditAdmission = {
   editId: UUID;
   cycleNumber: 1 | 2;
-  status: "generating";
+  status: "preparing_mask";
+  maskReady: false;
   baseRevisionId: UUID;
   selectionVersion: number;
   cyclesConsumed: 1 | 2;
@@ -2202,7 +2339,13 @@ METHOD_NOT_ALLOWED
 S4_INTERNAL_ERROR
 ~~~
 
-The S3 adapter may additionally emit its existing S3 code S3_REFINEMENT_CLOSED_BY_S4 when an S3 refinement route is blocked by the stage boundary. That code is not a new S3 persisted variant. No other generic or internal code is emitted by an S4 route. Unknown exceptions, provider details, storage errors, and invariant errors collapse to S4_INTERNAL_ERROR.
+When an S3 whole-concept refinement route is blocked by the S4 stage boundary,
+the existing S3 adapter emits the already accepted terminal S3 code
+`S3_LINEAGE_CONFLICT` with its existing safe envelope and status semantics. S4
+does not add that code to the S4 union, does not add a new S3 public code, and
+does not change any S3 persisted variant. No S4 route emits an S3 code. Unknown
+exceptions, provider details, storage errors, and invariant errors collapse to
+S4_INTERNAL_ERROR.
 
 ### Y.2 Safe envelope and status mapping
 
@@ -2228,6 +2371,7 @@ The status mapping is:
 | invalid JSON, unknown field, mask/instruction syntax, missing idempotency | 400 |
 | malformed or unauthorized project, source, revision, or edit lookup | 404 |
 | method not allowed | 405 |
+| `S4_IDEMPOTENCY_KEY_REUSE` | 409 |
 | stale version/source, in-flight edit, budget exhausted, duplicate edit, retry unavailable/waived, rollback guard | 409 |
 | internal persistence, integrity, or unexpected failure | 500 |
 
@@ -2243,6 +2387,7 @@ type PublicS4RevisionKind = "s3" | "s4";
 type PublicS4PreservationStatus = "NOT_STARTED" | "RUNNING" | "PASS" | "MATERIAL_FAIL" | "QA_UNAVAILABLE";
 type PublicS4AssessmentStatus = "NOT_STARTED" | "PENDING" | "RUNNING" | "PASS" | "WARNING" | "MATERIAL_FAIL" | "QA_UNAVAILABLE";
 type PublicS4EditStatus =
+  | "preparing_mask"
   | "generating"
   | "image_retry_available"
   | "publication_pending"
@@ -2278,7 +2423,7 @@ type PublicS4Edit = {
   baseRevisionKind: PublicS4RevisionKind;
   status: PublicS4EditStatus;
   instructionText: string;
-  maskReady: true;
+  maskReady: boolean;
   primitiveCount: number;
   editablePixelCount: number;
   comparisonPixelCount: number;
@@ -2309,7 +2454,7 @@ type PublicS4State = {
 };
 ~~~
 
-The public state is an allowlist, not a serialization of persisted records. It contains no raw primitive array; counts and the maskReady result are enough for user-visible progress. instructionText is included because it is the user's own normalized instruction and is needed to identify history; it is never treated as an authority or prompt.
+The public state is an allowlist, not a serialization of persisted records. It contains no raw primitive array; counts and the `maskReady` result are enough for user-visible progress. `maskReady` is false while the persisted edit has `maskMaterializationStatus: "pending"` and true only after both private mask objects have passed exact key/hash/size verification and the readiness transaction has committed. It is never inferred from client primitives or object presence alone. instructionText is included because it is the user's own normalized instruction and is needed to identify history; it is never treated as an authority or prompt.
 
 ### Z.2 Explicitly excluded fields
 
@@ -2317,7 +2462,7 @@ A public DTO MUST NOT expose private object keys or URLs, raw mask bytes or prim
 
 ### Z.3 History and quality
 
-An edit with a committed output and current-quality PASS/WARNING records projects as usable_history unless its revision is the active pointer, in which case it projects active_tip. A failed, stale, no-op, preservation-failing, or QA-unavailable edit projects historical_non_activatable. These values are derived; no active or usable flag is added to the immutable revision.
+An edit with `maskMaterializationStatus: "pending"` projects as `preparing_mask` with `maskReady: false` and has no image operation. After readiness commits, it projects as `generating` with `maskReady: true` until later lifecycle states apply. An edit with a committed output and current-quality PASS/WARNING records projects as usable_history unless its revision is the active pointer, in which case it projects active_tip. A failed, stale, no-op, preservation-failing, or QA-unavailable edit projects historical_non_activatable. These values are derived; no active or usable flag is added to the immutable revision.
 
 ## AA. Client contract
 
@@ -2328,11 +2473,11 @@ The client keeps a draft primitive array locally until submit. It may render a d
 The UI shows:
 
 ~~~text
-maskReady = true  when the local primitive array is non-empty, valid under the public bounds, and the server-submit form is complete
-maskReady = false otherwise
+draftMaskReady = true  when the local primitive array is non-empty, valid under the public bounds, and the server-submit form is complete
+draftMaskReady = false otherwise
 ~~~
 
-The server's accepted edit maskReady is always true and refers to the persisted server raster, not the browser preview. Clear and reset set the local primitive array to empty, clear the local overlay, and make submit unavailable without a network mutation.
+`draftMaskReady` is local UI state only and is not the public server `maskReady`. The server `maskReady` is false from the accepted admission until the post-commit materializer has verified both private mask objects and the readiness transaction has committed; it is true only in the persisted ready state. Clear and reset set the local primitive array to empty, clear the local overlay, and make submit unavailable without a network mutation.
 
 Rectangle UI controls create a rectangle primitive. Brush UI controls create an ordered point list and radiusQ8. The client may prevent obviously invalid input for usability, but the server repeats every validation and remains authoritative.
 
@@ -2346,6 +2491,7 @@ After a 202, the client immediately polls GET /s4/edits/{editId} or GET /s4 and 
 
 The client renders these states distinctly:
 
+- preparing_mask while the admission and private mask objects are durably pending; `maskReady` is false and no image operation may be dispatched;
 - generating while image work is queued or running;
 - image_retry_available with one explicit Retry image control;
 - publication_pending while output is being verified and committed;
@@ -2418,9 +2564,9 @@ This is an internal projection, not a public API DTO. S5 may read the private st
 
 ### AC.1 Evidence rules
 
-The evidence design is execution-bound. The manifest is a separate static artifact from proof records. The manifest declares every frozen claim; proof records are produced by executed assertions. Static claims may be proven by source/document inspection. Behavioral, boundary, client/API, concurrency, failure-injection, and persistence/restart claims require the corresponding local fixture or test observation. A provider mock is allowed for local implementation evidence; a live provider call is not allowed for this contract authoring task.
+The evidence design is execution-bound. The manifest is a separate static artifact from proof records. The manifest declares every frozen claim; proof records are produced by executed assertions. Static is reserved for identities, closed schemas, and source/document structure that can be proven without running the candidate. Any runtime behavior, migration, route, lifecycle, provider-mock, log-safety, runner, typecheck, lint, build, or exact-head/tree claim MUST use a non-static evidence class and an actual successful execution; source-string or document inspection alone cannot satisfy it. A local provider mock is allowed for implementation evidence; a live provider call is never allowed.
 
-Missing, unknown, duplicate, and skipped claims are derived from the manifest and proof records. A claim count is never hand-entered as a success value. Candidate commit SHA and tree are read at runtime before and after the evidence run. A head or tree movement fails the run, even when individual assertions pass.
+Missing, unknown, duplicate, and skipped claims are derived from the manifest and proof records. A claim count is never hand-entered as a success value. Candidate commit and tree IDs are read at runtime before and after the evidence run. A head or tree movement fails the run, even when individual assertions pass.
 
 ### AC.2 Exact manifest and proof model
 
@@ -2473,12 +2619,12 @@ type S4EvidenceArtifact = {
   schemaVersion: "s4-evidence-v1-execution-bound";
   executionId: UUID;
   contractPath: "docs/G2_S4_CONTRACT.md";
-  canonicalBaseSha: Sha256;
-  canonicalBaseTree: Sha256;
-  candidateCommitSha: Sha256;
-  candidateTree: Sha256;
-  candidateCommitShaAfter: Sha256;
-  candidateTreeAfter: Sha256;
+  canonicalBaseSha: GitObjectId;
+  canonicalBaseTree: GitObjectId;
+  candidateCommitSha: GitObjectId;
+  candidateTree: GitObjectId;
+  candidateCommitShaAfter: GitObjectId;
+  candidateTreeAfter: GitObjectId;
   manifestHash: Sha256;
   rowCount: number;
   claimCount: number;
@@ -2489,24 +2635,26 @@ type S4EvidenceArtifact = {
 };
 ~~~
 
-The artifact is valid only when the base SHA/tree equal the locked canonical values, candidate SHA/tree are unchanged before and after execution, manifestHash matches the separate manifest, rowCount is 29, claimCount is 291, all expected claims have exactly one proof record, no proof is unknown/duplicate/skipped, and every proof assertion passes. The present documentation-only PR contains no runtime proof artifact and MUST NOT pretend that this condition is satisfied.
+The canonical G2 base remains the fixed commit 4d13f3832572a41517876286b36d43e2e8e0d01d and tree 7bc73a36a80b55771de9d68c24b1453f5ae54b86. A future G3 implementation candidate has its own runtime-derived candidateCommitSha and candidateTree values after this G2 contract is accepted and canonically merged; those candidate values MUST NOT be substituted for the locked base fields.
+
+The artifact is valid only when the six Git object fields match the `GitObjectId` pattern, the base SHA/tree equal the locked canonical values, candidate SHA/tree are unchanged before and after execution, `manifestHash` matches the separate manifest, `rowCount` equals `rows.length`, `claimCount` equals the sum of the variant-array lengths and the manifest claim count, all expected claims have exactly one proof record, no proof is unknown/duplicate/skipped, and every proof assertion passes. A contract checkout without a separate runtime proof artifact is incomplete; the contract never manufactures proof or treats a missing artifact as success.
 
 ### AC.3 Fixed evidence matrix
 
-The matrix below is the sole source of the row and claim count. Each row is one frozen contract surface; each listed variant is one independently proven claim. The count is the sum of the listed variant lengths, not an arbitrary report.
+The matrix below is the sole source of the row and claim count. Each row is one frozen contract surface; each listed variant is one independently proven claim. Each (testId, variantId) pair yields one unique claimId; missing or duplicate pairs fail comparison. The count is the sum of the listed variant lengths, not an arbitrary report.
 
 | Test ID | Evidence class | Frozen surface | Claim count |
 | --- | --- | --- | ---: |
-| IDENTITY-001 | static | canonical base, G1 lock, proposed G2 lock, docs-only scope, provider-doc recheck | 5 |
-| MODEL-001 | static | S4 collections, global idempotency, S3 union exactness, S3 counters, migration, record closure | 6 |
+| IDENTITY-001 | static | canonical G2 base, accepted G1 lock, G2 lock identity, canonical contract path/identity, provider-contract identity | 5 |
+| MODEL-001 | persistence/restart | S4 collections, global idempotency, S3 union exactness, S3 counters, migration, record closure | 6 |
 | RESOLVE-001 | behavioral | S3 source/refinement and S4 resolution, duplicates, foreign context, lineage, quality, pointer projection | 10 |
-| STAGE-001 | behavioral | not-started, admission, failed first, second, third, replay, closure, rollback, waiver, busy | 10 |
+| STAGE-001 | behavioral | not-started, mask preparation, failed first, second, third, replay, closure, rollback, waiver, busy | 10 |
 | MASK-API-001 | boundary | body, primitives, coordinate/radius bounds, ordering, duplicates, degeneracy, size, clear | 11 |
 | RASTER-001 | boundary | rectangle, brush, fixed point, center, segment, union, clipping, empty, area, layout, hash | 14 |
 | MASK-PNG-001 | boundary | dimensions, RGBA, polarity, deterministic encoding, metadata, identity, filename, fixture | 9 |
 | IMAGE-001 | behavioral | endpoint, model, source/mask count, n, size, quality, PNG, omitted field, no references, output validation | 13 |
 | INSTRUCTION-001 | boundary | NFC, trim, scalar/byte bounds, controls, surrogate, no parser, untrusted text, server facts, hash | 10 |
-| IDENTITY-BIND-001 | static | project/generation, selection, source, bytes, quality, facts, mask, instruction, request, exclusions | 12 |
+| IDENTITY-BIND-001 | behavioral | project/generation, selection, source, bytes, quality, facts, mask, instruction, request, exclusions | 12 |
 | REVISION-001 | behavioral | S4 separation, immutability, parent/lineage, no copy, projection, asset | 8 |
 | PRESERVE-001 | behavioral | RGBA, dimensions, guard, RGB/alpha, components, aggregate, PASS/fail/QA, no warning/AI/no-op | 14 |
 | CALIBRATION-001 | boundary | all M-01 through M-16 fixture classes and derivation | 15 |
@@ -2514,27 +2662,27 @@ The matrix below is the sole source of the row and claim count. Each row is one 
 | ASSESS-RETRY-001 | failure-injection | initial, retry classes, one retry, same bytes/input, no image, no valid-result retry | 9 |
 | ACTIVATE-001 | concurrency | PASS/WARNING, every non-activation result, stale, no-op, CAS, atomicity, version, S3 counters | 12 |
 | ROLLBACK-001 | concurrency | shared route, S3/S4 targets, lineage/usability, in-flight, waiver, no reset/latest jump, next parent | 11 |
-| CONCURRENCY-001 | concurrency | lock, idempotency, busy, claims, stale completions, pointer race, liveness, ceiling | 12 |
-| RETRY-001 | failure-injection | image classes, ambiguity, bounds, assessment classes, no extra cycle/redispatch, waiver | 8 |
+| CONCURRENCY-001 | concurrency | lock, idempotency, S4 idempotency reuse, busy, claims, stale completions, pointer race, liveness, ceiling | 12 |
+| RETRY-001 | failure-injection | image classes, ambiguous transport, bounds, assessment classes, no extra cycle/redispatch, waiver | 8 |
 | DISPATCH-001 | boundary | image and assessment ceilings, preservation zero, possible/consumed accounting, no decrement | 6 |
 | RECOVERY-001 | persistence/restart | admission crash, pre-dispatch, ambiguity, lost response, publication, preservation, assessment, activation, no fake/overwrite | 12 |
-| KEYS-001 | static | mask, staged/committed output, preservation/assessment evidence, privacy, user-key exclusion | 8 |
+| KEYS-001 | persistence/restart | mask, staged/committed output, preservation/assessment evidence, privacy, user-key exclusion | 8 |
 | AUTH-API-001 | client/API | auth, default deny, isolation, routes, methods, headers, statuses, preview, errors, DTO | 10 |
-| PRIVACY-001 | static | keys, hashes, prompts, provider IDs, claims, evidence, credentials, safe logs | 8 |
+| PRIVACY-001 | behavioral | keys, hashes, prompts, provider IDs, claims, evidence, credentials, safe logs | 8 |
 | CLIENT-001 | client/API | mask state, rectangle/brush, clear, bounds, submit/poll, retry, preservation/assessment, history/rollback, budget | 14 |
 | S5-001 | behavioral | optional stage, active S3/S4, quality, version, projection, no S5 implementation | 7 |
-| REGRESSION-001 | static | S1/S2/S3 regressions and repository quality/no-dependency/head binding | 8 |
-| EVIDENCE-001 | static | separate manifest/proofs, runtime proofs, derived counters, head movement, static-only, schema | 9 |
-| GATE-001 | static | no G3/merge/provider/private-data claims, reconciliation, re-entry conditions | 6 |
+| REGRESSION-001 | behavioral | executed S1/S2/S3 regressions, typecheck, lint, build, repository quality/no-dependency, candidate head/tree binding | 8 |
+| EVIDENCE-001 | behavioral | manifest/proof separation, executed proof comparison, derived counters, head movement, static-claim boundary, exact schema | 9 |
+| GATE-001 | behavioral | executor does not self-finalise, candidate is not merged during evidence, no live provider call, no customer/private-data access, parent/child authority reconciled, gate-reentry condition honored | 6 |
 
 The exact variant IDs are:
 
 ~~~ts
 const S4_EVIDENCE_VARIANTS = {
-  "IDENTITY-001": ["canonical-base", "g1-lock", "g2-proposed", "docs-only", "provider-docs"],
+  "IDENTITY-001": ["canonical-g2-base", "g1-lock", "g2-lock", "contract-identity", "provider-contract"],
   "MODEL-001": ["s4-collections", "global-idempotency", "s3-union-unchanged", "s3-counters-unchanged", "migration-empty-default", "closed-record-keys"],
   "RESOLVE-001": ["s3-source", "s3-refinement", "s4-revision", "duplicate-id-fail", "foreign-project", "foreign-generation", "lineage", "quality", "pointer-only", "public-kind"],
-  "STAGE-001": ["not-started", "first-admit", "failed-first", "second-admit", "third-reject", "replay-no-cycle", "s3-close", "rollback-no-reset", "later-waives", "inflight-busy"],
+  "STAGE-001": ["not-started", "mask-preparation", "failed-first", "second-admit", "third-reject", "replay-no-cycle", "s3-close", "rollback-no-reset", "later-waives", "inflight-busy"],
   "MASK-API-001": ["exact-body", "rectangle", "brush", "primitive-count", "q16-range", "q8-radius", "ordering", "duplicates", "degenerate", "body-limit", "clear-client-only"],
   "RASTER-001": ["half-open", "pixel-center", "disk", "capsule", "segment-rational", "union", "clip-no-wrap", "empty", "min-area", "max-area", "full-image", "comparison-min", "binary-layout", "canonical-hash"],
   "MASK-PNG-001": ["dimensions", "rgba", "protected-opaque", "editable-transparent", "stored-deflate", "no-metadata", "hash-distinct", "filename", "editable-fixture"],
@@ -2548,10 +2696,10 @@ const S4_EVIDENCE_VARIANTS = {
   "ASSESS-RETRY-001": ["initial", "retryable", "one-retry", "same-bytes", "same-input", "no-image", "valid-no-retry", "uncertainty-no-retry", "terminal-no-retry"],
   "ACTIVATE-001": ["pass", "warning", "preserve-fail", "material-no", "qa-no", "stale-pass", "stale-warning", "no-op-no", "cas", "atomic", "version-increment", "s3-counters"],
   "ROLLBACK-001": ["shared-route", "s3-target", "s4-target", "same-lineage", "usable", "inflight-block", "retry-waiver", "no-reset", "no-latest-jump", "next-edit-target", "immutable"],
-  "CONCURRENCY-001": ["repo-lock", "same-key", "reuse-mismatch", "different-key-busy", "claims", "image-stale", "preserve-stale", "assessment-stale", "pointer-race", "dead-pre", "unknown-hold", "ceiling"],
-  "RETRY-001": ["image-classes", "ambiguous-no", "image-one", "assessment-classes", "assessment-one", "no-extra-cycle", "no-redispatch", "waiver"],
+  "CONCURRENCY-001": ["repo-lock", "same-key", "s4-idempotency-reuse", "different-key-busy", "claims", "image-stale", "preserve-stale", "assessment-stale", "pointer-race", "dead-pre", "unknown-hold", "ceiling"],
+  "RETRY-001": ["image-classes", "ambiguous-transport", "image-one", "assessment-classes", "assessment-one", "no-extra-cycle", "no-redispatch", "waiver"],
   "DISPATCH-001": ["image-four", "assessment-four", "preserve-zero", "count-may", "count-consumed", "no-decrement"],
-  "RECOVERY-001": ["admission-crash", "pre-dispatch", "ambiguous", "response-lost", "staging", "promotion", "publication-abort", "preserve-restart", "assessment-restart", "activation-crash", "no-fake", "no-overwrite"],
+  "RECOVERY-001": ["mask-intent-crash", "pre-dispatch", "ambiguous", "response-lost", "staging", "promotion", "publication-abort", "preserve-restart", "assessment-restart", "activation-crash", "no-fake", "no-overwrite"],
   "KEYS-001": ["mask-raster", "mask-provider", "staged", "committed", "preserve-evidence", "assessment-evidence", "private", "no-user-key"],
   "AUTH-API-001": ["auth-first", "default-deny", "cross-project", "routes", "methods", "headers", "statuses", "preview", "errors", "dto"],
   "PRIVACY-001": ["no-keys", "no-hashes", "no-prompts", "no-provider", "no-claims", "no-evidence", "no-credentials", "safe-log"],
@@ -2559,11 +2707,11 @@ const S4_EVIDENCE_VARIANTS = {
   "S5-001": ["optional", "active-s3", "active-s4", "quality", "selection-version", "projection", "no-s5"],
   "REGRESSION-001": ["s1", "s2", "s3", "typecheck", "lint", "build", "no-dependencies", "candidate-head-tree"],
   "EVIDENCE-001": ["manifest-separate", "proof-runtime", "missing-derived", "unknown-derived", "duplicate-derived", "skipped-derived", "head-movement-fail", "static-only", "exact-schema"],
-  "GATE-001": ["no-g3", "no-merge", "no-provider", "no-private-data", "parent-reconciled", "gate-reentry"]
+  "GATE-001": ["executor-no-self-finalize", "candidate-not-merged", "no-live-provider", "no-customer-private-data", "parent-child-reconciled", "gate-reentry"]
 } as const;
 ~~~
 
-The list contains 29 rows and 291 variants. Its normative row text and fixtureSetup strings are generated from the frozen table and the evidence class; they are not supplied by runtime results. The proof comparator must derive missingClaims, unknownClaims, duplicateClaims, and skippedClaims by claimId set comparison exactly as defined above.
+The list contains the rows shown in the table, and its claim count is derived from the actual variant-array lengths. Its normative row text and fixtureSetup strings are generated from the frozen table and the evidence class; they are not supplied by runtime results. The proof comparator must derive missingClaims, unknownClaims, duplicateClaims, and skippedClaims by claimId set comparison exactly as defined above.
 
 ### AC.4 Required proof coverage
 
@@ -2579,4 +2727,4 @@ The matrix MUST eventually prove, with the applicable evidence class:
 - authorization, cross-project isolation, closed API/errors/DTO privacy, persisted-truth client behavior, optional S4/S5 handoff, and S1/S2/S3 regressions;
 - runtime exact-head and exact-tree binding.
 
-No live provider, credential, deployment, or private/customer-data evidence is required or permitted for this documentation-only candidate.
+No live provider, credential, deployment, or private/customer-data evidence is required or permitted by this contract; local fixtures and provider mocks are the allowed execution boundary.
