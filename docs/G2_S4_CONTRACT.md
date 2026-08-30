@@ -2509,7 +2509,7 @@ The matrix below is the sole source of the row and claim count. Each row is one 
 | IDENTITY-BIND-001 | static | project/generation, selection, source, bytes, quality, facts, mask, instruction, request, exclusions | 12 |
 | REVISION-001 | behavioral | S4 separation, immutability, parent/lineage, no copy, projection, asset | 8 |
 | PRESERVE-001 | behavioral | RGBA, dimensions, guard, RGB/alpha, components, aggregate, PASS/fail/QA, no warning/AI/no-op | 14 |
-| CALIBRATION-001 | boundary | all M-01 through M-15 fixture classes and derivation | 15 |
+| CALIBRATION-001 | boundary | all M-01 through M-16 fixture classes and derivation | 15 |
 | ASSESS-001 | behavioral | own compiler/schema, model, source/output/mask/instruction/facts, strict observations, satisfaction/reducer | 14 |
 | ASSESS-RETRY-001 | failure-injection | initial, retry classes, one retry, same bytes/input, no image, no valid-result retry | 9 |
 | ACTIVATE-001 | concurrency | PASS/WARNING, every non-activation result, stale, no-op, CAS, atomicity, version, S3 counters | 12 |
