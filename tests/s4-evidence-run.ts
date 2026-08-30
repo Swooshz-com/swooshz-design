@@ -316,6 +316,7 @@ const unknownComparison = compareClaimProofs(manifest, [{ ...comparatorProof("pa
 const duplicateComparison = compareClaimProofs(manifest, [comparatorProof("passed"), comparatorProof("passed")]);
 const skippedComparison = compareClaimProofs(manifest, [comparatorProof("skipped")]);
 
+async function main(): Promise<void> {
 await runnerProof("REGRESSION-001", "s1", "The S1 regression suite passes in the final candidate.", "The repository-native S1 command exited successfully on the exact candidate checkout.", "s1Tests", ["validation=s1Tests", "scope=s1", "exitCode=" + s1Tests.exitCode], () => {
   assertValidationPassed("s1Tests");
 });
@@ -533,3 +534,9 @@ console.log(JSON.stringify({
   receiptCount: finalExecutionReceipts.length,
   validationFacts: validationRuns.map((run) => run.label + "=pass"),
 }));
+}
+
+void main().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});
