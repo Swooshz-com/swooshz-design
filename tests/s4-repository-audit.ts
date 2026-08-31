@@ -823,4 +823,3 @@ export function auditRepositorySurfaces(input: S4RepositoryAuditInput): S4Reposi
     : incompleteScriptAudit(basePackage?.scripts, candidatePackage?.scripts);
   return { dependencyAudit, scriptAudit };
 }
-
