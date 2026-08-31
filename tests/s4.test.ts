@@ -467,9 +467,60 @@ test("S4 image and assessment retries are explicit, bounded, and preserve the sa
     const before = value.repository.state();
     assert.equal(before.s4ImageOperations.length, 2);
     assert.equal(before.s4AssessmentAttempts.length, 1);
-    const firstOutputAsset = before.s4AssessmentAttempts[0].outputAssetId;
-    const firstOutputHash = before.s4AssessmentAttempts[0].outputSha256;
-    value.service.s4.assessmentRetry(value.projectId, admission.result.editId, randomUUID(), randomUUID());
+    const beforeAttempt = before.s4AssessmentAttempts[0];
+    const beforeAssessment = before.s4Assessments[0];
+    const beforeEdit = before.s4Edits[0];
+    assert.ok(beforeAttempt && beforeAssessment && beforeEdit);
+    const firstOutputAsset = beforeAttempt.outputAssetId;
+    const firstOutputHash = beforeAttempt.outputSha256;
+    const retryableBeforeRestart = {
+      attemptStatus: beforeAttempt.status,
+      failureCode: beforeAttempt.failureCode,
+      disposition: beforeAttempt.disposition,
+      providerDispatchState: beforeAttempt.providerDispatchState,
+      assessmentStatus: beforeAssessment.status,
+      assessmentRetryState: beforeAssessment.retryState,
+      editStatus: beforeEdit.status,
+      editRetryState: beforeEdit.retryState,
+      outputAssetId: beforeAttempt.outputAssetId,
+      outputSha256: beforeAttempt.outputSha256,
+      outputRevisionId: beforeAttempt.revisionId,
+      imageCalls: value.imageCallCount(),
+      assessmentCalls: value.assessmentCallCount(),
+    };
+    assert.equal(retryableBeforeRestart.providerDispatchState, "consumed");
+    assert.equal(retryableBeforeRestart.attemptStatus, "failed");
+    assert.equal(retryableBeforeRestart.failureCode, "QA_PROVIDER_EMPTY");
+    assert.equal(retryableBeforeRestart.disposition, "qa_unavailable_retryable");
+    assert.equal(retryableBeforeRestart.assessmentStatus, "qa_unavailable_retryable");
+    assert.equal(retryableBeforeRestart.assessmentRetryState, "available");
+    assert.equal(retryableBeforeRestart.editStatus, "assessment_retry_available");
+    assert.equal(retryableBeforeRestart.editRetryState, "assessment_available");
+    const retryableRestarted = restart(value, { processId: 9102, isProcessAlive: (processId) => processId === 9102 });
+    const retryableAfterRestart = value.repository.state();
+    const retryableRestartState = retryableRestarted.s4.getState(value.projectId);
+    const retryableAttemptAfterRestart = retryableAfterRestart.s4AssessmentAttempts[0];
+    const retryableAssessmentAfterRestart = retryableAfterRestart.s4Assessments[0];
+    const retryableEditAfterRestart = retryableAfterRestart.s4Edits[0];
+    assert.ok(retryableAttemptAfterRestart && retryableAssessmentAfterRestart && retryableEditAfterRestart);
+    assert.equal(retryableAttemptAfterRestart.status, retryableBeforeRestart.attemptStatus);
+    assert.equal(retryableAttemptAfterRestart.failureCode, retryableBeforeRestart.failureCode);
+    assert.equal(retryableAttemptAfterRestart.disposition, retryableBeforeRestart.disposition);
+    assert.equal(retryableAttemptAfterRestart.providerDispatchState, retryableBeforeRestart.providerDispatchState);
+    assert.equal(retryableAttemptAfterRestart.outputAssetId, retryableBeforeRestart.outputAssetId);
+    assert.equal(retryableAttemptAfterRestart.outputSha256, retryableBeforeRestart.outputSha256);
+    assert.equal(retryableAssessmentAfterRestart.status, retryableBeforeRestart.assessmentStatus);
+    assert.equal(retryableAssessmentAfterRestart.retryState, retryableBeforeRestart.assessmentRetryState);
+    assert.equal(retryableEditAfterRestart.status, retryableBeforeRestart.editStatus);
+    assert.equal(retryableEditAfterRestart.retryState, retryableBeforeRestart.editRetryState);
+    assert.equal(value.imageCallCount(), retryableBeforeRestart.imageCalls);
+    assert.equal(value.assessmentCallCount(), retryableBeforeRestart.assessmentCalls);
+    assert.equal(retryableRestartState.activeRevisionId, selected.sourceRevisionId);
+    assert.equal(retryableRestartState.edits[0]?.status, "assessment_retry_available");
+    assert.equal(retryableRestartState.edits[0]?.assessmentRetryAvailable, true);
+    assert.equal(retryableRestartState.edits[0]?.assessment?.status, "QA_UNAVAILABLE");
+    assert.equal(retryableRestartState.edits[0]?.assessment?.retryAvailable, true);
+    retryableRestarted.s4.assessmentRetry(value.projectId, admission.result.editId, randomUUID(), randomUUID());
     const complete = await waitFor(() => value.service.s4.getState(value.projectId), (current) => current.edits[0]?.status === "usable_pass");
     const after = value.repository.state();
     assert.equal(complete.edits[0].assessmentRetryAvailable, false);
@@ -478,20 +529,26 @@ test("S4 image and assessment retries are explicit, bounded, and preserve the sa
     assert.equal(after.s4AssessmentAttempts[1].retryOfAttemptId, after.s4AssessmentAttempts[0].assessmentAttemptId);
     assert.equal(after.s4AssessmentAttempts[1].outputAssetId, firstOutputAsset);
     assert.equal(after.s4AssessmentAttempts[1].outputSha256, firstOutputHash);
+    assert.equal(after.s4AssessmentAttempts[1].revisionId, retryableBeforeRestart.outputRevisionId);
     assert.equal(after.s4ImageOperations.every((item) => item.providerDispatchState === "consumed"), true);
     assert.equal(after.s4AssessmentAttempts.every((item) => item.providerDispatchState === "consumed"), true);
+    assert.equal(value.imageCallCount(), retryableBeforeRestart.imageCalls);
+    assert.equal(value.assessmentCallCount(), retryableBeforeRestart.assessmentCalls + 1);
     validateS4Graph(after);
     const assessmentInputHash = (input: any): string => [
       sha256(input.sourceBytes), sha256(input.outputBytes), sha256(input.maskBytes), input.promptText,
     ].join(":");
+    assert.equal(value.assessmentInputs.length, 2);
+    assert.deepEqual(value.assessmentInputs[0], value.assessmentInputs[1]);
+    assert.equal(assessmentInputHash(value.assessmentInputs[0]), assessmentInputHash(value.assessmentInputs[1]));
     const imageRetryError = () => value.service.s4.imageRetry(value.projectId, admission.result.editId, randomUUID(), randomUUID());
     const assessmentRetryError = () => value.service.s4.assessmentRetry(value.projectId, admission.result.editId, randomUUID(), randomUUID());
     await proveS4Variants("ASSESS-RETRY-001", "S4 image and assessment retries are explicit, bounded, and preserve the same output identity", "retry-matrix", "The executed retry scenarios established consumed retryable failures, one retry per operation, exact output/input reuse, and conservative retry fences.", {
       "initial": () => { assert.equal(before.s4ImageOperations[0].attempt, 1); assert.equal(before.s4AssessmentAttempts[0].attempt, 1); },
-      "retryable": () => { assert.equal(imageRetryState.edits[0].status, "image_retry_available"); assert.equal(before.s4ImageOperations[0].failureCode, "PROVIDER_RATE_LIMIT"); assert.equal(before.s4AssessmentAttempts[0].failureCode, "QA_PROVIDER_EMPTY"); },
-      "one-retry": () => { assert.deepEqual(after.s4ImageOperations.map((item) => item.attempt), [1, 2]); assert.deepEqual(after.s4AssessmentAttempts.map((item) => item.attempt), [1, 2]); assert.throws(imageRetryError); },
+      "retryable": () => { assert.equal(imageRetryState.edits[0].status, "image_retry_available"); assert.equal(before.s4ImageOperations[0].failureCode, "PROVIDER_RATE_LIMIT"); assert.equal(retryableBeforeRestart.failureCode, "QA_PROVIDER_EMPTY"); assert.equal(retryableAttemptAfterRestart.failureCode, "QA_PROVIDER_EMPTY"); assert.equal(retryableRestartState.edits[0]?.assessmentRetryAvailable, true); },
+      "one-retry": () => { assert.deepEqual(after.s4ImageOperations.map((item) => item.attempt), [1, 2]); assert.deepEqual(after.s4AssessmentAttempts.map((item) => item.attempt), [1, 2]); assert.equal(value.assessmentCallCount(), 2); assert.throws(imageRetryError); },
       "same-bytes": () => { assert.equal(after.s4AssessmentAttempts[1].outputAssetId, firstOutputAsset); assert.equal(after.s4AssessmentAttempts[1].outputSha256, firstOutputHash); },
-      "same-input": () => { assert.equal(value.assessmentInputs.length, 2); assert.equal(assessmentInputHash(value.assessmentInputs[0]), assessmentInputHash(value.assessmentInputs[1])); },
+      "same-input": () => { assert.deepEqual(value.assessmentInputs[0], value.assessmentInputs[1]); assert.equal(assessmentInputHash(value.assessmentInputs[0]), assessmentInputHash(value.assessmentInputs[1])); },
       "no-image": () => { assert.equal(value.imageCallCount(), 2); assert.equal(after.s4ImageOperations.length, 2); },
       "valid-no-retry": () => { assert.equal(complete.edits[0].status, "usable_pass"); assert.equal(complete.edits[0].assessmentRetryAvailable, false); assert.equal(after.s4AssessmentAttempts[1].failureCode, null); assert.throws(assessmentRetryError, (error: unknown) => errorCode(error) === "S4_ASSESSMENT_RETRY_NOT_AVAILABLE"); },
     }, [
@@ -499,6 +556,27 @@ test("S4 image and assessment retries are explicit, bounded, and preserve the sa
       "assessmentAttempts=" + after.s4AssessmentAttempts.length,
       "outputAssetId=" + firstOutputAsset,
       "assessmentInputHash=" + assessmentInputHash(value.assessmentInputs[0]),
+    ]);
+    await proveS4Variants("RECOVERY-001", "S4 image and assessment retries are explicit, bounded, and preserve the same output identity", "classified-assessment-restart", "The executed restart preserved a complete retryable consumed assessment failure, then reused its committed output without image redispatch.", {
+      "assessment-restart": () => {
+        assert.equal(retryableAttemptAfterRestart.status, "failed");
+        assert.equal(retryableAttemptAfterRestart.failureCode, retryableBeforeRestart.failureCode);
+        assert.equal(retryableAttemptAfterRestart.disposition, retryableBeforeRestart.disposition);
+        assert.equal(retryableAssessmentAfterRestart.retryState, "available");
+        assert.equal(retryableEditAfterRestart.retryState, "assessment_available");
+        assert.equal(value.imageCallCount(), retryableBeforeRestart.imageCalls);
+        assert.equal(value.assessmentCallCount(), retryableBeforeRestart.assessmentCalls + 1);
+        assert.equal(after.s4AssessmentAttempts[1].outputAssetId, retryableBeforeRestart.outputAssetId);
+        assert.equal(after.s4AssessmentAttempts[1].outputSha256, retryableBeforeRestart.outputSha256);
+      },
+    }, [
+      "beforeFailureCode=" + retryableBeforeRestart.failureCode,
+      "afterRestartFailureCode=" + retryableAttemptAfterRestart.failureCode,
+      "assessmentCallsBeforeRestart=" + retryableBeforeRestart.assessmentCalls,
+      "assessmentCallsAfterRestartBeforeRetry=" + retryableBeforeRestart.assessmentCalls,
+      "imageCallsAfterRetry=" + value.imageCallCount(),
+      "outputAssetId=" + retryableBeforeRestart.outputAssetId,
+      "outputSha256=" + retryableBeforeRestart.outputSha256,
     ]);
     await proveS4Variants("RETRY-001", "S4 image and assessment retries are explicit, bounded, and preserve the same output identity", "retry-classes", "The executed retry fixture established one image retry and one assessment retry for explicit retryable classes without creating another S4 cycle.", {
       "image-one": () => { assert.deepEqual(after.s4ImageOperations.map((item) => item.attempt), [1, 2]); assert.equal(value.imageCallCount(), 2); },
@@ -1029,7 +1107,6 @@ test("S4 high-risk publication and assessment recovery preserves exact objects",
       "promotion": () => { assert.equal(promotedAfter.s4Publications[0].state, "committed"); assert.equal(promoted.objects.read(promotedPublication.finalObjects[0].key).equals(promotedBytesBefore), true); },
       "publication-abort": () => { assert.equal(abortedAfter.s4Publications[0].state, "aborted"); assert.equal(abortedAfter.s4ImageOperations[0].failureCode, "PUBLICATION_FAILED"); },
       "preserve-restart": () => { assert.equal(preservationAfter.s4PreservationChecks[0].status, "PASS"); assert.equal(preservationDone.activeRevisionKind, "s4"); },
-      "assessment-restart": () => { assert.equal(assessment.assessmentCallCount(), 1); assert.equal(assessmentDone.activeRevisionKind, "s4"); },
     }, [
       "stagedPublication=" + stagedPublication.publicationId,
       "promotedPublication=" + promotedPublication.publicationId,
@@ -1187,8 +1264,44 @@ test("S4 high-risk activation matrix proves positive, negative, stale, and atomi
     assert.equal(qaDone.edits[0].assessment?.status, "QA_UNAVAILABLE");
     assert.equal(qaAfter.s3Selections[0].activeRevisionId, qaSelected.sourceRevisionId);
     assert.equal(qaAfter.s3Selections[0].selectionVersion, qaSelected.selectionVersion);
+    const qaBeforeRestart = qaUnavailable.repository.state();
+    const qaAttemptBeforeRestart = qaBeforeRestart.s4AssessmentAttempts[0];
+    const qaAssessmentBeforeRestart = qaBeforeRestart.s4Assessments[0];
+    const qaEditBeforeRestart = qaBeforeRestart.s4Edits[0];
+    assert.ok(qaAttemptBeforeRestart && qaAssessmentBeforeRestart && qaEditBeforeRestart);
+    assert.equal(qaAttemptBeforeRestart.status, "failed");
+    assert.equal(qaAttemptBeforeRestart.providerDispatchState, "consumed");
+    assert.equal(qaAttemptBeforeRestart.failureCode, "QA_PROVIDER_REFUSED");
+    assert.equal(qaAttemptBeforeRestart.disposition, "qa_unavailable_terminal");
+    assert.equal(qaAssessmentBeforeRestart.status, "qa_unavailable_terminal");
+    assert.equal(qaAssessmentBeforeRestart.retryState, "none");
+    assert.equal(qaEditBeforeRestart.status, "qa_unavailable");
+    assert.equal(qaEditBeforeRestart.retryState, "none");
+    const qaAssessmentCallsBeforeRestart = qaUnavailable.assessmentCallCount();
+    const qaImageCallsBeforeRestart = qaUnavailable.imageCallCount();
+    const qaRecovered = restart(qaUnavailable, { processId: 8310, isProcessAlive: (processId) => processId === 8310 });
+    const qaAfterRestart = qaUnavailable.repository.state();
+    const qaRestartState = qaRecovered.s4.getState(qaUnavailable.projectId);
+    const qaAttemptAfterRestart = qaAfterRestart.s4AssessmentAttempts[0];
+    assert.ok(qaAttemptAfterRestart);
+    assert.equal(qaUnavailable.assessmentCallCount(), qaAssessmentCallsBeforeRestart);
+    assert.equal(qaUnavailable.imageCallCount(), qaImageCallsBeforeRestart);
+    assert.equal(qaAttemptAfterRestart.status, "failed");
+    assert.equal(qaAttemptAfterRestart.providerDispatchState, "consumed");
+    assert.equal(qaAttemptAfterRestart.failureCode, "QA_PROVIDER_REFUSED");
+    assert.equal(qaAttemptAfterRestart.disposition, "qa_unavailable_terminal");
+    assert.equal(qaAfterRestart.s4Assessments[0].status, "qa_unavailable_terminal");
+    assert.equal(qaAfterRestart.s4Assessments[0].retryState, "none");
+    assert.equal(qaAfterRestart.s4Edits[0].status, "qa_unavailable");
+    assert.equal(qaAfterRestart.s4Edits[0].retryState, "none");
+    assert.equal(qaRestartState.edits[0]?.status, "qa_unavailable");
+    assert.equal(qaRestartState.edits[0]?.assessment?.status, "QA_UNAVAILABLE");
+    assert.equal(qaRestartState.edits[0]?.assessmentRetryAvailable, false);
+    assert.equal(qaRestartState.activeRevisionId, qaSelected.sourceRevisionId);
+    assert.equal(qaAfterRestart.s3Selections[0].activeRevisionId, qaSelected.sourceRevisionId);
+    assert.equal(qaAfterRestart.s3Selections[0].selectionVersion, qaSelected.selectionVersion);
     let qaRetryCode: string | null = null;
-    try { qaUnavailable.service.s4.assessmentRetry(qaUnavailable.projectId, qaDone.edits[0].editId, randomUUID(), randomUUID()); }
+    try { qaRecovered.s4.assessmentRetry(qaUnavailable.projectId, qaDone.edits[0].editId, randomUUID(), randomUUID()); }
     catch (error) { qaRetryCode = errorCode(error); }
     assert.equal(qaRetryCode, "S4_ASSESSMENT_RETRY_NOT_AVAILABLE");
 
@@ -1264,16 +1377,55 @@ test("S4 high-risk activation matrix proves positive, negative, stale, and atomi
     await waitFor(() => assessmentPostResponseCommits, (count) => count >= 2);
     const crashBefore = activationCrash.repository.state();
     const crashAttempt = crashBefore.s4AssessmentAttempts[0];
+    const crashAssessmentRecord = crashBefore.s4Assessments[0];
+    const crashEdit = crashBefore.s4Edits[0];
     const crashAsset = crashBefore.s4Assets[0];
-    assert.ok(crashAttempt && crashAsset);
+    assert.ok(crashAttempt && crashAssessmentRecord && crashEdit && crashAsset);
     assert.equal(crashAttempt.status, "running");
     assert.equal(crashAttempt.providerDispatchState, "consumed");
     assert.equal(crashBefore.s4Edits[0].status, "assessment_running");
+    assert.equal(crashAssessmentRecord.status, "running");
+    assert.equal(crashEdit.retryState, "none");
+    const crashAssessmentCallsBeforeRestart = activationCrash.assessmentCallCount();
+    const crashImageCallsBeforeRestart = activationCrash.imageCallCount();
+    const crashPointerBeforeRestart = crashBefore.s3Selections[0].activeRevisionId;
+    const crashSelectionVersionBeforeRestart = crashBefore.s3Selections[0].selectionVersion;
     const crashBytesBefore = activationCrash.objects.read(crashAsset.storageKeyNormalized);
     const crashRecovered = restart(activationCrash, { processId: 8308, isProcessAlive: (processId) => processId === 8308 });
     const crashDone = await waitFor(() => crashRecovered.s4.getState(activationCrash.projectId), (state) => state.edits[0]?.status === "qa_unavailable");
     const crashAfter = activationCrash.repository.state();
-    assert.equal(crashAfter.s4AssessmentAttempts[0].failureCode, "PERSISTENCE_FAILED");
+    const crashAfterAttempt = crashAfter.s4AssessmentAttempts[0];
+    const crashAfterAssessment = crashAfter.s4Assessments[0];
+    const crashAfterEdit = crashAfter.s4Edits[0];
+    assert.ok(crashAfterAttempt && crashAfterAssessment && crashAfterEdit);
+    assert.equal(activationCrash.assessmentCallCount(), crashAssessmentCallsBeforeRestart);
+    assert.equal(activationCrash.imageCallCount(), crashImageCallsBeforeRestart);
+    assert.equal(crashAfterAttempt.status, "failed");
+    assert.equal(crashAfterAttempt.providerDispatchState, "consumed");
+    assert.equal(crashAfterAttempt.failureCode, "PERSISTENCE_FAILED");
+    assert.equal(crashAfterAttempt.disposition, "qa_unavailable_terminal");
+    assert.equal(crashAfterAttempt.claimedBy, null);
+    assert.equal(crashAfterAttempt.claimedProcessId, null);
+    assert.equal(crashAfterAttempt.claimToken, null);
+    assert.deepEqual(crashAfterAttempt.requirementObservations, []);
+    assert.deepEqual(crashAfterAttempt.designObservations, []);
+    assert.equal(crashAfterAttempt.requestedEditSatisfaction, null);
+    assert.equal(crashAfterAttempt.overallRequirementResult, null);
+    assert.equal(crashAfterAttempt.overallBuildabilityResult, null);
+    assert.equal(crashAfterAttempt.materialFindingIds.length, 0);
+    assert.equal(crashAfterAttempt.warningFindingIds.length, 0);
+    assert.equal(crashAfterAttempt.uncertainFindingIds.length, 0);
+    assert.equal(crashAfterAttempt.evidenceObject, null);
+    assert.equal(crashAfterAssessment.status, "qa_unavailable_terminal");
+    assert.equal(crashAfterAssessment.retryState, "none");
+    assert.equal(crashAfterAssessment.requestedEditSatisfaction, null);
+    assert.equal(crashAfterAssessment.overallRequirementResult, null);
+    assert.equal(crashAfterAssessment.overallBuildabilityResult, null);
+    assert.equal(crashAfterEdit.status, "qa_unavailable");
+    assert.equal(crashAfterEdit.retryState, "none");
+    assert.equal(crashAfterEdit.outputRevisionId, crashAttempt.revisionId);
+    assert.equal(crashAfter.s3Selections[0].activeRevisionId, crashPointerBeforeRestart);
+    assert.equal(crashAfter.s3Selections[0].selectionVersion, crashSelectionVersionBeforeRestart);
     assert.equal(crashDone.activeRevisionId, crashSelected.sourceRevisionId);
     assert.equal(activationCrash.objects.read(crashAsset.storageKeyNormalized).equals(crashBytesBefore), true);
 
@@ -1298,8 +1450,8 @@ test("S4 high-risk activation matrix proves positive, negative, stale, and atomi
     ]);
     await proveS4Variants("RECOVERY-001", "S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", "recovery-matrix", "The executed restart fixtures established mask-intent and activation interruption recovery without fabricated success or object overwrite.", {
       "mask-intent-crash": () => { assert.equal(maskInterrupted.s4Edits[0].maskMaterializationStatus, "pending"); assert.equal(maskDone.edits[0].maskReady, true); },
-      "activation-crash": () => { assert.equal(crashAttempt.status, "running"); assert.equal(crashAfter.s4AssessmentAttempts[0].failureCode, "PERSISTENCE_FAILED"); },
-      "no-fake": () => { assert.equal(crashDone.edits[0].status, "qa_unavailable"); assert.equal(crashDone.activeRevisionId, crashSelected.sourceRevisionId); },
+      "activation-crash": () => { assert.equal(crashAttempt.status, "running"); assert.equal(crashAttempt.providerDispatchState, "consumed"); assert.equal(crashAfterAttempt.status, "failed"); assert.equal(crashAfterAttempt.failureCode, "PERSISTENCE_FAILED"); assert.equal(activationCrash.assessmentCallCount(), crashAssessmentCallsBeforeRestart); assert.equal(activationCrash.imageCallCount(), crashImageCallsBeforeRestart); },
+      "no-fake": () => { assert.equal(crashDone.edits[0].status, "qa_unavailable"); assert.equal(crashDone.activeRevisionId, crashSelected.sourceRevisionId); assert.deepEqual(crashAfterAttempt.requirementObservations, []); assert.deepEqual(crashAfterAttempt.designObservations, []); assert.equal(crashAfterAttempt.requestedEditSatisfaction, null); assert.equal(crashAfterAttempt.overallRequirementResult, null); assert.equal(crashAfterAttempt.overallBuildabilityResult, null); assert.equal(crashAfterAttempt.evidenceObject, null); assert.equal(crashAfterAssessment.requestedEditSatisfaction, null); assert.equal(crashAfterAssessment.overallRequirementResult, null); assert.equal(crashAfterAssessment.overallBuildabilityResult, null); assert.equal(crashAfterAssessment.retryState, "none"); },
       "no-overwrite": () => assert.equal(activationCrash.objects.read(crashAsset.storageKeyNormalized).equals(crashBytesBefore), true),
     }, [
       "maskCommitInterruptions=" + (maskCommitCount - maskBaselineCommits),
@@ -1308,8 +1460,8 @@ test("S4 high-risk activation matrix proves positive, negative, stale, and atomi
       "crashOutputHash=" + sha256(crashBytesBefore),
     ]);
     await proveS4Variants("ASSESS-RETRY-001", "S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", "terminal-retry-fence", "The executed terminal assessment failure remained QA unavailable and rejected any retry admission.", {
-      "terminal-no-retry": () => { assert.equal(qaDone.edits[0].assessment?.status, "QA_UNAVAILABLE"); assert.equal(qaRetryCode, "S4_ASSESSMENT_RETRY_NOT_AVAILABLE"); },
-    }, ["qaFailure=QA_PROVIDER_REFUSED", "retryCode=" + qaRetryCode]);
+      "terminal-no-retry": () => { assert.equal(qaRestartState.edits[0]?.assessment?.status, "QA_UNAVAILABLE"); assert.equal(qaRestartState.edits[0]?.assessmentRetryAvailable, false); assert.equal(qaAfterRestart.s4AssessmentAttempts[0].failureCode, "QA_PROVIDER_REFUSED"); assert.equal(qaAfterRestart.s4AssessmentAttempts[0].disposition, "qa_unavailable_terminal"); assert.equal(qaRetryCode, "S4_ASSESSMENT_RETRY_NOT_AVAILABLE"); assert.equal(qaUnavailable.assessmentCallCount(), qaAssessmentCallsBeforeRestart); assert.equal(qaUnavailable.imageCallCount(), qaImageCallsBeforeRestart); assert.equal(qaAfterRestart.s3Selections[0].activeRevisionId, qaSelected.sourceRevisionId); },
+    }, ["qaFailure=QA_PROVIDER_REFUSED", "retryCode=" + qaRetryCode, "assessmentCallsBeforeRestart=" + qaAssessmentCallsBeforeRestart, "assessmentCallsAfterRestart=" + qaUnavailable.assessmentCallCount(), "imageCallsBeforeRestart=" + qaImageCallsBeforeRestart, "imageCallsAfterRestart=" + qaUnavailable.imageCallCount()]);
     await proveS4Variants("CONCURRENCY-001", "S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", "pointer-race", "The executed assessment completion lost its selection-version race and remained historical without changing the active pointer.", {
       "pointer-race": () => { assert.equal(stalePassDone.edits[0].status, "stale"); assert.equal(stalePassAfter.s3Selections[0].activeRevisionId, stalePassSelected.sourceRevisionId); assert.equal(stalePassAfter.s3Selections[0].selectionVersion, stalePassSelected.selectionVersion + 1); },
     }, ["stalePassSelectionVersion=" + stalePassAfter.s3Selections[0].selectionVersion, "activeRevision=" + stalePassAfter.s3Selections[0].activeRevisionId]);

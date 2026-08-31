@@ -3090,7 +3090,7 @@ export class S4WorkflowService {
       return;
     }
     if (attempt.providerDispatchState === "consumed" &&
-        ((attempt.status !== "succeeded" && dead) || (noClaim && attempt.status !== "succeeded"))) {
+        attempt.status === "running" && (dead || noClaim)) {
       this.recoverAssessmentTerminal(state, attempt, assessment, edit, "PERSISTENCE_FAILED");
     }
   }
