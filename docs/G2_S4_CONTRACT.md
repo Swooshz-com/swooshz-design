@@ -1,16 +1,20 @@
 # S4 G2 implementation contract
 
-**Status:** S4 G2 contract candidate. Its normative authority is controlled by Web's exact-head G2 adjudication on issue #9; this document does not self-accept. When its exact commit is accepted and canonically merged, this same document becomes the normative G2 implementation contract.
+**Status:** S4 G2 evidence-contract re-entry candidate. Its normative authority is controlled by Web's exact-head G2 adjudication on issue #9; this document does not self-accept. When its exact commit is accepted and canonically merged, this same document becomes the normative G2 implementation contract.
 
 **Programme item:** `Swooshz-com/swooshz-design` issue #9, S4 masked local editing and preservation validation.
 
-**Proposed decision lock:** `DL-SD-S4-G2-001`
+**Existing accepted G2 lock:** `DL-SD-S4-G2-001`
+
+**Proposed replacement/revision decision lock:** `DL-SD-S4-G2-002`
 
 **Controlling G1 lock:** `DL-SD-S4-G1-001`, accepted by Web in #9 comment `5466875771` and reconciled in parent #1 comment `5466877803`.
 
-**Canonical base:** `main` at SHA `4d13f3832572a41517876286b36d43e2e8e0d01d`, tree `7bc73a36a80b55771de9d68c24b1453f5ae54b86`.
+**Controlling re-entry receipts:** PR #25 `5477436121`; S4 #9 `5477438465`; parent #1 `5477440571`.
 
-This is the complete normative construction manual for S4. It defines the data model, local mask mathematics, provider boundary, deterministic preservation check, S4 assessment, lifecycle, recovery, API, privacy, client, S5 handoff, and evidence obligations. It does not build any of those surfaces.
+**Canonical re-entry base:** `main` at SHA `2e01a90b6b2f40f4729764970a8cb89f25bbe0c8`, tree `b144ae4bc0bb80bee82d696be0f7e550af0a3ae9`.
+
+This is the complete normative construction manual for S4. It defines the data model, local mask mathematics, provider boundary, deterministic preservation check, S4 assessment, lifecycle, recovery, API, privacy, client, S5 handoff, and evidence obligations. This re-entry changes only the bounded repository dependency/package/script evidence semantics in section AC; G1 architecture and all unaffected G2 product, security, privacy, recovery, preservation, activation, concurrency, and API requirements carry forward unchanged from `DL-SD-S4-G2-001`. It does not build any of those surfaces.
 
 ## A. Scope and authority
 
@@ -22,7 +26,7 @@ S4 MUST preserve the last authoritative usable visual revision whenever an edit 
 
 ### A.2 Authority order
 
-The current user request and repository `AGENTS.md` are controlling execution instructions. The accepted G1 decision lock and its Web normalisations are controlling S4 product constraints. This document is the proposed G2 implementation contract derived from those constraints and the terminal S2/S3 contracts. Web owns G2 acceptance, G3 implementation authorisation, Ready/merge, canonical verification, and programme progression.
+The current user request and repository `AGENTS.md` are controlling execution instructions. The accepted G1 decision lock and its Web normalisations are controlling S4 product constraints. The existing accepted G2 lock `DL-SD-S4-G2-001` remains controlling for every unaffected product, security, privacy, recovery, preservation, activation, concurrency, and API requirement. This document proposes the bounded G2 evidence-contract revision `DL-SD-S4-G2-002`, derived from those constraints and the terminal S2/S3 contracts. Web owns G2 acceptance, G3 implementation authorisation, Ready/merge, canonical verification, and programme progression.
 
 G2 MUST NOT claim that G2 is accepted, G3 is authorised, implementation is authorised, the branch is Ready, the PR is mergeable, S4 is complete, or S5 is authorised.
 
@@ -40,11 +44,11 @@ The following seven normalisations are part of this contract and override any ea
 
 ### A.4 Explicit exclusions
 
-This contract excludes product implementation, tests, package or lockfile changes, workflows, configuration, deployment, provider calls, credential changes, customer or private business data, S5 implementation, and any mutation of terminal S3 type definitions. It also excludes hidden provider retries, a second activation pointer, mutable flags on immutable revisions, copied fake parents, semantic parsing of user instructions, and any perceptual preservation fallback.
+This G2 re-entry candidate excludes product implementation, tests, package or lockfile changes, workflows, configuration, deployment, provider calls, credential changes, customer or private business data, S5 implementation, and any mutation of terminal S3 type definitions. The re-entry itself does not authorize any such implementation change. A future G3 candidate may contain a test/evidence-only `devDependencies` or validation-script delta only when section AC proves it as an explicitly Web-authorized, exact, conformant delta; this does not authorize any production/runtime dependency expansion. The contract also excludes hidden provider retries, a second activation pointer, mutable flags on immutable revisions, copied fake parents, semantic parsing of user instructions, and any perceptual preservation fallback.
 
 ### A.5 Gate boundary
 
-Web controls acceptance of `DL-SD-S4-G2-001` at the exact candidate head. G3 may implement only after an explicit Web G3 decision. If the canonical base, accepted authority, OpenAI mask semantics, single-pointer resolution, terminal S3 compatibility, or calibration envelope materially changes, work MUST stop with `PARENT_RECONCILIATION_INCOMPLETE` or `GATE_REENTRY_REQUIRED` as applicable.
+Web controls acceptance of the proposed replacement `DL-SD-S4-G2-002` at the exact candidate head. Until that acceptance, `DL-SD-S4-G2-001` remains the accepted lock for unaffected semantics and this candidate is not normative. G3 may implement only after an explicit Web G2 acceptance of the replacement and a separate Web G3 decision. If the canonical base, accepted authority, OpenAI mask semantics, single-pointer resolution, terminal S3 compatibility, or calibration envelope materially changes, work MUST stop with `PARENT_RECONCILIATION_INCOMPLETE` or `GATE_REENTRY_REQUIRED` as applicable.
 
 ### A.6 S5 boundary
 
@@ -2611,9 +2615,9 @@ This is an internal projection, not a public API DTO. S5 may read the private st
 
 ### AC.1 Evidence rules
 
-The evidence design is execution-bound. The manifest is a separate static artifact from proof records. The manifest declares every frozen claim; proof records are produced by executed assertions. Static is reserved for identities, closed schemas, and source/document structure that can be proven without running the candidate. Any runtime behavior, migration, route, lifecycle, provider-mock, log-safety, runner, typecheck, lint, build, or exact-head/tree claim MUST use a non-static evidence class and an actual successful execution; source-string or document inspection alone cannot satisfy it. A local provider mock is allowed for implementation evidence; a live provider call is never allowed.
+The evidence design is execution-bound. The manifest is a separate static artifact from proof records. The manifest declares every frozen claim; proof records are produced by executed assertions. Static is reserved for identities, closed schemas, and source/document structure that can be proven without running the candidate. Any runtime behavior, migration, route, lifecycle, provider-mock, log-safety, runner, typecheck, lint, build, exact-head/tree, repository dependency, package-manifest, lockfile, or validation-script claim MUST use a non-static evidence class and an actual successful execution; source-string, document, or key-only inspection alone cannot satisfy it. A local provider mock is allowed for implementation evidence; a live provider call is never allowed.
 
-Missing, unknown, duplicate, and skipped claims are derived from the manifest and proof records. A claim count is never hand-entered as a success value. Candidate commit and tree IDs are read at runtime before and after the evidence run. A head or tree movement fails the run, even when individual assertions pass.
+Missing, unknown, duplicate, failed, and skipped claims are derived from the manifest and proof records. A claim count is never hand-entered as a success value. Candidate commit and tree IDs are read at runtime before and after the evidence run. A head or tree movement fails the run, even when individual assertions pass. The words "unchanged", "equal", and "identical" are reserved for a complete semantic comparison of the required surface, including values and not only keys.
 
 ### AC.2 Exact manifest and proof model
 
@@ -2647,19 +2651,88 @@ type S4ClaimManifest = {
 };
 
 type S4ClaimProofRecord = S4ClaimDefinition & {
-  status: "passed" | "skipped";
+  status: "passed" | "failed" | "skipped";
   expectedResult: string;
   actualResult: string;
   provingTest: string;
+  assertionId: string;
   observationFacts: string[];
 };
 
 type S4ClaimProofComparison = {
   passedRecords: S4ClaimProofRecord[];
+  failedClaims: number;
   missingClaims: number;
   unknownClaims: number;
   duplicateClaims: number;
   skippedClaims: number;
+};
+
+type S4DeltaDisposition =
+  | "unchanged"
+  | "changed_authorized_conformant"
+  | "changed_unauthorized_nonconformant";
+
+type S4ChangedDisposition = Exclude<S4DeltaDisposition, "unchanged">;
+
+type S4RepositoryDelta = {
+  surface: "production-runtime-dependency" | "test-only-dependency" | "package-manifest" | "lockfile";
+  path: string;
+  name: string | null;
+  baseValue: string | null;
+  candidateValue: string | null;
+  disposition: S4ChangedDisposition;
+  purpose: string | null;
+  authorityRefs: string[];
+  evidenceFacts: string[];
+};
+
+type S4DependencySectionSnapshot = {
+  dependencies: Record<string, string>;
+  optionalDependencies: Record<string, string>;
+  peerDependencies: Record<string, string>;
+  peerDependenciesMeta: Record<string, { optional?: boolean }>;
+  devDependencies: Record<string, string>;
+  bundledDependencies: string[];
+  bundleDependencies: string[];
+};
+
+type S4DependencyAudit = {
+  auditState: "complete" | "incomplete";
+  packageManifestPath: "package.json";
+  lockfilePath: "pnpm-lock.yaml";
+  baseManifestSha256: Sha256;
+  candidateManifestSha256: Sha256;
+  baseLockfileSha256: Sha256;
+  candidateLockfileSha256: Sha256;
+  baseDependencySections: S4DependencySectionSnapshot;
+  candidateDependencySections: S4DependencySectionSnapshot;
+  productionGraphUnchanged: boolean;
+  testOnlyRuntimeReachabilityAbsent: boolean;
+  deltas: S4RepositoryDelta[];
+  disposition: S4DeltaDisposition | null;
+};
+
+type S4ScriptDelta = {
+  scriptName: string;
+  baseValue: string | null;
+  candidateValue: string | null;
+  disposition: S4ChangedDisposition;
+  purpose: string | null;
+  authorityRefs: string[];
+  preservedRequiredValidation: string[];
+  removedRequiredValidation: string[];
+  executedRequiredValidation: string[];
+  evidenceFacts: string[];
+};
+
+type S4ScriptAudit = {
+  auditState: "complete" | "incomplete";
+  baseScripts: Record<string, string>;
+  candidateScripts: Record<string, string>;
+  completeMapEqual: boolean;
+  changedScripts: S4ScriptDelta[];
+  disposition: S4DeltaDisposition | null;
 };
 
 type S4EvidenceArtifact = {
@@ -2675,6 +2748,8 @@ type S4EvidenceArtifact = {
   manifestHash: Sha256;
   rowCount: number;
   claimCount: number;
+  dependencyAudit: S4DependencyAudit;
+  scriptAudit: S4ScriptAudit;
   proofComparison: S4ClaimProofComparison;
   status: "passed" | "failed" | "incomplete";
   startedAt: Timestamp;
@@ -2682,9 +2757,13 @@ type S4EvidenceArtifact = {
 };
 ~~~
 
-The canonical G2 base remains the fixed commit 4d13f3832572a41517876286b36d43e2e8e0d01d and tree 7bc73a36a80b55771de9d68c24b1453f5ae54b86. A future G3 implementation candidate has its own runtime-derived candidateCommitSha and candidateTree values after this G2 contract is accepted and canonically merged; those candidate values MUST NOT be substituted for the locked base fields.
+The `passedRecords` array contains only records with status: "passed". Failed or skipped execution records contribute to their derived counts and invalidate the artifact; they cannot be converted into a passing record by the comparator.
 
-The artifact is valid only when the six Git object fields match the `GitObjectId` pattern, the base SHA/tree equal the locked canonical values, candidate SHA/tree are unchanged before and after execution, `manifestHash` matches the separate manifest, `rowCount` equals `rows.length`, `claimCount` equals the sum of the variant-array lengths and the manifest claim count, all expected claims have exactly one proof record, no proof is unknown/duplicate/skipped, and every proof assertion passes. A contract checkout without a separate runtime proof artifact is incomplete; the contract never manufactures proof or treats a missing artifact as success.
+The canonical G2 re-entry base is the fixed commit 2e01a90b6b2f40f4729764970a8cb89f25bbe0c8 and tree b144ae4bc0bb80bee82d696be0f7e550af0a3ae9. A future G3 implementation candidate has its own runtime-derived candidateCommitSha and candidateTree values after this G2 contract is accepted and canonically merged; those candidate values MUST NOT be substituted for the locked base fields.
+
+The artifact is valid only when the six Git object fields match the GitObjectId pattern, the base SHA/tree equal the locked canonical values, candidate SHA/tree are unchanged before and after execution, manifestHash matches the separate manifest, rowCount equals rows.length, claimCount equals the sum of the variant-array lengths and the manifest claim count, all expected claims have exactly one proof record, no proof is unknown/duplicate/failed/skipped, every proof assertion passes, both repository audits have auditState: "complete", each audit disposition is either unchanged or changed_authorized_conformant, and every reported dependency or script delta has a truthful disposition. A contract checkout without a separate runtime proof artifact is incomplete; the contract never manufactures proof or treats a missing artifact as success.
+
+expectedResult is the exact invariant the assertion is required to establish. actualResult is derived from the assertion's observed facts and structured audit disposition. observationFacts MUST include the exact values or semantic delta needed to verify the result. A generic "scope audit passed", a key-set comparison, or a claim/proving-test name cannot establish an unchanged value or an authorized exception. A proof record is emitted only after its own assertion succeeds; a failed or incomplete assertion cannot be represented as a passing record.
 
 ### AC.3 Fixed evidence matrix
 
@@ -2718,8 +2797,8 @@ The matrix below is the sole source of the row and claim count. Each row is one 
 | PRIVACY-001 | behavioral | keys, hashes, prompts, provider IDs, claims, evidence, credentials, safe logs | 8 |
 | CLIENT-001 | client/API | mask state, rectangle/brush, clear, bounds, submit/poll, retry, preservation/assessment, history/rollback, budget | 14 |
 | S5-001 | behavioral | optional stage, active S3/S4, quality, version, projection, no S5 implementation | 7 |
-| REGRESSION-001 | behavioral | executed S1/S2/S3 regressions, typecheck, lint, build, repository quality/no-dependency, candidate head/tree binding | 8 |
-| EVIDENCE-001 | behavioral | manifest/proof separation, executed proof comparison, derived counters, head movement, static-claim boundary, exact schema | 9 |
+| REGRESSION-001 | behavioral | executed S1/S2/S3 regressions, typecheck, lint, build, complete dependency/package/lockfile/script audit, candidate head/tree binding | 8 |
+| EVIDENCE-001 | behavioral | manifest/proof separation, executed proof comparison, derived counters, candidate-delta dispositions, head movement, static-claim boundary, exact schema | 9 |
 | GATE-001 | behavioral | executor does not self-finalise, candidate is not merged during evidence, no live provider call, no customer/private-data access, parent/child authority reconciled, gate-reentry condition honored | 6 |
 
 The exact variant IDs are:
@@ -2758,7 +2837,9 @@ const S4_EVIDENCE_VARIANTS = {
 } as const;
 ~~~
 
-The list contains the rows shown in the table, and its claim count is derived from the actual variant-array lengths. Its normative row text and fixtureSetup strings are generated from the frozen table and the evidence class; they are not supplied by runtime results. The proof comparator must derive missingClaims, unknownClaims, duplicateClaims, and skippedClaims by claimId set comparison exactly as defined above.
+The list contains the rows shown in the table, and its claim count is derived from the actual variant-array lengths. Its normative row text and fixtureSetup strings are generated from the frozen table and the evidence class; they are not supplied by runtime results. The proof comparator must derive missingClaims, unknownClaims, duplicateClaims, failedClaims, and skippedClaims by claimId set comparison exactly as defined above.
+
+The historical variant ID REGRESSION-001:no-dependencies is intentionally retained for manifest compatibility. Its normative meaning is no unapproved dependency, runtime, package-manifest, lockfile, or validation-script expansion. It does not mean that every package, lockfile, or script value must be byte-for-byte unchanged. A permitted delta is never described or proved as unchanged.
 
 ### AC.4 Required proof coverage
 
@@ -2773,6 +2854,72 @@ The matrix MUST eventually prove, with the applicable evidence class:
 - prior-tip preservation, image/assessment retry bounds, same-byte assessment retry, idempotent replay, unique claims, pointer races, crash recovery, and private publication;
 - pre-consumed response loss as dispatch uncertainty versus post-consumed result-classification loss as terminal `PERSISTENCE_FAILED`, with no retry or redispatch;
 - authorization, cross-project isolation, closed API/errors/DTO privacy, persisted-truth client behavior, optional S4/S5 handoff, and S1/S2/S3 regressions;
+- complete production/runtime dependency, test-only dependency, package-manifest, lockfile, and validation-script comparisons, including exact values, authority, import reachability, required-validation coverage, and fail-closed unknown state;
 - runtime exact-head and exact-tree binding.
 
 No live provider, credential, deployment, or private/customer-data evidence is required or permitted by this contract; local fixtures and provider mocks are the allowed execution boundary.
+
+### AC.5 Repository dependency, package, lockfile, and script evidence
+
+This section freezes the repository-surface semantics used by REGRESSION-001:no-dependencies and the related EVIDENCE-001 proof. The comparison is against the exact canonical re-entry base and the exact candidate checkout. It is a runtime/non-static claim and MUST be produced by an executed audit, not by reading a claim label or a list of changed filenames. S4RepositoryDelta records dependency, package-manifest, and lockfile deltas; validation-script changes are recorded by S4ScriptDelta.
+
+#### Production/runtime dependency invariant
+
+The production/runtime dependency surface is the complete parsed package manifest and lockfile graph that can affect application execution. It includes package.json dependencies, optionalDependencies, peerDependencies, peerDependenciesMeta, bundledDependencies or bundleDependencies when present, and every lockfile package reachable from those production sections. The complete package manifest is compared as normalized JSON: every path outside the explicitly governed scripts and devDependencies paths MUST remain semantically equal, and every changed path MUST be reported. The dependency audit records full base and candidate package.json hashes; a hash difference caused only by the separately governed scripts object is attributed to scriptAudit and does not become a dependency delta.
+
+The base and candidate production dependency maps, the production importer entries in pnpm-lock.yaml, and the reachable production lockfile graph MUST compare by exact package names, exact version/range values, exact resolved identities, and exact integrity metadata. The productionGraphUnchanged fact may be true only after those complete comparisons execute. A production/runtime package change MUST NOT be reclassified as test infrastructure merely because a test imports it.
+
+This G2 re-entry authorizes no production/runtime dependency expansion. A future production/runtime delta requires separate explicit Web authority naming the exact manifest paths, package versions, lockfile entries, purpose, and applicable gate. Without that authority it has disposition changed_unauthorized_nonconformant and the evidence claim fails. Even with authority, it remains a production/runtime delta and is never represented as a test-only dependency or as unchanged.
+
+#### Permitted test-only dependency rule
+
+A test-only dependency may be disposition changed_authorized_conformant only when every condition below is proven for the exact candidate:
+
+1. A controlling Web authority explicitly names the exact package name, exact version, candidate purpose, allowed test/evidence surface, and candidate/base identity. An executor statement, a package name, or a successful install is not authority.
+2. The package is declared only in devDependencies with an exact pinned version string. Range prefixes, tags, workspace indirection, floating selectors, and an unlocked transitive version do not satisfy exact pinning.
+3. The package is imported only by tests or the evidence harness and has no application/runtime import from app, src, production entrypoints, production configuration, or the production build graph. The audit MUST prove this import reachability rather than infer it from the package section alone.
+4. The package and its transitive closure are absent from the production dependency graph. A new or changed transitive production/runtime edge is a production delta, not a test-only exception. Any unresolved or ambiguous reachability is fail-closed.
+5. The exact package version, resolved package identity, dependency metadata, and integrity data are present in pnpm-lock.yaml. The lockfile delta MUST list every changed importer and package entry required by this dependency and its dev-only closure. No unrelated lockfile entry, production importer entry, or integrity change is permitted.
+6. The evidence records the exact package-manifest path, base value, candidate value, lockfile paths/values, authority references, purpose, import/reachability facts, and validation execution receipts. It also proves that the package is used only for the authorized tests/evidence and does not change runtime behavior.
+
+This is a rule, not a package privilege. In particular, the failed G4 candidate's react-test-renderer@19.2.8 is only a candidate-specific example of a Web-authorized test-harness delta from the prior G3 authority. It is not a permanent allowlist entry, and another candidate must satisfy every condition again. A devDependency removal, version change outside these conditions, or unexplained package-manifest change is not silently accepted; it requires its own explicit authority and non-weakening proof or fails closed.
+
+#### Lockfile integrity
+
+If the complete dependency surface is unchanged, the base and candidate pnpm-lock.yaml semantic content and recorded lockfile identity MUST be equal. If an explicitly authorized test-only dependency changes, the lockfile may differ only in the exact importer and package entries required by the authorized dev-only closure. The audit MUST bind the base and candidate lockfile hashes, list the exact changed entries with base and candidate values, parse the lockfile successfully, verify exact integrity metadata, and prove that production importer and reachable production graph values are unchanged. A lockfile-only delta, a parse failure, a missing integrity value, an unlisted entry, or an ambiguous comparison is not an unchanged result and cannot produce a passing evidence artifact.
+
+#### Exact script semantics
+
+The complete script map is the parsed package.json scripts object. Every script key and its complete string value is part of the comparison. completeMapEqual is true only when both complete maps are valid and deep-equal in keys and values. The script audit MUST not compare only sorted key arrays. If completeMapEqual is true, changedScripts MUST be empty and the audit may report disposition unchanged. If any value or key differs, completeMapEqual is false and every addition, removal, or value change MUST appear exactly once in changedScripts with the base value (or null), candidate value (or null), purpose, authority references, and execution facts. A changed script MUST never be described as unchanged.
+
+The validation-critical scripts are test, build, lint, and typecheck. A legitimate change to one of them requires explicit Web authority, the exact base and candidate values, an authorized purpose, and proof that no required validation was removed, skipped, or weakened. The delta record MUST identify preservedRequiredValidation, removedRequiredValidation, and executedRequiredValidation. For a changed_authorized_conformant delta, removedRequiredValidation MUST always be empty: authority cannot authorize removal, skipping, or weakening of required validation under this contract. Every required base validation must be represented in preservedRequiredValidation and must execute successfully in the candidate validation evidence. The changed script itself and each required validation command must have an execution receipt. A script that merely exits successfully, or a generic scope audit, cannot prove that required coverage was preserved.
+
+A required regression-suite expansion is a changed_authorized_conformant validation-script delta, not an unchanged script result. The proof must state the exact old and new script values, identify the added coverage and preserved coverage, prove no unrelated script changed through the complete map comparison, and report the authorized delta. Changes to any other script also require exact Web authority; this G2 re-entry does not authorize arbitrary dev, start, or runtime-script changes.
+
+#### Candidate-delta dispositions
+
+Each complete repository audit reports exactly one overall disposition and reports every individual delta:
+
+- unchanged: auditState is complete, the complete governed maps/graphs are equal, no delta is listed, and no authority is implied;
+- changed_authorized_conformant: auditState is complete, every listed delta has exact base/candidate values, explicit controlling authority, a stated purpose, and all required import, lockfile, and validation facts; no unlisted delta exists;
+- changed_unauthorized_nonconformant: a known delta lacks authority, violates the production/test-only boundary, changes an ungoverned path, has an unrelated lockfile entry, or fails a required validation/integrity condition.
+
+When the audit cannot establish whether a required surface is complete because it is missing, unknown, unparseable, or ambiguous, auditState is incomplete and disposition is null. That state produces an incomplete evidence artifact and is never treated as unchanged or as a passing claim. A known nonconformant delta produces a failed evidence artifact and no passing REGRESSION-001:no-dependencies record. The three dispositions therefore remain distinguishable in the artifact; none is collapsed into a generic PASS.
+
+#### Execution-equivalent regression proof
+
+To pass REGRESSION-001:no-dependencies, the executing proof MUST parse the complete base and candidate package manifests and lockfile, compare all governed values, derive production reachability, verify the exact test-only conditions when applicable, compare the complete script maps including values, validate all authority and delta records, and verify every required candidate validation receipt. The assertion result, expectedResult, actualResult, and observationFacts MUST describe the same disposition and exact delta. A key-only comparison cannot pass this claim when script values differ, and a package-specific hard-coded exception cannot replace the generic rule.
+
+### AC.6 Proposed replacement decision lock (not accepted)
+
+The following is the proposed content of DL-SD-S4-G2-002 and is not self-accepting:
+
+- G1 architecture and lock DL-SD-S4-G1-001 remain unchanged.
+- The re-entry is bounded to truthful, execution-equivalent G2 evidence-contract semantics for repository dependency, package-manifest, lockfile, and validation-script surfaces.
+- Unaffected DL-SD-S4-G2-001 product, security, privacy, recovery, preservation, activation, concurrency, API, client, S5-boundary, and runtime trust requirements carry forward unchanged.
+- REGRESSION-001:no-dependencies is preserved as a stable variant ID with the normative meaning no unapproved dependency/runtime/package/script expansion; an authorized test-only dependency or validation-script delta is explicit evidence of change and is never represented as unchanged.
+- Every evidence claim must be no stronger than its executable assertion, complete values must be compared, candidate deltas must be classified, and missing/unknown/ambiguous audit state must fail closed.
+- The unified public resolver requirement remains fail-closed. S4_PUBLIC_RESOLVER_FAIL_CLOSED, specifically the remaining edit-detail projection defect that may return a contradictory 200 active_tip/previewAvailable=false state for a corrupt active revision, remains a later ordinary G3 repair 2/2 blocker. This re-entry neither waives nor fixes that product/API defect.
+- Web owns acceptance of this proposed lock, any G3 authorisation, any future G4 authorisation, Ready, merge, canonical verification, and programme progression.
+
+Until Web accepts the exact candidate and proposed lock, this document is a G2 re-entry candidate only. It does not accept G2, authorize G3/G4, authorize implementation, mark S4 Ready, or authorize merge.
