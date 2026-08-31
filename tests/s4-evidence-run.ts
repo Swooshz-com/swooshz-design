@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { compareClaimProofs, deriveClaimManifest, type S4ClaimProofComparison, type S4ClaimProofRecord } from "./s4-evidence-manifest";
 import { proveS4Claim } from "./s4-proof";
 import { jcs, sha256 } from "../src/lib/utils";
+import { OpenAIS4Provider } from "../src/lib/s4-provider";
 
 const SHA = /^[0-9a-f]{40}$/;
 const HASH = /^[0-9a-f]{64}$/;
@@ -140,7 +141,8 @@ const startedAt = new Date().toISOString();
 const proofDirectory = mkdtempSync(join(process.env.TEMP ?? process.cwd(), "swooshz-s4-g3-proof-"));
 const proofPath = join(proofDirectory, "claims.ndjson");
 const executionPath = join(proofDirectory, "executions.ndjson");
-const proofEnvironment = { S4_EVIDENCE_PROOF_PATH: proofPath, S4_EVIDENCE_EXECUTION_PATH: executionPath };
+const noProviderCredentialEnvironment = { OPENAI_API_KEY: "", OPENAI_ORG_ID: "", OPENAI_PROJECT_ID: "" };
+const proofEnvironment = { S4_EVIDENCE_PROOF_PATH: proofPath, S4_EVIDENCE_EXECUTION_PATH: executionPath, ...noProviderCredentialEnvironment };
 const noProofEnvironment = { S4_EVIDENCE_PROOF_PATH: "", S4_EVIDENCE_EXECUTION_PATH: "" };
 const s4ImplementationTests = runValidation(
   "node",
@@ -266,8 +268,6 @@ const focusedProofState = loadFocusedProofState();
 const changedFiles = git("diff", "--name-only", CANONICAL_BASE_SHA, candidateCommitSha).split(/\r?\n/).filter(Boolean);
 const dependencyFiles = changedFiles.filter((path) => /(^|[\\/])pnpm-lock\.yaml$/.test(path));
 const packageManifest = changedFiles.includes("package.json");
-const repairSourceFiles = ["src/lib/s4.ts", "src/lib/s4-persistence.ts"].filter((path) => changedFiles.includes(path));
-const repairSourceText = repairSourceFiles.map((path) => readFileSync(path, "utf8")).join("\n");
 const contractText = readFileSync("docs/G2_S4_CONTRACT.md", "utf8");
 const basePackageJson = JSON.parse(git("show", CANONICAL_BASE_SHA + ":package.json")) as Record<string, unknown>;
 const candidatePackageJson = JSON.parse(readFileSync("package.json", "utf8")) as Record<string, unknown>;
@@ -428,8 +428,19 @@ await runnerProof("GATE-001", "candidate-not-merged", "The candidate remains unm
   assert.equal(git("rev-list", "--merges", CANONICAL_BASE_SHA + ".." + candidateCommitSha), "");
   assertCandidateIdentity(candidateCommitSha, candidateTree);
 });
-await runnerProof("GATE-001", "no-live-provider", "The G3 candidate uses local provider fixtures only.", "The changed production surface contains no live-provider endpoint or credential lookup, and the evidence commands are local node, pnpm, and git commands.", "controller-gate", ["providerMode=local-mock", "liveProviderCalls=0"], () => {
-  assert.doesNotMatch(repairSourceText, /api\.openai\.com|process\.env\.[A-Z0-9_]*(?:KEY|TOKEN|SECRET)/i);
+const noLiveProviderFetchCalls = { count: 0 };
+const noLiveProvider = new OpenAIS4Provider({
+  apiKey: "",
+  fetchImpl: async () => {
+    noLiveProviderFetchCalls.count += 1;
+    return new Response("{}", { status: 200 });
+  },
+});
+await runnerProof("GATE-001", "no-live-provider", "The G3 candidate uses local provider fixtures only.", "The local OpenAI adapter rejected its blank configuration at the preflight boundary for both image and assessment, its injected transport was never called, and the S4 evidence child processes received named blank provider credential variables.", "controller-gate", ["providerMode=local-preflight", "liveProviderCalls=0", "blankedProviderVariables=OPENAI_API_KEY,OPENAI_ORG_ID,OPENAI_PROJECT_ID"], () => {
+  assert.throws(() => noLiveProvider.assertS4ImageEditReady(), (error: unknown) => (error as { safeCode?: string }).safeCode === "PROVIDER_NOT_CONFIGURED");
+  assert.throws(() => noLiveProvider.assertS4AssessmentReady(), (error: unknown) => (error as { safeCode?: string }).safeCode === "PROVIDER_NOT_CONFIGURED");
+  assert.equal(noLiveProviderFetchCalls.count, 0);
+  assert.deepEqual(Object.keys(noProviderCredentialEnvironment).sort(), ["OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID"]);
   assert.equal(validationRuns.every((run) => ["node", "pnpm.cmd", "git"].includes(run.command)), true);
 });
 await runnerProof("GATE-001", "no-customer-private-data", "The evidence run uses no customer or private business data.", "The candidate evidence sources and local commands contain no customer-data fixture path, credential file, or external data operation.", "controller-gate", ["customerData=0", "privateBusinessData=0"], () => {

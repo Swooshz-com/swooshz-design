@@ -603,9 +603,6 @@ export class PrivateObjectStore {
   put(key: string, bytes: Uint8Array): void {
     const path = this.pathFor(key);
     mkdirSync(dirname(path), { recursive: true });
-    if (existsSync(path)) {
-      throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: key });
-    }
     const temporary = path + "." + randomUUID() + ".tmp";
     let descriptor: number | null = null;
     try {
@@ -614,7 +611,8 @@ export class PrivateObjectStore {
       fsyncSync(descriptor);
       closeSync(descriptor);
       descriptor = null;
-      renameSync(temporary, path);
+      linkSync(temporary, path);
+      rmSync(temporary, { force: true });
     } catch {
       if (descriptor !== null) closeSync(descriptor);
       try {
@@ -630,13 +628,15 @@ export class PrivateObjectStore {
     const source = this.pathFor(stagingKey);
     const target = this.pathFor(finalKey);
     mkdirSync(dirname(target), { recursive: true });
-    if (existsSync(target)) {
+    try {
+      linkSync(source, target);
+    } catch {
       throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: finalKey });
     }
     try {
-      renameSync(source, target);
+      rmSync(source, { force: false });
     } catch {
-      throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: finalKey });
+      // The final link is already exclusive and complete; recovery can clean staging.
     }
   }
 
@@ -648,7 +648,14 @@ export class PrivateObjectStore {
       if (!actual.equals(expected)) throw new AppError(500, "PERSISTENCE_FAILED");
       return;
     }
-    this.put(key, expected);
+    try {
+      this.put(key, expected);
+    } catch (error) {
+      if (!this.exists(key)) throw error;
+      let actual: Buffer;
+      try { actual = this.read(key); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
+      if (!actual.equals(expected)) throw new AppError(500, "PERSISTENCE_FAILED");
+    }
   }
 
   promoteExact(stagingKey: string, finalKey: string, expected: Uint8Array): void {
@@ -659,7 +666,14 @@ export class PrivateObjectStore {
       if (!actual.equals(bytes)) throw new AppError(500, "PERSISTENCE_FAILED");
       return;
     }
-    this.promote(stagingKey, finalKey);
+    try {
+      this.promote(stagingKey, finalKey);
+    } catch (error) {
+      if (!this.exists(finalKey)) throw error;
+      let actual: Buffer;
+      try { actual = this.read(finalKey); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
+      if (!actual.equals(bytes)) throw new AppError(500, "PERSISTENCE_FAILED");
+    }
   }
 
   read(key: string): Buffer {

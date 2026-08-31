@@ -9,9 +9,101 @@ import {
 } from "../../src/lib/client-idempotency";
 
 type Fetcher = (input: string, init?: RequestInit) => Promise<Response>;
-type S4Primitive =
+export type S4Primitive =
   | { kind: "rectangle"; xQ16: number; yQ16: number; widthQ16: number; heightQ16: number }
   | { kind: "brush"; radiusQ8: number; points: Array<{ xQ16: number; yQ16: number }> };
+
+export const S4_CLIENT_MAX_PRIMITIVES = 64;
+export const S4_CLIENT_MAX_BRUSH_POINTS_PER_PRIMITIVE = 1_024;
+export const S4_CLIENT_MAX_TOTAL_BRUSH_POINTS = 4_096;
+export const S4_CLIENT_Q16_MAX = 65_536;
+export const S4_CLIENT_MIN_BRUSH_RADIUS_Q8 = 64;
+export const S4_CLIENT_MAX_BRUSH_RADIUS_Q8 = 25_600;
+export const S4_CLIENT_MAX_INSTRUCTION_SCALARS = 600;
+export const S4_CLIENT_MAX_INSTRUCTION_BYTES = 2_400;
+
+export type S4InstructionDraftState = {
+  scalarCount: number;
+  utf8ByteCount: number;
+  valid: boolean;
+};
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) { index += 1; continue; }
+      return true;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
+
+function normalizedInstruction(value: string): string {
+  try { return value.normalize("NFC").trim(); } catch { return value.trim(); }
+}
+
+export function instructionDraftState(value: string): S4InstructionDraftState {
+  const normalized = normalizedInstruction(value);
+  const scalarCount = hasUnpairedSurrogate(normalized) ? Number.MAX_SAFE_INTEGER : Array.from(normalized).length;
+  const utf8ByteCount = new TextEncoder().encode(normalized).byteLength;
+  const valid = scalarCount >= 1 && scalarCount <= S4_CLIENT_MAX_INSTRUCTION_SCALARS &&
+    utf8ByteCount <= S4_CLIENT_MAX_INSTRUCTION_BYTES &&
+    !hasUnpairedSurrogate(normalized) && !/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u.test(normalized);
+  return { scalarCount, utf8ByteCount, valid };
+}
+
+function q16(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= S4_CLIENT_Q16_MAX;
+}
+
+export function isS4PrimitiveLocallyValid(primitive: S4Primitive): boolean {
+  if (primitive.kind === "rectangle") {
+    return q16(primitive.xQ16) && q16(primitive.yQ16) &&
+      Number.isSafeInteger(primitive.widthQ16) && primitive.widthQ16 >= 1 && primitive.widthQ16 <= S4_CLIENT_Q16_MAX &&
+      Number.isSafeInteger(primitive.heightQ16) && primitive.heightQ16 >= 1 && primitive.heightQ16 <= S4_CLIENT_Q16_MAX &&
+      primitive.xQ16 + primitive.widthQ16 <= S4_CLIENT_Q16_MAX &&
+      primitive.yQ16 + primitive.heightQ16 <= S4_CLIENT_Q16_MAX;
+  }
+  if (primitive.kind !== "brush" || !Number.isSafeInteger(primitive.radiusQ8) ||
+      primitive.radiusQ8 < S4_CLIENT_MIN_BRUSH_RADIUS_Q8 || primitive.radiusQ8 > S4_CLIENT_MAX_BRUSH_RADIUS_Q8 ||
+      !Array.isArray(primitive.points) || primitive.points.length < 1 || primitive.points.length > S4_CLIENT_MAX_BRUSH_POINTS_PER_PRIMITIVE) return false;
+  return primitive.points.every((point) => q16(point.xQ16) && q16(point.yQ16));
+}
+
+function primitiveIdentity(primitive: S4Primitive): string {
+  return primitive.kind === "rectangle"
+    ? [primitive.kind, primitive.xQ16, primitive.yQ16, primitive.widthQ16, primitive.heightQ16].join(":")
+    : JSON.stringify([primitive.kind, primitive.radiusQ8, primitive.points.map((point) => [point.xQ16, point.yQ16])]);
+}
+
+export function isS4DraftSubmitReady(input: {
+  primitives: S4Primitive[];
+  instructionText: string;
+  hasActiveRevision: boolean;
+  cyclesRemaining: number;
+  busy?: boolean;
+}): boolean {
+  if (input.busy || !input.hasActiveRevision || !Number.isInteger(input.cyclesRemaining) || input.cyclesRemaining < 1 ||
+      !Array.isArray(input.primitives) || input.primitives.length < 1 || input.primitives.length > S4_CLIENT_MAX_PRIMITIVES) return false;
+  const identities = new Set<string>();
+  let brushPointCount = 0;
+  for (const primitive of input.primitives) {
+    if (!isS4PrimitiveLocallyValid(primitive)) return false;
+    const identity = primitiveIdentity(primitive);
+    if (identities.has(identity)) return false;
+    identities.add(identity);
+    if (primitive.kind === "brush") brushPointCount += primitive.points.length;
+  }
+  if (brushPointCount > S4_CLIENT_MAX_TOTAL_BRUSH_POINTS) return false;
+  return instructionDraftState(input.instructionText).valid;
+}
+
+export function isS4DraftClearEnabled(primitives: S4Primitive[], busy = false): boolean {
+  return !busy && primitives.length > 0;
+}
 type S4Assessment = {
   status: string;
   requestedEditSatisfaction: string | null;
@@ -162,6 +254,14 @@ export function S4Screen({ projectId, initialState = null }: { projectId: string
   const keys = useRef<IdempotencyKeyRetainer | null>(null);
   if (!keys.current) keys.current = createIdempotencyKeyRetainer();
   const client = useMemo(() => createS4Client({ projectId, operationKeys: keys.current! }), [projectId]);
+  const instruction = instructionDraftState(instructionText);
+  const draftReady = Boolean(state && isS4DraftSubmitReady({
+    primitives,
+    instructionText,
+    hasActiveRevision: Boolean(state.activeRevisionId),
+    cyclesRemaining: state.cyclesRemaining,
+    busy,
+  }));
 
   const refresh = async () => {
     try { setState(await client.refresh()); setError(""); }
@@ -184,17 +284,19 @@ export function S4Screen({ projectId, initialState = null }: { projectId: string
       kind: "rectangle", xQ16: percentQ16(rect.x), yQ16: percentQ16(rect.y),
       widthQ16: percentQ16(rect.width), heightQ16: percentQ16(rect.height),
     };
-    if ([next.xQ16, next.yQ16, next.widthQ16, next.heightQ16].every(Number.isFinite)) {
-      setPrimitives((current) => [...current, next]);
-    }
+    if (!isS4PrimitiveLocallyValid(next)) return;
+    setPrimitives((current) => current.length >= S4_CLIENT_MAX_PRIMITIVES ? current : [...current, next]);
   }
 
   function addBrush() {
     const point = { xQ16: percentQ16(brush.x), yQ16: percentQ16(brush.y) };
     const radiusQ8 = Math.round(Number(brush.radius) * 256);
-    if ([point.xQ16, point.yQ16, radiusQ8].every(Number.isFinite)) {
-      setPrimitives((current) => [...current, { kind: "brush", radiusQ8, points: [point] }]);
-    }
+    const next: S4Primitive = { kind: "brush", radiusQ8, points: [point] };
+    if (!isS4PrimitiveLocallyValid(next)) return;
+    setPrimitives((current) => {
+      const pointCount = current.reduce((sum, primitive) => sum + (primitive.kind === "brush" ? primitive.points.length : 0), 0);
+      return current.length >= S4_CLIENT_MAX_PRIMITIVES || pointCount + 1 > S4_CLIENT_MAX_TOTAL_BRUSH_POINTS ? current : [...current, next];
+    });
   }
 
   function clearLocalMask() {
@@ -202,7 +304,12 @@ export function S4Screen({ projectId, initialState = null }: { projectId: string
   }
 
   async function submit() {
-    if (!state?.activeRevisionId || primitives.length === 0 || !instructionText.trim()) return;
+    if (!state?.activeRevisionId || !isS4DraftSubmitReady({
+      primitives,
+      instructionText,
+      hasActiveRevision: true,
+      cyclesRemaining: state.cyclesRemaining,
+    })) return;
     setBusy(true); setError("");
     try {
       await client.edit({
@@ -258,14 +365,15 @@ export function S4Screen({ projectId, initialState = null }: { projectId: string
           {(["x", "y", "radius"] as const).map((key) => <label key={key}>{key} ({key === "radius" ? "px" : "% 0-100"})<input inputMode="decimal" value={brush[key]} disabled={busy} onChange={(event) => setBrush({ ...brush, [key]: event.target.value })} /></label>)}
         </div>
         <button type="button" disabled={busy} onClick={addBrush}>Add brush point to local mask</button>
-        <button type="button" disabled={busy || primitives.length === 0} onClick={clearLocalMask}>Clear local mask</button>
+        <button type="button" disabled={!isS4DraftClearEnabled(primitives, busy)} onClick={clearLocalMask}>Clear local mask</button>
         <p>{primitives.length} local primitive(s) staged for submission.</p>
         {primitives.length ? <ol>{primitives.map((primitive, index) => <li key={index}>{primitive.kind === "rectangle" ? "Rectangle" : "Brush point"} {index + 1} / editable region</li>)}</ol> : null}
       </section>
       <section className="panel">
         <h2>Instruction</h2>
-        <textarea value={instructionText} maxLength={600} disabled={busy || state.cyclesRemaining === 0} onChange={(event) => setInstructionText(event.target.value)} placeholder="Example: replace the selected counter finish while preserving the booth geometry." />
-        <button type="button" disabled={busy || state.cyclesRemaining === 0 || !state.activeRevisionId || !instructionText.trim() || primitives.length === 0} onClick={() => void submit()}>Submit local edit</button>
+        <textarea aria-describedby="instruction-limits" value={instructionText} disabled={busy || state.cyclesRemaining === 0} onChange={(event) => setInstructionText(event.target.value)} placeholder="Example: replace the selected counter finish while preserving the booth geometry." />
+        <p id="instruction-limits" aria-live="polite">{instruction.scalarCount}/{S4_CLIENT_MAX_INSTRUCTION_SCALARS} Unicode scalar values / {instruction.utf8ByteCount}/{S4_CLIENT_MAX_INSTRUCTION_BYTES} UTF-8 bytes {instruction.valid ? "- ready" : "- incomplete or over limit"}</p>
+        <button type="button" disabled={busy || !draftReady} onClick={() => void submit()}>Submit local edit</button>
       </section>
       <section className="panel">
         <h2>Persisted edit history</h2>

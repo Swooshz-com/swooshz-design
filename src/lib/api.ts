@@ -130,7 +130,7 @@ async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
       throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_LENGTH_INVALID" }]);
     }
     if (parsedLength > MAX_S4_BODY_BYTES) {
-      throw new AppError(413, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
+      throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
     }
   }
   if (!request.body) throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "JSON_OBJECT_REQUIRED" }]);
@@ -144,7 +144,7 @@ async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
       total += next.value.byteLength;
       if (total > MAX_S4_BODY_BYTES) {
         await reader.cancel().catch(() => undefined);
-        throw new AppError(413, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
+        throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
       }
       chunks.push(Buffer.from(next.value));
     }

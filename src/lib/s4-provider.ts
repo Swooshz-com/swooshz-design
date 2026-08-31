@@ -135,6 +135,9 @@ export function buildS4AssessmentRequest(input: S4AssessmentProviderInput): S4As
 export type S4ProviderContract = {
   runS4ImageEdit(input: S4ImageProviderInput): Promise<S4ImageProviderResult>;
   runS4Assessment(input: S4AssessmentProviderInput): Promise<S4AssessmentProviderResult>;
+  /** These checks are local-only and MUST NOT start provider transport. */
+  assertS4ImageEditReady?: () => void;
+  assertS4AssessmentReady?: () => void;
 };
 
 function strictBase64(value: string): boolean {
@@ -201,8 +204,20 @@ export class OpenAIS4Provider implements S4ProviderContract {
     this.timeoutMs = options.timeoutMs ?? 90_000;
   }
 
-  private async postJson(path: string, body: Record<string, unknown>): Promise<{ response: Response; body: Record<string, unknown> }> {
+  assertS4ImageEditReady(): void {
+    this.assertConfigured();
+  }
+
+  assertS4AssessmentReady(): void {
+    this.assertConfigured();
+  }
+
+  private assertConfigured(): void {
     if (!this.apiKey) throw new ProviderFailure("PROVIDER_NOT_CONFIGURED");
+  }
+
+  private async postJson(path: string, body: Record<string, unknown>): Promise<{ response: Response; body: Record<string, unknown> }> {
+    this.assertConfigured();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -235,7 +250,7 @@ export class OpenAIS4Provider implements S4ProviderContract {
   }
 
   private async postMultipart(path: string, form: FormData): Promise<{ response: Response; body: Record<string, unknown> }> {
-    if (!this.apiKey) throw new ProviderFailure("PROVIDER_NOT_CONFIGURED");
+    this.assertConfigured();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {

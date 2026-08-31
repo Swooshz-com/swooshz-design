@@ -908,6 +908,124 @@ export class S4WorkflowService {
     }
   }
 
+  private assertImageDispatchReady(): void {
+    if (typeof this.provider.runS4ImageEdit !== "function") throw new ProviderFailure("PROVIDER_NOT_CONFIGURED");
+    this.provider.assertS4ImageEditReady?.();
+  }
+
+  private assertAssessmentDispatchReady(): void {
+    if (typeof this.provider.runS4Assessment !== "function") throw new ProviderFailure("PROVIDER_NOT_CONFIGURED");
+    this.provider.assertS4AssessmentReady?.();
+  }
+
+  private requeueImageBeforeDispatch(operationId: UUID, token: UUID): void {
+    try {
+      this.repository.transact((state) => {
+        const operation = state.s4ImageOperations.find((item) => item.operationId === operationId);
+        const edit = operation && state.s4Edits.find((item) => item.editId === operation.editId);
+        if (!operation || !edit || !this.claimMatches(operation, token) || operation.providerDispatchState !== "not_started") return;
+        const previousOperation = operation.status;
+        const previousEdit = edit.status;
+        operation.status = "queued";
+        operation.startedAt = null;
+        operation.completedAt = null;
+        operation.failureCode = null;
+        clearClaim(operation);
+        edit.status = "image_queued";
+        edit.retryState = "none";
+        edit.retryWaivedReason = null;
+        edit.terminalAt = null;
+        edit.updatedAt = this.clock();
+        this.transition(state, {
+          transitionId: this.uuid(), at: this.clock(), projectId: operation.projectId,
+          generationSetId: operation.generationSetId, selectionStateId: operation.selectionStateId,
+          editId: edit.editId, operationId, publicationId: operation.publicationId,
+          preservationCheckId: null, assessmentId: null, assessmentAttemptId: null,
+          phase: "image", attempt: operation.attempt, from: previousOperation, to: "queued", reason: null,
+          priorRevisionId: operation.baseRevisionId, resultingRevisionId: null,
+          expectedSelectionVersion: operation.baseSelectionVersion,
+          resultingSelectionVersion: operation.baseSelectionVersion, requestReferenceId: operation.requestReferenceId,
+        });
+        this.transition(state, {
+          transitionId: this.uuid(), at: this.clock(), projectId: edit.projectId,
+          generationSetId: edit.generationSetId, selectionStateId: edit.selectionStateId,
+          editId: edit.editId, operationId, publicationId: operation.publicationId,
+          preservationCheckId: null, assessmentId: null, assessmentAttemptId: null,
+          phase: "edit", attempt: operation.attempt, from: previousEdit, to: "image_queued", reason: null,
+          priorRevisionId: edit.baseRevisionId, resultingRevisionId: null,
+          expectedSelectionVersion: edit.baseSelectionVersion,
+          resultingSelectionVersion: edit.baseSelectionVersion, requestReferenceId: operation.requestReferenceId,
+        });
+      });
+    } catch {
+      // Keep the unmarked claim conservative if the requeue transaction itself fails.
+    }
+  }
+
+  private requeueAssessmentBeforeDispatch(assessmentAttemptId: UUID, token: UUID): void {
+    try {
+      this.repository.transact((state) => {
+        const attempt = state.s4AssessmentAttempts.find((item) => item.assessmentAttemptId === assessmentAttemptId);
+        const assessment = attempt && state.s4Assessments.find((item) => item.assessmentId === attempt.assessmentId);
+        const edit = attempt && state.s4Edits.find((item) => item.editId === attempt.editId);
+        if (!attempt || !assessment || !edit || !this.claimMatches(attempt, token) || attempt.providerDispatchState !== "not_started") return;
+        const previousAttempt = attempt.status;
+        const previousAssessment = assessment.status;
+        const previousEdit = edit.status;
+        attempt.status = "queued";
+        attempt.disposition = "pending";
+        attempt.startedAt = null;
+        attempt.completedAt = null;
+        attempt.failureCode = null;
+        clearClaim(attempt);
+        assessment.status = "pending";
+        assessment.retryState = "none";
+        assessment.retryWaivedReason = null;
+        assessment.updatedAt = this.clock();
+        edit.status = "assessment_pending";
+        edit.retryState = "none";
+        edit.retryWaivedReason = null;
+        edit.terminalAt = null;
+        edit.updatedAt = this.clock();
+        this.transition(state, {
+          transitionId: this.uuid(), at: this.clock(), projectId: attempt.projectId,
+          generationSetId: attempt.generationSetId, selectionStateId: attempt.selectionStateId,
+          editId: edit.editId, operationId: null, publicationId: null,
+          preservationCheckId: edit.preservationCheckId, assessmentId: assessment.assessmentId,
+          assessmentAttemptId, phase: "assessment", attempt: attempt.attempt,
+          from: previousAttempt, to: "queued", reason: null,
+          priorRevisionId: attempt.revisionId, resultingRevisionId: attempt.revisionId,
+          expectedSelectionVersion: edit.baseSelectionVersion,
+          resultingSelectionVersion: edit.baseSelectionVersion, requestReferenceId: attempt.requestReferenceId,
+        });
+        this.transition(state, {
+          transitionId: this.uuid(), at: this.clock(), projectId: edit.projectId,
+          generationSetId: edit.generationSetId, selectionStateId: edit.selectionStateId,
+          editId: edit.editId, operationId: null, publicationId: null,
+          preservationCheckId: edit.preservationCheckId, assessmentId: assessment.assessmentId,
+          assessmentAttemptId, phase: "edit", attempt: attempt.attempt,
+          from: previousEdit, to: "assessment_pending", reason: null,
+          priorRevisionId: edit.baseRevisionId, resultingRevisionId: attempt.revisionId,
+          expectedSelectionVersion: edit.baseSelectionVersion,
+          resultingSelectionVersion: edit.baseSelectionVersion, requestReferenceId: attempt.requestReferenceId,
+        });
+        this.transition(state, {
+          transitionId: this.uuid(), at: this.clock(), projectId: assessment.projectId,
+          generationSetId: assessment.generationSetId, selectionStateId: assessment.selectionStateId,
+          editId: edit.editId, operationId: null, publicationId: null,
+          preservationCheckId: edit.preservationCheckId, assessmentId: assessment.assessmentId,
+          assessmentAttemptId, phase: "assessment", attempt: attempt.attempt,
+          from: previousAssessment, to: "pending", reason: null,
+          priorRevisionId: attempt.revisionId, resultingRevisionId: attempt.revisionId,
+          expectedSelectionVersion: edit.baseSelectionVersion,
+          resultingSelectionVersion: edit.baseSelectionVersion, requestReferenceId: attempt.requestReferenceId,
+        });
+      });
+    } catch {
+      // Keep the unmarked claim conservative if the requeue transaction itself fails.
+    }
+  }
+
   private claimMatches(operation: {
     status: string;
     claimedBy: string | null;
@@ -1513,6 +1631,12 @@ export class S4WorkflowService {
       const initial = this.state();
       const dispatch = this.imageDispatchInput(initial, claim.operation);
       await this.notifyDispatch("before-dispatch", claim.operation);
+      try {
+        this.assertImageDispatchReady();
+      } catch {
+        this.requeueImageBeforeDispatch(operationId, claim.token);
+        return;
+      }
       const marked = this.beginImageDispatch(operationId, claim.token);
       if (!marked) return;
       await this.notifyDispatch("after-dispatch-marked", marked);
@@ -2477,6 +2601,12 @@ export class S4WorkflowService {
       const initial = this.state();
       const dispatch = this.assessmentDispatchInput(initial, claim.attempt);
       await this.notifyDispatch("before-dispatch", claim.attempt);
+      try {
+        this.assertAssessmentDispatchReady();
+      } catch {
+        this.requeueAssessmentBeforeDispatch(assessmentAttemptId, claim.token);
+        return;
+      }
       const marked = this.beginAssessmentDispatch(assessmentAttemptId, claim.token);
       if (!marked) return;
       await this.notifyDispatch("after-dispatch-marked", marked);

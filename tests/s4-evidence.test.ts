@@ -10,8 +10,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { type BoothGeometrySnapshot, type S4DesignRuleSnapshot, type S4MaskPrimitive, type S4Requirement, type S4SourceQualityProof, type UUID } from "../src/lib/types";
 import { emptyStoreState, PrivateObjectStore } from "../src/lib/store";
 import { handleApiRequest } from "../src/lib/api";
-import { createS4Client, S4Screen } from "../app/components/S4Client";
-import { buildS4AssessmentRequest, buildS4ImageRequest } from "../src/lib/s4-provider";
+import { createS4Client, instructionDraftState, isS4DraftClearEnabled, isS4DraftSubmitReady, isS4PrimitiveLocallyValid, S4Screen, type S4Primitive } from "../app/components/S4Client";
+import { buildS4AssessmentRequest, buildS4ImageRequest, OpenAIS4Provider } from "../src/lib/s4-provider";
+import type { PublicS4State } from "../src/lib/s4";
 import {
   S4_ASSESSMENT_JSON_SCHEMA,
   S4_ASSESSMENT_MODEL,
@@ -51,6 +52,51 @@ const BODY_LIMIT_PRIMITIVES: S4MaskPrimitive[] = Array.from({ length: 65 }, (_, 
   ...RECTANGLE,
   xQ16: 1_000 + index * 500,
 }));
+const PUBLIC_ASSESSMENT = {
+  status: "PASS",
+  requestedEditSatisfaction: "satisfied",
+  overallRequirementResult: "satisfied",
+  overallBuildabilityResult: "buildable",
+  materialFindingCount: 0,
+  warningFindingCount: 1,
+  uncertainFindingCount: 0,
+  retryAvailable: false,
+} as const;
+const PUBLIC_EDIT = {
+  editId: UUID_2,
+  cycleNumber: 1,
+  baseRevisionId: UUID,
+  baseRevisionKind: "s3",
+  status: "usable_pass",
+  instructionText: "Replace the selected finish.",
+  maskReady: true,
+  primitiveCount: 1,
+  editablePixelCount: 12_000,
+  comparisonPixelCount: 1_500_000,
+  outputRevisionId: UUID_2,
+  preservationStatus: "PASS",
+  assessment: PUBLIC_ASSESSMENT,
+  imageRetryAvailable: false,
+  assessmentRetryAvailable: false,
+  activationState: "usable_history",
+  previewAvailable: true,
+  createdAt: "2026-08-31T00:00:00.000Z",
+  terminalAt: "2026-08-31T00:01:00.000Z",
+} as const;
+const PUBLIC_STATE: PublicS4State = {
+  projectId: UUID,
+  generationSetId: UUID_2,
+  selectionVersion: 2,
+  activeRevisionId: UUID_2,
+  activeRevisionKind: "s4",
+  activeQuality: "PASS",
+  activePreviewAvailable: true,
+  stageStatus: "started",
+  s3RefinementClosed: true,
+  cyclesConsumed: 1,
+  cyclesRemaining: 1,
+  edits: [PUBLIC_EDIT],
+};
 
 async function proveVariantClaims(
   testId: string,
@@ -218,6 +264,7 @@ test("S4 evidence: stage and cycle lifecycle is execution-bound", async () => {
 
 test("S4 evidence: mask request boundary is exact", async () => {
   const parsed = parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [RECTANGLE, BRUSH], instructionText: "Local edit" });
+  const degenerateRectangle = { ...RECTANGLE, widthQ16: 0 };
   assert.equal(parsed.primitives.length, 2);
   assert.equal(parsed.primitives[0].kind, "rectangle");
   assert.equal(parsed.primitives[1].kind, "brush");
@@ -225,6 +272,7 @@ test("S4 evidence: mask request boundary is exact", async () => {
   assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [{ ...RECTANGLE, xQ16: 65_537 }], instructionText: "Local edit" }));
   assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [{ kind: "brush", radiusQ8: 63, points: [{ xQ16: 1, yQ16: 1 }] }], instructionText: "Local edit" }));
   assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [], instructionText: "Local edit" }));
+  assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [degenerateRectangle], instructionText: "Local edit" }));
   await proveVariantClaims("MASK-API-001", "S4 evidence: mask request boundary is exact", "mask-request", "The executed parser assertion covered one frozen request-boundary variant.", {
     "exact-body": () => assert.deepEqual(Object.keys(parsed).sort(), ["baseRevisionId", "expectedSelectionVersion", "instructionText", "primitives"]),
     "rectangle": () => assert.equal(parsed.primitives[0].kind, "rectangle"),
@@ -234,7 +282,7 @@ test("S4 evidence: mask request boundary is exact", async () => {
     "q8-radius": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [{ kind: "brush", radiusQ8: 63, points: [{ xQ16: 1, yQ16: 1 }] }], instructionText: "Local edit" })),
     "ordering": () => assert.deepEqual(parsed.primitives.map((item) => item.kind), ["rectangle", "brush"]),
     "duplicates": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [RECTANGLE, RECTANGLE], instructionText: "Local edit" })),
-    "degenerate": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [], instructionText: "Local edit" })),
+    "degenerate": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: [degenerateRectangle], instructionText: "Local edit" })),
     "body-limit": () => assert.throws(() => parseS4MaskRequest({ baseRevisionId: UUID, expectedSelectionVersion: 1, primitives: BODY_LIMIT_PRIMITIVES, instructionText: "Local edit" })),
     "clear-client-only": () => assert.equal(Object.prototype.hasOwnProperty.call(parsed, "clear"), false),
   }, ["supportingTest=S4 mask and preservation fixtures use deterministic exact geometry"]);
@@ -245,7 +293,10 @@ test("S4 evidence: raster and area rules are deterministic", async () => {
   assert.equal(rectangleRaster.raster[0], 255);
   assert.equal(rectangleRaster.raster[384], 0);
   assert.equal(rectangleRaster.raster.length, PIXELS);
+  const diskRaster = rasterizeS4Mask([{ kind: "brush", radiusQ8: 4_096, points: [{ xQ16: 30_000, yQ16: 30_000 }] }]);
   const brushRaster = rasterizeS4Mask([BRUSH]);
+  const segmentRaster = rasterizeS4Mask([{ kind: "brush", radiusQ8: 128, points: [{ xQ16: 0, yQ16: 0 }, { xQ16: 65_536, yQ16: 65_536 }] }]);
+  const cornerRaster = rasterizeS4Mask([{ kind: "rectangle", xQ16: 0, yQ16: 0, widthQ16: 1, heightQ16: 1 }]);
   assert.ok(brushRaster.editablePixelCount > 0);
   assert.ok(brushRaster.comparisonPixelCount >= 65_536);
   const union = rasterizeS4Mask([RECTANGLE, BRUSH]);
@@ -263,11 +314,19 @@ test("S4 evidence: raster and area rules are deterministic", async () => {
   await proveVariantClaims("RASTER-001", "S4 evidence: raster and area rules are deterministic", "raster-rules", "The executed raster assertion covered one deterministic fixed-point, geometry, or area boundary.", {
     "half-open": () => assert.equal(rectangleRaster.raster[384], 0),
     "pixel-center": () => assert.equal(rectangleRaster.raster[0], 255),
-    "disk": () => assert.ok(brushRaster.editablePixelCount > 0),
-    "capsule": () => assert.ok(brushRaster.editablePixelCount >= 1),
-    "segment-rational": () => assert.ok(brushRaster.editablePixelCount <= PIXELS),
+    "disk": () => { assert.equal(diskRaster.raster[469 * WIDTH + 703], 255); assert.equal(diskRaster.raster[0], 0); },
+    "capsule": () => { assert.equal(brushRaster.raster[469 * WIDTH + 704], 255); assert.equal(brushRaster.raster[0], 0); },
+    "segment-rational": () => {
+      assert.equal(segmentRaster.raster[512 * WIDTH + 768], 255);
+      assert.equal(segmentRaster.raster[500 * WIDTH + 768], 0);
+    },
     "union": () => assert.ok(union.editablePixelCount >= rectangleRaster.editablePixelCount),
-    "clip-no-wrap": () => assert.deepEqual([...new Set(union.raster)], [0, 255]),
+    "clip-no-wrap": () => {
+      assert.equal(cornerRaster.raster[0], 255);
+      assert.equal(cornerRaster.raster[1], 0);
+      assert.equal(cornerRaster.raster[WIDTH], 0);
+      assert.equal(cornerRaster.raster[PIXELS - 1], 0);
+    },
     "empty": () => assert.throws(() => materializeS4Mask([])),
     "min-area": () => assert.throws(() => materializeS4Mask([{ kind: "rectangle", xQ16: 0, yQ16: 0, widthQ16: 1, heightQ16: 1 }])),
     "max-area": () => assert.throws(() => materializeS4Mask([{ kind: "rectangle", xQ16: 0, yQ16: 0, widthQ16: 60_000, heightQ16: 60_000 }])),
@@ -288,8 +347,22 @@ test("S4 evidence: provider mask PNG has exact polarity and encoding", async () 
   const scanlineSize = 1 + WIDTH * 4;
   const idatOffset = png.indexOf(Buffer.from("IDAT"));
   const idatLength = png.readUInt32BE(idatOffset - 4);
+  const idatData = png.subarray(idatOffset + 4, idatOffset + 4 + idatLength);
   assert.ok(idatOffset > 0 && idatLength > 0);
-  const decoded = inflateSync(png.subarray(idatOffset + 4, idatOffset + 4 + idatLength));
+  const chunkTypes: string[] = [];
+  for (let offset = 8; offset < png.length;) {
+    const length = png.readUInt32BE(offset);
+    chunkTypes.push(png.subarray(offset + 4, offset + 8).toString("ascii"));
+    offset += 12 + length;
+  }
+  const imageUploadRequest = buildS4ImageRequest({ promptText: "local", sourceBytes: Buffer.from([1]), maskBytes: png });
+  const decoded = inflateSync(idatData);
+  const singleEditableRaster = Buffer.alloc(PIXELS, 0);
+  singleEditableRaster[0] = 255;
+  const singleEditablePng = encodeS4ProviderMaskPng(singleEditableRaster);
+  const singleEditableIdatOffset = singleEditablePng.indexOf(Buffer.from("IDAT"));
+  const singleEditableIdatLength = singleEditablePng.readUInt32BE(singleEditableIdatOffset - 4);
+  const singleEditableDecoded = inflateSync(singleEditablePng.subarray(singleEditableIdatOffset + 4, singleEditableIdatOffset + 4 + singleEditableIdatLength));
   assert.equal(decoded[0], 0);
   assert.equal(decoded[1 + 3], 0);
   assert.equal(decoded[1 + 500 * 4 + 3], 255);
@@ -302,11 +375,18 @@ test("S4 evidence: provider mask PNG has exact polarity and encoding", async () 
     "rgba": () => assert.equal(metadata.channels, 4),
     "protected-opaque": () => assert.equal(decoded[1 + 500 * 4 + 3], 255),
     "editable-transparent": () => assert.equal(decoded[1 + 3], 0),
-    "stored-deflate": () => assert.ok(idatLength > 0 && decoded.length === HEIGHT * scanlineSize),
-    "no-metadata": () => assert.equal(png.includes(Buffer.from("tEXt")), false),
+    "stored-deflate": () => {
+      assert.deepEqual([...idatData.subarray(0, 2)], [0x78, 0x01]);
+      assert.deepEqual([...idatData.subarray(2, 7)], [0x00, 0xff, 0xff, 0x00, 0x00]);
+      assert.ok(idatLength > 0 && decoded.length === HEIGHT * scanlineSize);
+    },
+    "no-metadata": () => { assert.equal(png.includes(Buffer.from("tEXt")), false); assert.deepEqual(chunkTypes, ["IHDR", "IDAT", "IEND"]); },
     "hash-distinct": () => assert.notEqual(mask.providerPngSha256, materializeS4Mask([{ kind: "rectangle", xQ16: 20_000, yQ16: 13_107, widthQ16: 19_661, heightQ16: 19_661 }]).providerPngSha256),
-    "filename": () => assert.match("projects/" + UUID + "/s4/edits/" + UUID_2 + "/mask/" + UUID + "/provider.png", /provider\.png$/),
-    "editable-fixture": () => assert.equal(decoded[1 + 3], 0),
+    "filename": () => { assert.equal(imageUploadRequest.maskPart.fileName, "s4-mask.png"); assert.equal(imageUploadRequest.maskPart.contentType, "image/png"); },
+    "editable-fixture": () => {
+      assert.equal(singleEditableDecoded[1 + 3], 0);
+      assert.equal(singleEditableDecoded[1 + 1 * 4 + 3], 255);
+    },
   });
 });
 
@@ -328,6 +408,17 @@ test("S4 evidence: image provider request is fixed and single-output", async () 
   assert.equal(assessment.store, false);
   assert.equal(assessment.text.format.strict, true);
   assert.equal(assessment.text.format.name, S4_ASSESSMENT_SCHEMA_NAME);
+  let malformedImageCalls = 0;
+  const malformedImageProvider = new OpenAIS4Provider({
+    apiKey: "synthetic-test-key",
+    fetchImpl: async () => {
+      malformedImageCalls += 1;
+      return new Response(JSON.stringify({ data: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  const malformedImageError = await malformedImageProvider.runS4ImageEdit({ promptText: "local", sourceBytes: Buffer.from([1]), maskBytes: Buffer.from([2]) }).then(() => null, (error: unknown) => error);
+  assert.equal((malformedImageError as { safeCode?: string }).safeCode, "IMAGE_EMPTY");
+  assert.equal(malformedImageCalls, 1);
   await proveVariantClaims("IMAGE-001", "S4 evidence: image provider request is fixed and single-output", "provider-request", "The executed provider-request assertion covered one immutable request contract property.", {
     "endpoint": () => { assert.equal(request.endpoint, "/v1/images/edits"); assert.equal(assessment.endpoint, "/v1/responses"); },
     "snapshot": () => { assert.equal(request.model, S4_IMAGE_MODEL_SNAPSHOT); assert.equal(assessment.model, S4_ASSESSMENT_MODEL); },
@@ -341,7 +432,10 @@ test("S4 evidence: image provider request is fixed and single-output", async () 
     "no-references": () => assert.equal(request.imageParts[0].field, "image[]"),
     "no-hidden-retry": () => assert.equal(request.n, 1),
     "one-output": () => assert.equal(request.n, 1),
-    "response-validate": () => { assert.equal(assessment.store, false); assert.equal(assessment.text.format.strict, true); },
+    "response-validate": () => {
+      assert.equal((malformedImageError as { safeCode?: string }).safeCode, "IMAGE_EMPTY");
+      assert.equal(malformedImageCalls, 1);
+    },
   }, ["supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer"]);
 });
 
@@ -353,6 +447,12 @@ test("S4 evidence: instruction compiler is normalized and server-bound", async (
   assert.equal(s4InstructionHash("  edit  "), s4InstructionHash("edit"));
   assert.notEqual(s4InstructionHash("edit"), s4InstructionHash("different edit"));
   const prompt = compileS4LocalEdit(compilerContext(materializeS4Mask([RECTANGLE]))).promptText;
+  const exactUiInstruction = instructionDraftState("😀".repeat(600));
+  const overUiInstruction = instructionDraftState("😀".repeat(601));
+  assert.equal(exactUiInstruction.scalarCount, 600);
+  assert.equal(exactUiInstruction.utf8ByteCount, 2_400);
+  assert.equal(exactUiInstruction.valid, true);
+  assert.equal(overUiInstruction.valid, false);
   assert.match(prompt, /UNTRUSTED USER INSTRUCTION/);
   assert.match(prompt, /CONFIRMED GEOMETRY/);
   assert.match(prompt, /Never change/);
@@ -361,7 +461,11 @@ test("S4 evidence: instruction compiler is normalized and server-bound", async (
     "nfc": () => assert.equal(normalizeS4Instruction("Cafe\u0301"), "Café"),
     "trim": () => assert.equal(normalizeS4Instruction("  edit  "), "edit"),
     "scalar-bound": () => assert.throws(() => normalizeS4Instruction("😀".repeat(601))),
-    "utf8-bound": () => assert.throws(() => normalizeS4Instruction("é".repeat(601))),
+    "utf8-bound": () => {
+      assert.equal(exactUiInstruction.utf8ByteCount, 2_400);
+      assert.equal(exactUiInstruction.valid, true);
+      assert.equal(overUiInstruction.valid, false);
+    },
     "controls": () => assert.throws(() => normalizeS4Instruction("\u0000local")),
     "surrogate": () => assert.throws(() => normalizeS4Instruction("\ud800")),
     "no-keyword-parser": () => assert.equal(prompt.includes("keyword"), false),
@@ -622,100 +726,195 @@ test("S4 evidence: assessment schema and reducer are strict", async () => {
 });
 
 test("S4 evidence: API and privacy boundaries are default-deny", async () => {
-  const denied = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", UUID, "s4"], {
-    workflowService: {} as never,
+  const validEditBody = {
+    baseRevisionId: UUID,
+    expectedSelectionVersion: 2,
+    primitives: [RECTANGLE],
+    instructionText: "Replace the selected finish.",
+  };
+  let serviceLookups = 0;
+  const apiService = {
+    s4: {
+      getState: (_projectId: UUID) => { serviceLookups += 1; return PUBLIC_STATE; },
+      getEdit: (_projectId: UUID, _editId: UUID) => { serviceLookups += 1; return PUBLIC_EDIT; },
+      admitEdit: () => ({ replayed: false, result: { editId: UUID_2, cycleNumber: 1, status: "preparing_mask", maskReady: false, baseRevisionId: UUID, selectionVersion: 2, cyclesConsumed: 1 } }),
+      imageRetry: () => ({ replayed: false, result: { editId: UUID_2, status: "generating", imageRetryAvailable: false, assessmentRetryAvailable: false } }),
+      assessmentRetry: () => ({ replayed: false, result: { editId: UUID_2, status: "assessment_pending", imageRetryAvailable: false, assessmentRetryAvailable: false } }),
+    },
+    s3: {
+      getPreview: async (_projectId: UUID, _revisionId: UUID) => ({ bytes: Buffer.from([137, 80, 78, 71]), contentType: "image/png", contentLength: 4 }),
+    },
+  } as never;
+  let authorizationChecks = 0;
+  const authorized = {
+    workflowService: apiService,
+    s3Authorization: {
+      resolveContext: async () => { authorizationChecks += 1; return { subjectId: "synthetic-subject" }; },
+      authorizeProject: async (_context: { subjectId: string }, projectId: UUID) => projectId === UUID,
+    },
+  };
+  const requestFor = (method: string, headers: Record<string, string> = {}, body?: unknown): Request => new Request("http://localhost", {
+    method,
+    headers,
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const denied = await handleApiRequest(requestFor("GET"), ["projects", UUID, "s4"], {
+    workflowService: apiService,
     s3Authorization: { resolveContext: async () => null, authorizeProject: async () => true },
   });
-  assert.equal(denied.status, 404);
-  const crossProject = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", UUID, "s4"], {
-    workflowService: {} as never,
+  const crossProject = await handleApiRequest(requestFor("GET"), ["projects", UUID, "s4"], {
+    workflowService: apiService,
     s3Authorization: { resolveContext: async () => ({ subjectId: "synthetic" }), authorizeProject: async () => false },
   });
+  const defaultDeny = await handleApiRequest(requestFor("GET"), ["projects", UUID, "s4"], apiService);
+  const unauthorizedServiceLookups = serviceLookups;
+  const stateResponse = await handleApiRequest(requestFor("GET"), ["projects", UUID, "s4"], authorized);
+  const detailResponse = await handleApiRequest(requestFor("GET"), ["projects", UUID, "s4", "edits", UUID_2], authorized);
+  const admissionResponse = await handleApiRequest(requestFor("POST", { "content-type": "application/json", "Idempotency-Key": UUID_2 }, validEditBody), ["projects", UUID, "s4", "edits"], authorized);
+  const imageRetryResponse = await handleApiRequest(requestFor("POST", { "Idempotency-Key": UUID_2 }), ["projects", UUID, "s4", "edits", UUID_2, "image-retry"], authorized);
+  const assessmentRetryResponse = await handleApiRequest(requestFor("POST", { "Idempotency-Key": UUID_2 }), ["projects", UUID, "s4", "edits", UUID_2, "assessment-retry"], authorized);
+  const methodResponse = await handleApiRequest(requestFor("POST"), ["projects", UUID, "s4"], authorized);
+  const missingKeyResponse = await handleApiRequest(requestFor("POST", { "content-type": "application/json" }, validEditBody), ["projects", UUID, "s4", "edits"], authorized);
+  const missingContentTypeResponse = await handleApiRequest(requestFor("POST", { "Idempotency-Key": UUID_2 }, validEditBody), ["projects", UUID, "s4", "edits"], authorized);
+  const previewResponse = await handleApiRequest(requestFor("GET"), ["projects", UUID, "s3", "revisions", UUID_2, "preview"], authorized);
+  const logLines: string[] = [];
+  const originalConsoleError = console.error;
+  let errorResponse: Response;
+  console.error = (...args: unknown[]) => { logLines.push(args.map((item) => String(item)).join(" ")); };
+  try {
+    errorResponse = await handleApiRequest(requestFor("GET", { "x-request-id": UUID }), ["projects", UUID, "s4", "unknown"], authorized);
+  } finally {
+    console.error = originalConsoleError;
+  }
+  const stateBody = await stateResponse.json() as PublicS4State;
+  const detailBody = await detailResponse.json() as Record<string, unknown>;
+  const admissionBody = await admissionResponse.json() as Record<string, any>;
+  const imageRetryBody = await imageRetryResponse.json() as Record<string, any>;
+  const assessmentRetryBody = await assessmentRetryResponse.json() as Record<string, any>;
+  const missingKeyBody = await missingKeyResponse.json() as Record<string, any>;
+  const missingContentTypeBody = await missingContentTypeResponse.json() as Record<string, any>;
+  const errorBody = await errorResponse!.json() as Record<string, any>;
+  const previewBytes = Buffer.from(await previewResponse.arrayBuffer());
+  const publicJson = JSON.stringify({ state: stateBody, edit: detailBody });
+  const logRecord = JSON.parse(logLines[0]) as Record<string, unknown>;
+  assert.equal(denied.status, 404);
   assert.equal(crossProject.status, 404);
-  const markup = renderToStaticMarkup(createElement(S4Screen, {
-    projectId: UUID,
-    initialState: {
-      projectId: UUID,
-      generationSetId: UUID_2,
-      selectionVersion: 1,
-      activeRevisionId: UUID_2,
-      activeRevisionKind: "s3",
-      activeQuality: "PASS",
-      activePreviewAvailable: false,
-      stageStatus: "started",
-      s3RefinementClosed: true,
-      cyclesConsumed: 1,
-      cyclesRemaining: 1,
-      edits: [],
-    },
-  }));
-  assert.match(markup, /Local edit stage/);
-  assert.match(markup, /brush/);
-  assert.match(markup, /Clear local mask/);
-  assert.equal(markup.includes("storageKey"), false);
-  assert.equal(markup.includes("promptHash"), false);
-  assert.equal(markup.includes("OPENAI_API_KEY"), false);
+  assert.equal(defaultDeny.status, 404);
+  assert.equal(unauthorizedServiceLookups, 0);
+  assert.equal(authorizationChecks, 10);
+  assert.equal(serviceLookups > unauthorizedServiceLookups, true);
+  assert.equal(stateResponse.status, 200);
+  assert.equal(detailResponse.status, 200);
+  assert.equal(admissionResponse.status, 202);
+  assert.equal(imageRetryResponse.status, 202);
+  assert.equal(assessmentRetryResponse.status, 202);
+  assert.equal(methodResponse.status, 405);
+  assert.equal(missingKeyResponse.status, 400);
+  assert.equal(missingContentTypeResponse.status, 400);
+  assert.equal(previewResponse.status, 200);
+  assert.deepEqual(Object.keys(stateBody).sort(), Object.keys(PUBLIC_STATE).sort());
+  assert.deepEqual(Object.keys(detailBody).sort(), Object.keys(PUBLIC_EDIT).sort());
+  assert.deepEqual(Object.keys((detailBody.assessment ?? {}) as Record<string, unknown>).sort(), Object.keys(PUBLIC_ASSESSMENT).sort());
+  assert.equal(admissionBody.result.editId, UUID_2);
+  assert.equal(imageRetryBody.result.status, "generating");
+  assert.equal(assessmentRetryBody.result.status, "assessment_pending");
+  assert.equal(missingKeyBody.error.code, "IDEMPOTENCY_KEY_REQUIRED");
+  assert.deepEqual(missingKeyBody.error.fieldErrors, [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]);
+  assert.equal(missingContentTypeBody.error.code, "INVALID_REQUEST");
+  assert.deepEqual(missingContentTypeBody.error.fieldErrors, [{ field: "body", code: "JSON_REQUIRED" }]);
+  assert.deepEqual([...previewBytes], [137, 80, 78, 71]);
+  assert.equal(previewResponse.headers.get("cache-control"), "private, no-store");
+  assert.equal(errorResponse!.status, 400);
+  assert.deepEqual(errorBody.error, {
+    code: "INVALID_REQUEST",
+    message: "The request could not be completed. Try again or contact support with the reference ID.",
+    referenceId: UUID,
+    fieldErrors: [],
+  });
+  assert.deepEqual(Object.keys(logRecord).sort(), ["code", "operation", "referenceId", "status"]);
+  assert.deepEqual(logRecord, { code: "INVALID_REQUEST", operation: "api_request", referenceId: UUID, status: 400 });
+  assert.equal(publicJson.includes(PUBLIC_EDIT.instructionText), true);
+  for (const forbidden of ["storageKey", "promptHash", "providerMetadata", "claimToken", "evidenceObject", "OPENAI_API_KEY", "CONFIRMED GEOMETRY", "UNTRUSTED USER INSTRUCTION"]) {
+    assert.equal(publicJson.includes(forbidden), false, forbidden);
+  }
   await proveVariantClaims("AUTH-API-001", "S4 evidence: API and privacy boundaries are default-deny", "api-boundary", "The executed API assertion covered one authorization, route, method, header, status, preview, error, or DTO boundary.", {
-    "auth-first": () => assert.deepEqual(denied.status, 404),
-    "default-deny": () => assert.equal(crossProject.status, 404),
+    "auth-first": () => { assert.equal(unauthorizedServiceLookups, 0); assert.equal(authorizationChecks > 0, true); },
+    "default-deny": () => assert.equal(defaultDeny.status, 404),
     "cross-project": () => assert.equal(crossProject.status, 404),
-    "routes": () => assert.match(markup, /Local edit stage/),
-    "methods": () => assert.match(markup, /Clear local mask/),
-    "headers": () => assert.equal(markup.includes("storageKey"), false),
-    "statuses": () => { assert.equal(denied.status, 404); assert.equal(crossProject.status, 404); },
-    "preview": () => assert.match(markup, /brush/),
-    "errors": () => assert.equal(JSON.stringify({ status: denied.status }).includes("referenceId"), false),
-    "dto": () => assert.equal(markup.includes("promptHash"), false),
+    "routes": () => { assert.equal(stateResponse.status, 200); assert.equal(detailResponse.status, 200); assert.equal(admissionResponse.status, 202); assert.equal(imageRetryResponse.status, 202); assert.equal(assessmentRetryResponse.status, 202); },
+    "methods": () => assert.equal(methodResponse.status, 405),
+    "headers": () => { assert.deepEqual(missingKeyBody.error.fieldErrors, [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]); assert.deepEqual(missingContentTypeBody.error.fieldErrors, [{ field: "body", code: "JSON_REQUIRED" }]); },
+    "statuses": () => assert.deepEqual([stateResponse.status, admissionResponse.status, missingKeyResponse.status, methodResponse.status, crossProject.status], [200, 202, 400, 405, 404]),
+    "preview": () => { assert.deepEqual([...previewBytes], [137, 80, 78, 71]); assert.equal(previewResponse.headers.get("cache-control"), "private, no-store"); },
+    "errors": () => { assert.equal(errorBody.error.referenceId, UUID); assert.equal(errorBody.error.message.includes("reference ID"), true); assert.deepEqual(errorBody.error.fieldErrors, []); },
+    "dto": () => { assert.deepEqual(Object.keys(stateBody).sort(), Object.keys(PUBLIC_STATE).sort()); assert.deepEqual(Object.keys(detailBody).sort(), Object.keys(PUBLIC_EDIT).sort()); },
   });
   await proveVariantClaims("PRIVACY-001", "S4 evidence: API and privacy boundaries are default-deny", "privacy-boundary", "The executed privacy assertion verified that one prohibited private field or provider surface was absent.", {
-    "no-keys": () => assert.equal(markup.includes("storageKey"), false),
-    "no-hashes": () => assert.equal(markup.includes("promptHash"), false),
-    "no-prompts": () => assert.equal(markup.includes("instructionText"), false),
-    "no-provider": () => assert.equal(markup.includes("providerMetadata"), false),
-    "no-claims": () => assert.equal(markup.includes("claimToken"), false),
-    "no-evidence": () => assert.equal(markup.includes("evidenceObject"), false),
-    "no-credentials": () => assert.equal(markup.includes("OPENAI_API_KEY"), false),
-    "safe-log": () => assert.equal(markup.includes("customer"), false),
+    "no-keys": () => assert.equal(publicJson.includes("storageKey"), false),
+    "no-hashes": () => assert.equal(publicJson.includes("promptHash"), false),
+    "no-prompts": () => { assert.equal(publicJson.includes(PUBLIC_EDIT.instructionText), true); assert.equal(publicJson.includes("CONFIRMED GEOMETRY"), false); assert.equal(publicJson.includes("UNTRUSTED USER INSTRUCTION"), false); },
+    "no-provider": () => assert.equal(publicJson.includes("providerMetadata"), false),
+    "no-claims": () => assert.equal(publicJson.includes("claimToken"), false),
+    "no-evidence": () => assert.equal(publicJson.includes("evidenceObject"), false),
+    "no-credentials": () => assert.equal(publicJson.includes("OPENAI_API_KEY"), false),
+    "safe-log": () => { assert.deepEqual(Object.keys(logRecord).sort(), ["code", "operation", "referenceId", "status"]); assert.equal(JSON.stringify(logRecord).includes("customer"), false); },
   });
 });
 
 test("S4 evidence: client requests retain operation keys", async () => {
   const calls: Array<{ input: string; init?: RequestInit }> = [];
-  const response = () => new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  const response = () => new Response(JSON.stringify(PUBLIC_STATE), { status: 200, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
   const client = createS4Client({ projectId: UUID, fetcher: async (input, init) => { calls.push({ input, init }); return response(); } });
+  const validPrimitive: S4Primitive = { kind: "rectangle", xQ16: 1, yQ16: 1, widthQ16: 20_000, heightQ16: 20_000 };
+  const validDraft = { primitives: [validPrimitive], instructionText: "local", hasActiveRevision: true, cyclesRemaining: 1 };
+  const invalidRectangle: S4Primitive = { kind: "rectangle", xQ16: 65_000, yQ16: 1, widthQ16: 1_000, heightQ16: 20_000 };
+  const invalidBrush: S4Primitive = { kind: "brush", radiusQ8: 63, points: [{ xQ16: 1, yQ16: 1 }] };
+  const exactInstruction = instructionDraftState("😀".repeat(600));
+  const overInstruction = instructionDraftState("😀".repeat(601));
+  assert.equal(isS4PrimitiveLocallyValid(validPrimitive), true);
+  assert.equal(isS4DraftSubmitReady(validDraft), true);
+  assert.equal(isS4DraftSubmitReady({ ...validDraft, primitives: [] }), false);
+  assert.equal(isS4DraftSubmitReady({ ...validDraft, primitives: [invalidRectangle] }), false);
+  assert.equal(isS4DraftSubmitReady({ ...validDraft, primitives: [invalidBrush] }), false);
+  assert.equal(isS4DraftSubmitReady({ ...validDraft, cyclesRemaining: 0 }), false);
+  assert.equal(exactInstruction.scalarCount, 600);
+  assert.equal(exactInstruction.utf8ByteCount, 2_400);
+  assert.equal(exactInstruction.valid, true);
+  assert.equal(overInstruction.valid, false);
+  assert.equal(isS4DraftClearEnabled([validPrimitive]), true);
+  assert.equal(isS4DraftClearEnabled([validPrimitive], true), false);
+  await client.refresh();
   await client.edit({ baseRevisionId: UUID_2, expectedSelectionVersion: 1, primitives: [{ kind: "rectangle", xQ16: 1, yQ16: 1, widthQ16: 20_000, heightQ16: 20_000 }], instructionText: "local" });
   await client.retry(UUID_2, "image");
   await client.retry(UUID_2, "assessment");
   await client.rollback(UUID_2, 1);
-  assert.equal(calls.length, 4);
-  assert.equal(calls[0].input, "/api/projects/" + UUID + "/s4/edits");
-  assert.equal(calls[1].input, "/api/projects/" + UUID + "/s4/edits/" + UUID_2 + "/image-retry");
-  assert.equal(calls[2].input, "/api/projects/" + UUID + "/s4/edits/" + UUID_2 + "/assessment-retry");
-  assert.equal(calls[3].input, "/api/projects/" + UUID + "/s3/selection");
-  for (const call of calls) assert.ok(new Headers(call.init?.headers).get("Idempotency-Key"));
+  assert.equal(calls.length, 5);
+  assert.equal(calls[0].input, "/api/projects/" + UUID + "/s4");
+  assert.equal(calls[0].init?.cache, "no-store");
+  assert.equal(calls[1].input, "/api/projects/" + UUID + "/s4/edits");
+  assert.equal(calls[2].input, "/api/projects/" + UUID + "/s4/edits/" + UUID_2 + "/image-retry");
+  assert.equal(calls[3].input, "/api/projects/" + UUID + "/s4/edits/" + UUID_2 + "/assessment-retry");
+  assert.equal(calls[4].input, "/api/projects/" + UUID + "/s3/selection");
+  for (const call of calls.slice(1)) assert.ok(new Headers(call.init?.headers).get("Idempotency-Key"));
   const markup = renderToStaticMarkup(createElement(S4Screen, {
     projectId: UUID,
-    initialState: {
-      projectId: UUID, generationSetId: UUID_2, selectionVersion: 1, activeRevisionId: UUID_2,
-      activeRevisionKind: "s3", activeQuality: "PASS", activePreviewAvailable: true,
-      stageStatus: "started", s3RefinementClosed: true, cyclesConsumed: 1, cyclesRemaining: 1, edits: [],
-    },
+    initialState: PUBLIC_STATE,
   }));
   await proveVariantClaims("CLIENT-001", "S4 evidence: client requests retain operation keys", "client-surface", "The executed client assertion covered one route, control, persisted-state, or request-key property.", {
-    "mask-ready": () => assert.match(markup, /Local edit stage/),
+    "mask-ready": () => { assert.equal(isS4DraftSubmitReady(validDraft), true); assert.match(markup, /Mask verified/); },
     "rectangle-ui": () => assert.match(markup, /rectangle/),
     "brush-ui": () => assert.match(markup, /brush/),
-    "clear": () => assert.match(markup, /Clear local mask/),
-    "bounds": () => assert.equal(calls[0].input.includes("/s4/edits"), true),
-    "submit": () => assert.equal(calls[0].init?.method, "POST"),
-    "poll": () => assert.equal(calls.length >= 1, true),
-    "retry": () => assert.equal(calls[1].input.endsWith("/image-retry"), true),
+    "clear": () => { assert.match(markup, /Clear local mask/); assert.equal(isS4DraftClearEnabled([validPrimitive]), true); },
+    "bounds": () => { assert.equal(isS4PrimitiveLocallyValid(invalidRectangle), false); assert.equal(isS4PrimitiveLocallyValid(invalidBrush), false); },
+    "submit": () => { assert.equal(calls[1].init?.method, "POST"); assert.equal(isS4DraftSubmitReady(validDraft), true); },
+    "poll": () => { assert.equal(calls[0].input, "/api/projects/" + UUID + "/s4"); assert.equal(calls[0].init?.cache, "no-store"); },
+    "retry": () => assert.equal(calls[2].input.endsWith("/image-retry"), true),
     "preservation": () => assert.match(markup, /preserv/i),
-    "assessment": () => assert.equal(calls[2].input.endsWith("/assessment-retry"), true),
-    "history": () => assert.match(markup, /History|history/i),
-    "rollback": () => assert.equal(calls[3].input.endsWith("/s3/selection"), true),
-    "budget": () => assert.match(markup, /cycle|Cycles/i),
-    "no-infer": () => assert.equal(calls.every((call) => new Headers(call.init?.headers).get("Idempotency-Key")), true),
+    "assessment": () => { assert.equal(calls[3].input.endsWith("/assessment-retry"), true); assert.match(markup, /assessment PASS/); },
+    "history": () => assert.match(markup, /Persisted edit history/),
+    "rollback": () => { assert.equal(calls[4].input.endsWith("/s3/selection"), true); assert.match(markup, /Rollback pointer/); },
+    "budget": () => assert.match(markup, /cycle\(s\) remaining/),
+    "no-infer": () => { assert.equal(isS4DraftSubmitReady({ ...validDraft, cyclesRemaining: 0 }), false); assert.equal(calls.slice(1).every((call) => new Headers(call.init?.headers).get("Idempotency-Key")), true); },
   }, [
     "requestCount=" + calls.length,
     "idempotencyKeys=" + calls.filter((call) => Boolean(new Headers(call.init?.headers).get("Idempotency-Key"))).length,

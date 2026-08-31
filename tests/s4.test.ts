@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,11 +14,11 @@ import { handleApiRequest, type ApiRequestDependencies } from "../src/lib/api";
 import { createExactS3FixturePng } from "../src/lib/s3-media";
 import { materializeS4Mask } from "../src/lib/s4-mask";
 import { evaluateS4Preservation } from "../src/lib/s4-preservation";
-import type { S4ProviderContract } from "../src/lib/s4-provider";
+import { OpenAIS4Provider, type S4ProviderContract } from "../src/lib/s4-provider";
 import { resolveActiveVisualRevision, resolveVisualRevision } from "../src/lib/revision-resolver";
 import { validateS4Collections, validateS4Graph } from "../src/lib/s4-persistence";
 import { cloneJson, sha256 } from "../src/lib/utils";
-import { createS4Client, S4Screen } from "../app/components/S4Client";
+import { createS4Client, instructionDraftState, isS4DraftClearEnabled, isS4DraftSubmitReady, isS4PrimitiveLocallyValid, S4Screen } from "../app/components/S4Client";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { proveS4Claims } from "./s4-proof";
@@ -175,6 +176,7 @@ type S4Fixture = {
 type S4FixtureOptions = Pick<WorkflowServiceOptions, "processId" | "isProcessAlive" | "onS4ProviderDispatchPhase" | "onS4PublicationPhase"> & {
   imageResults?: Array<Buffer | ProviderFailure>;
   assessmentResults?: Array<any | ProviderFailure>;
+  s4Provider?: S4ProviderContract;
   beforeCommit?: () => void;
   onLockPhase?: (phase: RepositoryLockPhase, record: RepositoryLockRecord, path: string) => void;
 };
@@ -237,15 +239,19 @@ async function fixture(options: S4FixtureOptions = {}): Promise<S4Fixture> {
     },
   };
   const provider = new MockOpenAIProvider({ briefData: briefData(), s2QaResponseFactory: (input) => s2QaPayload(input) });
-  const { imageResults: _images, assessmentResults: _assessments, ...workflowOptions } = options;
-  const service = createWorkflowService({ repository, objects, provider, s4Provider, ...workflowOptions });
-  return { root, repository, objects, service, provider, s4Provider, projectId, generationSetId, sourceBytes, outputBytes, imageCallCount: () => imageCalls, assessmentCallCount: () => assessmentCalls, imageInputs, assessmentInputs };
+  const { imageResults: _images, assessmentResults: _assessments, s4Provider: suppliedS4Provider, ...workflowOptions } = options;
+  const activeS4Provider = suppliedS4Provider ?? s4Provider;
+  const service = createWorkflowService({ repository, objects, provider, s4Provider: activeS4Provider, ...workflowOptions });
+  return { root, repository, objects, service, provider, s4Provider: activeS4Provider, projectId, generationSetId, sourceBytes, outputBytes, imageCallCount: () => imageCalls, assessmentCallCount: () => assessmentCalls, imageInputs, assessmentInputs };
 }
 
-function restart(value: S4Fixture, options: Pick<WorkflowServiceOptions, "processId" | "isProcessAlive" | "onS4ProviderDispatchPhase" | "onS4PublicationPhase"> = {}): WorkflowService {
-  const repository = new JsonRepository(value.root, options.processId === undefined ? {} : { processId: options.processId, isProcessAlive: options.isProcessAlive });
+type S4RestartOptions = Pick<WorkflowServiceOptions, "processId" | "isProcessAlive" | "onS4ProviderDispatchPhase" | "onS4PublicationPhase"> & { s4Provider?: S4ProviderContract };
+
+function restart(value: S4Fixture, options: S4RestartOptions = {}): WorkflowService {
+  const { s4Provider, ...workflowOptions } = options;
+  const repository = new JsonRepository(value.root, workflowOptions.processId === undefined ? {} : { processId: workflowOptions.processId, isProcessAlive: workflowOptions.isProcessAlive });
   const objects = new PrivateObjectStore(join(value.root, "objects"));
-  return createWorkflowService({ repository, objects, provider: value.provider, s4Provider: value.s4Provider, ...options });
+  return createWorkflowService({ repository, objects, provider: value.provider, s4Provider: s4Provider ?? value.s4Provider, ...workflowOptions });
 }
 
 async function waitFor<T>(read: () => T, done: (value: T) => boolean, timeoutMs = 30_000): Promise<T> {
@@ -271,6 +277,23 @@ async function ready(value: S4Fixture): Promise<{ sourceRevisionId: string; sele
 }
 
 function cleanup(value: S4Fixture): void { rmSync(value.root, { recursive: true, force: true }); }
+
+function runStoreRaceWriter(root: string, barrier: string, key: string, bytes: Buffer): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["node_modules/tsx/dist/cli.mjs", "tests/s4-object-store-race-worker.ts", root, barrier, key, bytes.toString("hex")], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { output += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) { reject(new Error("store race writer failed")); return; }
+      resolve(output.trim());
+    });
+  });
+}
 
 const EDIT_PRIMITIVES: S4MaskPrimitive[] = [{ kind: "rectangle", xQ16: 13_107, yQ16: 13_107, widthQ16: 19_661, heightQ16: 19_661 }];
 
@@ -395,6 +418,323 @@ test("S4 successful edit persists one stage, one cycle, and activates through th
     });
     assert.throws(() => value.service.s3.refine(value.projectId, state.activeRevisionId!, state.selectionVersion, "S3 must be closed", randomUUID(), randomUUID()), (error: unknown) => error instanceof AppError && error.code === "S3_LINEAGE_CONFLICT");
   } finally { cleanup(value); }
+});
+
+test("S4 pre-dispatch preflight keeps local failures not_started and recovers the same attempt", async () => {
+  const missingImageMethod = await fixture();
+  const missingAssessmentMethod = await fixture();
+  const missingImageConfig = await fixture();
+  let missingAssessmentConfig!: S4Fixture;
+  let missingAssessmentProvider!: OpenAIS4Provider;
+  const missingAssessmentFetchUrls: string[] = [];
+  missingAssessmentProvider = new OpenAIS4Provider({
+    apiKey: "",
+    fetchImpl: async (input) => {
+      missingAssessmentFetchUrls.push(String(input));
+      return new Response("{}", { status: 200 });
+    },
+  });
+  missingAssessmentConfig = await fixture({
+    onS4ProviderDispatchPhase: (phase, operation) => {
+      if (phase === "before-dispatch" && "assessmentAttemptId" in operation) {
+        missingAssessmentConfig.s4Provider.runS4Assessment = missingAssessmentProvider.runS4Assessment.bind(missingAssessmentProvider);
+        missingAssessmentConfig.s4Provider.assertS4AssessmentReady = missingAssessmentProvider.assertS4AssessmentReady.bind(missingAssessmentProvider);
+      }
+    },
+  });
+  const missingImageFetchUrls: string[] = [];
+  const correctedImageFetch: typeof fetch = async (input) => {
+    const url = String(input);
+    missingImageFetchUrls.push(url);
+    if (url.endsWith("/images/edits")) {
+      return new Response(JSON.stringify({ data: [{ b64_json: missingImageConfig.outputBytes.toString("base64") }] }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ id: "synthetic-assessment", output_text: JSON.stringify(s4AssessmentPayload(missingImageConfig.repository)) }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const missingImageProvider = new OpenAIS4Provider({ apiKey: "", fetchImpl: correctedImageFetch });
+  const correctedImageProvider = new OpenAIS4Provider({ apiKey: "synthetic-test-key", fetchImpl: correctedImageFetch });
+  try {
+    const missingImageMethodOriginal = missingImageMethod.s4Provider.runS4ImageEdit;
+    delete (missingImageMethod.s4Provider as Partial<S4ProviderContract>).runS4ImageEdit;
+    const missingImageSelected = await ready(missingImageMethod);
+    admit(missingImageMethod, missingImageSelected, "missing image provider method");
+    const missingImageQueued = await waitFor(() => missingImageMethod.repository.state(), (state) => state.s4ImageOperations[0]?.status === "queued" && state.s4ImageOperations[0]?.providerDispatchState === "not_started");
+    const missingImageOperation = missingImageQueued.s4ImageOperations[0];
+    assert.ok(missingImageOperation);
+    assert.equal(missingImageOperation.attempt, 1);
+    assert.equal(missingImageOperation.providerDispatchState, "not_started");
+    assert.equal(missingImageOperation.claimedBy, null);
+    assert.equal(missingImageOperation.claimedProcessId, null);
+    assert.equal(missingImageMethod.imageCallCount(), 0);
+    assert.equal(missingImageQueued.s4ImageOperations.length, 1);
+    assert.equal(missingImageQueued.s4Edits.length, 1);
+    assert.equal(missingImageQueued.s4Stages[0].cyclesConsumed, 1);
+    missingImageMethod.s4Provider.runS4ImageEdit = missingImageMethodOriginal;
+    const missingImageRecovered = restart(missingImageMethod, { processId: 8601, isProcessAlive: (processId) => processId === 8601 });
+    const missingImageDone = await waitFor(() => missingImageRecovered.s4.getState(missingImageMethod.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const missingImageAfter = missingImageMethod.repository.state();
+    assert.equal(missingImageAfter.s4ImageOperations[0].operationId, missingImageOperation.operationId);
+    assert.equal(missingImageAfter.s4ImageOperations[0].attempt, 1);
+    assert.equal(missingImageAfter.s4ImageOperations[0].providerDispatchState, "consumed");
+    assert.equal(missingImageMethod.imageCallCount(), 1);
+    assert.equal(missingImageDone.activeRevisionKind, "s4");
+
+    const missingAssessmentMethodOriginal = missingAssessmentMethod.s4Provider.runS4Assessment;
+    delete (missingAssessmentMethod.s4Provider as Partial<S4ProviderContract>).runS4Assessment;
+    const missingAssessmentSelected = await ready(missingAssessmentMethod);
+    admit(missingAssessmentMethod, missingAssessmentSelected, "missing assessment provider method");
+    const missingAssessmentQueued = await waitFor(() => missingAssessmentMethod.repository.state(), (state) => state.s4AssessmentAttempts[0]?.status === "queued" && state.s4AssessmentAttempts[0]?.providerDispatchState === "not_started");
+    const missingAssessmentAttempt = missingAssessmentQueued.s4AssessmentAttempts[0];
+    assert.ok(missingAssessmentAttempt);
+    assert.equal(missingAssessmentAttempt.attempt, 1);
+    assert.equal(missingAssessmentAttempt.providerDispatchState, "not_started");
+    assert.equal(missingAssessmentAttempt.claimedBy, null);
+    assert.equal(missingAssessmentMethod.assessmentCallCount(), 0);
+    assert.equal(missingAssessmentQueued.s4AssessmentAttempts.length, 1);
+    assert.equal(missingAssessmentQueued.s4Edits.length, 1);
+    missingAssessmentMethod.s4Provider.runS4Assessment = missingAssessmentMethodOriginal;
+    const missingAssessmentRecovered = restart(missingAssessmentMethod, { processId: 8602, isProcessAlive: (processId) => processId === 8602 });
+    const missingAssessmentDone = await waitFor(() => missingAssessmentRecovered.s4.getState(missingAssessmentMethod.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const missingAssessmentAfter = missingAssessmentMethod.repository.state();
+    assert.equal(missingAssessmentAfter.s4AssessmentAttempts[0].assessmentAttemptId, missingAssessmentAttempt.assessmentAttemptId);
+    assert.equal(missingAssessmentAfter.s4AssessmentAttempts[0].attempt, 1);
+    assert.equal(missingAssessmentAfter.s4AssessmentAttempts[0].providerDispatchState, "consumed");
+    assert.equal(missingAssessmentMethod.assessmentCallCount(), 1);
+    assert.equal(missingAssessmentDone.activeRevisionKind, "s4");
+
+    assert.throws(() => missingImageProvider.assertS4ImageEditReady(), (error: unknown) => error instanceof ProviderFailure && error.safeCode === "PROVIDER_NOT_CONFIGURED");
+    const missingImageConfigSelected = await ready(missingImageConfig);
+    missingImageConfig.service = createWorkflowService({
+      repository: missingImageConfig.repository,
+      objects: missingImageConfig.objects,
+      provider: missingImageConfig.provider,
+      s4Provider: missingImageProvider,
+    });
+    const configAdmission = admit(missingImageConfig, missingImageConfigSelected, "missing image configuration");
+    const configQueued = await waitFor(() => missingImageConfig.repository.state(), (state) => state.s4ImageOperations[0]?.status === "queued" && state.s4ImageOperations[0]?.providerDispatchState === "not_started");
+    const configOperation = configQueued.s4ImageOperations[0];
+    assert.ok(configOperation);
+    assert.equal(configOperation.attempt, 1);
+    assert.equal(configOperation.providerDispatchState, "not_started");
+    assert.equal(missingImageFetchUrls.length, 0);
+    assert.equal(configQueued.s4ImageOperations.length, 1);
+    assert.equal(configQueued.s4Stages[0].cyclesConsumed, configAdmission.result.cyclesConsumed);
+    const configRecovered = restart(missingImageConfig, { processId: 8603, isProcessAlive: (processId) => processId === 8603, s4Provider: correctedImageProvider });
+    const configDone = await waitFor(() => configRecovered.s4.getState(missingImageConfig.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const configAfter = missingImageConfig.repository.state();
+    assert.equal(configAfter.s4ImageOperations[0].operationId, configOperation.operationId);
+    assert.equal(configAfter.s4ImageOperations[0].attempt, 1);
+    assert.equal(configAfter.s4ImageOperations[0].providerDispatchState, "consumed");
+    assert.equal(missingImageFetchUrls.filter((url) => url.endsWith("/images/edits")).length, 1);
+    assert.equal(configAfter.s4ImageOperations.length, 1);
+    assert.equal(configDone.activeRevisionKind, "s4");
+
+    assert.throws(() => missingAssessmentProvider.assertS4AssessmentReady(), (error: unknown) => error instanceof ProviderFailure && error.safeCode === "PROVIDER_NOT_CONFIGURED");
+    const missingAssessmentConfigSelected = await ready(missingAssessmentConfig);
+    admit(missingAssessmentConfig, missingAssessmentConfigSelected, "missing assessment configuration");
+    const assessmentConfigQueued = await waitFor(() => missingAssessmentConfig.repository.state(), (state) => state.s4AssessmentAttempts[0]?.status === "queued" && state.s4AssessmentAttempts[0]?.providerDispatchState === "not_started");
+    const assessmentConfigAttempt = assessmentConfigQueued.s4AssessmentAttempts[0];
+    assert.ok(assessmentConfigAttempt);
+    assert.equal(assessmentConfigAttempt.attempt, 1);
+    assert.equal(assessmentConfigAttempt.providerDispatchState, "not_started");
+    assert.equal(missingAssessmentFetchUrls.length, 0);
+    const correctedAssessmentProvider = new OpenAIS4Provider({
+      apiKey: "synthetic-test-key",
+      fetchImpl: async (input) => {
+        missingAssessmentFetchUrls.push(String(input));
+        return new Response(JSON.stringify({ id: "synthetic-assessment", output_text: JSON.stringify(s4AssessmentPayload(missingAssessmentConfig.repository)) }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+    const correctedAssessmentProviderContract: S4ProviderContract = {
+      runS4ImageEdit: missingAssessmentConfig.s4Provider.runS4ImageEdit,
+      runS4Assessment: correctedAssessmentProvider.runS4Assessment.bind(correctedAssessmentProvider),
+      assertS4AssessmentReady: correctedAssessmentProvider.assertS4AssessmentReady.bind(correctedAssessmentProvider),
+    };
+    const assessmentConfigRecovered = restart(missingAssessmentConfig, { processId: 8604, isProcessAlive: (processId) => processId === 8604, s4Provider: correctedAssessmentProviderContract });
+    const assessmentConfigDone = await waitFor(() => assessmentConfigRecovered.s4.getState(missingAssessmentConfig.projectId), (state) => state.edits[0]?.status === "usable_pass");
+    const assessmentConfigAfter = missingAssessmentConfig.repository.state();
+    assert.equal(assessmentConfigAfter.s4AssessmentAttempts[0].assessmentAttemptId, assessmentConfigAttempt.assessmentAttemptId);
+    assert.equal(assessmentConfigAfter.s4AssessmentAttempts[0].attempt, 1);
+    assert.equal(assessmentConfigAfter.s4AssessmentAttempts[0].providerDispatchState, "consumed");
+    assert.equal(missingAssessmentFetchUrls.filter((url) => url.endsWith("/responses")).length, 1);
+    assert.equal(missingAssessmentConfig.imageCallCount(), 1);
+    assert.equal(assessmentConfigAfter.s4AssessmentAttempts.length, 1);
+    assert.equal(assessmentConfigDone.activeRevisionKind, "s4");
+
+    await proveS4Variants("RECOVERY-001", "S4 pre-dispatch preflight keeps local failures not_started and recovers the same attempt", "pre-dispatch-preflight", "The executed image and assessment missing-method and missing-configuration fixtures completed no transport before preflight, preserved not_started accounting, and recovered the original attempt exactly once after local correction.", {
+      "pre-dispatch": () => {
+        assert.equal(missingImageOperation.providerDispatchState, "not_started");
+        assert.equal(missingAssessmentAttempt.providerDispatchState, "not_started");
+        assert.equal(configOperation.providerDispatchState, "not_started");
+        assert.equal(assessmentConfigAttempt.providerDispatchState, "not_started");
+        assert.equal(missingImageMethod.imageCallCount(), 1);
+        assert.equal(missingAssessmentMethod.assessmentCallCount(), 1);
+        assert.equal(missingImageFetchUrls.filter((url) => url.endsWith("/images/edits")).length, 1);
+        assert.equal(missingAssessmentFetchUrls.filter((url) => url.endsWith("/responses")).length, 1);
+        assert.equal(missingImageAfter.s4ImageOperations.length, 1);
+        assert.equal(missingAssessmentAfter.s4AssessmentAttempts.length, 1);
+        assert.equal(configAfter.s4ImageOperations.length, 1);
+        assert.equal(assessmentConfigAfter.s4AssessmentAttempts.length, 1);
+      },
+    }, [
+      "missingImageMethodCalls=0-before/1-after",
+      "missingAssessmentMethodCalls=0-before/1-after",
+      "missingImageConfigFetches=0-before/1-image-after",
+      "missingAssessmentConfigFetches=0-before/1-response-after",
+      "sameAttempt=true",
+      "newCycle=false",
+    ]);
+  } finally {
+    cleanup(missingImageMethod);
+    cleanup(missingAssessmentMethod);
+    cleanup(missingImageConfig);
+    cleanup(missingAssessmentConfig);
+  }
+});
+
+test("S4 object publication is exclusive under a competing writer and exact recovery", async () => {
+  const raceRoot = mkdtempSync(join(tmpdir(), "swooshz-s4-store-race-"));
+  const objects = new PrivateObjectStore(join(raceRoot, "objects"));
+  const barrier = join(raceRoot, "race.barrier");
+  const raceKey = "projects/" + FOREIGN_UUID + "/s4/race.bin";
+  const firstBytes = Buffer.from("complete-object-first");
+  const secondBytes = Buffer.from("complete-object-second");
+  let publicationFixture: S4Fixture | null = null;
+  try {
+    const outcomes = await Promise.all([
+      runStoreRaceWriter(objects.root, barrier, raceKey, firstBytes),
+      runStoreRaceWriter(objects.root, barrier, raceKey, secondBytes),
+    ]);
+    const winners = outcomes.filter((value) => value.startsWith("won:"));
+    const losers = outcomes.filter((value) => value === "lost:PERSISTENCE_FAILED");
+    assert.equal(winners.length, 1);
+    assert.equal(losers.length, 1);
+    const finalRaceBytes = objects.read(raceKey);
+    const finalRaceHash = sha256(finalRaceBytes);
+    assert.equal(winners[0], "won:" + finalRaceHash);
+    assert.equal(finalRaceBytes.equals(firstBytes) || finalRaceBytes.equals(secondBytes), true);
+
+    const existingKey = "projects/" + FOREIGN_UUID + "/s4/existing.bin";
+    const existingBytes = Buffer.from("existing-object");
+    const conflictingBytes = Buffer.from("different-object");
+    objects.put(existingKey, existingBytes);
+    assert.throws(() => objects.putExact(existingKey, conflictingBytes), (error: unknown) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
+    assert.equal(objects.read(existingKey).equals(existingBytes), true);
+    const conflictingStageKey = "projects/" + FOREIGN_UUID + "/s4/staging-conflict.bin";
+    objects.put(conflictingStageKey, conflictingBytes);
+    assert.throws(() => objects.promoteExact(conflictingStageKey, existingKey, conflictingBytes), (error: unknown) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
+    assert.equal(objects.read(existingKey).equals(existingBytes), true);
+    assert.equal(objects.read(conflictingStageKey).equals(conflictingBytes), true);
+    const identicalStageKey = "projects/" + FOREIGN_UUID + "/s4/staging-identical.bin";
+    objects.put(identicalStageKey, existingBytes);
+    objects.putExact(existingKey, existingBytes);
+    objects.promoteExact(identicalStageKey, existingKey, existingBytes);
+    assert.equal(objects.read(existingKey).equals(existingBytes), true);
+    objects.remove(conflictingStageKey);
+    objects.remove(identicalStageKey);
+
+    const stagedReached = deferred<void>();
+    publicationFixture = await fixture({
+      processId: 8701,
+      isProcessAlive: () => true,
+      onS4PublicationPhase: (phase) => {
+        if (phase === "after-publication-staged") {
+          stagedReached.resolve();
+          return "interrupt";
+        }
+      },
+    });
+    const selected = await ready(publicationFixture);
+    admit(publicationFixture, selected, "publication competing writer");
+    await stagedReached.promise;
+    const stagedState = publicationFixture.repository.state();
+    const publication = stagedState.s4Publications[0];
+    const stagedOperation = stagedState.s4ImageOperations[0];
+    assert.ok(publication && stagedOperation);
+    assert.equal(publication.state, "staged");
+    const publicationConflict = Buffer.from("conflicting-final-publication");
+    publicationFixture.objects.put(publication.finalObjects[0].key, publicationConflict);
+    const recovered = restart(publicationFixture, { processId: 8702, isProcessAlive: (processId) => processId === 8702 });
+    const recoveredState = await waitFor(() => publicationFixture!.repository.state(), (state) => state.s4ImageOperations[0]?.status === "failed");
+    assert.equal(recovered.s4.getState(publicationFixture.projectId).edits[0]?.status, "image_failed");
+    assert.equal(recoveredState.s4Publications[0].state, "aborted");
+    assert.equal(recoveredState.s4ImageOperations[0].failureCode, "PERSISTENCE_FAILED");
+    assert.equal(recoveredState.s4ImageOperations[0].providerDispatchState, "consumed");
+    assert.equal(publicationFixture.objects.read(publication.finalObjects[0].key).equals(publicationConflict), true);
+    assert.equal(publicationFixture.objects.exists(publication.stagingObjects[0].key), false);
+    assert.equal(recoveredState.s4Revisions.length, 0);
+    assert.equal(recoveredState.s4Assets.length, 0);
+    assert.equal(recoveredState.s3Selections[0].activeRevisionId, selected.sourceRevisionId);
+    validateS4Graph(recoveredState);
+    await proveS4Variants("RECOVERY-001", "S4 object publication is exclusive under a competing writer and exact recovery", "publication-competing-writer", "The executed competing-writer and publication-recovery fixtures preserved complete winning bytes, rejected conflicting exact publication, accepted identical recovery, and aborted a conflicting final without fake activation.", {
+      "no-overwrite": () => {
+        assert.equal(finalRaceHash, winners[0].slice(4));
+        assert.equal(publicationFixture!.objects.read(publication.finalObjects[0].key).equals(publicationConflict), true);
+        assert.equal(recoveredState.s4Publications[0].state, "aborted");
+        assert.equal(recoveredState.s4Revisions.length, 0);
+        assert.equal(recoveredState.s3Selections[0].activeRevisionId, selected.sourceRevisionId);
+      },
+    }, [
+      "raceWinnerHash=" + finalRaceHash,
+      "raceLoser=PERSISTENCE_FAILED",
+      "putExactConflictHash=" + sha256(existingBytes),
+      "promoteExactConflictHash=" + sha256(existingBytes),
+      "publicationConflictHash=" + sha256(publicationConflict),
+    ]);
+  } finally {
+    if (publicationFixture) cleanup(publicationFixture);
+    rmSync(raceRoot, { recursive: true, force: true });
+  }
+});
+
+test("S4 client draft readiness enforces local mask and instruction bounds", () => {
+  const validRectangle = { kind: "rectangle" as const, xQ16: 0, yQ16: 1, widthQ16: 65_536, heightQ16: 1 };
+  const validBrush = { kind: "brush" as const, radiusQ8: 64, points: [{ xQ16: 65_536, yQ16: 0 }] };
+  assert.equal(isS4PrimitiveLocallyValid(validRectangle), true);
+  assert.equal(isS4PrimitiveLocallyValid(validBrush), true);
+  assert.equal(isS4PrimitiveLocallyValid({ ...validRectangle, widthQ16: 0 }), false);
+  assert.equal(isS4PrimitiveLocallyValid({ ...validRectangle, xQ16: 1, widthQ16: 65_536 }), false);
+  assert.equal(isS4PrimitiveLocallyValid({ ...validRectangle, yQ16: 1, heightQ16: 65_536 }), false);
+  assert.equal(isS4PrimitiveLocallyValid({ ...validBrush, radiusQ8: 63 }), false);
+  assert.equal(isS4PrimitiveLocallyValid({ ...validBrush, points: [{ xQ16: 65_537, yQ16: 0 }] }), false);
+  assert.equal(isS4PrimitiveLocallyValid({ ...validBrush, points: Array.from({ length: 1_025 }, () => ({ xQ16: 1, yQ16: 1 })) }), false);
+  const tooManyBrushPoints = Array.from({ length: 5 }, (_, index) => ({ kind: "brush" as const, radiusQ8: 64 + index, points: Array.from({ length: 1_024 }, () => ({ xQ16: index, yQ16: index })) }));
+  assert.equal(isS4DraftSubmitReady({ primitives: tooManyBrushPoints, instructionText: "edit", hasActiveRevision: true, cyclesRemaining: 1 }), false);
+  const atScalarAndByteLimit = instructionDraftState("😀".repeat(600));
+  assert.deepEqual(atScalarAndByteLimit, { scalarCount: 600, utf8ByteCount: 2_400, valid: true });
+  assert.equal(instructionDraftState("😀".repeat(601)).valid, false);
+  assert.equal(instructionDraftState("\ud800").valid, false);
+  assert.equal(instructionDraftState("   ").valid, false);
+  const readyInput = { primitives: [validRectangle], instructionText: "edit", hasActiveRevision: true, cyclesRemaining: 1 };
+  assert.equal(isS4DraftSubmitReady({ ...readyInput, primitives: [] }), false);
+  assert.equal(isS4DraftSubmitReady({ ...readyInput, primitives: [validRectangle] }), true);
+  assert.equal(isS4DraftSubmitReady({ ...readyInput, primitives: [validRectangle, validRectangle] }), false);
+  assert.equal(isS4DraftSubmitReady({ ...readyInput, cyclesRemaining: 0 }), false);
+  assert.equal(isS4DraftSubmitReady({ ...readyInput, busy: true }), false);
+  assert.equal(isS4DraftClearEnabled([], false), false);
+  assert.equal(isS4DraftClearEnabled([validRectangle], false), true);
+  assert.equal(isS4DraftClearEnabled([validRectangle], true), false);
+  const markup = renderToStaticMarkup(createElement(S4Screen, {
+    projectId: FOREIGN_UUID,
+    initialState: {
+      projectId: FOREIGN_UUID,
+      generationSetId: randomUUID(),
+      selectionVersion: 1,
+      activeRevisionId: randomUUID(),
+      activeRevisionKind: "s3",
+      activeQuality: "PASS",
+      activePreviewAvailable: false,
+      stageStatus: "started",
+      s3RefinementClosed: true,
+      cyclesConsumed: 1,
+      cyclesRemaining: 1,
+      edits: [],
+    },
+  }));
+  assert.match(markup, /0\/600 Unicode scalar values \/ 0\/2400 UTF-8 bytes/);
+  assert.match(markup, /Clear local mask/);
+  assert.match(markup, /Submit local edit/);
+  assert.match(markup, /disabled=""[^>]*>Clear local mask|disabled=""[^>]*>Submit local edit/);
 });
 
 test("S4 high-risk resolver matrix resolves exact S3 and S4 identities", async () => {
@@ -877,8 +1217,7 @@ test("S4 high-risk dispatch recovery distinguishes pre-dispatch, ambiguous, and 
       "ambiguous-transport": () => { assert.equal(ambiguousOperation.providerDispatchState, "may_have_started"); assert.equal(ambiguous.imageCallCount(), 0); },
       "no-redispatch": () => { assert.equal(ambiguous.imageCallCount(), 0); assert.equal(consumedCalls, 1); assert.equal(assessmentAmbiguous.assessmentCallCount(), 0); },
     });
-    await proveS4Variants("RECOVERY-001", "S4 high-risk dispatch recovery distinguishes pre-dispatch, ambiguous, and consumed loss", "dispatch-recovery", "The executed dispatch restart fixtures classified not_started, may_have_started, and consumed classification loss with terminal no-retry outcomes.", {
-      "pre-dispatch": () => { assert.equal(preAfter.s4ImageOperations[0].providerDispatchState, "consumed"); assert.equal(pre.imageCallCount(), 1); },
+    await proveS4Variants("RECOVERY-001", "S4 high-risk dispatch recovery distinguishes pre-dispatch, ambiguous, and consumed loss", "dispatch-recovery", "The executed dispatch restart fixtures classified may_have_started and consumed classification loss with terminal no-retry outcomes.", {
       "ambiguous": () => { assert.equal(ambiguousAfter.s4ImageOperations[0].failureCode, "PROVIDER_DISPATCH_UNCERTAIN"); assert.equal(ambiguousDone.activeRevisionId, ambiguousSelected.sourceRevisionId); },
       "response-lost": () => { assert.equal(consumedAfter.s4ImageOperations[0].failureCode, "PERSISTENCE_FAILED"); assert.equal(consumedDone.activeRevisionId, consumedSelected.sourceRevisionId); },
     }, ["preProcessId=8101", "ambiguousProcessId=8103", "consumedCalls=" + consumedCalls]);
@@ -1448,11 +1787,10 @@ test("S4 high-risk activation matrix proves positive, negative, stale, and atomi
       "passSelectionVersion=" + passAfter.s3Selections[0].selectionVersion,
       "warningSelectionVersion=" + warningAfter.s3Selections[0].selectionVersion,
     ]);
-    await proveS4Variants("RECOVERY-001", "S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", "recovery-matrix", "The executed restart fixtures established mask-intent and activation interruption recovery without fabricated success or object overwrite.", {
+    await proveS4Variants("RECOVERY-001", "S4 high-risk activation matrix proves positive, negative, stale, and atomic fences", "recovery-matrix", "The executed restart fixtures established mask-intent and activation interruption recovery without fabricated success.", {
       "mask-intent-crash": () => { assert.equal(maskInterrupted.s4Edits[0].maskMaterializationStatus, "pending"); assert.equal(maskDone.edits[0].maskReady, true); },
       "activation-crash": () => { assert.equal(crashAttempt.status, "running"); assert.equal(crashAttempt.providerDispatchState, "consumed"); assert.equal(crashAfterAttempt.status, "failed"); assert.equal(crashAfterAttempt.failureCode, "PERSISTENCE_FAILED"); assert.equal(activationCrash.assessmentCallCount(), crashAssessmentCallsBeforeRestart); assert.equal(activationCrash.imageCallCount(), crashImageCallsBeforeRestart); },
       "no-fake": () => { assert.equal(crashDone.edits[0].status, "qa_unavailable"); assert.equal(crashDone.activeRevisionId, crashSelected.sourceRevisionId); assert.deepEqual(crashAfterAttempt.requirementObservations, []); assert.deepEqual(crashAfterAttempt.designObservations, []); assert.equal(crashAfterAttempt.requestedEditSatisfaction, null); assert.equal(crashAfterAttempt.overallRequirementResult, null); assert.equal(crashAfterAttempt.overallBuildabilityResult, null); assert.equal(crashAfterAttempt.evidenceObject, null); assert.equal(crashAfterAssessment.requestedEditSatisfaction, null); assert.equal(crashAfterAssessment.overallRequirementResult, null); assert.equal(crashAfterAssessment.overallBuildabilityResult, null); assert.equal(crashAfterAssessment.retryState, "none"); },
-      "no-overwrite": () => assert.equal(activationCrash.objects.read(crashAsset.storageKeyNormalized).equals(crashBytesBefore), true),
     }, [
       "maskCommitInterruptions=" + (maskCommitCount - maskBaselineCommits),
       "activationCommitInterruptions=" + assessmentPostResponseCommits,
@@ -1741,8 +2079,26 @@ test("S4 API enforces auth-first access, exact JSON routes, safe errors, and S3 
     assert.equal(publicPayload.includes("OPENAI_API_KEY"), false);
 
     const tooLarge = await handleApiRequest(new Request("http://localhost", { method: "POST", headers: { "content-type": "application/json", "content-length": "131073", "Idempotency-Key": randomUUID() }, body: "{}" }), ["projects", value.projectId, "s4", "edits"], dependencies);
-    assert.equal(tooLarge.status, 413);
-    assert.equal((await tooLarge.json() as any).error.code, "INVALID_REQUEST");
+    assert.equal(tooLarge.status, 400);
+    const tooLargeBody = await tooLarge.json() as any;
+    assert.equal(tooLargeBody.error.code, "INVALID_REQUEST");
+    assert.deepEqual(tooLargeBody.error.fieldErrors, [{ field: "body", code: "BODY_TOO_LARGE" }]);
+    const streamedBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(131_073));
+        controller.close();
+      },
+    });
+    const streamedTooLarge = await handleApiRequest(new Request("http://localhost", {
+      method: "POST",
+      headers: { "content-type": "application/json", "Idempotency-Key": randomUUID() },
+      body: streamedBody,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" }), ["projects", value.projectId, "s4", "edits"], dependencies);
+    assert.equal(streamedTooLarge.status, 400);
+    const streamedTooLargeBody = await streamedTooLarge.json() as any;
+    assert.equal(streamedTooLargeBody.error.code, "INVALID_REQUEST");
+    assert.deepEqual(streamedTooLargeBody.error.fieldErrors, [{ field: "body", code: "BODY_TOO_LARGE" }]);
     const wrongMethod = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", value.projectId, "s4", "edits"], dependencies);
     assert.equal(wrongMethod.status, 405);
     const denied = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", value.projectId, "s4"], { workflowService: value.service, s3Authorization: { resolveContext: () => null, authorizeProject: () => true } });
