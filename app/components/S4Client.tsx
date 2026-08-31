@@ -16,6 +16,8 @@ export type S4Primitive =
 export const S4_CLIENT_MAX_PRIMITIVES = 64;
 export const S4_CLIENT_MAX_BRUSH_POINTS_PER_PRIMITIVE = 1_024;
 export const S4_CLIENT_MAX_TOTAL_BRUSH_POINTS = 4_096;
+export const S4_CLIENT_MASK_WIDTH = 1_536;
+export const S4_CLIENT_MASK_HEIGHT = 1_024;
 export const S4_CLIENT_Q16_MAX = 65_536;
 export const S4_CLIENT_MIN_BRUSH_RADIUS_Q8 = 64;
 export const S4_CLIENT_MAX_BRUSH_RADIUS_Q8 = 25_600;
@@ -70,7 +72,14 @@ export function isS4PrimitiveLocallyValid(primitive: S4Primitive): boolean {
   if (primitive.kind !== "brush" || !Number.isSafeInteger(primitive.radiusQ8) ||
       primitive.radiusQ8 < S4_CLIENT_MIN_BRUSH_RADIUS_Q8 || primitive.radiusQ8 > S4_CLIENT_MAX_BRUSH_RADIUS_Q8 ||
       !Array.isArray(primitive.points) || primitive.points.length < 1 || primitive.points.length > S4_CLIENT_MAX_BRUSH_POINTS_PER_PRIMITIVE) return false;
-  return primitive.points.every((point) => q16(point.xQ16) && q16(point.yQ16));
+  const points = new Set<string>();
+  return primitive.points.every((point) => {
+    if (!q16(point.xQ16) || !q16(point.yQ16)) return false;
+    const identity = point.xQ16 + "," + point.yQ16;
+    if (points.has(identity)) return false;
+    points.add(identity);
+    return true;
+  });
 }
 
 function primitiveIdentity(primitive: S4Primitive): string {

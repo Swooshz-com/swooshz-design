@@ -697,6 +697,7 @@ test("S4 client draft readiness enforces local mask and instruction bounds", () 
   assert.equal(isS4PrimitiveLocallyValid({ ...validRectangle, yQ16: 1, heightQ16: 65_536 }), false);
   assert.equal(isS4PrimitiveLocallyValid({ ...validBrush, radiusQ8: 63 }), false);
   assert.equal(isS4PrimitiveLocallyValid({ ...validBrush, points: [{ xQ16: 65_537, yQ16: 0 }] }), false);
+  assert.equal(isS4PrimitiveLocallyValid({ ...validBrush, points: [{ xQ16: 65_536, yQ16: 0 }, { xQ16: 65_536, yQ16: 0 }] }), false);
   assert.equal(isS4PrimitiveLocallyValid({ ...validBrush, points: Array.from({ length: 1_025 }, () => ({ xQ16: 1, yQ16: 1 })) }), false);
   const tooManyBrushPoints = Array.from({ length: 5 }, (_, index) => ({ kind: "brush" as const, radiusQ8: 64 + index, points: Array.from({ length: 1_024 }, () => ({ xQ16: index, yQ16: index })) }));
   assert.equal(isS4DraftSubmitReady({ primitives: tooManyBrushPoints, instructionText: "edit", hasActiveRevision: true, cyclesRemaining: 1 }), false);
