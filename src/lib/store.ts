@@ -663,7 +663,7 @@ export class PrivateObjectStore {
     if (this.exists(finalKey)) {
       let actual: Buffer;
       try { actual = this.read(finalKey); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
-      if (!actual.equals(bytes)) throw new AppError(500, "PERSISTENCE_FAILED");
+      if (!actual.equals(bytes)) throw new AppError(500, "PUBLICATION_OBJECT_MISMATCH");
       return;
     }
     try {
@@ -672,7 +672,7 @@ export class PrivateObjectStore {
       if (!this.exists(finalKey)) throw error;
       let actual: Buffer;
       try { actual = this.read(finalKey); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
-      if (!actual.equals(bytes)) throw new AppError(500, "PERSISTENCE_FAILED");
+      if (!actual.equals(bytes)) throw new AppError(500, "PUBLICATION_OBJECT_MISMATCH");
     }
   }
 

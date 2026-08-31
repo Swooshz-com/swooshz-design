@@ -14,6 +14,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 const CANONICAL_BASE_SHA = "2e01a90b6b2f40f4729764970a8cb89f25bbe0c8";
 const CANONICAL_BASE_TREE = "b144ae4bc0bb80bee82d696be0f7e550af0a3ae9";
 const RUNNER_TEST_IDS = new Set(["REGRESSION-001", "EVIDENCE-001", "GATE-001"]);
+const PROVIDER_CREDENTIAL_NAMES = ["OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID"] as const;
 
 type ValidationResult = {
   label: string;
@@ -21,6 +22,8 @@ type ValidationResult = {
   args: string[];
   output: string;
   exitCode: 0;
+  providerCredentialEnvironmentBlanked: true;
+  blankedProviderCredentialNames: string[];
 };
 
 type S4ClaimExecution = {
@@ -35,7 +38,15 @@ type S4ClaimExecution = {
 };
 
 function git(...args: string[]): string {
-  return execFileSync("git", args, { encoding: "utf8" }).trim();
+  const environment = { ...process.env };
+  for (const name of PROVIDER_CREDENTIAL_NAMES) environment[name] = "";
+  return execFileSync("git", args, { encoding: "utf8", env: environment }).trim();
+}
+
+function safeValidationEnvironment(environment: Record<string, string>): { values: NodeJS.ProcessEnv; names: string[] } {
+  const values = { ...process.env, ...environment };
+  for (const name of PROVIDER_CREDENTIAL_NAMES) values[name] = "";
+  return { values, names: Array.from(PROVIDER_CREDENTIAL_NAMES) };
 }
 
 function assertCandidateIdentity(expectedSha: string, expectedTree: string): void {
@@ -51,6 +62,7 @@ function assertCandidateWorktreeClean(): void {
 function runValidation(command: string, args: string[], label: string, environment: Record<string, string> = {}): ValidationResult {
   assertCandidateIdentity(candidateCommitSha, candidateTree);
   assertCandidateWorktreeClean();
+  const safeEnvironment = safeValidationEnvironment(environment);
   let output: string;
   try {
     const executable = command === "pnpm.cmd" ? (process.env.ComSpec ?? "cmd.exe") : command;
@@ -59,7 +71,7 @@ function runValidation(command: string, args: string[], label: string, environme
       cwd: process.cwd(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...environment },
+      env: safeEnvironment.values,
       maxBuffer: 64 * 1024 * 1024,
     });
   } catch (error) {
@@ -67,7 +79,15 @@ function runValidation(command: string, args: string[], label: string, environme
   }
   assertCandidateIdentity(candidateCommitSha, candidateTree);
   assertCandidateWorktreeClean();
-  return { label, command, args: Array.from(args), output, exitCode: 0 };
+  return {
+    label,
+    command,
+    args: Array.from(args),
+    output,
+    exitCode: 0,
+    providerCredentialEnvironmentBlanked: true,
+    blankedProviderCredentialNames: safeEnvironment.names,
+  };
 }
 
 function checkedString(value: unknown, name: string): string {
@@ -141,7 +161,7 @@ const startedAt = new Date().toISOString();
 const proofDirectory = mkdtempSync(join(process.env.TEMP ?? process.cwd(), "swooshz-s4-g3-proof-"));
 const proofPath = join(proofDirectory, "claims.ndjson");
 const executionPath = join(proofDirectory, "executions.ndjson");
-const noProviderCredentialEnvironment = { OPENAI_API_KEY: "", OPENAI_ORG_ID: "", OPENAI_PROJECT_ID: "" };
+const noProviderCredentialEnvironment = Object.fromEntries(PROVIDER_CREDENTIAL_NAMES.map((name) => [name, ""]));
 const proofEnvironment = { S4_EVIDENCE_PROOF_PATH: proofPath, S4_EVIDENCE_EXECUTION_PATH: executionPath, ...noProviderCredentialEnvironment };
 const noProofEnvironment = { S4_EVIDENCE_PROOF_PATH: "", S4_EVIDENCE_EXECUTION_PATH: "" };
 const s4ImplementationTests = runValidation(
@@ -440,7 +460,11 @@ await runnerProof("GATE-001", "no-live-provider", "The G3 candidate uses local p
   assert.throws(() => noLiveProvider.assertS4ImageEditReady(), (error: unknown) => (error as { safeCode?: string }).safeCode === "PROVIDER_NOT_CONFIGURED");
   assert.throws(() => noLiveProvider.assertS4AssessmentReady(), (error: unknown) => (error as { safeCode?: string }).safeCode === "PROVIDER_NOT_CONFIGURED");
   assert.equal(noLiveProviderFetchCalls.count, 0);
-  assert.deepEqual(Object.keys(noProviderCredentialEnvironment).sort(), ["OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID"]);
+  assert.deepEqual(Object.keys(noProviderCredentialEnvironment).sort(), Array.from(PROVIDER_CREDENTIAL_NAMES).sort());
+  assert.equal(validationRuns.length, 10);
+  assert.equal(validationRuns.every((run) => run.providerCredentialEnvironmentBlanked === true), true);
+  assert.equal(validationRuns.every((run) => run.blankedProviderCredentialNames.length === PROVIDER_CREDENTIAL_NAMES.length), true);
+  assert.equal(validationRuns.every((run) => PROVIDER_CREDENTIAL_NAMES.every((name) => run.blankedProviderCredentialNames.includes(name))), true);
   assert.equal(validationRuns.every((run) => ["node", "pnpm.cmd", "git"].includes(run.command)), true);
 });
 await runnerProof("GATE-001", "no-customer-private-data", "The evidence run uses no customer or private business data.", "The candidate evidence sources and local commands contain no customer-data fixture path, credential file, or external data operation.", "controller-gate", ["customerData=0", "privateBusinessData=0"], () => {

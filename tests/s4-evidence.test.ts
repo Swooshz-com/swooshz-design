@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { randomUUID } from "node:crypto";
 import { inflateSync } from "node:zlib";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -7,11 +8,13 @@ import { test } from "node:test";
 import sharp from "sharp";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { type BoothGeometrySnapshot, type S4DesignRuleSnapshot, type S4MaskPrimitive, type S4Requirement, type S4SourceQualityProof, type UUID } from "../src/lib/types";
-import { emptyStoreState, PrivateObjectStore } from "../src/lib/store";
+import { type BoothGeometry, type BoothGeometrySnapshot, type ProviderMetadata, type S4DesignRuleSnapshot, type S4MaskPrimitive, type S4Requirement, type S4SourceQualityProof, type UUID } from "../src/lib/types";
+import { emptyStoreState, JsonRepository, PrivateObjectStore } from "../src/lib/store";
+import { MockOpenAIProvider } from "../src/lib/openai";
+import { createWorkflowService, type WorkflowService } from "../src/lib/workflow";
 import { handleApiRequest } from "../src/lib/api";
-import { createS4Client, instructionDraftState, isS4DraftClearEnabled, isS4DraftSubmitReady, isS4PrimitiveLocallyValid, S4Screen, type S4Primitive } from "../app/components/S4Client";
-import { buildS4AssessmentRequest, buildS4ImageRequest, OpenAIS4Provider } from "../src/lib/s4-provider";
+import { createS4Client, instructionDraftState, isS4DraftClearEnabled, isS4DraftSubmitReady, isS4PrimitiveLocallyValid, mutateThenRefresh, S4Screen, type S4Primitive } from "../app/components/S4Client";
+import { buildS4AssessmentRequest, buildS4ImageRequest, OpenAIS4Provider, type S4ProviderContract } from "../src/lib/s4-provider";
 import type { PublicS4State } from "../src/lib/s4";
 import {
   S4_ASSESSMENT_JSON_SCHEMA,
@@ -97,6 +100,220 @@ const PUBLIC_STATE: PublicS4State = {
   cyclesRemaining: 1,
   edits: [PUBLIC_EDIT],
 };
+
+type RealS4ApiFixture = {
+  root: string;
+  repository: JsonRepository;
+  objects: PrivateObjectStore;
+  service: WorkflowService;
+  projectId: UUID;
+  sourceRevisionId: UUID;
+  editId: UUID;
+  publicState: PublicS4State;
+  publicEdit: Record<string, unknown>;
+  privateStateText: string;
+  privateNeedles: string[];
+  privateStorageKeys: string[];
+  privateHashValues: string[];
+  privateProviderRequestIds: string[];
+  privatePromptTexts: string[];
+  privateClaimFacts: { image: boolean; assessment: boolean };
+};
+
+function realS4BriefData(): any {
+  return {
+    projectFacts: { clientName: "S4 Local Fixture", eventName: "Local Event", venueName: "Local Venue", eventLocation: "Local", eventStartDate: null, eventEndDate: null, notes: null },
+    brandStyle: { brandName: "Local Brand", brandValues: ["clear"], visualDirection: "calm", preferredColors: ["blue"], materials: ["timber"], logoInstructions: null },
+    functionalRequirements: [{ name: "Reception", count: null, countIsExact: false, mandatory: true, details: null }],
+    mandatoryRequirements: ["Keep the entry clear."],
+    prohibitedRequirements: ["No enclosed ceiling."],
+    budget: { amount: null, currency: null, basis: "unknown", notes: null },
+    unknowns: [], assumptions: [], freeTextRequirements: [],
+    extractedGeometryMentions: { widthText: null, depthText: null, openSidesText: null, maxHeightText: null },
+  };
+}
+
+function realS4QaPayload(input: any): any {
+  return {
+    requirements: input.requirements.map((item: any) => ({
+      requirementId: item.requirementId, expected: item.expected, expectedCount: item.expectedCount,
+      observed: item.expected === "absent" ? "absent" : "present",
+      observedCount: item.expected === "exact_count" ? item.expectedCount : null,
+      confidence: 0.99, evidence: "Local S4 workflow fixture observation",
+    })),
+    designRules: input.designRules.filter((item: any) => item.applicability === "applicable").map((item: any) => ({
+      ruleId: item.ruleId, observed: "compliant", confidence: 0.99, evidence: "Local S4 workflow fixture observation",
+    })),
+  };
+}
+
+function realS4AssessmentPayload(repository: JsonRepository): any {
+  const assessment = repository.state().s4Assessments.at(-1);
+  if (!assessment) throw new Error("real S4 assessment fixture is not persisted");
+  return {
+    requirements: assessment.canonicalRequirements.map((item) => ({
+      requirementId: item.requirementId, expected: item.expected, expectedCount: item.expectedCount,
+      expectedValue: item.expectedValue, observed: item.expected === "absent" ? "absent" : "present",
+      observedCount: item.expected === "exact_count" ? item.expectedCount : null,
+      confidence: 0.99, evidence: "Local S4 workflow assessment observation",
+    })),
+    designRules: assessment.designRuleSnapshot.filter((item) => item.applicability === "applicable").map((item) => ({
+      ruleId: item.ruleId, observed: "compliant", confidence: 0.99, evidence: "Local S4 workflow assessment observation",
+    })),
+    requestedEdit: { outcome: "satisfied", evidence: "The marked local region was updated." },
+    overall: { requirementResult: "satisfied", buildabilityResult: "buildable", evidence: "The local fixture remains buildable." },
+  };
+}
+
+async function realS4EditedPng(sourceBytes: Uint8Array): Promise<Buffer> {
+  const raw = await sharp(sourceBytes).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  for (let y = 210; y < 510; y += 1) for (let x = 315; x < 760; x += 1) {
+    const offset = (y * WIDTH + x) * 4;
+    raw.data[offset] = raw.data[offset] === 0 ? 1 : 0;
+  }
+  return sharp(raw.data, { raw: { width: WIDTH, height: HEIGHT, channels: 4 } })
+    .png({ compressionLevel: 9, adaptiveFiltering: false }).toBuffer();
+}
+
+async function realS4WaitFor<T>(read: () => T, done: (value: T) => boolean, timeoutMs = 30_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = read();
+    if (done(value)) return value;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("real S4 API fixture timed out");
+}
+
+async function createRealS4ApiFixture(): Promise<RealS4ApiFixture> {
+  const root = mkdtempSync(join(tmpdir(), "swooshz-s4-api-real-"));
+  const repository = new JsonRepository(root);
+  const objects = new PrivateObjectStore(join(root, "objects"));
+  const projectId = randomUUID() as UUID;
+  const generationSetId = randomUUID() as UUID;
+  const briefVersionId = randomUUID() as UUID;
+  const geometry: BoothGeometry = { widthMm: 9000, depthMm: 6000, openSides: ["north", "west"], maxHeightMm: null };
+  const sourceBytes = await createExactS3FixturePng();
+  const outputBytes = await realS4EditedPng(sourceBytes);
+  const sourceHash = sha256(sourceBytes);
+  const metadata: ProviderMetadata = { provider: "openai", api: "responses", model: "gpt-5.4-mini", modelSnapshot: "gpt-5.4-mini-2026-03-17", providerRequestId: null, inputTokens: null, outputTokens: null, totalTokens: null, receivedAt: new Date(0).toISOString() };
+  const candidates: any[] = [];
+  const conceptAssets: any[] = [];
+  for (let index = 1; index <= 4; index += 1) {
+    const candidateId = randomUUID();
+    const assetId = randomUUID();
+    const storageKey = "projects/" + projectId + "/generations/" + generationSetId + "/" + assetId + ".png";
+    objects.put(storageKey, sourceBytes);
+    conceptAssets.push({ assetId, projectId, generationSetId, storageKey, mimeType: "image/png", byteSize: sourceBytes.byteLength, sha256: sourceHash, status: "stored", createdAt: new Date(0).toISOString() });
+    candidates.push({
+      candidateId, generationSetId, projectId, confirmedBriefVersionId: briefVersionId, candidateIndex: index,
+      directionKey: "open-demo", assetId,
+      compilerMetadata: { compilerVersion: "g2-booth-v1", directionKey: "open-demo", canonicalInputHash: sourceHash, promptHash: sourceHash, compiledAt: new Date(0).toISOString() },
+      providerMetadata: { provider: "openai", api: "images", model: "gpt-image-2", modelSnapshot: "gpt-image-2-2026-04-21", providerRequestId: null, inputTokens: null, outputTokens: null, totalTokens: null, receivedAt: new Date(0).toISOString() },
+      createdAt: new Date(0).toISOString(),
+    });
+  }
+  repository.transact((state) => {
+    state.projects.push({ projectId, name: "S4 local API fixture", status: "concepts_ready", boothGeometry: geometry, briefAssetId: null, briefDraftId: null, confirmedBriefVersionId: briefVersionId, activeGenerationSetId: generationSetId, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() });
+    state.briefVersions.push({ briefVersionId, projectId, sourceDraftId: randomUUID(), sourceAssetId: randomUUID(), versionNumber: 1, schemaVersion: "brief-v1", status: "confirmed", geometrySnapshot: geometry, data: realS4BriefData(), contentHash: sourceHash, confirmationMode: "explicit_user_action", confirmedAt: new Date(0).toISOString(), extractionProviderMetadata: metadata });
+    state.generationSets.push({ generationSetId, projectId, confirmedBriefVersionId: briefVersionId, generationRequestId: randomUUID(), attempt: 1, retryOfGenerationSetId: null, status: "succeeded", expectedCandidateCount: 4, promptCompilerVersion: "g2-booth-v1", promptManifestHash: sourceHash, provider: "openai", imageModelSnapshot: "gpt-image-2-2026-04-21", createdAt: new Date(0).toISOString(), completedAt: new Date(0).toISOString(), failureCode: null });
+    state.candidates.push(...candidates);
+    state.conceptAssets.push(...conceptAssets);
+  });
+
+  let imagePromptText = "";
+  let assessmentPromptText = "";
+  const privateClaimFacts = { image: false, assessment: false };
+  const s4Provider: S4ProviderContract = {
+    runS4ImageEdit: async (input) => {
+      imagePromptText = input.promptText;
+      return { pngBytes: outputBytes, providerRequestId: "real-fixture-image-request" };
+    },
+    runS4Assessment: async (input) => {
+      assessmentPromptText = input.promptText;
+      return { payload: realS4AssessmentPayload(repository), providerRequestId: "real-fixture-assessment-request" };
+    },
+  };
+  const provider = new MockOpenAIProvider({ briefData: realS4BriefData(), s2QaResponseFactory: (input) => realS4QaPayload(input) });
+  const service = createWorkflowService({
+    repository,
+    objects,
+    provider,
+    s4Provider,
+    onS4ProviderDispatchPhase: (phase, operation) => {
+      if (phase !== "before-dispatch") return;
+      if ("operationId" in operation) privateClaimFacts.image = Boolean(operation.claimedBy && operation.claimedProcessId !== null && operation.claimToken);
+      if ("assessmentAttemptId" in operation) privateClaimFacts.assessment = Boolean(operation.claimedBy && operation.claimedProcessId !== null && operation.claimToken);
+    },
+  });
+  service.s2.getReferenceDraft(projectId);
+  const bound = await service.s2.bindQa(projectId, generationSetId, 1, randomUUID() as UUID, randomUUID() as UUID);
+  await realS4WaitFor(() => repository.state().s2QaRuns.find((item) => item.id === bound.qaRun.id)?.status, (status) => status === "completed");
+  const s3State = service.s3.getState(projectId);
+  const sourceRevisionId = s3State.screenedCandidates.find((item) => item.originalSourceId)?.originalSourceId;
+  assert.ok(sourceRevisionId);
+  const selected = service.s3.selectSource(projectId, "source_root", sourceRevisionId, 0, randomUUID() as UUID, randomUUID() as UUID);
+  const admission = service.s4.admitEdit(projectId, {
+    baseRevisionId: selected.result.activeRevisionId,
+    expectedSelectionVersion: selected.result.selectionVersion,
+    primitives: [RECTANGLE],
+    instructionText: "  Replace the selected finish.  ",
+  }, randomUUID() as UUID, randomUUID() as UUID);
+  const editId = admission.result.editId;
+  await realS4WaitFor(() => repository.state().s4Edits.find((item) => item.editId === editId)?.status, (status) => status === "completed");
+  const privateState = repository.state();
+  const publicState = service.s4.getState(projectId);
+  const publicEdit = service.s4.getEdit(projectId, editId) as unknown as Record<string, unknown>;
+  const mask = privateState.s4Masks[0];
+  const edit = privateState.s4Edits[0];
+  const imageOperation = privateState.s4ImageOperations[0];
+  const revision = privateState.s4Revisions[0];
+  const asset = privateState.s4Assets[0];
+  const preservation = privateState.s4PreservationChecks[0];
+  const assessment = privateState.s4Assessments[0];
+  const assessmentAttempt = privateState.s4AssessmentAttempts[0];
+  const privateStorageKeys = [
+    mask?.rasterStorageKey,
+    mask?.providerPngStorageKey,
+    asset?.storageKeyNormalized,
+    edit?.promptHash,
+    preservation?.evidenceObject?.key,
+    assessmentAttempt?.evidenceObject?.key,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  const privateHashValues = [
+    edit?.promptHash,
+    edit?.providerRequestHash,
+    imageOperation?.operationInputHash,
+    revision?.outputSha256,
+    assessment?.assessmentInputHash,
+    assessment?.assessmentPromptHash,
+    assessmentAttempt?.assessmentPromptHash,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  const privateProviderRequestIds = [
+    imageOperation?.providerMetadata?.providerRequestId,
+    assessmentAttempt?.providerMetadata?.providerRequestId,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  const privatePromptTexts = [
+    imagePromptText,
+    assessmentPromptText,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  const privateNeedles = [...privateStorageKeys, ...privateHashValues, ...privateProviderRequestIds, ...privatePromptTexts];
+  assert.equal(privateState.s4Masks.length, 1);
+  assert.equal(privateState.s4Edits.length, 1);
+  assert.equal(privateState.s4Revisions.length, 1);
+  assert.equal(privateState.s4Assets.length, 1);
+  assert.equal(privateState.s4PreservationChecks[0]?.evidenceObject !== null, true);
+  assert.equal(privateState.s4AssessmentAttempts[0]?.evidenceObject !== null, true);
+  assert.equal(privateState.s4ImageOperations[0]?.providerMetadata !== null, true);
+  assert.equal(privateState.s4Edits[0]?.promptHash.length, 64);
+  assert.equal(privateClaimFacts.image, true);
+  assert.equal(privateClaimFacts.assessment, true);
+  return {
+    root, repository, objects, service, projectId, sourceRevisionId, editId, publicState, publicEdit,
+    privateStateText: JSON.stringify(privateState), privateNeedles, privateStorageKeys, privateHashValues,
+    privateProviderRequestIds, privatePromptTexts, privateClaimFacts,
+  };
+}
 
 async function proveVariantClaims(
   testId: string,
@@ -786,8 +1003,6 @@ test("S4 evidence: API and privacy boundaries are default-deny", async () => {
   } finally {
     console.error = originalConsoleError;
   }
-  const stateBody = await stateResponse.json() as PublicS4State;
-  const detailBody = await detailResponse.json() as Record<string, unknown>;
   const admissionBody = await admissionResponse.json() as Record<string, any>;
   const imageRetryBody = await imageRetryResponse.json() as Record<string, any>;
   const assessmentRetryBody = await assessmentRetryResponse.json() as Record<string, any>;
@@ -795,8 +1010,6 @@ test("S4 evidence: API and privacy boundaries are default-deny", async () => {
   const missingContentTypeBody = await missingContentTypeResponse.json() as Record<string, any>;
   const errorBody = await errorResponse!.json() as Record<string, any>;
   const previewBytes = Buffer.from(await previewResponse.arrayBuffer());
-  const publicJson = JSON.stringify({ state: stateBody, edit: detailBody });
-  const logRecord = JSON.parse(logLines[0]) as Record<string, unknown>;
   assert.equal(denied.status, 404);
   assert.equal(crossProject.status, 404);
   assert.equal(defaultDeny.status, 404);
@@ -812,9 +1025,6 @@ test("S4 evidence: API and privacy boundaries are default-deny", async () => {
   assert.equal(missingKeyResponse.status, 400);
   assert.equal(missingContentTypeResponse.status, 400);
   assert.equal(previewResponse.status, 200);
-  assert.deepEqual(Object.keys(stateBody).sort(), Object.keys(PUBLIC_STATE).sort());
-  assert.deepEqual(Object.keys(detailBody).sort(), Object.keys(PUBLIC_EDIT).sort());
-  assert.deepEqual(Object.keys((detailBody.assessment ?? {}) as Record<string, unknown>).sort(), Object.keys(PUBLIC_ASSESSMENT).sort());
   assert.equal(admissionBody.result.editId, UUID_2);
   assert.equal(imageRetryBody.result.status, "generating");
   assert.equal(assessmentRetryBody.result.status, "assessment_pending");
@@ -831,40 +1041,197 @@ test("S4 evidence: API and privacy boundaries are default-deny", async () => {
     referenceId: UUID,
     fieldErrors: [],
   });
-  assert.deepEqual(Object.keys(logRecord).sort(), ["code", "operation", "referenceId", "status"]);
-  assert.deepEqual(logRecord, { code: "INVALID_REQUEST", operation: "api_request", referenceId: UUID, status: 400 });
-  assert.equal(publicJson.includes(PUBLIC_EDIT.instructionText), true);
-  for (const forbidden of ["storageKey", "promptHash", "providerMetadata", "claimToken", "evidenceObject", "OPENAI_API_KEY", "CONFIRMED GEOMETRY", "UNTRUSTED USER INSTRUCTION"]) {
-    assert.equal(publicJson.includes(forbidden), false, forbidden);
+});
+
+test("S4 evidence: real workflow projections and safe logs are exact", async () => {
+  const value = await createRealS4ApiFixture();
+  const originalGetState = value.service.s4.getState;
+  const originalGetEdit = value.service.s4.getEdit;
+  let serviceLookups = 0;
+  let authorizationChecks = 0;
+  value.service.s4.getState = (projectId: UUID) => { serviceLookups += 1; return originalGetState.call(value.service.s4, projectId); };
+  value.service.s4.getEdit = (projectId: UUID, editId: UUID) => { serviceLookups += 1; return originalGetEdit.call(value.service.s4, projectId, editId); };
+  const requestFor = (method: string, headers: Record<string, string> = {}, body?: unknown): Request => new Request("http://localhost", {
+    method,
+    headers,
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const validEditBody = {
+    baseRevisionId: value.sourceRevisionId,
+    expectedSelectionVersion: value.publicState.selectionVersion,
+    primitives: [RECTANGLE],
+    instructionText: "Replace the selected finish.",
+  };
+  const authorized = {
+    workflowService: value.service,
+    s3Authorization: {
+      resolveContext: async () => { authorizationChecks += 1; return { subjectId: "real-local-fixture-subject" }; },
+      authorizeProject: async (_context: { subjectId: string }, projectId: UUID) => projectId === value.projectId,
+    },
+  };
+  try {
+    const denied = await handleApiRequest(requestFor("GET"), ["projects", value.projectId, "s4"], {
+      workflowService: value.service,
+      s3Authorization: { resolveContext: async () => null, authorizeProject: async () => true },
+    });
+    const crossProject = await handleApiRequest(requestFor("GET"), ["projects", value.projectId, "s4"], {
+      workflowService: value.service,
+      s3Authorization: { resolveContext: async () => ({ subjectId: "real-local-fixture-subject" }), authorizeProject: async () => false },
+    });
+    const defaultDeny = await handleApiRequest(requestFor("GET"), ["projects", value.projectId, "s4"], value.service);
+    const unauthorizedServiceLookups = serviceLookups;
+    assert.ok(value.publicState.activeRevisionId);
+    const stateResponse = await handleApiRequest(requestFor("GET"), ["projects", value.projectId, "s4"], authorized);
+    const detailResponse = await handleApiRequest(requestFor("GET"), ["projects", value.projectId, "s4", "edits", value.editId], authorized);
+    const methodResponse = await handleApiRequest(requestFor("POST"), ["projects", value.projectId, "s4"], authorized);
+    const missingKeyResponse = await handleApiRequest(requestFor("POST", { "content-type": "application/json" }, validEditBody), ["projects", value.projectId, "s4", "edits"], authorized);
+    const missingContentTypeResponse = await handleApiRequest(requestFor("POST", { "Idempotency-Key": UUID_2 }, validEditBody), ["projects", value.projectId, "s4", "edits"], authorized);
+    const previewResponse = await handleApiRequest(requestFor("GET"), ["projects", value.projectId, "s3", "revisions", value.publicState.activeRevisionId, "preview"], authorized);
+    const logLines: string[] = [];
+    const originalConsoleError = console.error;
+    let errorResponse: Response;
+    console.error = (...args: unknown[]) => { logLines.push(args.map((item) => String(item)).join(" ")); };
+    try {
+      errorResponse = await handleApiRequest(requestFor("GET", { "x-request-id": UUID_2 }), ["projects", value.projectId, "s4", "unknown"], authorized);
+    } finally {
+      console.error = originalConsoleError;
+    }
+
+    const stateBody = await stateResponse.json() as Record<string, unknown>;
+    const detailBody = await detailResponse.json() as Record<string, unknown>;
+    const assessmentBody = detailBody.assessment as Record<string, unknown>;
+    const missingKeyBody = await missingKeyResponse.json() as Record<string, any>;
+    const missingContentTypeBody = await missingContentTypeResponse.json() as Record<string, any>;
+    const errorBody = await errorResponse!.json() as Record<string, any>;
+    const previewBytes = Buffer.from(await previewResponse.arrayBuffer());
+    const logRecord = JSON.parse(logLines[0]) as Record<string, unknown>;
+    const stateKeys = ["activePreviewAvailable", "activeQuality", "activeRevisionId", "activeRevisionKind", "cyclesConsumed", "cyclesRemaining", "edits", "generationSetId", "projectId", "s3RefinementClosed", "selectionVersion", "stageStatus"];
+    const editKeys = ["activationState", "assessment", "assessmentRetryAvailable", "baseRevisionId", "baseRevisionKind", "comparisonPixelCount", "createdAt", "cycleNumber", "editId", "editablePixelCount", "imageRetryAvailable", "instructionText", "maskReady", "outputRevisionId", "preservationStatus", "previewAvailable", "primitiveCount", "status", "terminalAt"];
+    const assessmentKeys = ["materialFindingCount", "overallBuildabilityResult", "overallRequirementResult", "requestedEditSatisfaction", "retryAvailable", "status", "uncertainFindingCount", "warningFindingCount"];
+    const publicJson = JSON.stringify({ state: stateBody, edit: detailBody });
+    const forbiddenFieldNames = [
+      "rasterStorageKey", "providerPngStorageKey", "storageKeyNormalized", "promptHash", "editInputHash", "providerRequestHash",
+      "providerMetadata", "providerRequestId", "inputTokens", "outputTokens", "totalTokens", "operationInputHash", "assessmentInputHash",
+      "assessmentPromptHash", "claimToken", "claimedBy", "claimedProcessId", "evidenceObject", "OPENAI_API_KEY",
+    ];
+    assert.equal(denied.status, 404);
+    assert.equal(crossProject.status, 404);
+    assert.equal(defaultDeny.status, 404);
+    assert.equal(unauthorizedServiceLookups, 0);
+    assert.equal(authorizationChecks > 0, true);
+    assert.equal(serviceLookups > unauthorizedServiceLookups, true);
+    assert.equal(stateResponse.status, 200);
+    assert.equal(detailResponse.status, 200);
+    assert.equal(methodResponse.status, 405);
+    assert.equal(missingKeyResponse.status, 400);
+    assert.equal(missingContentTypeResponse.status, 400);
+    assert.equal(previewResponse.status, 200);
+    assert.equal(errorResponse!.status, 400);
+    assert.deepEqual(stateBody, value.publicState);
+    assert.deepEqual(detailBody, value.publicEdit);
+    assert.deepEqual(Object.keys(stateBody).sort(), stateKeys.sort());
+    assert.deepEqual(Object.keys(detailBody).sort(), editKeys.sort());
+    assert.deepEqual(Object.keys(assessmentBody).sort(), assessmentKeys.sort());
+    assert.equal(detailBody.instructionText, "Replace the selected finish.");
+    assert.equal(detailBody.preservationStatus, "PASS");
+    assert.equal(assessmentBody.status, "PASS");
+    assert.equal(missingKeyBody.error.code, "IDEMPOTENCY_KEY_REQUIRED");
+    assert.deepEqual(missingKeyBody.error.fieldErrors, [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]);
+    assert.equal(missingContentTypeBody.error.code, "INVALID_REQUEST");
+    assert.deepEqual(missingContentTypeBody.error.fieldErrors, [{ field: "body", code: "JSON_REQUIRED" }]);
+    assert.deepEqual([...previewBytes.slice(0, 4)], [137, 80, 78, 71]);
+    assert.equal(previewResponse.headers.get("cache-control"), "private, no-store");
+    assert.deepEqual(errorBody.error, {
+      code: "INVALID_REQUEST",
+      message: "The request could not be completed. Try again or contact support with the reference ID.",
+      referenceId: UUID_2,
+      fieldErrors: [],
+    });
+    assert.equal(logLines.length, 1);
+    assert.deepEqual(Object.keys(logRecord).sort(), ["code", "operation", "referenceId", "status"]);
+    assert.deepEqual(logRecord, { code: "INVALID_REQUEST", operation: "api_request", referenceId: UUID_2, status: 400 });
+    assert.equal(value.privateStateText.includes("rasterStorageKey"), true);
+    assert.equal(value.privateStateText.includes("providerMetadata"), true);
+    assert.equal(value.privateStateText.includes("promptHash"), true);
+    assert.equal(value.privateStateText.includes("evidenceObject"), true);
+    assert.equal(value.privateClaimFacts.image, true);
+    assert.equal(value.privateClaimFacts.assessment, true);
+    assert.equal(value.privateNeedles.length >= 8, true);
+    assert.equal(forbiddenFieldNames.every((field) => !publicJson.includes(field)), true);
+    assert.equal(value.privateStorageKeys.every((needle) => !publicJson.includes(needle)), true);
+    assert.equal(value.privateHashValues.every((needle) => !publicJson.includes(needle)), true);
+    assert.equal(value.privateProviderRequestIds.every((needle) => !publicJson.includes(needle)), true);
+    assert.equal(value.privatePromptTexts.every((needle) => needle.length > String(detailBody.instructionText).length && !publicJson.includes(needle)), true);
+    assert.equal(publicJson.includes("Replace the selected finish."), true);
+    assert.equal(publicJson.includes("sk-"), false);
+
+    await proveVariantClaims("AUTH-API-001", "S4 evidence: real workflow projections and safe logs are exact", "real-api-boundary", "The executed handleApiRequest path used a real S4WorkflowService over populated JsonRepository and PrivateObjectStore state, with authorization checked before real service reads.", {
+      "auth-first": () => { assert.equal(unauthorizedServiceLookups, 0); assert.equal(authorizationChecks > 0, true); },
+      "default-deny": () => assert.equal(defaultDeny.status, 404),
+      "cross-project": () => assert.equal(crossProject.status, 404),
+      "routes": () => { assert.equal(stateResponse.status, 200); assert.equal(detailResponse.status, 200); assert.equal(previewResponse.status, 200); },
+      "methods": () => assert.equal(methodResponse.status, 405),
+      "headers": () => { assert.deepEqual(missingKeyBody.error.fieldErrors, [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]); assert.deepEqual(missingContentTypeBody.error.fieldErrors, [{ field: "body", code: "JSON_REQUIRED" }]); },
+      "statuses": () => assert.deepEqual([stateResponse.status, detailResponse.status, previewResponse.status, methodResponse.status, missingKeyResponse.status, crossProject.status], [200, 200, 200, 405, 400, 404]),
+      "preview": () => { assert.deepEqual([...previewBytes.slice(0, 4)], [137, 80, 78, 71]); assert.equal(previewResponse.headers.get("cache-control"), "private, no-store"); },
+      "errors": () => { assert.equal(errorBody.error.referenceId, UUID_2); assert.equal(errorBody.error.message.includes("reference ID"), true); assert.deepEqual(errorBody.error.fieldErrors, []); },
+      "dto": () => { assert.deepEqual(Object.keys(stateBody).sort(), stateKeys.sort()); assert.deepEqual(Object.keys(detailBody).sort(), editKeys.sort()); assert.deepEqual(Object.keys(assessmentBody).sort(), assessmentKeys.sort()); assert.equal(detailBody.instructionText, "Replace the selected finish."); },
+    }, [
+      "workflowFixture=real-S4WorkflowService-JsonRepository-PrivateObjectStore",
+      "unauthorizedServiceReads=" + unauthorizedServiceLookups,
+      "authorizedServiceReads=" + serviceLookups,
+      "publicStateKeys=" + stateKeys.length,
+      "publicEditKeys=" + editKeys.length,
+      "publicAssessmentKeys=" + assessmentKeys.length,
+    ]);
+    await proveVariantClaims("PRIVACY-001", "S4 evidence: real workflow projections and safe logs are exact", "real-privacy-boundary", "The executed public state, edit detail, assessment summary, and production API error adapter excluded actual private S4 keys, hashes, compiled prompts, provider data, claims, evidence, credentials, and private log payloads while retaining the user instruction.", {
+      "no-keys": () => assert.equal(value.privateStorageKeys.every((needle) => !publicJson.includes(needle)), true),
+      "no-hashes": () => assert.equal(value.privateHashValues.every((needle) => !publicJson.includes(needle)), true),
+      "no-prompts": () => { assert.equal(publicJson.includes("Replace the selected finish."), true); assert.equal(value.privatePromptTexts.every((needle) => needle.length > String(detailBody.instructionText).length && !publicJson.includes(needle)), true); },
+      "no-provider": () => { assert.equal(publicJson.includes("providerMetadata"), false); assert.equal(value.privateProviderRequestIds.every((needle) => !publicJson.includes(needle)), true); },
+      "no-claims": () => { assert.equal(publicJson.includes("claimToken"), false); assert.equal(publicJson.includes("claimedProcessId"), false); },
+      "no-evidence": () => assert.equal(publicJson.includes("evidenceObject"), false),
+      "no-credentials": () => { assert.equal(publicJson.includes("OPENAI_API_KEY"), false); assert.equal(publicJson.includes("sk-"), false); },
+      "safe-log": () => { assert.deepEqual(Object.keys(logRecord).sort(), ["code", "operation", "referenceId", "status"]); assert.equal(JSON.stringify(logRecord).includes("customer"), false); assert.equal(JSON.stringify(logRecord).includes("storage"), false); },
+    }, [
+      "privateStorageValuesChecked=" + value.privateStorageKeys.length,
+      "privateHashValuesChecked=" + value.privateHashValues.length,
+      "providerRequestValuesChecked=" + value.privateProviderRequestIds.length,
+      "compiledPromptValuesChecked=" + value.privatePromptTexts.length,
+      "safeLogKeys=code,operation,referenceId,status",
+    ]);
+  } finally {
+    value.service.s4.getState = originalGetState;
+    value.service.s4.getEdit = originalGetEdit;
+    rmSync(value.root, { recursive: true, force: true });
   }
-  await proveVariantClaims("AUTH-API-001", "S4 evidence: API and privacy boundaries are default-deny", "api-boundary", "The executed API assertion covered one authorization, route, method, header, status, preview, error, or DTO boundary.", {
-    "auth-first": () => { assert.equal(unauthorizedServiceLookups, 0); assert.equal(authorizationChecks > 0, true); },
-    "default-deny": () => assert.equal(defaultDeny.status, 404),
-    "cross-project": () => assert.equal(crossProject.status, 404),
-    "routes": () => { assert.equal(stateResponse.status, 200); assert.equal(detailResponse.status, 200); assert.equal(admissionResponse.status, 202); assert.equal(imageRetryResponse.status, 202); assert.equal(assessmentRetryResponse.status, 202); },
-    "methods": () => assert.equal(methodResponse.status, 405),
-    "headers": () => { assert.deepEqual(missingKeyBody.error.fieldErrors, [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]); assert.deepEqual(missingContentTypeBody.error.fieldErrors, [{ field: "body", code: "JSON_REQUIRED" }]); },
-    "statuses": () => assert.deepEqual([stateResponse.status, admissionResponse.status, missingKeyResponse.status, methodResponse.status, crossProject.status], [200, 202, 400, 405, 404]),
-    "preview": () => { assert.deepEqual([...previewBytes], [137, 80, 78, 71]); assert.equal(previewResponse.headers.get("cache-control"), "private, no-store"); },
-    "errors": () => { assert.equal(errorBody.error.referenceId, UUID); assert.equal(errorBody.error.message.includes("reference ID"), true); assert.deepEqual(errorBody.error.fieldErrors, []); },
-    "dto": () => { assert.deepEqual(Object.keys(stateBody).sort(), Object.keys(PUBLIC_STATE).sort()); assert.deepEqual(Object.keys(detailBody).sort(), Object.keys(PUBLIC_EDIT).sort()); },
-  });
-  await proveVariantClaims("PRIVACY-001", "S4 evidence: API and privacy boundaries are default-deny", "privacy-boundary", "The executed privacy assertion verified that one prohibited private field or provider surface was absent.", {
-    "no-keys": () => assert.equal(publicJson.includes("storageKey"), false),
-    "no-hashes": () => assert.equal(publicJson.includes("promptHash"), false),
-    "no-prompts": () => { assert.equal(publicJson.includes(PUBLIC_EDIT.instructionText), true); assert.equal(publicJson.includes("CONFIRMED GEOMETRY"), false); assert.equal(publicJson.includes("UNTRUSTED USER INSTRUCTION"), false); },
-    "no-provider": () => assert.equal(publicJson.includes("providerMetadata"), false),
-    "no-claims": () => assert.equal(publicJson.includes("claimToken"), false),
-    "no-evidence": () => assert.equal(publicJson.includes("evidenceObject"), false),
-    "no-credentials": () => assert.equal(publicJson.includes("OPENAI_API_KEY"), false),
-    "safe-log": () => { assert.deepEqual(Object.keys(logRecord).sort(), ["code", "operation", "referenceId", "status"]); assert.equal(JSON.stringify(logRecord).includes("customer"), false); },
-  });
 });
 
 test("S4 evidence: client requests retain operation keys", async () => {
   const calls: Array<{ input: string; init?: RequestInit }> = [];
   const response = () => new Response(JSON.stringify(PUBLIC_STATE), { status: 200, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
   const client = createS4Client({ projectId: UUID, fetcher: async (input, init) => { calls.push({ input, init }); return response(); } });
+  const mutationRefreshCalls: Array<{ input: string; init?: RequestInit }> = [];
+  const mutationSentinel = { status: "usable_pass", outputExists: true, preservation: "PASS", assessment: "PASS", activated: true, currentRevisionUsable: true, sentinel: "MUTATION_RESULT_IS_NOT_STATE" };
+  const authoritativeState: PublicS4State = {
+    ...PUBLIC_STATE,
+    activeQuality: "WARNING",
+    edits: [{
+      ...PUBLIC_EDIT,
+      status: "generating",
+      preservationStatus: "NOT_STARTED",
+      assessment: null,
+      outputRevisionId: null,
+      activationState: "historical_non_activatable",
+      previewAvailable: false,
+      terminalAt: null,
+    }],
+  };
+  const mutationRefreshClient = createS4Client({ projectId: UUID, fetcher: async (input, init) => {
+    mutationRefreshCalls.push({ input, init });
+    if (init?.method === "POST") return new Response(JSON.stringify(mutationSentinel), { status: 202, headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify(authoritativeState), { status: 200, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
+  } });
   const validPrimitive: S4Primitive = { kind: "rectangle", xQ16: 1, yQ16: 1, widthQ16: 20_000, heightQ16: 20_000 };
   const validDraft = { primitives: [validPrimitive], instructionText: "local", hasActiveRevision: true, cyclesRemaining: 1 };
   const invalidRectangle: S4Primitive = { kind: "rectangle", xQ16: 65_000, yQ16: 1, widthQ16: 1_000, heightQ16: 20_000 };
@@ -888,6 +1255,21 @@ test("S4 evidence: client requests retain operation keys", async () => {
   await client.retry(UUID_2, "image");
   await client.retry(UUID_2, "assessment");
   await client.rollback(UUID_2, 1);
+  const refreshedAfterMutation = await mutateThenRefresh(
+    () => mutationRefreshClient.edit({ baseRevisionId: UUID_2, expectedSelectionVersion: 1, primitives: [validPrimitive], instructionText: "local" }),
+    mutationRefreshClient.refresh,
+  );
+  assert.deepEqual(refreshedAfterMutation, authoritativeState);
+  assert.equal(mutationRefreshCalls.length, 2);
+  assert.equal(mutationRefreshCalls[0].init?.method, "POST");
+  assert.equal(mutationRefreshCalls[1].input, "/api/projects/" + UUID + "/s4");
+  assert.equal(mutationRefreshCalls[1].init?.cache, "no-store");
+  assert.equal(JSON.stringify(refreshedAfterMutation).includes("MUTATION_RESULT_IS_NOT_STATE"), false);
+  assert.equal((refreshedAfterMutation as unknown as Record<string, unknown>).activated, undefined);
+  assert.equal(refreshedAfterMutation.edits[0]?.status, "generating");
+  assert.equal(refreshedAfterMutation.edits[0]?.preservationStatus, "NOT_STARTED");
+  assert.equal(refreshedAfterMutation.edits[0]?.assessment, null);
+  assert.equal(refreshedAfterMutation.activeQuality, "WARNING");
   assert.equal(calls.length, 5);
   assert.equal(calls[0].input, "/api/projects/" + UUID + "/s4");
   assert.equal(calls[0].init?.cache, "no-store");
@@ -900,7 +1282,7 @@ test("S4 evidence: client requests retain operation keys", async () => {
     projectId: UUID,
     initialState: PUBLIC_STATE,
   }));
-  await proveVariantClaims("CLIENT-001", "S4 evidence: client requests retain operation keys", "client-surface", "The executed client assertion covered one route, control, persisted-state, or request-key property.", {
+  await proveVariantClaims("CLIENT-001", "S4 evidence: client requests retain operation keys", "client-surface", "The executed client assertion covered one route, control, persisted-state, or request-key property; no-infer used the real mutation-then-refresh helper.", {
     "mask-ready": () => { assert.equal(isS4DraftSubmitReady(validDraft), true); assert.match(markup, /Mask verified/); },
     "rectangle-ui": () => assert.match(markup, /rectangle/),
     "brush-ui": () => assert.match(markup, /brush/),
@@ -914,10 +1296,22 @@ test("S4 evidence: client requests retain operation keys", async () => {
     "history": () => assert.match(markup, /Persisted edit history/),
     "rollback": () => { assert.equal(calls[4].input.endsWith("/s3/selection"), true); assert.match(markup, /Rollback pointer/); },
     "budget": () => assert.match(markup, /cycle\(s\) remaining/),
-    "no-infer": () => { assert.equal(isS4DraftSubmitReady({ ...validDraft, cyclesRemaining: 0 }), false); assert.equal(calls.slice(1).every((call) => new Headers(call.init?.headers).get("Idempotency-Key")), true); },
+    "no-infer": () => {
+      assert.equal(mutationRefreshCalls[0].init?.method, "POST");
+      assert.equal(mutationRefreshCalls[1].input, "/api/projects/" + UUID + "/s4");
+      assert.deepEqual(refreshedAfterMutation, authoritativeState);
+      assert.equal(JSON.stringify(refreshedAfterMutation).includes("MUTATION_RESULT_IS_NOT_STATE"), false);
+      assert.equal(refreshedAfterMutation.edits[0]?.status, "generating");
+      assert.equal(refreshedAfterMutation.edits[0]?.preservationStatus, "NOT_STARTED");
+      assert.equal(refreshedAfterMutation.edits[0]?.assessment, null);
+      assert.equal(isS4DraftSubmitReady({ ...validDraft, cyclesRemaining: 0 }), false);
+    },
   }, [
     "requestCount=" + calls.length,
     "idempotencyKeys=" + calls.filter((call) => Boolean(new Headers(call.init?.headers).get("Idempotency-Key"))).length,
+    "mutationResponseSentinelIgnored=true",
+    "mutationThenRefreshOrder=POST,GET",
+    "authoritativeState=GET-persisted-state",
     "supportingTest=S4 evidence: API and privacy boundaries are default-deny",
     "supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer",
   ]);

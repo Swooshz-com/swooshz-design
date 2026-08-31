@@ -201,6 +201,11 @@ async function withKey(
   });
 }
 
+export async function mutateThenRefresh<T>(mutation: () => Promise<unknown>, refresh: () => Promise<T>): Promise<T> {
+  await mutation();
+  return refresh();
+}
+
 function defaultFetch(input: string, init?: RequestInit): Promise<Response> { return fetch(input, init); }
 
 export function createS4Client(options: { projectId: string; operationKeys?: IdempotencyKeyRetainer; fetcher?: Fetcher }) {
@@ -330,15 +335,16 @@ export function S4Screen({ projectId, initialState = null }: { projectId: string
       hasActiveRevision: true,
       cyclesRemaining: state.cyclesRemaining,
     })) return;
+    const activeRevisionId = state.activeRevisionId;
     setBusy(true); setError("");
     try {
-      await client.edit({
-        baseRevisionId: state.activeRevisionId,
+      const persisted = await mutateThenRefresh(() => client.edit({
+        baseRevisionId: activeRevisionId,
         expectedSelectionVersion: state.selectionVersion,
         primitives,
         instructionText,
-      });
-      setInstructionText(""); setPrimitives([]); await refresh();
+      }), client.refresh);
+      setInstructionText(""); setPrimitives([]); setState(persisted);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The request could not be completed.");
       await refresh();
@@ -347,7 +353,7 @@ export function S4Screen({ projectId, initialState = null }: { projectId: string
 
   async function retry(editId: string, kind: "image" | "assessment") {
     setBusy(true); setError("");
-    try { await client.retry(editId, kind); await refresh(); }
+    try { setState(await mutateThenRefresh(() => client.retry(editId, kind), client.refresh)); }
     catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); await refresh(); }
     finally { setBusy(false); }
   }
@@ -355,7 +361,7 @@ export function S4Screen({ projectId, initialState = null }: { projectId: string
   async function rollback(revisionId: string) {
     if (!state) return;
     setBusy(true); setError("");
-    try { await client.rollback(revisionId, state.selectionVersion); await refresh(); }
+    try { setState(await mutateThenRefresh(() => client.rollback(revisionId, state.selectionVersion), client.refresh)); }
     catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); await refresh(); }
     finally { setBusy(false); }
   }

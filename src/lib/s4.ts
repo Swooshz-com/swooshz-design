@@ -1701,8 +1701,22 @@ export class S4WorkflowService {
     }
   }
 
+  private publicationObjectState(
+    object: { key: string; sha256: string; byteSize: number },
+    expectedBytes?: Uint8Array,
+  ): "exact" | "mismatch" | "missing" | "unavailable" {
+    if (!this.objects.exists(object.key)) return "missing";
+    let actual: Buffer;
+    try { actual = this.objects.read(object.key); } catch { return "unavailable"; }
+    if (actual.byteLength !== object.byteSize || sha256(actual) !== object.sha256) return "mismatch";
+    if (expectedBytes !== undefined && !actual.equals(Buffer.from(expectedBytes))) return "mismatch";
+    return "exact";
+  }
+
   private verifyPublicationObject(object: { key: string; sha256: string; byteSize: number }): void {
-    if (!this.objectMatches(object)) throw fail(500, "PUBLICATION_OBJECT_MISMATCH");
+    const state = this.publicationObjectState(object);
+    if (state === "mismatch") throw fail(500, "PUBLICATION_OBJECT_MISMATCH");
+    if (state !== "exact") throw fail(500, "PUBLICATION_FAILED");
   }
 
   private putPublicationObject(
@@ -1726,16 +1740,22 @@ export class S4WorkflowService {
     final: { key: string; sha256: string; byteSize: number },
     bytes: Uint8Array,
   ): void {
-    if (this.objects.exists(final.key)) {
-      this.verifyPublicationObject(final);
-      return;
-    }
+    const before = this.publicationObjectState(final, bytes);
+    if (before === "exact") return;
+    if (before === "mismatch") throw fail(500, "PUBLICATION_OBJECT_MISMATCH");
+    if (before === "unavailable") throw fail(500, "PUBLICATION_FAILED");
     try {
       this.objects.promoteExact(staging.key, final.key, bytes);
     } catch {
+      const afterFailure = this.publicationObjectState(final, bytes);
+      if (afterFailure === "exact") return;
+      if (afterFailure === "mismatch") throw fail(500, "PUBLICATION_OBJECT_MISMATCH");
       throw fail(500, "PUBLICATION_FAILED");
     }
-    this.verifyPublicationObject(final);
+    const afterPromotion = this.publicationObjectState(final, bytes);
+    if (afterPromotion === "exact") return;
+    if (afterPromotion === "mismatch") throw fail(500, "PUBLICATION_OBJECT_MISMATCH");
+    throw fail(500, "PUBLICATION_FAILED");
   }
 
   private claimPreservation(preservationCheckId: UUID): { check: S4PreservationCheck; token: UUID } | null {
@@ -2929,12 +2949,42 @@ export class S4WorkflowService {
       try {
         const staging = publication.stagingObjects[0];
         const final = publication.finalObjects[0];
+        const finalState = this.publicationObjectState(final);
+        if (finalState === "mismatch") {
+          this.abortRecoveredPublication(publication.publicationId, "PUBLICATION_OBJECT_MISMATCH");
+          this.objects.remove(staging.key);
+          continue;
+        }
+        if (finalState === "unavailable") {
+          this.abortRecoveredPublication(publication.publicationId, "PERSISTENCE_FAILED");
+          this.objects.remove(staging.key);
+          continue;
+        }
         const stagingReady = this.objectMatches(staging);
-        let finalReady = this.objectMatches(final);
+        let finalReady = finalState === "exact";
         if (!finalReady && stagingReady) {
           const bytes = this.objects.read(staging.key);
-          this.objects.promoteExact(staging.key, final.key, bytes);
-          finalReady = this.objectMatches(final);
+          try {
+            this.objects.promoteExact(staging.key, final.key, bytes);
+          } catch (error) {
+            const afterFailure = this.publicationObjectState(final, bytes);
+            if (afterFailure === "mismatch") {
+              this.abortRecoveredPublication(publication.publicationId, "PUBLICATION_OBJECT_MISMATCH");
+              this.objects.remove(staging.key);
+              continue;
+            }
+            if (afterFailure === "exact") finalReady = true;
+            else throw error;
+          }
+          if (!finalReady) {
+            const afterPromotion = this.publicationObjectState(final, bytes);
+            if (afterPromotion === "mismatch") {
+              this.abortRecoveredPublication(publication.publicationId, "PUBLICATION_OBJECT_MISMATCH");
+              this.objects.remove(staging.key);
+              continue;
+            }
+            finalReady = afterPromotion === "exact";
+          }
         }
         if (!finalReady) {
           this.abortRecoveredPublication(publication.publicationId);

@@ -600,6 +600,7 @@ test("S4 object publication is exclusive under a competing writer and exact reco
   const firstBytes = Buffer.from("complete-object-first");
   const secondBytes = Buffer.from("complete-object-second");
   let publicationFixture: S4Fixture | null = null;
+  let directRaceFixture: S4Fixture | null = null;
   try {
     const outcomes = await Promise.all([
       runStoreRaceWriter(objects.root, barrier, raceKey, firstBytes),
@@ -622,7 +623,7 @@ test("S4 object publication is exclusive under a competing writer and exact reco
     assert.equal(objects.read(existingKey).equals(existingBytes), true);
     const conflictingStageKey = "projects/" + FOREIGN_UUID + "/s4/staging-conflict.bin";
     objects.put(conflictingStageKey, conflictingBytes);
-    assert.throws(() => objects.promoteExact(conflictingStageKey, existingKey, conflictingBytes), (error: unknown) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
+    assert.throws(() => objects.promoteExact(conflictingStageKey, existingKey, conflictingBytes), (error: unknown) => error instanceof AppError && error.code === "PUBLICATION_OBJECT_MISMATCH");
     assert.equal(objects.read(existingKey).equals(existingBytes), true);
     assert.equal(objects.read(conflictingStageKey).equals(conflictingBytes), true);
     const identicalStageKey = "projects/" + FOREIGN_UUID + "/s4/staging-identical.bin";
@@ -632,6 +633,49 @@ test("S4 object publication is exclusive under a competing writer and exact reco
     assert.equal(objects.read(existingKey).equals(existingBytes), true);
     objects.remove(conflictingStageKey);
     objects.remove(identicalStageKey);
+
+    const genericStageKey = "projects/" + FOREIGN_UUID + "/s4/staging-generic.bin";
+    const genericFinalKey = "projects/" + FOREIGN_UUID + "/s4/final-generic.bin";
+    objects.put(genericStageKey, existingBytes);
+    const originalPromote = objects.promote.bind(objects);
+    objects.promote = () => { throw new AppError(500, "PERSISTENCE_FAILED"); };
+    try {
+      assert.throws(() => objects.promoteExact(genericStageKey, genericFinalKey, existingBytes), (error: unknown) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
+    } finally {
+      objects.promote = originalPromote;
+    }
+    assert.equal(objects.exists(genericFinalKey), false);
+    assert.equal(objects.read(genericStageKey).equals(existingBytes), true);
+    objects.remove(genericStageKey);
+
+    directRaceFixture = await fixture();
+    const directRaceSelected = await ready(directRaceFixture);
+    const directRaceConflict = Buffer.from("direct-race-winning-bytes");
+    const originalPromoteExact = directRaceFixture.objects.promoteExact.bind(directRaceFixture.objects);
+    directRaceFixture.objects.promoteExact = (stagingKey: string, finalKey: string, expected: Uint8Array): void => {
+      directRaceFixture!.objects.put(finalKey, directRaceConflict);
+      originalPromoteExact(stagingKey, finalKey, expected);
+    };
+    admit(directRaceFixture, directRaceSelected, "publication direct race");
+    const directRaceState = await waitFor(() => directRaceFixture!.repository.state(), (state) => state.s4ImageOperations[0]?.status === "failed");
+    directRaceFixture.objects.promoteExact = originalPromoteExact;
+    const directRacePublication = directRaceState.s4Publications[0];
+    const directRaceOperation = directRaceState.s4ImageOperations[0];
+    const directRaceEdit = directRaceFixture.service.s4.getState(directRaceFixture.projectId).edits[0];
+    assert.ok(directRacePublication && directRaceOperation && directRaceEdit);
+    assert.equal(directRacePublication.state, "aborted");
+    assert.equal(directRaceOperation.failureCode, "PUBLICATION_OBJECT_MISMATCH");
+    assert.equal(directRaceEdit.status, "publication_failed");
+    assert.equal(directRaceEdit.imageRetryAvailable, false);
+    assert.equal(directRaceEdit.assessmentRetryAvailable, false);
+    assert.equal(directRaceFixture.objects.read(directRacePublication.finalObjects[0].key).equals(directRaceConflict), true);
+    assert.equal(directRaceState.s3Selections[0].activeRevisionId, directRaceSelected.sourceRevisionId);
+    assert.equal(directRaceState.s4Revisions.length, 0);
+    assert.equal(directRaceState.s4Assets.length, 0);
+    assert.equal(directRaceState.s4PreservationChecks.length, 0);
+    assert.equal(directRaceState.s4Assessments.length, 0);
+    assert.equal(directRaceState.s4AssessmentAttempts.length, 0);
+    validateS4Graph(directRaceState);
 
     const stagedReached = deferred<void>();
     publicationFixture = await fixture({
@@ -656,32 +700,62 @@ test("S4 object publication is exclusive under a competing writer and exact reco
     publicationFixture.objects.put(publication.finalObjects[0].key, publicationConflict);
     const recovered = restart(publicationFixture, { processId: 8702, isProcessAlive: (processId) => processId === 8702 });
     const recoveredState = await waitFor(() => publicationFixture!.repository.state(), (state) => state.s4ImageOperations[0]?.status === "failed");
-    assert.equal(recovered.s4.getState(publicationFixture.projectId).edits[0]?.status, "image_failed");
+    assert.equal(recovered.s4.getState(publicationFixture.projectId).edits[0]?.status, "publication_failed");
     assert.equal(recoveredState.s4Publications[0].state, "aborted");
-    assert.equal(recoveredState.s4ImageOperations[0].failureCode, "PERSISTENCE_FAILED");
+    assert.equal(recoveredState.s4ImageOperations[0].failureCode, "PUBLICATION_OBJECT_MISMATCH");
     assert.equal(recoveredState.s4ImageOperations[0].providerDispatchState, "consumed");
     assert.equal(publicationFixture.objects.read(publication.finalObjects[0].key).equals(publicationConflict), true);
     assert.equal(publicationFixture.objects.exists(publication.stagingObjects[0].key), false);
     assert.equal(recoveredState.s4Revisions.length, 0);
     assert.equal(recoveredState.s4Assets.length, 0);
+    assert.equal(recoveredState.s4PreservationChecks.length, 0);
+    assert.equal(recoveredState.s4Assessments.length, 0);
+    assert.equal(recoveredState.s4AssessmentAttempts.length, 0);
     assert.equal(recoveredState.s3Selections[0].activeRevisionId, selected.sourceRevisionId);
+    const recoveredEdit = recovered.s4.getState(publicationFixture.projectId).edits[0];
+    assert.ok(recoveredEdit);
+    assert.equal(recoveredEdit.imageRetryAvailable, false);
+    assert.equal(recoveredEdit.assessmentRetryAvailable, false);
     validateS4Graph(recoveredState);
     await proveS4Variants("RECOVERY-001", "S4 object publication is exclusive under a competing writer and exact recovery", "publication-competing-writer", "The executed competing-writer and publication-recovery fixtures preserved complete winning bytes, rejected conflicting exact publication, accepted identical recovery, and aborted a conflicting final without fake activation.", {
       "no-overwrite": () => {
         assert.equal(finalRaceHash, winners[0].slice(4));
+        assert.equal(directRaceOperation.failureCode, "PUBLICATION_OBJECT_MISMATCH");
+        assert.equal(directRacePublication.state, "aborted");
+        assert.equal(directRaceFixture!.objects.read(directRacePublication.finalObjects[0].key).equals(directRaceConflict), true);
+        assert.equal(directRaceEdit.status, "publication_failed");
+        assert.equal(directRaceEdit.imageRetryAvailable, false);
+        assert.equal(directRaceEdit.assessmentRetryAvailable, false);
+        assert.equal(directRaceState.s4Revisions.length, 0);
+        assert.equal(directRaceState.s4Assets.length, 0);
+        assert.equal(directRaceState.s4PreservationChecks.length, 0);
+        assert.equal(directRaceState.s4AssessmentAttempts.length, 0);
+        assert.equal(directRaceState.s3Selections[0].activeRevisionId, directRaceSelected.sourceRevisionId);
         assert.equal(publicationFixture!.objects.read(publication.finalObjects[0].key).equals(publicationConflict), true);
         assert.equal(recoveredState.s4Publications[0].state, "aborted");
+        assert.equal(recoveredState.s4ImageOperations[0].failureCode, "PUBLICATION_OBJECT_MISMATCH");
+        assert.equal(recoveredEdit.imageRetryAvailable, false);
+        assert.equal(recoveredEdit.assessmentRetryAvailable, false);
         assert.equal(recoveredState.s4Revisions.length, 0);
+        assert.equal(recoveredState.s4Assets.length, 0);
+        assert.equal(recoveredState.s4PreservationChecks.length, 0);
+        assert.equal(recoveredState.s4Assessments.length, 0);
+        assert.equal(recoveredState.s4AssessmentAttempts.length, 0);
         assert.equal(recoveredState.s3Selections[0].activeRevisionId, selected.sourceRevisionId);
       },
     }, [
       "raceWinnerHash=" + finalRaceHash,
       "raceLoser=PERSISTENCE_FAILED",
       "putExactConflictHash=" + sha256(existingBytes),
-      "promoteExactConflictHash=" + sha256(existingBytes),
+      "promoteExactConflictCode=PUBLICATION_OBJECT_MISMATCH",
+      "genericStorageFailureCode=PERSISTENCE_FAILED",
+      "directRaceFailureCode=" + directRaceOperation.failureCode,
+      "directRaceWinnerHash=" + sha256(directRaceConflict),
+      "recoveryRaceFailureCode=" + recoveredState.s4ImageOperations[0].failureCode,
       "publicationConflictHash=" + sha256(publicationConflict),
     ]);
   } finally {
+    if (directRaceFixture) cleanup(directRaceFixture);
     if (publicationFixture) cleanup(publicationFixture);
     rmSync(raceRoot, { recursive: true, force: true });
   }
