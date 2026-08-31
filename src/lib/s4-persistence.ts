@@ -1,5 +1,6 @@
 import type { StoreState, UUID } from "./types";
-import { uuidV4Pattern } from "./utils";
+import { normalizeS4Instruction } from "./s4-compiler";
+import { codePointLength, uuidV4Pattern } from "./utils";
 
 type AnyRecord = Record<string, unknown>;
 
@@ -56,6 +57,15 @@ function sha(value: unknown): void { if (typeof value !== "string" || !SHA.test(
 function integer(value: unknown, min = 0, max = Number.MAX_SAFE_INTEGER): void { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) fail(); }
 function finite(value: unknown): void { if (typeof value !== "number" || !Number.isFinite(value)) fail(); }
 function text(value: unknown, max = 4096): void { if (typeof value !== "string" || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) fail(); }
+function instructionText(value: unknown): void {
+  if (typeof value !== "string") fail();
+  try {
+    if (normalizeS4Instruction(value) !== value) fail();
+  } catch {
+    fail();
+  }
+}
+function assessmentEvidence(value: unknown): void { if (typeof value !== "string" || codePointLength(value) > 400) fail(); }
 function boolean(value: unknown): void { if (typeof value !== "boolean") fail(); }
 function oneOf(value: unknown, values: readonly string[]): void { if (typeof value !== "string" || !values.includes(value)) fail(); }
 function literal(value: unknown, expected: unknown): void { if (value !== expected) fail(); }
@@ -145,7 +155,7 @@ function validateRecord(name: string, value: unknown): void {
   }
   if (name === "s4Edits") {
     common(item, ["editId", "projectId", "generationSetId", "selectionStateId", "sourceSnapshotId", "lineageRootRevisionId", "baseRevisionId", "maskId"], ["maskIdentityHash", "instructionHash", "editInputHash", "promptHash", "providerRequestHash"], ["createdAt", "admittedAt", "updatedAt", "terminalAt"]);
-    integer(item.cycleNumber, 1, 2); oneOf(item.baseRevisionKind, ["s3", "s4"]); integer(item.baseSelectionVersion); oneOf(item.maskMaterializationStatus, ["pending", "ready"]); text(item.instructionText, 600); literal(item.compilerVersion, "s4-local-edit-v1");
+    integer(item.cycleNumber, 1, 2); oneOf(item.baseRevisionKind, ["s3", "s4"]); integer(item.baseSelectionVersion); oneOf(item.maskMaterializationStatus, ["pending", "ready"]); instructionText(item.instructionText); literal(item.compilerVersion, "s4-local-edit-v1");
     const imageIds = arr(item.imageOperationIds); const assessmentIds = arr(item.assessmentAttemptIds);
     if (imageIds.length > 2 || assessmentIds.length > 2) fail(); imageIds.forEach(uuid); assessmentIds.forEach(uuid);
     nullableUuid(item.outputRevisionId); nullableUuid(item.preservationCheckId); nullableUuid(item.assessmentId);
@@ -157,7 +167,7 @@ function validateRecord(name: string, value: unknown): void {
   }
   if (name === "s4Revisions") {
     common(item, ["revisionId", "projectId", "generationSetId", "selectionStateId", "sourceSnapshotId", "lineageRootRevisionId", "parentRevisionId", "editId", "maskId", "sourceAssetId", "outputAssetId", "preservationCheckId", "assessmentId"], ["maskIdentityHash", "instructionHash", "editInputHash", "promptHash", "providerRequestHash", "sourceSha256", "outputSha256"], ["createdAt"]);
-    literal(item.kind, "s4_local_edit"); oneOf(item.parentRevisionKind, ["s3", "s4"]); integer(item.cycleNumber, 1, 2); text(item.instructionText, 600); literal(item.compilerVersion, "s4-local-edit-v1"); quality(item.sourceQuality); integer(item.sourceByteSize, 1); literal(item.sourceWidth, 1536); literal(item.sourceHeight, 1024); literal(item.sourcePixelCount, 1572864); integer(item.outputByteSize, 1); literal(item.outputWidth, 1536); literal(item.outputHeight, 1024); literal(item.outputPixelCount, 1572864); literal(item.outputMediaProfile, "s2-media-v1"); return;
+    literal(item.kind, "s4_local_edit"); oneOf(item.parentRevisionKind, ["s3", "s4"]); integer(item.cycleNumber, 1, 2); instructionText(item.instructionText); literal(item.compilerVersion, "s4-local-edit-v1"); quality(item.sourceQuality); integer(item.sourceByteSize, 1); literal(item.sourceWidth, 1536); literal(item.sourceHeight, 1024); literal(item.sourcePixelCount, 1572864); integer(item.outputByteSize, 1); literal(item.outputWidth, 1536); literal(item.outputHeight, 1024); literal(item.outputPixelCount, 1572864); literal(item.outputMediaProfile, "s2-media-v1"); return;
   }
   if (name === "s4Assets") {
     common(item, ["assetId", "projectId", "generationSetId", "revisionId"], ["providerOutputSha256", "normalizedSha256"], ["createdAt"]);
@@ -199,9 +209,9 @@ function validateRecord(name: string, value: unknown): void {
 function observation(value: unknown, kind: "requirement" | "rule"): void {
   if (kind === "requirement") {
     const item = exact(value, ["requirementId", "expected", "expectedCount", "expectedValue", "observed", "observedCount", "confidence", "evidence"]);
-    text(item.requirementId, 128); oneOf(item.expected, ["present", "absent", "exact_count"]); if (item.expectedCount !== null) integer(item.expectedCount); if (item.expectedValue !== null && !["string", "number", "boolean"].includes(typeof item.expectedValue)) fail(); oneOf(item.observed, ["present", "absent", "uncertain", "not_verifiable"]); if (item.observedCount !== null) integer(item.observedCount); finite(item.confidence); if ((item.confidence as number) < 0 || (item.confidence as number) > 1) fail(); text(item.evidence, 400); return;
+    text(item.requirementId, 128); oneOf(item.expected, ["present", "absent", "exact_count"]); if (item.expectedCount !== null) integer(item.expectedCount); if (item.expectedValue !== null && !["string", "number", "boolean"].includes(typeof item.expectedValue)) fail(); oneOf(item.observed, ["present", "absent", "uncertain", "not_verifiable"]); if (item.observedCount !== null) integer(item.observedCount); finite(item.confidence); if ((item.confidence as number) < 0 || (item.confidence as number) > 1) fail(); assessmentEvidence(item.evidence); return;
   }
-  const item = exact(value, ["ruleId", "observed", "confidence", "evidence"]); text(item.ruleId, 128); oneOf(item.observed, ["compliant", "non_compliant", "uncertain", "not_verifiable"]); finite(item.confidence); if ((item.confidence as number) < 0 || (item.confidence as number) > 1) fail(); text(item.evidence, 400);
+  const item = exact(value, ["ruleId", "observed", "confidence", "evidence"]); text(item.ruleId, 128); oneOf(item.observed, ["compliant", "non_compliant", "uncertain", "not_verifiable"]); finite(item.confidence); if ((item.confidence as number) < 0 || (item.confidence as number) > 1) fail(); assessmentEvidence(item.evidence);
 }
 
 function publicationObject(value: unknown): void { const item = exact(value, ["key", "sha256", "byteSize"]); key(item.key); sha(item.sha256); integer(item.byteSize, 1); }

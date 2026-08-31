@@ -817,11 +817,10 @@ export class S4WorkflowService {
     assertUuid(projectId, "projectId");
     const state = this.state();
     const { generationSet, selection } = this.generation(state, projectId);
-    let active: ResolvedVisualRevision | null = null;
-    if (selection.activeRevisionId !== null) {
-      try { active = resolveActiveVisualRevision(state, projectId, this.objects); }
-      catch { active = null; }
-    }
+    const active =
+      selection.activeRevisionId === null
+        ? null
+        : resolveActiveVisualRevision(state, projectId, this.objects);
     const stage = state.s4Stages.find((item) =>
       item.projectId === projectId && item.generationSetId === generationSet.generationSetId &&
       item.selectionStateId === selection.selectionStateId && item.lineageRootRevisionId === selection.lineageRootRevisionId);

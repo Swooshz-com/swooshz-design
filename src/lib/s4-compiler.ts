@@ -508,7 +508,7 @@ function strictRecord(value: unknown, keys: readonly string[], failure: "QA_SCHE
 }
 
 function boundedText(value: unknown): string {
-  if (typeof value !== "string" || value.length > 400) schemaFailure("QA_SCHEMA_INVALID");
+  if (typeof value !== "string" || codePointLength(value) > 400) schemaFailure("QA_SCHEMA_INVALID");
   return value;
 }
 

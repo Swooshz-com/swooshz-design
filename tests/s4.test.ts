@@ -848,8 +848,41 @@ test("S4 high-risk resolver matrix resolves exact S3 and S4 identities", async (
     badQuality.s4Assessments[0].status = "material_fail";
     const pointerOnly = cloneJson(persisted);
     pointerOnly.s3Selections[0].activeRevisionId = null;
+    const publicResolverCases = [
+      { name: "missing", state: (() => { const candidate = cloneJson(persisted); candidate.s3Selections[0].activeRevisionId = FOREIGN_UUID; return candidate; })() },
+      { name: "duplicate", state: duplicate },
+      { name: "cross-boundary", state: foreignProject },
+      { name: "invalid-quality", state: badQuality },
+    ];
+    const publicResolverResponses: Array<{ name: string; status: number; body: any }> = [];
+    const originalRepositoryState = value.repository.state.bind(value.repository);
+    const publicDependencies: ApiRequestDependencies = {
+      workflowService: value.service,
+      s3Authorization: {
+        resolveContext: async () => ({ subjectId: "resolver-public-proof" }),
+        authorizeProject: async (_context, projectId) => projectId === value.projectId,
+      },
+    };
+    try {
+      for (const candidate of publicResolverCases) {
+        value.repository.state = () => candidate.state;
+        const response = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", value.projectId, "s4"], publicDependencies);
+        const body = await response.json();
+        publicResolverResponses.push({ name: candidate.name, status: response.status, body });
+      }
+    } finally {
+      value.repository.state = originalRepositoryState;
+    }
+    for (const result of publicResolverResponses) {
+      assert.equal(result.status, 500);
+      assert.equal(result.body.error.code, "S4_INTERNAL_ERROR");
+      assert.equal(result.body.error.message, "The request could not be completed. Try again or contact support with the reference ID.");
+      assert.equal(typeof result.body.error.referenceId, "string");
+      assert.equal(result.body.activeRevisionKind, undefined);
+      assert.equal(result.body.activeQuality, undefined);
+    }
 
-    await proveS4Variants("RESOLVE-001", "S4 high-risk resolver matrix resolves exact S3 and S4 identities", "resolver-matrix", "The executed resolver scenarios established exact positive resolution and fail-closed identity fences.", {
+    await proveS4Variants("RESOLVE-001", "S4 high-risk resolver matrix resolves exact S3 and S4 identities", "resolver-matrix", "The executed resolver scenarios established exact positive resolution, fail-closed identity fences, and generic public S4 errors for corrupt active records.", {
       "s3-source": () => assert.equal(sourceResolved.kind, "s3"),
       "s3-refinement": () => { assert.equal(refinementAdmission.result.cycleNumber, 1); assert.equal(refinementResolved.kind, "s3"); assert.notEqual(refinementResolved.revisionId, sourceResolved.revisionId); },
       "s4-revision": () => { assert.equal(s4Resolved.kind, "s4"); assert.equal(completed.activeRevisionId, revision.revisionId); },
@@ -859,12 +892,22 @@ test("S4 high-risk resolver matrix resolves exact S3 and S4 identities", async (
       "lineage": () => assert.throws(() => resolveVisualRevision(foreignLineage, value.projectId, revision.revisionId, value.objects)),
       "quality": () => assert.throws(() => resolveVisualRevision(badQuality, value.projectId, revision.revisionId, value.objects)),
       "pointer-only": () => assert.equal(resolveActiveVisualRevision(pointerOnly, value.projectId, value.objects), null),
-      "public-kind": () => assert.ok(["s3", "s4"].includes(s4Resolved.kind)),
+      "public-kind": () => {
+        assert.equal(publicResolverResponses.length, 4);
+        for (const result of publicResolverResponses) {
+          assert.equal(result.status, 500);
+          assert.equal(result.body.error.code, "S4_INTERNAL_ERROR");
+          assert.equal(result.body.activeRevisionKind, undefined);
+          assert.equal(result.body.activeQuality, undefined);
+        }
+      },
     }, [
       "s3SourceRevision=" + sourceResolved.revisionId,
       "s3RefinementRevision=" + refinementResolved.revisionId,
       "s4Revision=" + s4Resolved.revisionId,
       "s4ImageOperations=" + persisted.s4ImageOperations.length,
+      "publicResolverCases=" + publicResolverResponses.map((result) => result.name).join(","),
+      "publicResolverError=S4_INTERNAL_ERROR/status-500",
     ]);
   } finally { cleanup(value); }
 });

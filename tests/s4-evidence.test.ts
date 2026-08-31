@@ -1,19 +1,20 @@
 import { strict as assert } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { inflateSync } from "node:zlib";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import sharp from "sharp";
+import { act, create as createTestRenderer, type ReactTestInstance } from "react-test-renderer";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { type BoothGeometry, type BoothGeometrySnapshot, type ProviderMetadata, type S4DesignRuleSnapshot, type S4MaskPrimitive, type S4Requirement, type S4SourceQualityProof, type UUID } from "../src/lib/types";
+import { AppError, type BoothGeometry, type BoothGeometrySnapshot, type ProviderMetadata, type S4DesignRuleSnapshot, type S4MaskPrimitive, type S4Requirement, type S4SourceQualityProof, type UUID } from "../src/lib/types";
 import { emptyStoreState, JsonRepository, PrivateObjectStore } from "../src/lib/store";
 import { MockOpenAIProvider } from "../src/lib/openai";
 import { createWorkflowService, type WorkflowService } from "../src/lib/workflow";
 import { handleApiRequest } from "../src/lib/api";
-import { createS4Client, instructionDraftState, isS4DraftClearEnabled, isS4DraftSubmitReady, isS4PrimitiveLocallyValid, mutateThenRefresh, S4Screen, type S4Primitive } from "../app/components/S4Client";
+import { createS4Client, instructionDraftState, isS4DraftClearEnabled, isS4DraftSubmitReady, isS4PrimitiveLocallyValid, S4Screen, type S4Primitive } from "../app/components/S4Client";
 import { buildS4AssessmentRequest, buildS4ImageRequest, OpenAIS4Provider, type S4ProviderContract } from "../src/lib/s4-provider";
 import type { PublicS4State } from "../src/lib/s4";
 import {
@@ -40,7 +41,7 @@ import { evaluateS4Preservation } from "../src/lib/s4-preservation";
 import { createExactS3FixturePng } from "../src/lib/s3-media";
 import { resolveActiveVisualRevision, resolveVisualRevision } from "../src/lib/revision-resolver";
 import { validateS4Collections, validateS4Graph } from "../src/lib/s4-persistence";
-import { sha256 } from "../src/lib/utils";
+import { cloneJson, sha256 } from "../src/lib/utils";
 import { proveS4Claims } from "./s4-proof";
 
 const UUID = "11111111-1111-4111-8111-111111111111" as UUID;
@@ -147,7 +148,7 @@ function realS4QaPayload(input: any): any {
   };
 }
 
-function realS4AssessmentPayload(repository: JsonRepository): any {
+function realS4AssessmentPayload(repository: JsonRepository, evidence = "Local S4 workflow assessment observation"): any {
   const assessment = repository.state().s4Assessments.at(-1);
   if (!assessment) throw new Error("real S4 assessment fixture is not persisted");
   return {
@@ -155,13 +156,13 @@ function realS4AssessmentPayload(repository: JsonRepository): any {
       requirementId: item.requirementId, expected: item.expected, expectedCount: item.expectedCount,
       expectedValue: item.expectedValue, observed: item.expected === "absent" ? "absent" : "present",
       observedCount: item.expected === "exact_count" ? item.expectedCount : null,
-      confidence: 0.99, evidence: "Local S4 workflow assessment observation",
+      confidence: 0.99, evidence,
     })),
     designRules: assessment.designRuleSnapshot.filter((item) => item.applicability === "applicable").map((item) => ({
-      ruleId: item.ruleId, observed: "compliant", confidence: 0.99, evidence: "Local S4 workflow assessment observation",
+      ruleId: item.ruleId, observed: "compliant", confidence: 0.99, evidence,
     })),
-    requestedEdit: { outcome: "satisfied", evidence: "The marked local region was updated." },
-    overall: { requirementResult: "satisfied", buildabilityResult: "buildable", evidence: "The local fixture remains buildable." },
+    requestedEdit: { outcome: "satisfied", evidence },
+    overall: { requirementResult: "satisfied", buildabilityResult: "buildable", evidence },
   };
 }
 
@@ -185,7 +186,7 @@ async function realS4WaitFor<T>(read: () => T, done: (value: T) => boolean, time
   throw new Error("real S4 API fixture timed out");
 }
 
-async function createRealS4ApiFixture(): Promise<RealS4ApiFixture> {
+async function createRealS4ApiFixture(options: { instructionText?: string; assessmentEvidence?: string } = {}): Promise<RealS4ApiFixture> {
   const root = mkdtempSync(join(tmpdir(), "swooshz-s4-api-real-"));
   const repository = new JsonRepository(root);
   const objects = new PrivateObjectStore(join(root, "objects"));
@@ -231,7 +232,7 @@ async function createRealS4ApiFixture(): Promise<RealS4ApiFixture> {
     },
     runS4Assessment: async (input) => {
       assessmentPromptText = input.promptText;
-      return { payload: realS4AssessmentPayload(repository), providerRequestId: "real-fixture-assessment-request" };
+      return { payload: realS4AssessmentPayload(repository, options.assessmentEvidence), providerRequestId: "real-fixture-assessment-request" };
     },
   };
   const provider = new MockOpenAIProvider({ briefData: realS4BriefData(), s2QaResponseFactory: (input) => realS4QaPayload(input) });
@@ -257,7 +258,7 @@ async function createRealS4ApiFixture(): Promise<RealS4ApiFixture> {
     baseRevisionId: selected.result.activeRevisionId,
     expectedSelectionVersion: selected.result.selectionVersion,
     primitives: [RECTANGLE],
-    instructionText: "  Replace the selected finish.  ",
+    instructionText: options.instructionText ?? "  Replace the selected finish.  ",
   }, randomUUID() as UUID, randomUUID() as UUID);
   const editId = admission.result.editId;
   await realS4WaitFor(() => repository.state().s4Edits.find((item) => item.editId === editId)?.status, (status) => status === "completed");
@@ -313,6 +314,74 @@ async function createRealS4ApiFixture(): Promise<RealS4ApiFixture> {
     privateStateText: JSON.stringify(privateState), privateNeedles, privateStorageKeys, privateHashValues,
     privateProviderRequestIds, privatePromptTexts, privateClaimFacts,
   };
+}
+
+type UnicodePersistenceEvidence = {
+  instruction: string;
+  evidence: string;
+  reloadedInstruction: string;
+  stateFileInstruction: string;
+  reloadedRequirementEvidence: string;
+  rejectedInstructionBoundaries: number;
+  rejectedEvidenceBoundaries: number;
+};
+
+async function executeUnicodePersistenceBoundary(): Promise<UnicodePersistenceEvidence> {
+  const instruction = "😀".repeat(600);
+  const evidence = "😀".repeat(400);
+  const unicodeFixture = await createRealS4ApiFixture({ instructionText: instruction, assessmentEvidence: evidence });
+  try {
+    const committed = unicodeFixture.repository.state();
+    const reloaded = new JsonRepository(unicodeFixture.root).state();
+    const persistedDocument = JSON.parse(readFileSync(join(unicodeFixture.root, "state.json"), "utf8")) as any;
+    const committedEdit = committed.s4Edits.find((item) => item.editId === unicodeFixture.editId);
+    const reloadedEdit = reloaded.s4Edits.find((item) => item.editId === unicodeFixture.editId);
+    const reloadedAttempt = reloaded.s4AssessmentAttempts[0];
+    const assessment = committed.s4Assessments[0];
+    if (!committedEdit || !reloadedEdit || !reloadedAttempt || !assessment) throw new Error("Unicode persistence fixture is incomplete");
+    const stateFileInstruction = persistedDocument.s4Edits.find((item: any) => item.editId === unicodeFixture.editId)?.instructionText;
+    const reloadedRequirementEvidence = reloadedAttempt.requirementObservations[0]?.evidence;
+    if (typeof stateFileInstruction !== "string" || typeof reloadedRequirementEvidence !== "string") throw new Error("Unicode persistence fixture fields are incomplete");
+    assert.equal(Array.from(instruction).length, 600);
+    assert.equal(Buffer.byteLength(instruction, "utf8"), 2_400);
+    assert.equal(committedEdit.instructionText, instruction);
+    assert.equal(reloadedEdit.instructionText, instruction);
+    assert.equal(persistedDocument.s4Edits.find((item: any) => item.editId === unicodeFixture.editId)?.instructionText, instruction);
+    assert.equal(reloadedAttempt.requirementObservations[0]?.evidence, evidence);
+    assert.equal(reloadedAttempt.designObservations[0]?.evidence, evidence);
+    let rejectedInstructionBoundaries = 0;
+    for (const invalidInstruction of ["😀".repeat(601), instruction + "a"]) {
+      const poisonRoot = mkdtempSync(join(tmpdir(), "swooshz-s4-poisoned-instruction-"));
+      try {
+        const poisoned = cloneJson(reloaded);
+        poisoned.s4Edits[0]!.instructionText = invalidInstruction;
+        writeFileSync(join(poisonRoot, "state.json"), JSON.stringify(poisoned), "utf8");
+        assert.throws(() => new JsonRepository(poisonRoot).state(), (error: unknown) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
+        rejectedInstructionBoundaries += 1;
+      } finally { rmSync(poisonRoot, { recursive: true, force: true }); }
+    }
+    let rejectedEvidenceBoundaries = 0;
+    const poisonedEvidenceRoot = mkdtempSync(join(tmpdir(), "swooshz-s4-poisoned-evidence-"));
+    try {
+      const poisoned = cloneJson(reloaded);
+      poisoned.s4AssessmentAttempts[0]!.requirementObservations[0]!.evidence = evidence + "😀";
+      writeFileSync(join(poisonedEvidenceRoot, "state.json"), JSON.stringify(poisoned), "utf8");
+      assert.throws(() => new JsonRepository(poisonedEvidenceRoot).state(), (error: unknown) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
+      rejectedEvidenceBoundaries += 1;
+    } finally { rmSync(poisonedEvidenceRoot, { recursive: true, force: true }); }
+    const overEvidencePayload = realS4AssessmentPayload(unicodeFixture.repository, evidence + "😀");
+    assert.throws(() => reduceS4AssessmentPayload(overEvidencePayload, assessment.canonicalRequirements, assessment.designRuleSnapshot));
+    rejectedEvidenceBoundaries += 1;
+    return {
+      instruction,
+      evidence,
+      reloadedInstruction: reloadedEdit.instructionText,
+      stateFileInstruction,
+      reloadedRequirementEvidence,
+      rejectedInstructionBoundaries,
+      rejectedEvidenceBoundaries,
+    };
+  } finally { rmSync(unicodeFixture.root, { recursive: true, force: true }); }
 }
 
 async function proveVariantClaims(
@@ -674,14 +743,17 @@ test("S4 evidence: instruction compiler is normalized and server-bound", async (
   assert.match(prompt, /CONFIRMED GEOMETRY/);
   assert.match(prompt, /Never change/);
   assert.equal(prompt.includes("keyword"), false);
-  await proveVariantClaims("INSTRUCTION-001", "S4 evidence: instruction compiler is normalized and server-bound", "instruction-compiler", "The executed compiler assertion covered one normalized, bounded, untrusted-input property.", {
+  const unicodeBoundary = await executeUnicodePersistenceBoundary();
+  await proveVariantClaims("INSTRUCTION-001", "S4 evidence: instruction compiler is normalized and server-bound", "instruction-compiler", "The executed compiler assertion covered normalized server input plus admission, durable commit, production reload, and fail-closed Unicode boundaries.", {
     "nfc": () => assert.equal(normalizeS4Instruction("Cafe\u0301"), "Café"),
     "trim": () => assert.equal(normalizeS4Instruction("  edit  "), "edit"),
-    "scalar-bound": () => assert.throws(() => normalizeS4Instruction("😀".repeat(601))),
+    "scalar-bound": () => { assert.throws(() => normalizeS4Instruction("😀".repeat(601))); assert.equal(unicodeBoundary.reloadedInstruction, unicodeBoundary.instruction); },
     "utf8-bound": () => {
       assert.equal(exactUiInstruction.utf8ByteCount, 2_400);
       assert.equal(exactUiInstruction.valid, true);
       assert.equal(overUiInstruction.valid, false);
+      assert.equal(Buffer.byteLength(unicodeBoundary.reloadedInstruction, "utf8"), 2_400);
+      assert.equal(unicodeBoundary.reloadedRequirementEvidence, unicodeBoundary.evidence);
     },
     "controls": () => assert.throws(() => normalizeS4Instruction("\u0000local")),
     "surrogate": () => assert.throws(() => normalizeS4Instruction("\ud800")),
@@ -689,7 +761,15 @@ test("S4 evidence: instruction compiler is normalized and server-bound", async (
     "untrusted": () => assert.match(prompt, /UNTRUSTED USER INSTRUCTION/),
     "server-facts": () => { assert.match(prompt, /CONFIRMED GEOMETRY/); assert.match(prompt, /Never change/); },
     "hash": () => { assert.equal(s4InstructionHash("  edit  "), s4InstructionHash("edit")); assert.notEqual(s4InstructionHash("edit"), s4InstructionHash("different edit")); },
-  });
+  }, [
+    "unicodeInstructionScalars=600",
+    "unicodeInstructionUtf8Bytes=2400",
+    "assessmentEvidenceScalars=400",
+    "transactionCommitAndStateJson=exact",
+    "productionReload=JsonRepository.state",
+    "poisonedInstructionBoundariesRejected=" + unicodeBoundary.rejectedInstructionBoundaries,
+    "poisonedEvidenceBoundariesRejected=" + unicodeBoundary.rejectedEvidenceBoundaries,
+  ]);
 });
 
 test("S4 evidence: edit and assessment identities bind all frozen inputs", async () => {
@@ -1207,31 +1287,98 @@ test("S4 evidence: real workflow projections and safe logs are exact", async () 
   }
 });
 
+type S4ScreenRenderer = {
+  root: { findAllByType(type: string): ReactTestInstance[] };
+  toJSON(): unknown;
+  unmount(): void;
+};
+type S4ScreenHarnessResult = {
+  calls: Array<{ input: string; init?: RequestInit }>;
+  renderedText: string;
+};
+
+async function flushS4ScreenWork(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+function s4ScreenButton(renderer: S4ScreenRenderer, label: string): ReactTestInstance {
+  const button = renderer.root.findAllByType("button").find((item) => item.props.children === label);
+  if (!button) throw new Error("S4 screen button not found: " + label);
+  return button;
+}
+
+function s4ScreenTextarea(renderer: S4ScreenRenderer): ReactTestInstance {
+  const textarea = renderer.root.findAllByType("textarea")[0];
+  if (!textarea) throw new Error("S4 screen instruction textarea not found");
+  return textarea;
+}
+
+async function runS4ScreenEventHarness(options: {
+  initialState: PublicS4State;
+  trigger: (renderer: S4ScreenRenderer) => Promise<void>;
+  postResponse?: () => Response;
+  getState?: (getCount: number) => PublicS4State;
+}): Promise<S4ScreenHarnessResult> {
+  const calls: Array<{ input: string; init?: RequestInit }> = [];
+  const originalFetch = globalThis.fetch;
+  const originalActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  let getCount = 0;
+  let renderer: S4ScreenRenderer | null = null;
+  const postResponse = options.postResponse ?? (() => new Response(JSON.stringify({ sentinel: "MUTATION_RESULT_IS_NOT_STATE", activated: true }), { status: 202, headers: { "content-type": "application/json" } }));
+  const getState = options.getState ?? ((count: number) => count === 1 ? options.initialState : AUTHORITATIVE_S4_STATE);
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { setInterval: () => 1, clearInterval: () => undefined } });
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  globalThis.fetch = async (input, init) => {
+    calls.push({ input: String(input), init });
+    if (init?.method === "POST") return postResponse();
+    getCount += 1;
+    return new Response(JSON.stringify(getState(getCount)), { status: 200, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
+  };
+  try {
+    let activeRenderer!: S4ScreenRenderer;
+    await act(async () => {
+      activeRenderer = createTestRenderer(createElement(S4Screen, { projectId: UUID, initialState: options.initialState }));
+      renderer = activeRenderer;
+      await flushS4ScreenWork();
+    });
+    await options.trigger(activeRenderer);
+    await act(async () => { await flushS4ScreenWork(); });
+    return { calls, renderedText: JSON.stringify(activeRenderer.toJSON()) };
+  } finally {
+    try {
+      if (renderer) await act(async () => { renderer?.unmount(); });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalActEnvironment === undefined) delete (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+      else (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = originalActEnvironment;
+      if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+      else delete (globalThis as { window?: unknown }).window;
+    }
+  }
+}
+
+const AUTHORITATIVE_S4_STATE: PublicS4State = {
+  ...PUBLIC_STATE,
+  activeQuality: "WARNING",
+  edits: [{
+    ...PUBLIC_EDIT,
+    status: "generating",
+    preservationStatus: "NOT_STARTED",
+    assessment: null,
+    outputRevisionId: null,
+    activationState: "historical_non_activatable",
+    previewAvailable: false,
+    terminalAt: null,
+  }],
+};
+
 test("S4 evidence: client requests retain operation keys", async () => {
   const calls: Array<{ input: string; init?: RequestInit }> = [];
   const response = () => new Response(JSON.stringify(PUBLIC_STATE), { status: 200, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
   const client = createS4Client({ projectId: UUID, fetcher: async (input, init) => { calls.push({ input, init }); return response(); } });
-  const mutationRefreshCalls: Array<{ input: string; init?: RequestInit }> = [];
-  const mutationSentinel = { status: "usable_pass", outputExists: true, preservation: "PASS", assessment: "PASS", activated: true, currentRevisionUsable: true, sentinel: "MUTATION_RESULT_IS_NOT_STATE" };
-  const authoritativeState: PublicS4State = {
-    ...PUBLIC_STATE,
-    activeQuality: "WARNING",
-    edits: [{
-      ...PUBLIC_EDIT,
-      status: "generating",
-      preservationStatus: "NOT_STARTED",
-      assessment: null,
-      outputRevisionId: null,
-      activationState: "historical_non_activatable",
-      previewAvailable: false,
-      terminalAt: null,
-    }],
-  };
-  const mutationRefreshClient = createS4Client({ projectId: UUID, fetcher: async (input, init) => {
-    mutationRefreshCalls.push({ input, init });
-    if (init?.method === "POST") return new Response(JSON.stringify(mutationSentinel), { status: 202, headers: { "content-type": "application/json" } });
-    return new Response(JSON.stringify(authoritativeState), { status: 200, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
-  } });
   const validPrimitive: S4Primitive = { kind: "rectangle", xQ16: 1, yQ16: 1, widthQ16: 20_000, heightQ16: 20_000 };
   const validDraft = { primitives: [validPrimitive], instructionText: "local", hasActiveRevision: true, cyclesRemaining: 1 };
   const invalidRectangle: S4Primitive = { kind: "rectangle", xQ16: 65_000, yQ16: 1, widthQ16: 1_000, heightQ16: 20_000 };
@@ -1255,21 +1402,6 @@ test("S4 evidence: client requests retain operation keys", async () => {
   await client.retry(UUID_2, "image");
   await client.retry(UUID_2, "assessment");
   await client.rollback(UUID_2, 1);
-  const refreshedAfterMutation = await mutateThenRefresh(
-    () => mutationRefreshClient.edit({ baseRevisionId: UUID_2, expectedSelectionVersion: 1, primitives: [validPrimitive], instructionText: "local" }),
-    mutationRefreshClient.refresh,
-  );
-  assert.deepEqual(refreshedAfterMutation, authoritativeState);
-  assert.equal(mutationRefreshCalls.length, 2);
-  assert.equal(mutationRefreshCalls[0].init?.method, "POST");
-  assert.equal(mutationRefreshCalls[1].input, "/api/projects/" + UUID + "/s4");
-  assert.equal(mutationRefreshCalls[1].init?.cache, "no-store");
-  assert.equal(JSON.stringify(refreshedAfterMutation).includes("MUTATION_RESULT_IS_NOT_STATE"), false);
-  assert.equal((refreshedAfterMutation as unknown as Record<string, unknown>).activated, undefined);
-  assert.equal(refreshedAfterMutation.edits[0]?.status, "generating");
-  assert.equal(refreshedAfterMutation.edits[0]?.preservationStatus, "NOT_STARTED");
-  assert.equal(refreshedAfterMutation.edits[0]?.assessment, null);
-  assert.equal(refreshedAfterMutation.activeQuality, "WARNING");
   assert.equal(calls.length, 5);
   assert.equal(calls[0].input, "/api/projects/" + UUID + "/s4");
   assert.equal(calls[0].init?.cache, "no-store");
@@ -1278,11 +1410,67 @@ test("S4 evidence: client requests retain operation keys", async () => {
   assert.equal(calls[3].input, "/api/projects/" + UUID + "/s4/edits/" + UUID_2 + "/assessment-retry");
   assert.equal(calls[4].input, "/api/projects/" + UUID + "/s3/selection");
   for (const call of calls.slice(1)) assert.ok(new Headers(call.init?.headers).get("Idempotency-Key"));
+  const imageRetryState: PublicS4State = {
+    ...PUBLIC_STATE,
+    edits: [{ ...PUBLIC_EDIT, status: "image_retry_available", preservationStatus: "NOT_STARTED", assessment: null, imageRetryAvailable: true, assessmentRetryAvailable: false, outputRevisionId: null, activationState: "historical_non_activatable", previewAvailable: false, terminalAt: null }],
+  };
+  const assessmentRetryState: PublicS4State = {
+    ...PUBLIC_STATE,
+    edits: [{ ...PUBLIC_EDIT, status: "assessment_retry_available", assessment: { ...PUBLIC_ASSESSMENT, status: "QA_UNAVAILABLE", retryAvailable: true }, imageRetryAvailable: false, assessmentRetryAvailable: true, outputRevisionId: null, activationState: "historical_non_activatable", previewAvailable: false, terminalAt: null }],
+  };
+  const submitHarness = await runS4ScreenEventHarness({
+    initialState: PUBLIC_STATE,
+    trigger: async (renderer) => {
+      await act(async () => { s4ScreenButton(renderer, "Add rectangle to local mask").props.onClick(); });
+      await act(async () => { s4ScreenTextarea(renderer).props.onChange({ target: { value: "local" } }); });
+      await act(async () => { s4ScreenButton(renderer, "Submit local edit").props.onClick(); await flushS4ScreenWork(); });
+    },
+  });
+  const imageRetryHarness = await runS4ScreenEventHarness({
+    initialState: imageRetryState,
+    trigger: async (renderer) => { await act(async () => { s4ScreenButton(renderer, "Retry image").props.onClick(); await flushS4ScreenWork(); }); },
+  });
+  const assessmentRetryHarness = await runS4ScreenEventHarness({
+    initialState: assessmentRetryState,
+    trigger: async (renderer) => { await act(async () => { s4ScreenButton(renderer, "Retry assessment").props.onClick(); await flushS4ScreenWork(); }); },
+  });
+  const rollbackHarness = await runS4ScreenEventHarness({
+    initialState: PUBLIC_STATE,
+    trigger: async (renderer) => { await act(async () => { s4ScreenButton(renderer, "Rollback pointer to this revision").props.onClick(); await flushS4ScreenWork(); }); },
+  });
+  const errorHarness = await runS4ScreenEventHarness({
+    initialState: PUBLIC_STATE,
+    postResponse: () => new Response(JSON.stringify({ error: { code: "S4_INTERNAL_ERROR", message: "The request could not be completed.", referenceId: "component-error-reference", fields: [] } }), { status: 500, headers: { "content-type": "application/json" } }),
+    trigger: async (renderer) => {
+      await act(async () => { s4ScreenButton(renderer, "Add rectangle to local mask").props.onClick(); });
+      await act(async () => { s4ScreenTextarea(renderer).props.onChange({ target: { value: "local" } }); });
+      await act(async () => { s4ScreenButton(renderer, "Submit local edit").props.onClick(); await flushS4ScreenWork(); });
+    },
+  });
+  const assertEventMutationPath = (result: S4ScreenHarnessResult, suffix: string): void => {
+    const postIndex = result.calls.findIndex((call) => call.init?.method === "POST");
+    assert.ok(postIndex >= 0);
+    assert.equal(result.calls[postIndex]?.input, "/api/projects/" + UUID + suffix);
+    assert.equal(result.calls[postIndex + 1]?.input, "/api/projects/" + UUID + "/s4");
+    assert.equal(result.calls[postIndex + 1]?.init?.cache, "no-store");
+    assert.ok(new Headers(result.calls[postIndex]?.init?.headers).get("Idempotency-Key"));
+    assert.equal(result.renderedText.includes("MUTATION_RESULT_IS_NOT_STATE"), false);
+    assert.equal(result.renderedText.includes('"activated":true'), false);
+    assert.match(result.renderedText, /Generating one image attempt/);
+    assert.match(result.renderedText, /WARNING/);
+    assert.equal(result.renderedText.includes("assessment PASS"), false);
+  };
+  assertEventMutationPath(submitHarness, "/s4/edits");
+  assertEventMutationPath(imageRetryHarness, "/s4/edits/" + UUID_2 + "/image-retry");
+  assertEventMutationPath(assessmentRetryHarness, "/s4/edits/" + UUID_2 + "/assessment-retry");
+  assertEventMutationPath(rollbackHarness, "/s3/selection");
+  assertEventMutationPath(errorHarness, "/s4/edits");
+  assert.equal(errorHarness.calls.find((call) => call.init?.method === "POST")?.init?.body?.toString().includes("local"), true);
   const markup = renderToStaticMarkup(createElement(S4Screen, {
     projectId: UUID,
     initialState: PUBLIC_STATE,
   }));
-  await proveVariantClaims("CLIENT-001", "S4 evidence: client requests retain operation keys", "client-surface", "The executed client assertion covered one route, control, persisted-state, or request-key property; no-infer used the real mutation-then-refresh helper.", {
+  await proveVariantClaims("CLIENT-001", "S4 evidence: client requests retain operation keys", "client-surface", "The executed client assertion covered one route, control, persisted-state, or request-key property; no-infer drove the rendered S4Screen handlers through POST then persisted GET.", {
     "mask-ready": () => { assert.equal(isS4DraftSubmitReady(validDraft), true); assert.match(markup, /Mask verified/); },
     "rectangle-ui": () => assert.match(markup, /rectangle/),
     "brush-ui": () => assert.match(markup, /brush/),
@@ -1297,21 +1485,22 @@ test("S4 evidence: client requests retain operation keys", async () => {
     "rollback": () => { assert.equal(calls[4].input.endsWith("/s3/selection"), true); assert.match(markup, /Rollback pointer/); },
     "budget": () => assert.match(markup, /cycle\(s\) remaining/),
     "no-infer": () => {
-      assert.equal(mutationRefreshCalls[0].init?.method, "POST");
-      assert.equal(mutationRefreshCalls[1].input, "/api/projects/" + UUID + "/s4");
-      assert.deepEqual(refreshedAfterMutation, authoritativeState);
-      assert.equal(JSON.stringify(refreshedAfterMutation).includes("MUTATION_RESULT_IS_NOT_STATE"), false);
-      assert.equal(refreshedAfterMutation.edits[0]?.status, "generating");
-      assert.equal(refreshedAfterMutation.edits[0]?.preservationStatus, "NOT_STARTED");
-      assert.equal(refreshedAfterMutation.edits[0]?.assessment, null);
+      assertEventMutationPath(submitHarness, "/s4/edits");
+      assertEventMutationPath(imageRetryHarness, "/s4/edits/" + UUID_2 + "/image-retry");
+      assertEventMutationPath(assessmentRetryHarness, "/s4/edits/" + UUID_2 + "/assessment-retry");
+      assertEventMutationPath(rollbackHarness, "/s3/selection");
+      assertEventMutationPath(errorHarness, "/s4/edits");
+      assert.equal(errorHarness.calls.some((call) => call.input === "/api/projects/" + UUID + "/s4" && call.init?.method === undefined), true);
       assert.equal(isS4DraftSubmitReady({ ...validDraft, cyclesRemaining: 0 }), false);
     },
   }, [
     "requestCount=" + calls.length,
     "idempotencyKeys=" + calls.filter((call) => Boolean(new Headers(call.init?.headers).get("Idempotency-Key"))).length,
+    "componentEventPaths=submit,image-retry,assessment-retry,rollback",
     "mutationResponseSentinelIgnored=true",
     "mutationThenRefreshOrder=POST,GET",
     "authoritativeState=GET-persisted-state",
+    "errorRecovery=POST-failure-then-persisted-GET",
     "supportingTest=S4 evidence: API and privacy boundaries are default-deny",
     "supportingTest=S4 successful edit persists one stage, one cycle, and activates through the shared pointer",
   ]);
