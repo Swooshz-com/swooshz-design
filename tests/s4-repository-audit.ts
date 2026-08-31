@@ -526,6 +526,7 @@ function buildGraph(lock: JsonRecord, sectionName: "dependencies" | "devDependen
   const pending: Array<{ name: string; version: string }> = [];
   for (const [name, entry] of Object.entries(rootsSection)) pending.push({ name, version: checkedString(mapAt(entry, "importer entry").version, "importer version") });
   const roots = new Set<string>();
+  for (const root of pending) roots.add(resolveSnapshotKey(root.name, root.version, snapshots));
   const snapshotKeys = new Set<string>();
   const packageKeys = new Set<string>();
   const entries = new Map<string, { packageKey: string; packageValue: JsonValue; snapshotValue: JsonValue }>();
@@ -537,7 +538,6 @@ function buildGraph(lock: JsonRecord, sectionName: "dependencies" | "devDependen
     const packageValue = packages[packageKey];
     const snapshotValue = snapshots[snapshotKey];
     if (!isRecord(packageValue) || !isRecord(snapshotValue)) throw new Error("invalid graph entry " + snapshotKey);
-    roots.add(snapshotKey);
     snapshotKeys.add(snapshotKey);
     packageKeys.add(packageKey);
     entries.set(snapshotKey, { packageKey, packageValue, snapshotValue });
