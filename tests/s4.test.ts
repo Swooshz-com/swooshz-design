@@ -22,7 +22,8 @@ import { createS4Client, instructionDraftState, isS4DraftClearEnabled, isS4Draft
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { proveS4Claims } from "./s4-proof";
-import { auditRepositorySurfaces, type S4RepositoryAuditInput } from "./s4-repository-audit";
+import { auditRepositorySurfaces, s4DependencyMetadataReferenceHash, type S4RepositoryAuditInput } from "./s4-repository-audit";
+import { S4_G3_AUTHORIZED_DEPENDENCY_METADATA } from "./s4-dependency-authority";
 
 const WIDTH = 1536;
 const HEIGHT = 1024;
@@ -322,7 +323,7 @@ function expectErrorCode(action: () => unknown, expected: string): void {
 test("S4 repository audit enforces exact resolved package identity and fails closed", () => {
   const baseSha = "2e01a90b6b2f40f4729764970a8cb89f25bbe0c8";
   const baseTree = "b144ae4bc0bb80bee82d696be0f7e550af0a3ae9";
-  const authorityRef = "5478517427";
+  const authorityRef = "5481945791";
   const packageName = "react-test-renderer";
   const packageVersion = "19.2.8";
   const purpose = "direct in-process rendered S4Screen component/event evidence for submit, image retry, assessment retry and rollback.";
@@ -358,6 +359,30 @@ test("S4 repository audit enforces exact resolved package identity and fails clo
     return replaceOnce(result, "  react-test-renderer@19.2.8:", "  " + packageLocator);
   }
 
+  const rendererPackageEntry = [
+    "  react-test-renderer@19.2.8:",
+    "    resolution: {integrity: sha512-GHKPaDRaNYU24PHTLG8Bx8VMY9t+qNfxQbt/Yjp7aMWBkKU6766SR0n6TnYu7P5I1MfEuAMUadqiyDHyI4Yy9Q==}",
+    "    peerDependencies:",
+    "      react: ^19.2.8",
+    "",
+  ].join("\n");
+  const rendererSnapshotEntry = [
+    "  react-test-renderer@19.2.8(react@19.2.8):",
+    "    dependencies:",
+    "      react: 19.2.8",
+    "      react-is: 19.2.8",
+    "      scheduler: 0.27.0",
+    "",
+  ].join("\n");
+
+  function rendererPackageMetadataLock(replacement: string): string {
+    return replaceOnce(candidateLockfileText, rendererPackageEntry, replacement);
+  }
+
+  function rendererSnapshotMetadataLock(replacement: string): string {
+    return replaceOnce(candidateLockfileText, rendererSnapshotEntry, replacement);
+  }
+
   function input(overrides: AuditOverrides = {}): S4RepositoryAuditInput {
     return {
       basePackageText: overrides.basePackageText ?? basePackageText,
@@ -376,6 +401,7 @@ test("S4 repository audit enforces exact resolved package identity and fails clo
         requiredAuthorityRef: authorityRef,
         baselineSha: baseSha,
         baselineTree: baseTree,
+        expectedMetadata: S4_G3_AUTHORIZED_DEPENDENCY_METADATA,
         ...overrides.dependencyAuthority,
       },
       scriptAuthority: {
@@ -410,6 +436,14 @@ test("S4 repository audit enforces exact resolved package identity and fails clo
   const valid = audit();
   assert.equal(valid.auditState, "complete", "valid locator audit state");
   assert.equal(valid.disposition, "changed_authorized_conformant", "valid actual locator");
+  assert.equal(S4_G3_AUTHORIZED_DEPENDENCY_METADATA.sourceSha, "3ff5676478cc6cab4aec4d1afe65bbb1c1c029ee");
+  assert.equal(S4_G3_AUTHORIZED_DEPENDENCY_METADATA.sourceTree, "ffa1d9e9f19bf563a6562aa8f4d94ac557ab4e77");
+  assert.equal(S4_G3_AUTHORIZED_DEPENDENCY_METADATA.metadataSha256, s4DependencyMetadataReferenceHash(S4_G3_AUTHORIZED_DEPENDENCY_METADATA));
+
+  function assertKnownNonconformant(label: string, result: ReturnType<typeof audit>): void {
+    assert.equal(result.auditState, "complete", label + " audit state");
+    assert.equal(result.disposition, "changed_unauthorized_nonconformant", label + " disposition");
+  }
 
   assertIncomplete("malformed locator", audit({
     candidateLockfileText: rendererIdentityLock("19.2.8(react@19.2.8", "react-test-renderer@19.2.8(react@19.2.8)"),
@@ -426,6 +460,55 @@ test("S4 repository audit enforces exact resolved package identity and fails clo
   }));
   assertNonconformant("peer-context mismatch", audit({
     candidateLockfileText: rendererIdentityLock("19.2.8(react@19.2.80)", "react-test-renderer@19.2.8(react@19.2.80)"),
+  }));
+  assertKnownNonconformant("incompatible peer declaration", audit({
+    candidateLockfileText: rendererPackageMetadataLock(rendererPackageEntry.replace("react: ^19.2.8", "react: ^18.0.0")),
+  }));
+  assertKnownNonconformant("compatible but different peer declaration", audit({
+    candidateLockfileText: rendererPackageMetadataLock(rendererPackageEntry.replace("react: ^19.2.8", "react: ^19.0.0")),
+  }));
+  assertKnownNonconformant("extra optional peer declaration", audit({
+    candidateLockfileText: rendererPackageMetadataLock(rendererPackageEntry.replace(
+      "      react: ^19.2.8\n",
+      "      react: ^19.2.8\n      react-dom: ^19.2.8\n    peerDependenciesMeta:\n      react-dom:\n        optional: true\n",
+    )),
+  }));
+  assertKnownNonconformant("changed optional flag", audit({
+    candidateLockfileText: rendererPackageMetadataLock(rendererPackageEntry.replace(
+      "      react: ^19.2.8\n",
+      "      react: ^19.2.8\n    peerDependenciesMeta:\n      react:\n        optional: true\n",
+    )),
+  }));
+  assertKnownNonconformant("missing authorised peer declaration", audit({
+    candidateLockfileText: rendererPackageMetadataLock(rendererPackageEntry.replace(
+      "    peerDependencies:\n      react: ^19.2.8\n",
+      "",
+    )),
+  }));
+  assertKnownNonconformant("extra peer metadata", audit({
+    candidateLockfileText: rendererPackageMetadataLock(rendererPackageEntry.replace(
+      "      react: ^19.2.8\n",
+      "      react: ^19.2.8\n    peerDependenciesMeta:\n      react-dom:\n        optional: true\n",
+    )),
+  }));
+  assertKnownNonconformant("direct package metadata drift", audit({
+    candidateLockfileText: rendererPackageMetadataLock(rendererPackageEntry.replace(
+      "sha512-GHKPaDRaNYU24PHTLG8Bx8VMY9t+qNfxQbt/Yjp7aMWBkKU6766SR0n6TnYu7P5I1MfEuAMUadqiyDHyI4Yy9Q==",
+      "sha512-" + "A".repeat(86) + "==",
+    )),
+  }));
+  assertKnownNonconformant("snapshot metadata drift", audit({
+    candidateLockfileText: rendererSnapshotMetadataLock(rendererSnapshotEntry.replace(
+      "      scheduler: 0.27.0\n",
+      "      scheduler: 0.27.0\n    optionalDependencies:\n      react-is: 19.2.8\n",
+    )),
+  }));
+  assertKnownNonconformant("authorised closure metadata drift", audit({
+    candidateLockfileText: replaceOnce(
+      candidateLockfileText,
+      "sha512-s5un28nYxKJw5gvUHyW5PCC28CvBqLu9r3cWgzHT4Vo/5fqqkFcdRYsGcKf50WMPpjjFZS5d76fn3YCo2njKwQ==",
+      "sha512-" + "B".repeat(86) + "==",
+    ),
   }));
   assertIncomplete("direct package version mismatch", audit({
     candidateLockfileText: rendererIdentityLock("19.2.80(react@19.2.8)", "react-test-renderer@19.2.80(react@19.2.8)", "react-test-renderer@19.2.80:"),
@@ -487,6 +570,24 @@ test("S4 repository audit enforces exact resolved package identity and fails clo
   }));
   assertNonconformant("missing Web authority", audit({
     dependencyAuthority: { authorityRefs: [] },
+  }));
+  assertIncomplete("missing expected authority metadata", audit({
+    dependencyAuthority: { expectedMetadata: undefined },
+  }));
+  const ambiguousExpectedMetadata = {
+    ...S4_G3_AUTHORIZED_DEPENDENCY_METADATA,
+    packageEntries: [
+      ...S4_G3_AUTHORIZED_DEPENDENCY_METADATA.packageEntries,
+      S4_G3_AUTHORIZED_DEPENDENCY_METADATA.packageEntries[0],
+    ],
+  };
+  assertIncomplete("ambiguous expected authority metadata", audit({
+    dependencyAuthority: {
+      expectedMetadata: {
+        ...ambiguousExpectedMetadata,
+        metadataSha256: s4DependencyMetadataReferenceHash(ambiguousExpectedMetadata),
+      },
+    },
   }));
 });
 

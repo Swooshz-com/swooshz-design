@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { compareClaimProofs, deriveClaimManifest, type S4ClaimProofComparison, type S4ClaimProofRecord } from "./s4-evidence-manifest";
 import { proveS4Claim } from "./s4-proof";
 import { auditRepositorySurfaces, type S4DependencyAudit, type S4ScriptAudit } from "./s4-repository-audit";
+import { S4_G3_AUTHORIZED_DEPENDENCY_METADATA } from "./s4-dependency-authority";
 import { jcs, sha256 } from "../src/lib/utils";
 import { OpenAIS4Provider } from "../src/lib/s4-provider";
 
@@ -18,7 +19,7 @@ const CANONICAL_BASE_SHA = "2e01a90b6b2f40f4729764970a8cb89f25bbe0c8";
 const CANONICAL_BASE_TREE = "b144ae4bc0bb80bee82d696be0f7e550af0a3ae9";
 const RUNNER_TEST_IDS = new Set(["REGRESSION-001", "EVIDENCE-001", "GATE-001"]);
 const PROVIDER_CREDENTIAL_NAMES = ["OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID"] as const;
-const AUTHORITY_REF = "5478517427";
+const AUTHORITY_REF = "5481945791";
 const PRIOR_AUTHORITY_REFS = ["5476041097", "5477010746"];
 const AUTHORIZED_PACKAGE_NAME = "react-test-renderer";
 const AUTHORIZED_PACKAGE_VERSION = "19.2.8";
@@ -334,6 +335,7 @@ const repositoryAudit = auditRepositorySurfaces({
     requiredAuthorityRef: AUTHORITY_REF,
     baselineSha: CANONICAL_BASE_SHA,
     baselineTree: CANONICAL_BASE_TREE,
+    expectedMetadata: S4_G3_AUTHORIZED_DEPENDENCY_METADATA,
   },
   scriptAuthority: {
     scriptName: "test",

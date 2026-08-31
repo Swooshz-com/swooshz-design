@@ -76,6 +76,18 @@ export type S4DependencyAuthority = {
   requiredAuthorityRef: string;
   baselineSha: string;
   baselineTree: string;
+  expectedMetadata: S4DependencyMetadataReference;
+};
+
+export type S4DependencyMetadataReferenceInput = {
+  sourceSha: string;
+  sourceTree: string;
+  packageEntries: Array<{ locator: string; value: Record<string, unknown> }>;
+  snapshotEntries: Array<{ locator: string; value: Record<string, unknown> }>;
+};
+
+export type S4DependencyMetadataReference = S4DependencyMetadataReferenceInput & {
+  metadataSha256: string;
 };
 
 export type S4ScriptAuthority = {
@@ -130,6 +142,16 @@ function isRecord(value: JsonValue): value is JsonRecord {
 }
 
 function canonical(value: JsonValue): string { return jcs(value); }
+
+export function s4DependencyMetadataReferenceHash(reference: S4DependencyMetadataReferenceInput): string {
+  return sha256(Buffer.from(canonical({
+    schemaVersion: "s4-dependency-metadata-v1",
+    sourceSha: reference.sourceSha,
+    sourceTree: reference.sourceTree,
+    packageEntries: reference.packageEntries,
+    snapshotEntries: reference.snapshotEntries,
+  }), "utf8"));
+}
 
 function equalValue(left: JsonValue, right: JsonValue): boolean {
   if (left === undefined || right === undefined) return left === right;
@@ -634,6 +656,63 @@ function snapshotDependencyLocator(snapshot: JsonRecord, name: string): PnpmLoca
   return unique[0] ?? null;
 }
 
+function validatedExpectedMetadata(authority: S4DependencyAuthority): S4DependencyMetadataReference {
+  const reference = authority.expectedMetadata;
+  if (!isRecord(reference)) throw new Error("missing expected dependency metadata");
+  const referenceKeys = Object.keys(reference).sort();
+  if (canonical(referenceKeys) !== canonical(["metadataSha256", "packageEntries", "snapshotEntries", "sourceSha", "sourceTree"].sort())) {
+    throw new Error("invalid expected dependency metadata shape");
+  }
+  if (typeof reference.sourceSha !== "string" || !/^[0-9a-f]{40}$/.test(reference.sourceSha) || typeof reference.sourceTree !== "string" || !/^[0-9a-f]{40}$/.test(reference.sourceTree)) {
+    throw new Error("invalid expected dependency metadata source");
+  }
+  if (typeof reference.metadataSha256 !== "string" || !/^[0-9a-f]{64}$/.test(reference.metadataSha256)) {
+    throw new Error("invalid expected dependency metadata hash");
+  }
+  const validateEntries = (value: unknown, label: string): Array<{ locator: string; value: Record<string, unknown> }> => {
+    if (!Array.isArray(value) || value.length === 0) throw new Error("missing expected " + label);
+    const seen = new Set<string>();
+    return value.map((item, index) => {
+      if (!isRecord(item) || canonical(Object.keys(item).sort()) !== canonical(["locator", "value"].sort()) || typeof item.locator !== "string" || !isRecord(item.value)) {
+        throw new Error("invalid expected " + label + " entry " + index);
+      }
+      const identity = parsePnpmLocator(item.locator, "expected " + label + " locator");
+      const identityKey = canonical(locatorShape(identity));
+      if (seen.has(identityKey)) throw new Error("ambiguous expected " + label + " locator " + item.locator);
+      seen.add(identityKey);
+      return { locator: item.locator, value: item.value };
+    });
+  };
+  const packageEntries = validateEntries(reference.packageEntries, "package metadata");
+  const snapshotEntries = validateEntries(reference.snapshotEntries, "snapshot metadata");
+  if (s4DependencyMetadataReferenceHash({ sourceSha: reference.sourceSha, sourceTree: reference.sourceTree, packageEntries, snapshotEntries }) !== reference.metadataSha256) {
+    throw new Error("expected dependency metadata hash mismatch");
+  }
+  const directPackage = directLocator(authority.packageName, authority.packageVersion, "expected authorized package locator");
+  const directPackageMatches = packageEntries.filter((entry) => {
+    const identity = parsePnpmLocator(entry.locator, "expected package metadata locator");
+    return identity.name === directPackage.name && identity.version === directPackage.version && identity.peers.length === 0;
+  });
+  const directSnapshotMatches = snapshotEntries.filter((entry) => {
+    const identity = parsePnpmLocator(entry.locator, "expected snapshot metadata locator");
+    return identity.name === directPackage.name && identity.version === directPackage.version;
+  });
+  if (directPackageMatches.length !== 1 || directSnapshotMatches.length !== 1) {
+    throw new Error("missing or ambiguous expected direct dependency metadata");
+  }
+  return { sourceSha: reference.sourceSha, sourceTree: reference.sourceTree, packageEntries, snapshotEntries, metadataSha256: reference.metadataSha256 };
+}
+
+function expectedMetadataFacts(reference: S4DependencyMetadataReference): string[] {
+  return [
+    "expectedMetadataSourceSha=" + reference.sourceSha,
+    "expectedMetadataSourceTree=" + reference.sourceTree,
+    "expectedMetadataSha256=" + reference.metadataSha256,
+    "expectedPackageMetadataLocators=" + reference.packageEntries.map((entry) => entry.locator).join(","),
+    "expectedSnapshotMetadataLocators=" + reference.snapshotEntries.map((entry) => entry.locator).join(","),
+  ];
+}
+
 function peerContextConformant(
   directPackageKey: string,
   directPackage: JsonRecord,
@@ -751,6 +830,7 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
     && graphEqual(basePeerGraph, candidatePeerGraph);
 
   const authority = input.dependencyAuthority;
+  const expectedMetadata = validatedExpectedMetadata(authority);
   const authorityIsValid = validAuthority(authority);
   const devManifestDelta = manifestDelta.filter((change) => change.surface === "test-only-dependency");
   const exactDevDelta = devManifestDelta.length === 1
@@ -767,10 +847,14 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
   const candidateSnapshots = mapAt(candidateLock.snapshots, "candidate snapshots");
   const newDevPackageKeys = new Set(Array.from(candidateDevGraph.packageKeys).filter((key) => !Object.prototype.hasOwnProperty.call(basePackages, key)));
   const newDevSnapshotKeys = new Set(Array.from(candidateDevGraph.snapshotKeys).filter((key) => !Object.prototype.hasOwnProperty.call(baseSnapshots, key)));
+  const expectedPackageKeys = new Set(expectedMetadata.packageEntries.map((entry) => entry.locator));
+  const expectedSnapshotKeys = new Set(expectedMetadata.snapshotEntries.map((entry) => entry.locator));
+  const expectedNewPackageKeys = new Set(Array.from(expectedPackageKeys).filter((key) => !Object.prototype.hasOwnProperty.call(basePackages, key)));
+  const expectedNewSnapshotKeys = new Set(Array.from(expectedSnapshotKeys).filter((key) => !Object.prototype.hasOwnProperty.call(baseSnapshots, key)));
   const actualPackageChanges = new Set(lockDelta.filter((change) => change.lockKind === "package").map((change) => change.lockKey));
   const actualSnapshotChanges = new Set(lockDelta.filter((change) => change.lockKind === "snapshot").map((change) => change.lockKey));
-  const exactPackageChanges = canonical(Array.from(actualPackageChanges).sort()) === canonical(Array.from(newDevPackageKeys).sort());
-  const exactSnapshotChanges = canonical(Array.from(actualSnapshotChanges).sort()) === canonical(Array.from(newDevSnapshotKeys).sort());
+  const exactPackageChanges = canonical(Array.from(actualPackageChanges).sort()) === canonical(Array.from(expectedNewPackageKeys).sort());
+  const exactSnapshotChanges = canonical(Array.from(actualSnapshotChanges).sort()) === canonical(Array.from(expectedNewSnapshotKeys).sort());
   const importerPath = "pnpm-lock.yaml.importers[\".\"].devDependencies." + authority.packageName;
   const importerChange = lockDelta.filter((change) => change.lockKind === "importer" && change.path === importerPath);
   const unrelatedLockChanges = lockDelta.filter((change) => !((change.lockKind === "importer" && change.path === importerPath) || (change.lockKind === "package" && newDevPackageKeys.has(change.lockKey ?? "")) || (change.lockKind === "snapshot" && newDevSnapshotKeys.has(change.lockKey ?? ""))));
@@ -794,6 +878,12 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
   const directSnapshotKey = resolveSnapshotKey(authority.packageName, candidateDevVersion, candidateSnapshots);
   const directSnapshot = mapAt(candidateSnapshots[directSnapshotKey], "authorized snapshot entry");
   const directSnapshotIdentity = parsePnpmLocator(directSnapshotKey, "authorized snapshot identity");
+  const expectedPackageValuesConformant = expectedMetadata.packageEntries.every((entry) => Object.prototype.hasOwnProperty.call(candidatePackages, entry.locator) && equalValue(candidatePackages[entry.locator], entry.value) && candidateDevGraph.packageKeys.has(entry.locator));
+  const expectedSnapshotValuesConformant = expectedMetadata.snapshotEntries.every((entry) => Object.prototype.hasOwnProperty.call(candidateSnapshots, entry.locator) && equalValue(candidateSnapshots[entry.locator], entry.value) && candidateDevGraph.snapshotKeys.has(entry.locator));
+  const expectedMetadataIsConformant = expectedPackageValuesConformant
+    && expectedSnapshotValuesConformant
+    && canonical(Array.from(newDevPackageKeys).sort()) === canonical(Array.from(expectedNewPackageKeys).sort())
+    && canonical(Array.from(newDevSnapshotKeys).sort()) === canonical(Array.from(expectedNewSnapshotKeys).sort());
   const exactPackageIdentity = directPackageIdentity.name === authority.packageName
     && directPackageIdentity.version === authority.packageVersion
     && directPackageIdentity.peers.length === 0;
@@ -808,7 +898,7 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
     candidateSnapshots,
     candidateDevGraph,
   );
-  const exactResolvedIdentity = exactPackageIdentity && importerSnapshotIdentityMatch && peerContextIsConformant;
+  const exactResolvedIdentity = exactPackageIdentity && importerSnapshotIdentityMatch && peerContextIsConformant && expectedMetadataIsConformant;
   const integrityKeys = Array.from(newDevPackageKeys).every((key) => {
     const resolution = mapAt(candidatePackages[key], "new package resolution " + key).resolution;
     return isRecord(resolution) && validSha512Integrity(resolution.integrity);
@@ -835,6 +925,7 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
   const disposition: S4DeltaDisposition = !hasKnownDelta ? "unchanged" : authorized ? "changed_authorized_conformant" : "changed_unauthorized_nonconformant";
   const facts = [
     ...authorityFacts(authority),
+    ...expectedMetadataFacts(expectedMetadata),
     "baseManifestSha256=" + baseManifestSha256,
     "candidateManifestSha256=" + candidateManifestSha256,
     "baseLockfileSha256=" + baseLockfileSha256,
@@ -851,6 +942,9 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
     "resolvedSnapshotLocator=" + canonical(locatorShape(directSnapshotIdentity)),
     "importerSnapshotIdentityMatch=" + importerSnapshotIdentityMatch,
     "peerContextIsConformant=" + peerContextIsConformant,
+    "expectedPackageValuesConformant=" + expectedPackageValuesConformant,
+    "expectedSnapshotValuesConformant=" + expectedSnapshotValuesConformant,
+    "expectedMetadataIsConformant=" + expectedMetadataIsConformant,
     "exactResolvedIdentity=" + exactResolvedIdentity,
     "integrityIsConformant=" + exactIntegrity,
     "lockConformant=" + lockConformant,
