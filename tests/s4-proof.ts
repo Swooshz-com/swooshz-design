@@ -83,10 +83,11 @@ export async function proveS4Claim(input: S4ClaimProofInput, assertion: () => vo
     expectedResult: input.expectedResult,
     actualResult: input.actualResult,
     provingTest: input.provingTest,
+    assertionId: input.assertionId,
     observationFacts: [...observationFacts, "executionReceiptId=" + receipt.receiptId, "executionObservationHash=" + receipt.observationHash],
   };
   const comparison = compareClaimProofs(manifest, [record]);
-  if (comparison.unknownClaims !== 0 || comparison.duplicateClaims !== 0 || comparison.skippedClaims !== 0) {
+  if (comparison.failedClaims !== 0 || comparison.unknownClaims !== 0 || comparison.duplicateClaims !== 0 || comparison.skippedClaims !== 0) {
     throw new Error("invalid S4 claim proof identity: " + record.claimId);
   }
   appendProofRecord(record);

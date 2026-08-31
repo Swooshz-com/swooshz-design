@@ -5,16 +5,35 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { dirname, join, resolve } from "node:path";
 import { compareClaimProofs, deriveClaimManifest, type S4ClaimProofComparison, type S4ClaimProofRecord } from "./s4-evidence-manifest";
 import { proveS4Claim } from "./s4-proof";
+import { auditRepositorySurfaces, type S4DependencyAudit, type S4ScriptAudit } from "./s4-repository-audit";
 import { jcs, sha256 } from "../src/lib/utils";
 import { OpenAIS4Provider } from "../src/lib/s4-provider";
 
 const SHA = /^[0-9a-f]{40}$/;
 const HASH = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CANONICAL_MAIN_SHA = "a43c833c8da57814d2e97ebf014c1d2762cb2d80";
+const CANONICAL_MAIN_TREE = "b8b3810cfdc0334441a0e8aacde39257ac020c27";
 const CANONICAL_BASE_SHA = "2e01a90b6b2f40f4729764970a8cb89f25bbe0c8";
 const CANONICAL_BASE_TREE = "b144ae4bc0bb80bee82d696be0f7e550af0a3ae9";
 const RUNNER_TEST_IDS = new Set(["REGRESSION-001", "EVIDENCE-001", "GATE-001"]);
 const PROVIDER_CREDENTIAL_NAMES = ["OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID"] as const;
+const AUTHORITY_REF = "5478517427";
+const PRIOR_AUTHORITY_REFS = ["5476041097", "5477010746"];
+const AUTHORIZED_PACKAGE_NAME = "react-test-renderer";
+const AUTHORIZED_PACKAGE_VERSION = "19.2.8";
+const AUTHORIZED_DEPENDENCY_PURPOSE = "direct in-process rendered S4Screen component/event evidence for submit, image retry, assessment retry and rollback.";
+const BASE_TEST_SCRIPT = "tsx --test tests/g3.test.ts tests/s2-evidence.test.ts tests/s2-lifecycle.test.ts";
+const CANDIDATE_TEST_SCRIPT = "tsx --test tests/g3.test.ts tests/s2-evidence.test.ts tests/s2-lifecycle.test.ts tests/s3.test.ts tests/s3-evidence.test.ts tests/s4.test.ts tests/s4-evidence.test.ts";
+const PRESERVED_REQUIRED_VALIDATION = [
+  "testScriptBase=" + BASE_TEST_SCRIPT,
+  "testFile=tests/g3.test.ts",
+  "testFile=tests/s2-evidence.test.ts",
+  "testFile=tests/s2-lifecycle.test.ts",
+  "build=next build",
+  "lint=tsc --noEmit",
+  "typecheck=tsc --noEmit",
+];
 
 type ValidationResult = {
   label: string;
@@ -41,6 +60,10 @@ function git(...args: string[]): string {
   const environment = { ...process.env };
   for (const name of PROVIDER_CREDENTIAL_NAMES) environment[name] = "";
   return execFileSync("git", args, { encoding: "utf8", env: environment }).trim();
+}
+
+function gitSucceeds(...args: string[]): boolean {
+  try { git(...args); return true; } catch { return false; }
 }
 
 function safeValidationEnvironment(environment: Record<string, string>): { values: NodeJS.ProcessEnv; names: string[] } {
@@ -98,12 +121,12 @@ function checkedString(value: unknown, name: string): string {
 function proofRecord(value: unknown, line: number): S4ClaimProofRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("invalid proof record at line " + line);
   const record = value as Record<string, unknown>;
-  const expectedKeys = ["testId", "claimId", "variantId", "normativeRowText", "evidenceClass", "fixtureSetup", "status", "expectedResult", "actualResult", "provingTest", "observationFacts"].sort();
+  const expectedKeys = ["testId", "claimId", "variantId", "normativeRowText", "evidenceClass", "fixtureSetup", "status", "expectedResult", "actualResult", "provingTest", "assertionId", "observationFacts"].sort();
   const actualKeys = Object.keys(record).sort();
   if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) => key !== expectedKeys[index])) throw new Error("proof record shape mismatch at line " + line);
-  if (record.status !== "passed" && record.status !== "skipped") throw new Error("invalid proof status at line " + line);
+  if (record.status !== "passed" && record.status !== "failed" && record.status !== "skipped") throw new Error("invalid proof status at line " + line);
   if (!Array.isArray(record.observationFacts) || record.observationFacts.some((item) => typeof item !== "string")) throw new Error("invalid proof observations at line " + line);
-  for (const field of ["testId", "claimId", "variantId", "normativeRowText", "evidenceClass", "fixtureSetup", "expectedResult", "actualResult", "provingTest"]) {
+  for (const field of ["testId", "claimId", "variantId", "normativeRowText", "evidenceClass", "fixtureSetup", "expectedResult", "actualResult", "provingTest", "assertionId"]) {
     if (typeof record[field] !== "string" || record[field].length === 0) throw new Error("invalid proof field " + field + " at line " + line);
   }
   return record as unknown as S4ClaimProofRecord;
@@ -155,6 +178,7 @@ function assertExactKeys(value: Record<string, unknown>, keys: readonly string[]
 const candidateCommitSha = git("rev-parse", "HEAD");
 const candidateTree = git("rev-parse", "HEAD^{tree}");
 if (!SHA.test(candidateCommitSha) || !SHA.test(candidateTree) || candidateCommitSha === CANONICAL_BASE_SHA) throw new Error("candidate identity is not a distinct 40-hex git object");
+if (git("rev-parse", "origin/main") !== CANONICAL_MAIN_SHA || git("rev-parse", "origin/main^{tree}") !== CANONICAL_MAIN_TREE) throw new Error("canonical main identity changed during evidence execution");
 assertCandidateWorktreeClean();
 const startedAt = new Date().toISOString();
 
@@ -222,13 +246,14 @@ function assertExecutionBinding(records: S4ClaimProofRecord[], receipts: S4Claim
     const receiptFact = record.observationFacts.find((fact) => fact.startsWith("executionReceiptId="));
     const hashFact = record.observationFacts.find((fact) => fact.startsWith("executionObservationHash="));
     if (record.status !== "passed") {
-      if (receiptFact || hashFact) throw new Error("skipped proof contains execution metadata " + record.claimId);
+      if (receiptFact || hashFact) throw new Error("non-passed proof contains execution metadata " + record.claimId);
       continue;
     }
     if (record.claimId !== record.testId + ":" + record.variantId) throw new Error("claim identity mismatch " + record.claimId);
     const claimFact = factValue(record.observationFacts, "claimId=", record.claimId);
     if (claimFact !== record.claimId) throw new Error("proof claim fact mismatch " + record.claimId);
     const assertionId = factValue(record.observationFacts, "assertionId=", record.claimId);
+    if (record.assertionId !== assertionId) throw new Error("proof assertion ID mismatch " + record.claimId);
     const scenario = factValue(record.observationFacts, "scenario=", record.claimId);
     const receiptId = factValue(record.observationFacts, "executionReceiptId=", record.claimId);
     const observationHash = factValue(record.observationFacts, "executionObservationHash=", record.claimId);
@@ -276,6 +301,7 @@ function loadFocusedProofState(): { records: S4ClaimProofRecord[]; receipts: S4C
   assert.equal(receipts.length, records.length, "focused receipt count");
   assertExecutionBinding(records, receipts);
   const comparison = compareClaimProofs(manifest, records);
+  assert.equal(comparison.failedClaims, 0, "focused failed claims");
   assert.equal(comparison.missingClaims, runnerClaims.length, "focused missing runner rows");
   assert.equal(comparison.unknownClaims, 0, "focused unknown claims");
   assert.equal(comparison.duplicateClaims, 0, "focused duplicate claims");
@@ -286,13 +312,44 @@ function loadFocusedProofState(): { records: S4ClaimProofRecord[]; receipts: S4C
 const focusedProofState = loadFocusedProofState();
 
 const changedFiles = git("diff", "--name-only", CANONICAL_BASE_SHA, candidateCommitSha).split(/\r?\n/).filter(Boolean);
-const dependencyFiles = changedFiles.filter((path) => /(^|[\\/])pnpm-lock\.yaml$/.test(path));
-const packageManifest = changedFiles.includes("package.json");
 const contractText = readFileSync("docs/G2_S4_CONTRACT.md", "utf8");
-const basePackageJson = JSON.parse(git("show", CANONICAL_BASE_SHA + ":package.json")) as Record<string, unknown>;
-const candidatePackageJson = JSON.parse(readFileSync("package.json", "utf8")) as Record<string, unknown>;
-const { scripts: baseScripts, ...basePackageWithoutScripts } = basePackageJson;
-const { scripts: candidateScripts, ...candidatePackageWithoutScripts } = candidatePackageJson;
+const candidateSourceFiles = Object.fromEntries(
+  git("ls-files", "--").split(/\r?\n/).filter((path) => /\.(?:c|m)?tsx?$|\.(?:c|m)?jsx?$/.test(path)).map((path) => [path, readFileSync(path, "utf8")]),
+);
+const executedValidationReceipts = validationRuns.map((run) => run.label + "=exitCode:" + run.exitCode);
+const repositoryAudit = auditRepositorySurfaces({
+  basePackageText: git("show", CANONICAL_BASE_SHA + ":package.json"),
+  candidatePackageText: readFileSync("package.json", "utf8"),
+  baseLockfileText: git("show", CANONICAL_BASE_SHA + ":pnpm-lock.yaml"),
+  candidateLockfileText: readFileSync("pnpm-lock.yaml", "utf8"),
+  sourceFiles: candidateSourceFiles,
+  dependencyAuthority: {
+    packageName: AUTHORIZED_PACKAGE_NAME,
+    packageVersion: AUTHORIZED_PACKAGE_VERSION,
+    baseManifestValue: null,
+    manifestPath: "devDependencies",
+    purpose: AUTHORIZED_DEPENDENCY_PURPOSE,
+    allowedImportSurface: ["tests/s4.test.ts", "tests/s4-evidence.test.ts", "tests/s4-evidence-run.ts", "tests/react-test-renderer.d.ts"],
+    authorityRefs: [AUTHORITY_REF, ...PRIOR_AUTHORITY_REFS],
+    requiredAuthorityRef: AUTHORITY_REF,
+    baselineSha: CANONICAL_BASE_SHA,
+    baselineTree: CANONICAL_BASE_TREE,
+  },
+  scriptAuthority: {
+    scriptName: "test",
+    baseValue: BASE_TEST_SCRIPT,
+    candidateValue: CANDIDATE_TEST_SCRIPT,
+    purpose: "Expand the default repository regression suite to include S3 and S4 tests while retaining every baseline test.",
+    authorityRefs: [AUTHORITY_REF],
+    requiredAuthorityRef: AUTHORITY_REF,
+    preservedRequiredValidation: PRESERVED_REQUIRED_VALIDATION,
+    removedRequiredValidation: [],
+    executedRequiredValidation: executedValidationReceipts,
+    requiredValidationLabels: ["s1Tests", "s2Tests", "s3Tests", "s4ImplementationTests", "s4EvidenceSuite", "fullRegressionTests", "typecheck", "lint", "build", "diffCheck"],
+  },
+});
+const dependencyAudit: S4DependencyAudit = repositoryAudit.dependencyAudit;
+const scriptAudit: S4ScriptAudit = repositoryAudit.scriptAudit;
 
 function assertValidationPassed(label: string): void {
   const run = validationRuns.find((item) => item.label === label);
@@ -302,13 +359,14 @@ function assertValidationPassed(label: string): void {
 
 const evidenceClaim = manifest.claims.find((claim) => claim.testId === "EVIDENCE-001" && claim.variantId === "proof-runtime");
 if (!evidenceClaim) throw new Error("missing evidence comparator claim");
-const comparatorProof = (status: "passed" | "skipped", claimId = evidenceClaim.claimId): S4ClaimProofRecord => ({
+const comparatorProof = (status: "passed" | "failed" | "skipped", claimId = evidenceClaim.claimId): S4ClaimProofRecord => ({
   ...evidenceClaim,
   claimId,
   status,
   expectedResult: "The evidence comparator derives claim identity and completeness counters from separate runtime proof records.",
-  actualResult: "The comparator self-audit executed empty, unknown, duplicate, and skipped proof cases before comparing the final run.",
+  actualResult: "The comparator self-audit executed empty, unknown, duplicate, failed, and skipped proof cases before comparing the final run.",
   provingTest: "evidence-run::comparator-self-audit",
+  assertionId: claimId + ":comparator",
   observationFacts: ["claimId=" + claimId, "assertionId=" + claimId + ":comparator", "scenario=evidence-comparator"],
 });
 
@@ -338,6 +396,7 @@ async function runnerProof(
 const emptyComparison = compareClaimProofs(manifest, []);
 const unknownComparison = compareClaimProofs(manifest, [{ ...comparatorProof("passed"), claimId: "UNKNOWN:claim" }]);
 const duplicateComparison = compareClaimProofs(manifest, [comparatorProof("passed"), comparatorProof("passed")]);
+const failedComparison = compareClaimProofs(manifest, [comparatorProof("failed")]);
 const skippedComparison = compareClaimProofs(manifest, [comparatorProof("skipped")]);
 
 process.env.S4_EVIDENCE_PROOF_PATH = proofPath;
@@ -362,17 +421,57 @@ await runnerProof("REGRESSION-001", "lint", "The final candidate passes the docu
 await runnerProof("REGRESSION-001", "build", "The final candidate passes the documented production build.", "pnpm run build exited successfully on the exact candidate checkout.", "build", ["validation=build", "exitCode=" + build.exitCode], () => {
   assertValidationPassed("build");
 });
-await runnerProof("REGRESSION-001", "no-dependencies", "The candidate adds only the authorized narrow test-only dependency and its audited lockfile entry.", "The base-to-candidate audit found no production dependency change, exactly one pinned react-test-renderer dev dependency, and its lockfile entry; scripts remain unchanged.", "scope-audit", ["changedFiles=" + changedFiles.length, "lockfileChanges=" + dependencyFiles.length, "packageManifestChanged=" + packageManifest, "authorizedDevDependency=react-test-renderer@19.2.8"], () => {
-  assert.deepEqual(dependencyFiles, ["pnpm-lock.yaml"]);
-  assert.equal(packageManifest, true);
-  const { devDependencies: baseDevDependencies, ...basePackageWithoutDevDependencies } = basePackageWithoutScripts as Record<string, unknown>;
-  const { devDependencies: candidateDevDependencies, ...candidatePackageWithoutDevDependencies } = candidatePackageWithoutScripts as Record<string, unknown>;
-  assert.deepEqual(candidatePackageWithoutDevDependencies, basePackageWithoutDevDependencies);
-  assert.deepEqual(candidateDevDependencies, { ...(baseDevDependencies as Record<string, unknown>), "react-test-renderer": "19.2.8" });
-  assert.deepEqual(candidatePackageJson.dependencies, basePackageJson.dependencies);
-  const lockfileText = readFileSync("pnpm-lock.yaml", "utf8");
-  assert.match(lockfileText, /react-test-renderer@19\.2\.8:[\s\S]*?integrity: sha512-/);
-  assert.deepEqual(Object.keys(candidateScripts as Record<string, unknown>).sort(), Object.keys(baseScripts as Record<string, unknown>).sort());
+await runnerProof("REGRESSION-001", "no-dependencies", "The candidate has no unapproved dependency/runtime/package/script expansion; all governed deltas are complete and conformant.", "The executed complete dependency/lockfile audit and complete script-map audit classified the authorized react-test-renderer dev-only closure and test-script expansion as changed_authorized_conformant, with the production graph unchanged and no runtime reachability.", "scope-audit", [
+  "changedFiles=" + changedFiles.length,
+  "dependencyAuditState=" + dependencyAudit.auditState,
+  "dependencyDisposition=" + dependencyAudit.disposition,
+  "scriptAuditState=" + scriptAudit.auditState,
+  "scriptDisposition=" + scriptAudit.disposition,
+  "completeMapEqual=" + scriptAudit.completeMapEqual,
+  "authorizedPackage=react-test-renderer@19.2.8",
+  "authorityRefs=" + AUTHORITY_REF + "," + PRIOR_AUTHORITY_REFS.join(","),
+  "productionGraphUnchanged=" + dependencyAudit.productionGraphUnchanged,
+  "testOnlyRuntimeReachabilityAbsent=" + dependencyAudit.testOnlyRuntimeReachabilityAbsent,
+  "lockfileDeltaCount=" + dependencyAudit.deltas.filter((delta) => delta.surface === "lockfile").length,
+  "scriptDeltaCount=" + scriptAudit.changedScripts.length,
+  ...PRESERVED_REQUIRED_VALIDATION,
+], () => {
+  assert.equal(dependencyAudit.auditState, "complete");
+  assert.equal(scriptAudit.auditState, "complete");
+  assert.equal(dependencyAudit.disposition, "changed_authorized_conformant");
+  assert.equal(scriptAudit.disposition, "changed_authorized_conformant");
+  assert.equal(dependencyAudit.productionGraphUnchanged, true);
+  assert.equal(dependencyAudit.testOnlyRuntimeReachabilityAbsent, true);
+  assert.equal(scriptAudit.completeMapEqual, false);
+  assert.deepEqual(dependencyAudit.deltas.map((delta) => delta.path).sort(), [
+    "package.json.devDependencies.react-test-renderer",
+    "pnpm-lock.yaml.importers[\".\"].devDependencies.react-test-renderer",
+    "pnpm-lock.yaml.packages.react-is@19.2.8",
+    "pnpm-lock.yaml.packages.react-test-renderer@19.2.8",
+    "pnpm-lock.yaml.snapshots.react-is@19.2.8",
+    "pnpm-lock.yaml.snapshots.react-test-renderer@19.2.8(react@19.2.8)",
+  ].sort());
+  assert.equal(dependencyAudit.deltas.every((delta) => delta.disposition === "changed_authorized_conformant"), true);
+  assert.equal(dependencyAudit.deltas.every((delta) => delta.authorityRefs.includes(AUTHORITY_REF)), true);
+  const manifestDelta = dependencyAudit.deltas.find((delta) => delta.path === "package.json.devDependencies.react-test-renderer");
+  assert.ok(manifestDelta);
+  assert.equal(manifestDelta.baseValue, null);
+  assert.equal(manifestDelta.candidateValue, AUTHORIZED_PACKAGE_VERSION);
+  assert.equal(manifestDelta.purpose, AUTHORIZED_DEPENDENCY_PURPOSE);
+  const lockDeltas = dependencyAudit.deltas.filter((delta) => delta.surface === "lockfile");
+  assert.equal(lockDeltas.every((delta) => delta.evidenceFacts.some((fact) => fact.startsWith("lockfileDeltaPaths="))), true);
+  assert.equal(lockDeltas.filter((delta) => delta.path.includes("packages.")).every((delta) => delta.candidateValue?.includes("sha512-")), true);
+  assert.equal(scriptAudit.changedScripts.length, 1);
+  const testDelta = scriptAudit.changedScripts[0];
+  assert.equal(testDelta.scriptName, "test");
+  assert.equal(testDelta.baseValue, BASE_TEST_SCRIPT);
+  assert.equal(testDelta.candidateValue, CANDIDATE_TEST_SCRIPT);
+  assert.equal(testDelta.disposition, "changed_authorized_conformant");
+  assert.equal(testDelta.purpose, "Expand the default repository regression suite to include S3 and S4 tests while retaining every baseline test.");
+  assert.deepEqual(testDelta.removedRequiredValidation, []);
+  assert.deepEqual(testDelta.preservedRequiredValidation, PRESERVED_REQUIRED_VALIDATION);
+  assert.equal(testDelta.executedRequiredValidation.length, validationRuns.length);
+  assert.equal(testDelta.executedRequiredValidation.every((item) => /exitCode:0$/.test(item)), true);
 });
 await runnerProof("REGRESSION-001", "candidate-head-tree", "The candidate head and tree remain bound to the execution.", "The candidate commit and tree matched before and after every validation command.", "candidate-identity", ["candidateCommitSha=" + candidateCommitSha, "candidateTree=" + candidateTree, "candidateCommitShaAfter=" + validationCandidateCommitShaAfter, "candidateTreeAfter=" + validationCandidateTreeAfter], () => {
   assertCandidateIdentity(candidateCommitSha, candidateTree);
@@ -388,14 +487,18 @@ await runnerProof("EVIDENCE-001", "manifest-separate", "The manifest is a separa
   assert.equal(existsSync(proofPath), true);
   assert.equal(existsSync(executionPath), true);
 });
-await runnerProof("EVIDENCE-001", "proof-runtime", "Every non-static claim has executed proof.", "The runner parsed claim records and execution receipts and verified a hash-bound successful assertion for every focused runtime claim before adding runner claims.", "proof-runtime", ["focusedProofRecords=" + focusedProofState.records.length, "focusedExecutionReceipts=" + focusedProofState.receipts.length, "focusedClaims=" + focusedClaims.length, "runnerClaims=" + runnerClaims.length], () => {
+await runnerProof("EVIDENCE-001", "proof-runtime", "Every non-static claim has executed proof, and failed/skipped records cannot be promoted.", "The runner parsed claim records and execution receipts, verified a hash-bound successful assertion for every focused runtime claim, and separately derived failed/skipped comparator counters before adding runner claims.", "proof-runtime", ["focusedProofRecords=" + focusedProofState.records.length, "focusedExecutionReceipts=" + focusedProofState.receipts.length, "focusedClaims=" + focusedClaims.length, "runnerClaims=" + runnerClaims.length, "syntheticFailedClaims=" + failedComparison.failedClaims, "syntheticSkippedClaims=" + skippedComparison.skippedClaims, "syntheticFailedPassedRecords=" + failedComparison.passedRecords.length], () => {
   const state = loadFocusedProofState();
   assert.equal(state.records.length, focusedClaims.length);
   assert.equal(state.receipts.length, focusedClaims.length);
   assert.equal(state.records.filter((record) => record.evidenceClass !== "static").length, 263);
+  assert.equal(failedComparison.failedClaims, 1);
+  assert.equal(failedComparison.passedRecords.length, 0);
+  assert.equal(skippedComparison.skippedClaims, 1);
 });
-await runnerProof("EVIDENCE-001", "missing-derived", "Missing claims are derived from manifest/proof set comparison.", "The comparator derived missingClaims=" + emptyComparison.missingClaims + " from the empty proof set against the 291-claim manifest.", "missing-counter", ["missingClaims=" + emptyComparison.missingClaims, "unknownClaims=" + emptyComparison.unknownClaims, "duplicateClaims=" + emptyComparison.duplicateClaims, "skippedClaims=" + emptyComparison.skippedClaims], () => {
+await runnerProof("EVIDENCE-001", "missing-derived", "Missing claims are derived from manifest/proof set comparison.", "The comparator derived missingClaims=" + emptyComparison.missingClaims + " from the empty proof set against the 291-claim manifest.", "missing-counter", ["missingClaims=" + emptyComparison.missingClaims, "failedClaims=" + emptyComparison.failedClaims, "unknownClaims=" + emptyComparison.unknownClaims, "duplicateClaims=" + emptyComparison.duplicateClaims, "skippedClaims=" + emptyComparison.skippedClaims], () => {
   const result = compareClaimProofs(manifest, []);
+  assert.equal(result.failedClaims, 0);
   assert.equal(result.missingClaims, manifest.claimCount);
   assert.equal(result.unknownClaims, 0);
   assert.equal(result.duplicateClaims, 0);
@@ -437,21 +540,24 @@ await runnerProof("EVIDENCE-001", "exact-schema", "The execution artifact uses t
     manifestHash: manifest.manifestHash,
     rowCount: manifest.rowCount,
     claimCount: manifest.claimCount,
-    proofComparison: { passedRecords: [], missingClaims: 0, unknownClaims: 0, duplicateClaims: 0, skippedClaims: 0 },
+    dependencyAudit,
+    scriptAudit,
+    proofComparison: { passedRecords: [], failedClaims: 0, missingClaims: 0, unknownClaims: 0, duplicateClaims: 0, skippedClaims: 0 },
     status: "passed",
     startedAt,
     completedAt: startedAt,
   };
-  assertExactKeys(probe, ["schemaVersion", "executionId", "contractPath", "canonicalBaseSha", "canonicalBaseTree", "candidateCommitSha", "candidateTree", "candidateCommitShaAfter", "candidateTreeAfter", "manifestHash", "rowCount", "claimCount", "proofComparison", "status", "startedAt", "completedAt"], "S4 evidence artifact");
-  assertExactKeys(probe.proofComparison, ["passedRecords", "missingClaims", "unknownClaims", "duplicateClaims", "skippedClaims"], "S4 proof comparison");
+  assertExactKeys(probe, ["schemaVersion", "executionId", "contractPath", "canonicalBaseSha", "canonicalBaseTree", "candidateCommitSha", "candidateTree", "candidateCommitShaAfter", "candidateTreeAfter", "manifestHash", "rowCount", "claimCount", "dependencyAudit", "scriptAudit", "proofComparison", "status", "startedAt", "completedAt"], "S4 evidence artifact");
+  assertExactKeys(probe.proofComparison, ["passedRecords", "failedClaims", "missingClaims", "unknownClaims", "duplicateClaims", "skippedClaims"], "S4 proof comparison");
 });
 await runnerProof("GATE-001", "executor-no-self-finalize", "The executor remains a candidate producer and does not self-finalize G3.", "The evidence process stayed on web/s4-g3, wrote only candidate evidence, and performed no acceptance or later-stage operation.", "controller-gate", ["candidateOnly=true", "g3Accepted=false", "g4Authorized=false"], () => {
   assert.equal(git("branch", "--show-current"), "web/s4-g3");
   assert.equal(candidateCommitSha === CANONICAL_BASE_SHA, false);
   assertCandidateWorktreeClean();
 });
-await runnerProof("GATE-001", "candidate-not-merged", "The candidate remains unmerged during execution.", "The candidate has no merge commit between the canonical base and its head, and this runner invokes only local validation commands.", "controller-gate", ["mergeCommitCount=0", "mergeInvoked=false", "candidateOnly=true"], () => {
-  assert.equal(git("rev-list", "--merges", CANONICAL_BASE_SHA + ".." + candidateCommitSha), "");
+await runnerProof("GATE-001", "candidate-not-merged", "The candidate remains unmerged into canonical main during execution while retaining the required canonical-main integration.", "The candidate contains canonical main as an ancestry-preserving integration and is not an ancestor of origin/main; this runner invoked only local validation commands.", "controller-gate", ["canonicalMainIntegrated=true", "candidateMergedToOriginMain=false", "mergeInvoked=false", "candidateOnly=true"], () => {
+  assert.equal(gitSucceeds("merge-base", "--is-ancestor", CANONICAL_MAIN_SHA, candidateCommitSha), true);
+  assert.equal(gitSucceeds("merge-base", "--is-ancestor", candidateCommitSha, "origin/main"), false);
   assertCandidateIdentity(candidateCommitSha, candidateTree);
 });
 const noLiveProviderFetchCalls = { count: 0 };
@@ -493,8 +599,8 @@ const comparison = compareClaimProofs(manifest, finalProofRecords);
 const executedClaimIds = new Set(finalProofRecords.filter((record) => record.status === "passed").map((record) => record.claimId));
 const unexecutedClaimIds = manifest.claims.filter((claim) => !executedClaimIds.has(claim.claimId)).map((claim) => claim.claimId);
 const computedSkippedClaims = comparison.skippedClaims + unexecutedClaimIds.length;
-if (comparison.missingClaims !== 0 || comparison.unknownClaims !== 0 || comparison.duplicateClaims !== 0 || computedSkippedClaims !== 0) {
-  throw new Error("S4 evidence completeness failed: missing=" + comparison.missingClaims + " unknown=" + comparison.unknownClaims + " duplicate=" + comparison.duplicateClaims + " skipped=" + computedSkippedClaims + " unexecuted=" + unexecutedClaimIds.length);
+if (comparison.missingClaims !== 0 || comparison.failedClaims !== 0 || comparison.unknownClaims !== 0 || comparison.duplicateClaims !== 0 || computedSkippedClaims !== 0) {
+  throw new Error("S4 evidence completeness failed: missing=" + comparison.missingClaims + " failed=" + comparison.failedClaims + " unknown=" + comparison.unknownClaims + " duplicate=" + comparison.duplicateClaims + " skipped=" + computedSkippedClaims + " unexecuted=" + unexecutedClaimIds.length);
 }
 if (comparison.passedRecords.length !== manifest.claimCount || finalProofRecords.length !== manifest.claimCount || finalExecutionReceipts.length !== manifest.claimCount) {
   throw new Error("not every expected claim has one passing proof record and execution receipt");
@@ -528,6 +634,7 @@ if (!UUID.test(executionId) || !/^s4-g3-[0-9a-f-]{36}$/i.test(safeReference)) th
 const completedAt = new Date().toISOString();
 const proofComparison: S4ClaimProofComparison = {
   passedRecords: comparison.passedRecords,
+  failedClaims: comparison.failedClaims,
   missingClaims: comparison.missingClaims,
   unknownClaims: comparison.unknownClaims,
   duplicateClaims: comparison.duplicateClaims,
@@ -546,14 +653,16 @@ const artifact = {
   manifestHash: manifest.manifestHash,
   rowCount: manifest.rowCount,
   claimCount: manifest.claimCount,
+  dependencyAudit,
+  scriptAudit,
   proofComparison,
   status: "passed" as const,
   startedAt,
   completedAt,
 };
-assertExactKeys(artifact, ["schemaVersion", "executionId", "contractPath", "canonicalBaseSha", "canonicalBaseTree", "candidateCommitSha", "candidateTree", "candidateCommitShaAfter", "candidateTreeAfter", "manifestHash", "rowCount", "claimCount", "proofComparison", "status", "startedAt", "completedAt"], "S4 evidence artifact");
-assertExactKeys(artifact.proofComparison, ["passedRecords", "missingClaims", "unknownClaims", "duplicateClaims", "skippedClaims"], "S4 proof comparison");
-if (artifact.status !== "passed" || artifact.canonicalBaseSha !== CANONICAL_BASE_SHA || artifact.canonicalBaseTree !== CANONICAL_BASE_TREE || artifact.candidateCommitSha !== artifact.candidateCommitShaAfter || artifact.candidateTree !== artifact.candidateTreeAfter || artifact.proofComparison.missingClaims !== 0 || artifact.proofComparison.unknownClaims !== 0 || artifact.proofComparison.duplicateClaims !== 0 || artifact.proofComparison.skippedClaims !== 0) throw new Error("S4 evidence artifact did not satisfy the passing invariants");
+assertExactKeys(artifact, ["schemaVersion", "executionId", "contractPath", "canonicalBaseSha", "canonicalBaseTree", "candidateCommitSha", "candidateTree", "candidateCommitShaAfter", "candidateTreeAfter", "manifestHash", "rowCount", "claimCount", "dependencyAudit", "scriptAudit", "proofComparison", "status", "startedAt", "completedAt"], "S4 evidence artifact");
+assertExactKeys(artifact.proofComparison, ["passedRecords", "failedClaims", "missingClaims", "unknownClaims", "duplicateClaims", "skippedClaims"], "S4 proof comparison");
+if (artifact.status !== "passed" || artifact.canonicalBaseSha !== CANONICAL_BASE_SHA || artifact.canonicalBaseTree !== CANONICAL_BASE_TREE || artifact.candidateCommitSha !== artifact.candidateCommitShaAfter || artifact.candidateTree !== artifact.candidateTreeAfter || artifact.dependencyAudit.auditState !== "complete" || artifact.dependencyAudit.disposition === "unchanged" || artifact.dependencyAudit.disposition !== "changed_authorized_conformant" || artifact.scriptAudit.auditState !== "complete" || artifact.scriptAudit.disposition !== "changed_authorized_conformant" || artifact.proofComparison.failedClaims !== 0 || artifact.proofComparison.missingClaims !== 0 || artifact.proofComparison.unknownClaims !== 0 || artifact.proofComparison.duplicateClaims !== 0 || artifact.proofComparison.skippedClaims !== 0) throw new Error("S4 evidence artifact did not satisfy the passing invariants");
 
 const outputPath = process.argv[2] ?? join(process.env.TEMP ?? process.cwd(), "swooshz-s4-g3-evidence", safeReference + ".json");
 mkdirSync(dirname(outputPath), { recursive: true });
@@ -575,9 +684,18 @@ console.log(JSON.stringify({
   rowCount: artifact.rowCount,
   claimCount: artifact.claimCount,
   missingClaims: artifact.proofComparison.missingClaims,
+  failedClaims: artifact.proofComparison.failedClaims,
   unknownClaims: artifact.proofComparison.unknownClaims,
   duplicateClaims: artifact.proofComparison.duplicateClaims,
   skippedClaims: artifact.proofComparison.skippedClaims,
+  dependencyAuditState: artifact.dependencyAudit.auditState,
+  dependencyDisposition: artifact.dependencyAudit.disposition,
+  productionGraphUnchanged: artifact.dependencyAudit.productionGraphUnchanged,
+  testOnlyRuntimeReachabilityAbsent: artifact.dependencyAudit.testOnlyRuntimeReachabilityAbsent,
+  scriptAuditState: artifact.scriptAudit.auditState,
+  scriptDisposition: artifact.scriptAudit.disposition,
+  completeMapEqual: artifact.scriptAudit.completeMapEqual,
+  changedScripts: artifact.scriptAudit.changedScripts.map((delta) => ({ scriptName: delta.scriptName, baseValue: delta.baseValue, candidateValue: delta.candidateValue, disposition: delta.disposition })),
   staticClaimCount: manifest.claims.filter((claim) => claim.evidenceClass === "static").length,
   nonStaticClaimCount,
   actualExecutedScenarioCount,

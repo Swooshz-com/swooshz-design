@@ -492,15 +492,18 @@ function assessmentPayload(compilation: ReturnType<typeof compileS4Assessment>):
 test("S4 evidence: accepted identity remains fixed", async () => {
   const contract = readFileSync("docs/G2_S4_CONTRACT.md", "utf8");
   assert.match(contract, /DL-SD-S4-G1-001/);
-  assert.match(contract, /DL-SD-S4-G2-001/);
+  assert.match(contract, /DL-SD-S4-G2-002/);
+  assert.match(contract, /Canonical re-entry base/);
+  assert.match(contract, /2e01a90b6b2f40f4729764970a8cb89f25bbe0c8/);
+  assert.match(contract, /b144ae4bc0bb80bee82d696be0f7e550af0a3ae9/);
   assert.match(contract, /s4-evidence-v1-execution-bound/);
   assert.equal(S4_EDIT_COMPILER_VERSION, "s4-local-edit-v1");
   assert.equal(S4_IMAGE_MODEL_SNAPSHOT, "gpt-image-2-2026-04-21");
   assert.equal(S4_ASSESSMENT_MODEL, "gpt-5.4-mini-2026-03-17");
   await proveVariantClaims("IDENTITY-001", "S4 evidence: accepted identity remains fixed", "accepted-identity", "The executed identity assertion matched the frozen lock, contract, and provider constants.", {
-    "canonical-g2-base": () => assert.match(contract, /\*\*Canonical base:\*\*/),
+    "canonical-g2-base": () => assert.match(contract, /\*\*Canonical re-entry base:\*\*/),
     "g1-lock": () => assert.match(contract, /DL-SD-S4-G1-001/),
-    "g2-lock": () => assert.match(contract, /DL-SD-S4-G2-001/),
+    "g2-lock": () => assert.match(contract, /DL-SD-S4-G2-002/),
     "contract-identity": () => assert.match(contract, /s4-evidence-v1-execution-bound/),
     "provider-contract": () => {
       assert.equal(S4_IMAGE_MODEL_SNAPSHOT, "gpt-image-2-2026-04-21");

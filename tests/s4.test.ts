@@ -855,6 +855,7 @@ test("S4 high-risk resolver matrix resolves exact S3 and S4 identities", async (
       { name: "invalid-quality", state: badQuality },
     ];
     const publicResolverResponses: Array<{ name: string; status: number; body: any }> = [];
+    let publicEditDetailResponse: { status: number; body: any } | null = null;
     const originalRepositoryState = value.repository.state.bind(value.repository);
     const publicDependencies: ApiRequestDependencies = {
       workflowService: value.service,
@@ -864,6 +865,18 @@ test("S4 high-risk resolver matrix resolves exact S3 and S4 identities", async (
       },
     };
     try {
+      value.repository.state = () => badQuality;
+      const editDetail = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", value.projectId, "s4", "edits", admission.result.editId], publicDependencies);
+      const editDetailBody = await editDetail.json();
+      publicEditDetailResponse = { status: editDetail.status, body: editDetailBody };
+      assert.equal(editDetail.status, 500);
+      assert.equal(editDetailBody.error.code, "S4_INTERNAL_ERROR");
+      assert.equal(editDetailBody.error.message, "The request could not be completed. Try again or contact support with the reference ID.");
+      assert.equal(typeof editDetailBody.error.referenceId, "string");
+      assert.equal(editDetailBody.activationState, undefined);
+      assert.equal(editDetailBody.previewAvailable, undefined);
+      assert.equal(JSON.stringify(editDetailBody).includes("active_tip"), false);
+      assert.equal(JSON.stringify(editDetailBody).includes("previewAvailable"), false);
       for (const candidate of publicResolverCases) {
         value.repository.state = () => candidate.state;
         const response = await handleApiRequest(new Request("http://localhost", { method: "GET" }), ["projects", value.projectId, "s4"], publicDependencies);
@@ -894,6 +907,10 @@ test("S4 high-risk resolver matrix resolves exact S3 and S4 identities", async (
       "pointer-only": () => assert.equal(resolveActiveVisualRevision(pointerOnly, value.projectId, value.objects), null),
       "public-kind": () => {
         assert.equal(publicResolverResponses.length, 4);
+        assert.equal(publicEditDetailResponse?.status, 500);
+        assert.equal(publicEditDetailResponse?.body.error.code, "S4_INTERNAL_ERROR");
+        assert.equal(publicEditDetailResponse?.body.activationState, undefined);
+        assert.equal(publicEditDetailResponse?.body.previewAvailable, undefined);
         for (const result of publicResolverResponses) {
           assert.equal(result.status, 500);
           assert.equal(result.body.error.code, "S4_INTERNAL_ERROR");
@@ -907,6 +924,9 @@ test("S4 high-risk resolver matrix resolves exact S3 and S4 identities", async (
       "s4Revision=" + s4Resolved.revisionId,
       "s4ImageOperations=" + persisted.s4ImageOperations.length,
       "publicResolverCases=" + publicResolverResponses.map((result) => result.name).join(","),
+      "publicEditDetailStatus=" + publicEditDetailResponse?.status,
+      "publicEditDetailError=" + publicEditDetailResponse?.body.error.code,
+      "publicEditDetailNoContradictoryProjection=" + (!JSON.stringify(publicEditDetailResponse?.body).includes("active_tip") && !JSON.stringify(publicEditDetailResponse?.body).includes("previewAvailable")),
       "publicResolverError=S4_INTERNAL_ERROR/status-500",
     ]);
   } finally { cleanup(value); }

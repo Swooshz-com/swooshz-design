@@ -61,15 +61,17 @@ export type S4ClaimManifest = {
 };
 
 export type S4ClaimProofRecord = S4ClaimDefinition & {
-  status: "passed" | "skipped";
+  status: "passed" | "failed" | "skipped";
   expectedResult: string;
   actualResult: string;
   provingTest: string;
+  assertionId: string;
   observationFacts: string[];
 };
 
 export type S4ClaimProofComparison = {
   passedRecords: S4ClaimProofRecord[];
+  failedClaims: number;
   missingClaims: number;
   unknownClaims: number;
   duplicateClaims: number;
@@ -153,6 +155,7 @@ export function compareClaimProofs(manifest: S4ClaimManifest, records: S4ClaimPr
   for (const record of records) counts.set(record.claimId, (counts.get(record.claimId) ?? 0) + 1);
   return {
     passedRecords: records.filter((record) => record.status === "passed"),
+    failedClaims: records.filter((record) => expectedIds.has(record.claimId) && record.status === "failed").length,
     missingClaims: manifest.claims.filter((claim) => !counts.has(claim.claimId)).length,
     unknownClaims: records.filter((record) => !expectedIds.has(record.claimId)).length,
     duplicateClaims: Array.from(counts.values()).reduce((sum, count) => sum + (count > 1 ? count - 1 : 0), 0),

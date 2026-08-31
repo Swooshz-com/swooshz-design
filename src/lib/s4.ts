@@ -769,7 +769,10 @@ export class S4WorkflowService {
   }
 
   private activationState(state: StoreState, edit: S4EditAdmission, activeRevisionId: UUID | null): PublicS4ActivationState {
-    if (activeRevisionId === edit.outputRevisionId && activeRevisionId !== null) return "active_tip";
+    if (activeRevisionId === edit.outputRevisionId && activeRevisionId !== null) {
+      resolveVisualRevision(state, edit.projectId, edit.outputRevisionId!, this.objects);
+      return "active_tip";
+    }
     if (edit.outputRevisionId === null) return "historical_non_activatable";
     try {
       resolveVisualRevision(state, edit.projectId, edit.outputRevisionId, this.objects);
