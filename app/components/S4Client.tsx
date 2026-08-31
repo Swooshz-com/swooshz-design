@@ -47,13 +47,24 @@ function normalizedInstruction(value: string): string {
   try { return value.normalize("NFC").trim(); } catch { return value.trim(); }
 }
 
+function hasRejectedInstructionControl(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if ((code >= 0 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f) ||
+        code === 0x061c || (code >= 0x200e && code <= 0x200f) ||
+        (code >= 0x202a && code <= 0x202e) || (code >= 0x2060 && code <= 0x2064) ||
+        (code >= 0x2066 && code <= 0x2069) || code === 0xfeff) return true;
+  }
+  return false;
+}
+
 export function instructionDraftState(value: string): S4InstructionDraftState {
   const normalized = normalizedInstruction(value);
   const scalarCount = hasUnpairedSurrogate(normalized) ? Number.MAX_SAFE_INTEGER : Array.from(normalized).length;
   const utf8ByteCount = new TextEncoder().encode(normalized).byteLength;
   const valid = scalarCount >= 1 && scalarCount <= S4_CLIENT_MAX_INSTRUCTION_SCALARS &&
     utf8ByteCount <= S4_CLIENT_MAX_INSTRUCTION_BYTES &&
-    !hasUnpairedSurrogate(normalized) && !/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u.test(normalized);
+    !hasUnpairedSurrogate(normalized) && !hasRejectedInstructionControl(normalized);
   return { scalarCount, utf8ByteCount, valid };
 }
 

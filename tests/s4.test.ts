@@ -706,6 +706,9 @@ test("S4 client draft readiness enforces local mask and instruction bounds", () 
   assert.equal(instructionDraftState("😀".repeat(601)).valid, false);
   assert.equal(instructionDraftState("\ud800").valid, false);
   assert.equal(instructionDraftState("   ").valid, false);
+  for (const control of ["\u0080", "\u061c", "\u200e", "\u2060", "\u202a", "\u2066", "\ufeff"]) {
+    assert.equal(instructionDraftState(control).valid, false);
+  }
   const readyInput = { primitives: [validRectangle], instructionText: "edit", hasActiveRevision: true, cyclesRemaining: 1 };
   assert.equal(isS4DraftSubmitReady({ ...readyInput, primitives: [] }), false);
   assert.equal(isS4DraftSubmitReady({ ...readyInput, primitives: [validRectangle] }), true);
