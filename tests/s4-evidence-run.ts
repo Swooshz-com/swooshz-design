@@ -362,10 +362,16 @@ await runnerProof("REGRESSION-001", "lint", "The final candidate passes the docu
 await runnerProof("REGRESSION-001", "build", "The final candidate passes the documented production build.", "pnpm run build exited successfully on the exact candidate checkout.", "build", ["validation=build", "exitCode=" + build.exitCode], () => {
   assertValidationPassed("build");
 });
-await runnerProof("REGRESSION-001", "no-dependencies", "The candidate adds no dependency or lockfile change.", "The base-to-candidate audit found no lockfile or dependency-surface change; the package-manifest delta is limited to test-script coverage.", "scope-audit", ["changedFiles=" + changedFiles.length, "lockfileChanges=" + dependencyFiles.length, "packageManifestChanged=" + packageManifest], () => {
-  assert.equal(dependencyFiles.length, 0);
+await runnerProof("REGRESSION-001", "no-dependencies", "The candidate adds only the authorized narrow test-only dependency and its audited lockfile entry.", "The base-to-candidate audit found no production dependency change, exactly one pinned react-test-renderer dev dependency, and its lockfile entry; scripts remain unchanged.", "scope-audit", ["changedFiles=" + changedFiles.length, "lockfileChanges=" + dependencyFiles.length, "packageManifestChanged=" + packageManifest, "authorizedDevDependency=react-test-renderer@19.2.8"], () => {
+  assert.deepEqual(dependencyFiles, ["pnpm-lock.yaml"]);
   assert.equal(packageManifest, true);
-  assert.deepEqual(candidatePackageWithoutScripts, basePackageWithoutScripts);
+  const { devDependencies: baseDevDependencies, ...basePackageWithoutDevDependencies } = basePackageWithoutScripts as Record<string, unknown>;
+  const { devDependencies: candidateDevDependencies, ...candidatePackageWithoutDevDependencies } = candidatePackageWithoutScripts as Record<string, unknown>;
+  assert.deepEqual(candidatePackageWithoutDevDependencies, basePackageWithoutDevDependencies);
+  assert.deepEqual(candidateDevDependencies, { ...(baseDevDependencies as Record<string, unknown>), "react-test-renderer": "19.2.8" });
+  assert.deepEqual(candidatePackageJson.dependencies, basePackageJson.dependencies);
+  const lockfileText = readFileSync("pnpm-lock.yaml", "utf8");
+  assert.match(lockfileText, /react-test-renderer@19\.2\.8:[\s\S]*?integrity: sha512-/);
   assert.deepEqual(Object.keys(candidateScripts as Record<string, unknown>).sort(), Object.keys(baseScripts as Record<string, unknown>).sort());
 });
 await runnerProof("REGRESSION-001", "candidate-head-tree", "The candidate head and tree remain bound to the execution.", "The candidate commit and tree matched before and after every validation command.", "candidate-identity", ["candidateCommitSha=" + candidateCommitSha, "candidateTree=" + candidateTree, "candidateCommitShaAfter=" + validationCandidateCommitShaAfter, "candidateTreeAfter=" + validationCandidateTreeAfter], () => {
