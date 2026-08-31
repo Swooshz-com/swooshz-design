@@ -193,6 +193,64 @@ function parsePackage(text: string): ParsedPackage {
 
 type YamlLine = { indent: number; text: string; line: number };
 
+type PnpmLocator = {
+  name: string;
+  version: string;
+  peers: PnpmLocator[];
+};
+
+function parsePnpmLocator(value: string, label: string, depth = 0): PnpmLocator {
+  if (!value || value.trim() !== value || depth > 32) throw new Error("invalid " + label);
+  const firstOpen = value.indexOf("(");
+  const baseEnd = firstOpen < 0 ? value.length : firstOpen;
+  if (baseEnd <= 0 || (value.includes(")") && firstOpen < 0)) throw new Error("invalid " + label);
+  const at = value.lastIndexOf("@", baseEnd - 1);
+  if (at <= 0 || at >= baseEnd - 1) throw new Error("invalid " + label);
+  const name = value.slice(0, at);
+  const version = value.slice(at + 1, baseEnd);
+  if (!name || !version || /[\s()]/.test(name) || /[\s()]/.test(version)) throw new Error("invalid " + label);
+  const peers: PnpmLocator[] = [];
+  let cursor = baseEnd;
+  while (cursor < value.length) {
+    if (value[cursor] !== "(") throw new Error("invalid " + label);
+    let nested = 1;
+    let close = -1;
+    for (let index = cursor + 1; index < value.length; index += 1) {
+      if (value[index] === "(") nested += 1;
+      else if (value[index] === ")") {
+        nested -= 1;
+        if (nested === 0) {
+          close = index;
+          break;
+        }
+      }
+    }
+    if (close <= cursor + 1) throw new Error("invalid " + label);
+    peers.push(parsePnpmLocator(value.slice(cursor + 1, close), label + " peer", depth + 1));
+    cursor = close + 1;
+  }
+  return { name, version, peers };
+}
+
+function locatorShape(locator: PnpmLocator): JsonValue {
+  return { name: locator.name, version: locator.version, peers: locator.peers.map(locatorShape) };
+}
+
+function locatorsEqual(left: PnpmLocator, right: PnpmLocator): boolean {
+  return canonical(locatorShape(left)) === canonical(locatorShape(right));
+}
+
+function directLocator(name: string, version: string, label: string): PnpmLocator {
+  return parsePnpmLocator(name + "@" + version, label);
+}
+
+function validSha512Integrity(value: JsonValue): value is string {
+  if (typeof value !== "string" || !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  const encoded = value.slice("sha512-".length);
+  const decoded = Buffer.from(encoded, "base64");
+  return decoded.length === 64 && decoded.toString("base64") === encoded;
+}
+
 function stripYamlComment(text: string): string {
   let quote: "'" | '"' | null = null;
   let escaped = false;
@@ -397,6 +455,8 @@ function parseLockfile(text: string): JsonRecord {
       if (value[section] !== undefined && (!isRecord(value[section]) || Object.values(value[section]).some((item) => typeof item !== "string"))) throw new Error("invalid lockfile snapshot dependency map " + key);
     }
   }
+  for (const key of Object.keys(root.packages)) parsePnpmLocator(key, "lockfile package locator");
+  for (const key of Object.keys(root.snapshots)) parsePnpmLocator(key, "lockfile snapshot locator");
   return root;
 }
 
@@ -495,25 +555,19 @@ type Graph = {
   entries: Map<string, { packageKey: string; packageValue: JsonValue; snapshotValue: JsonValue }>;
 };
 
-function versionBase(value: string): string {
-  const parenthesis = value.indexOf("(");
-  return parenthesis < 0 ? value : value.slice(0, parenthesis);
-}
-
 function resolvePackageKey(name: string, version: string, packages: JsonRecord): string {
-  const exact = name + "@" + version;
-  if (Object.prototype.hasOwnProperty.call(packages, exact)) return exact;
-  const base = name + "@" + versionBase(version);
-  const candidates = Object.keys(packages).filter((key) => key === base || key.startsWith(base + "(") || key.startsWith(base + "_"));
+  const requested = directLocator(name, version, "requested package locator");
+  const candidates = Object.keys(packages).filter((key) => {
+    const identity = parsePnpmLocator(key, "package locator");
+    return identity.name === requested.name && identity.version === requested.version;
+  });
   if (candidates.length !== 1) throw new Error("ambiguous or missing package locator " + name + "@" + version);
   return candidates[0];
 }
 
 function resolveSnapshotKey(name: string, version: string, snapshots: JsonRecord): string {
-  const exact = name + "@" + version;
-  if (Object.prototype.hasOwnProperty.call(snapshots, exact)) return exact;
-  const base = name + "@" + versionBase(version);
-  const candidates = Object.keys(snapshots).filter((key) => key === base || key.startsWith(base + "(") || key.startsWith(base + "_"));
+  const requested = parsePnpmLocator(name + "@" + version, "requested snapshot locator");
+  const candidates = Object.keys(snapshots).filter((key) => locatorsEqual(parsePnpmLocator(key, "snapshot locator"), requested));
   if (candidates.length !== 1) throw new Error("ambiguous or missing snapshot locator " + name + "@" + version);
   return candidates[0];
 }
@@ -548,6 +602,73 @@ function buildGraph(lock: JsonRecord, sectionName: "dependencies" | "devDependen
     }
   }
   return { roots, snapshotKeys, packageKeys, entries };
+}
+
+function rootLocator(lock: JsonRecord, name: string): PnpmLocator | null {
+  const importer = mapAt(mapAt(lock.importers, "importers")["."], "root importer");
+  const matches: PnpmLocator[] = [];
+  for (const section of LOCKFILE_IMPORTER_SECTIONS) {
+    const sectionValue = importer[section];
+    if (sectionValue === undefined) continue;
+    const entry = mapAt(sectionValue, "root importer " + section)[name];
+    if (entry === undefined) continue;
+    const version = checkedString(mapAt(entry, "root importer entry " + name).version, "root importer version " + name);
+    matches.push(directLocator(name, version, "root peer locator"));
+  }
+  const unique = matches.filter((match, index) => matches.findIndex((other) => locatorsEqual(match, other)) === index);
+  if (unique.length > 1) throw new Error("ambiguous root locator " + name);
+  return unique[0] ?? null;
+}
+
+function snapshotDependencyLocator(snapshot: JsonRecord, name: string): PnpmLocator | null {
+  const matches: PnpmLocator[] = [];
+  for (const section of ["dependencies", "optionalDependencies"] as const) {
+    const sectionValue = snapshot[section];
+    if (sectionValue === undefined) continue;
+    const version = mapAt(sectionValue, "snapshot " + section)[name];
+    if (version === undefined) continue;
+    matches.push(directLocator(name, checkedString(version, "snapshot dependency version " + name), "snapshot peer dependency locator"));
+  }
+  const unique = matches.filter((match, index) => matches.findIndex((other) => locatorsEqual(match, other)) === index);
+  if (unique.length > 1) throw new Error("ambiguous snapshot dependency locator " + name);
+  return unique[0] ?? null;
+}
+
+function peerContextConformant(
+  directPackageKey: string,
+  directPackage: JsonRecord,
+  directSnapshotKey: string,
+  directSnapshot: JsonRecord,
+  candidateLock: JsonRecord,
+  candidatePackages: JsonRecord,
+  candidateSnapshots: JsonRecord,
+  candidateDevGraph: Graph,
+): boolean {
+  const packageIdentity = parsePnpmLocator(directPackageKey, "authorized package identity");
+  const snapshotIdentity = parsePnpmLocator(directSnapshotKey, "authorized snapshot identity");
+  if (packageIdentity.peers.length !== 0 || packageIdentity.name !== snapshotIdentity.name || packageIdentity.version !== snapshotIdentity.version) return false;
+  const peerDependencies = checkedStringMap(directPackage.peerDependencies, "authorized package peerDependencies");
+  const peerMeta = checkedPeerMeta(directPackage.peerDependenciesMeta);
+  if (Object.keys(peerMeta).some((name) => !Object.prototype.hasOwnProperty.call(peerDependencies, name))) return false;
+  const contextByName = new Map<string, PnpmLocator>();
+  for (const peer of snapshotIdentity.peers) {
+    if (contextByName.has(peer.name) || !Object.prototype.hasOwnProperty.call(peerDependencies, peer.name)) return false;
+    contextByName.set(peer.name, peer);
+    const dependency = snapshotDependencyLocator(directSnapshot, peer.name);
+    if (!dependency || !locatorsEqual(dependency, peer)) return false;
+    const root = rootLocator(candidateLock, peer.name);
+    if (!root || !locatorsEqual(root, peer)) return false;
+    const peerSnapshotKey = resolveSnapshotKey(peer.name, peer.version, candidateSnapshots);
+    const peerPackageKey = resolvePackageKey(peer.name, peer.version, candidatePackages);
+    if (!candidateDevGraph.snapshotKeys.has(peerSnapshotKey) || !candidateDevGraph.packageKeys.has(peerPackageKey)) return false;
+  }
+  for (const peerName of Object.keys(peerDependencies)) {
+    const dependency = snapshotDependencyLocator(directSnapshot, peerName);
+    const optional = peerMeta[peerName]?.optional === true;
+    if (!optional && !contextByName.has(peerName)) return false;
+    if (dependency && !contextByName.has(peerName)) return false;
+  }
+  return true;
 }
 
 function graphEqual(base: Graph, candidate: Graph): boolean {
@@ -654,20 +775,46 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
   const importerChange = lockDelta.filter((change) => change.lockKind === "importer" && change.path === importerPath);
   const unrelatedLockChanges = lockDelta.filter((change) => !((change.lockKind === "importer" && change.path === importerPath) || (change.lockKind === "package" && newDevPackageKeys.has(change.lockKey ?? "")) || (change.lockKind === "snapshot" && newDevSnapshotKeys.has(change.lockKey ?? ""))));
   const candidateDevMap = mapAt(candidateImporter.devDependencies, "candidate devDependencies");
-  const candidateDevEntry = candidateDevMap[authority.packageName];
-  const candidateDevVersion = candidateDevEntry ? checkedString(mapAt(candidateDevEntry, "candidate dependency entry").version, "candidate dev version") : null;
-  const exactImporter = importerChange.length === 1 && candidateDevVersion !== null && candidateDevVersion.startsWith(authority.packageVersion);
+  const candidateDevEntryValue = candidateDevMap[authority.packageName];
+  if (candidateDevEntryValue === undefined) throw new Error("missing authorized importer entry");
+  const candidateDevEntry = mapAt(candidateDevEntryValue, "candidate dependency entry");
+  const candidateDevVersion = checkedString(candidateDevEntry.version, "candidate dev version");
+  const candidateDevSpecifier = checkedString(candidateDevEntry.specifier, "candidate dev specifier");
+  const candidateDevLocator = directLocator(authority.packageName, candidateDevVersion, "candidate importer locator");
+  const exactImporterEntryShape = canonical(Object.keys(candidateDevEntry).sort()) === canonical(["specifier", "version"]);
+  const exactImporter = importerChange.length === 1
+    && exactImporterEntryShape
+    && candidateDevSpecifier === authority.packageVersion
+    && candidateDevLocator.name === authority.packageName
+    && candidateDevLocator.version === authority.packageVersion;
   const directPackageKey = resolvePackageKey(authority.packageName, authority.packageVersion, candidatePackages);
   const directPackage = mapAt(candidatePackages[directPackageKey], "authorized package entry");
   const directResolution = mapAt(directPackage.resolution, "authorized package resolution");
-  const directSnapshotKey = resolveSnapshotKey(authority.packageName, candidateDevVersion ?? authority.packageVersion, candidateSnapshots);
+  const directPackageIdentity = parsePnpmLocator(directPackageKey, "authorized package identity");
+  const directSnapshotKey = resolveSnapshotKey(authority.packageName, candidateDevVersion, candidateSnapshots);
   const directSnapshot = mapAt(candidateSnapshots[directSnapshotKey], "authorized snapshot entry");
+  const directSnapshotIdentity = parsePnpmLocator(directSnapshotKey, "authorized snapshot identity");
+  const exactPackageIdentity = directPackageIdentity.name === authority.packageName
+    && directPackageIdentity.version === authority.packageVersion
+    && directPackageIdentity.peers.length === 0;
+  const importerSnapshotIdentityMatch = locatorsEqual(candidateDevLocator, directSnapshotIdentity);
+  const peerContextIsConformant = peerContextConformant(
+    directPackageKey,
+    directPackage,
+    directSnapshotKey,
+    directSnapshot,
+    candidateLock,
+    candidatePackages,
+    candidateSnapshots,
+    candidateDevGraph,
+  );
+  const exactResolvedIdentity = exactPackageIdentity && importerSnapshotIdentityMatch && peerContextIsConformant;
   const integrityKeys = Array.from(newDevPackageKeys).every((key) => {
     const resolution = mapAt(candidatePackages[key], "new package resolution " + key).resolution;
-    return isRecord(resolution) && typeof resolution.integrity === "string" && /^sha512-/.test(resolution.integrity);
+    return isRecord(resolution) && validSha512Integrity(resolution.integrity);
   });
   const snapshotKeysPresent = Array.from(newDevSnapshotKeys).every((key) => isRecord(candidateSnapshots[key]));
-  const exactIntegrity = typeof directResolution.integrity === "string" && /^sha512-/.test(directResolution.integrity) && isRecord(directSnapshot) && integrityKeys && snapshotKeysPresent;
+  const exactIntegrity = validSha512Integrity(directResolution.integrity) && isRecord(directSnapshot) && integrityKeys && snapshotKeysPresent;
   const imports = allImportFacts(input.sourceFiles, authority.packageName);
   const runtimeImports = imports.filter(productionImport);
   const unauthorizedImports = imports.filter((item) => !allowedPath(item.file, authority.allowedImportSurface));
@@ -682,7 +829,7 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
   ]);
   const newDevOnlyKeysAbsentFromProduction = Array.from(new Set([...newDevPackageKeys, ...newDevSnapshotKeys])).every((key) => !candidateProductionKeys.has(key));
   const testOnlyRuntimeReachabilityAbsent = importReachabilityConformant && newDevOnlyKeysAbsentFromProduction && !candidateProductionKeys.has(directPackageKey) && !candidateProductionKeys.has(directSnapshotKey);
-  const lockConformant = exactImporter && exactPackageChanges && exactSnapshotChanges && unrelatedLockChanges.length === 0 && exactIntegrity && lockDelta.length === 1 + newDevPackageKeys.size + newDevSnapshotKeys.size;
+  const lockConformant = exactImporter && exactResolvedIdentity && exactPackageChanges && exactSnapshotChanges && unrelatedLockChanges.length === 0 && exactIntegrity && lockDelta.length === 1 + newDevPackageKeys.size + newDevSnapshotKeys.size;
   const authorized = authorityIsValid && exactDevDelta && lockConformant && productionGraphUnchanged && testOnlyRuntimeReachabilityAbsent;
   const hasKnownDelta = manifestDelta.length > 0 || lockDelta.length > 0;
   const disposition: S4DeltaDisposition = !hasKnownDelta ? "unchanged" : authorized ? "changed_authorized_conformant" : "changed_unauthorized_nonconformant";
@@ -699,6 +846,13 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
     "newDevPackageKeys=" + Array.from(newDevPackageKeys).sort().join(","),
     "newDevSnapshotKeys=" + Array.from(newDevSnapshotKeys).sort().join(","),
     "lockfileDeltaPaths=" + lockPathFacts(lockDelta).join("|"),
+    "candidateImporterLocator=" + canonical(locatorShape(candidateDevLocator)),
+    "resolvedPackageLocator=" + canonical(locatorShape(directPackageIdentity)),
+    "resolvedSnapshotLocator=" + canonical(locatorShape(directSnapshotIdentity)),
+    "importerSnapshotIdentityMatch=" + importerSnapshotIdentityMatch,
+    "peerContextIsConformant=" + peerContextIsConformant,
+    "exactResolvedIdentity=" + exactResolvedIdentity,
+    "integrityIsConformant=" + exactIntegrity,
     "lockConformant=" + lockConformant,
   ];
   const deltas = [...manifestDelta, ...lockDelta].map((change) => {

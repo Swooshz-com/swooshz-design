@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -22,6 +22,7 @@ import { createS4Client, instructionDraftState, isS4DraftClearEnabled, isS4Draft
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { proveS4Claims } from "./s4-proof";
+import { auditRepositorySurfaces, type S4RepositoryAuditInput } from "./s4-repository-audit";
 
 const WIDTH = 1536;
 const HEIGHT = 1024;
@@ -317,6 +318,177 @@ function expectErrorCode(action: () => unknown, expected: string): void {
   try { action(); } catch (error) { actual = errorCode(error); }
   assert.equal(actual, expected);
 }
+
+test("S4 repository audit enforces exact resolved package identity and fails closed", () => {
+  const baseSha = "2e01a90b6b2f40f4729764970a8cb89f25bbe0c8";
+  const baseTree = "b144ae4bc0bb80bee82d696be0f7e550af0a3ae9";
+  const authorityRef = "5478517427";
+  const packageName = "react-test-renderer";
+  const packageVersion = "19.2.8";
+  const purpose = "direct in-process rendered S4Screen component/event evidence for submit, image retry, assessment retry and rollback.";
+  const baseScript = "tsx --test tests/g3.test.ts tests/s2-evidence.test.ts tests/s2-lifecycle.test.ts";
+  const candidateScript = "tsx --test tests/g3.test.ts tests/s2-evidence.test.ts tests/s2-lifecycle.test.ts tests/s3.test.ts tests/s3-evidence.test.ts tests/s4.test.ts tests/s4-evidence.test.ts";
+  const basePackageText = execFileSync("git", ["show", baseSha + ":package.json"], { encoding: "utf8" });
+  const baseLockfileText = execFileSync("git", ["show", baseSha + ":pnpm-lock.yaml"], { encoding: "utf8" });
+  const candidatePackageText = readFileSync("package.json", "utf8");
+  const candidateLockfileText = readFileSync("pnpm-lock.yaml", "utf8").replace(/\r\n/g, "\n");
+  const sourceFiles = { "tests/s4.test.ts": 'import { create } from "react-test-renderer";' };
+  type AuditOverrides = {
+    basePackageText?: string;
+    candidatePackageText?: string;
+    baseLockfileText?: string;
+    candidateLockfileText?: string;
+    sourceFiles?: Record<string, string>;
+    dependencyAuthority?: Partial<S4RepositoryAuditInput["dependencyAuthority"]>;
+    scriptAuthority?: Partial<S4RepositoryAuditInput["scriptAuthority"]>;
+  };
+
+  function replaceOnce(text: string, search: string, replacement: string): string {
+    assert.equal(text.split(search).length - 1, 1, "expected one disposable fixture match: " + search);
+    return text.replace(search, replacement);
+  }
+
+  function rendererIdentityLock(importerVersion: string, snapshotLocator: string, packageLocator = "react-test-renderer@19.2.8:"): string {
+    let result = replaceOnce(
+      candidateLockfileText,
+      "      react-test-renderer:\n        specifier: 19.2.8\n        version: 19.2.8(react@19.2.8)\n",
+      "      react-test-renderer:\n        specifier: 19.2.8\n        version: " + importerVersion + "\n",
+    );
+    result = replaceOnce(result, "  react-test-renderer@19.2.8(react@19.2.8):", "  " + snapshotLocator + ":");
+    return replaceOnce(result, "  react-test-renderer@19.2.8:", "  " + packageLocator);
+  }
+
+  function input(overrides: AuditOverrides = {}): S4RepositoryAuditInput {
+    return {
+      basePackageText: overrides.basePackageText ?? basePackageText,
+      candidatePackageText: overrides.candidatePackageText ?? candidatePackageText,
+      baseLockfileText: overrides.baseLockfileText ?? baseLockfileText,
+      candidateLockfileText: overrides.candidateLockfileText ?? candidateLockfileText,
+      sourceFiles: overrides.sourceFiles ?? sourceFiles,
+      dependencyAuthority: {
+        packageName,
+        packageVersion,
+        baseManifestValue: null,
+        manifestPath: "devDependencies",
+        purpose,
+        allowedImportSurface: ["tests/s4.test.ts"],
+        authorityRefs: [authorityRef],
+        requiredAuthorityRef: authorityRef,
+        baselineSha: baseSha,
+        baselineTree: baseTree,
+        ...overrides.dependencyAuthority,
+      },
+      scriptAuthority: {
+        scriptName: "test",
+        baseValue: baseScript,
+        candidateValue: candidateScript,
+        purpose: "S4 implementation and evidence tests remain in the shared validation script.",
+        authorityRefs: [authorityRef],
+        requiredAuthorityRef: authorityRef,
+        preservedRequiredValidation: ["testFile=tests/g3.test.ts", "build=next build"],
+        removedRequiredValidation: [],
+        executedRequiredValidation: ["s1Tests=exitCode:0"],
+        requiredValidationLabels: ["s1Tests"],
+        ...overrides.scriptAuthority,
+      },
+    };
+  }
+
+  function audit(overrides: AuditOverrides = {}) {
+    return auditRepositorySurfaces(input(overrides)).dependencyAudit;
+  }
+
+  function assertIncomplete(label: string, result: ReturnType<typeof audit>): void {
+    assert.equal(result.auditState, "incomplete", label + " audit state");
+    assert.equal(result.disposition, null, label + " disposition");
+  }
+
+  function assertNonconformant(label: string, result: ReturnType<typeof audit>): void {
+    assert.notEqual(result.disposition, "changed_authorized_conformant", label + " must not be conformant");
+  }
+
+  const valid = audit();
+  assert.equal(valid.auditState, "complete", "valid locator audit state");
+  assert.equal(valid.disposition, "changed_authorized_conformant", "valid actual locator");
+
+  assertIncomplete("malformed locator", audit({
+    candidateLockfileText: rendererIdentityLock("19.2.8(react@19.2.8", "react-test-renderer@19.2.8(react@19.2.8)"),
+  }));
+  assertIncomplete("missing resolved locator", audit({
+    candidateLockfileText: replaceOnce(
+      candidateLockfileText,
+      "      react-test-renderer:\n        specifier: 19.2.8\n        version: 19.2.8(react@19.2.8)\n",
+      "      react-test-renderer:\n        specifier: 19.2.8\n",
+    ),
+  }));
+  assertIncomplete("importer and snapshot peer-context mismatch", audit({
+    candidateLockfileText: rendererIdentityLock("19.2.8(react@19.2.80)", "react-test-renderer@19.2.8(react@19.2.8)"),
+  }));
+  assertNonconformant("peer-context mismatch", audit({
+    candidateLockfileText: rendererIdentityLock("19.2.8(react@19.2.80)", "react-test-renderer@19.2.8(react@19.2.80)"),
+  }));
+  assertIncomplete("direct package version mismatch", audit({
+    candidateLockfileText: rendererIdentityLock("19.2.80(react@19.2.8)", "react-test-renderer@19.2.80(react@19.2.8)", "react-test-renderer@19.2.80:"),
+  }));
+  assertIncomplete("textual prefix or suffix collision", audit({
+    candidateLockfileText: rendererIdentityLock("19.2.8-suffix(react@19.2.8)", "react-test-renderer@19.2.8-suffix(react@19.2.8)", "react-test-renderer@19.2.8-suffix:"),
+  }));
+  assertIncomplete("ambiguous package locator", audit({
+    candidateLockfileText: replaceOnce(
+      candidateLockfileText,
+      "  react-test-renderer@19.2.8:\n",
+      "  react-test-renderer@19.2.8(react@19.2.8): {}\n  react-test-renderer@19.2.8:\n",
+    ),
+  }));
+  assertIncomplete("ambiguous snapshot dependency locator", audit({
+    candidateLockfileText: replaceOnce(
+      candidateLockfileText,
+      "  react-test-renderer@19.2.8(react@19.2.8):\n    dependencies:\n      react: 19.2.8\n      react-is: 19.2.8\n      scheduler: 0.27.0\n",
+      "  react-test-renderer@19.2.8(react@19.2.8):\n    dependencies:\n      react: 19.2.8\n      react-is: 19.2.8\n      scheduler: 0.27.0\n    optionalDependencies:\n      react: 19.2.80\n",
+    ),
+  }));
+  assertNonconformant("missing integrity", audit({
+    candidateLockfileText: replaceOnce(
+      candidateLockfileText,
+      "  react-test-renderer@19.2.8:\n    resolution: {integrity: sha512-GHKPaDRaNYU24PHTLG8Bx8VMY9t+qNfxQbt/Yjp7aMWBkKU6766SR0n6TnYu7P5I1MfEuAMUadqiyDHyI4Yy9Q==}\n",
+      "  react-test-renderer@19.2.8:\n    resolution: {}\n",
+    ),
+  }));
+  assertNonconformant("integrity mismatch", audit({
+    candidateLockfileText: replaceOnce(
+      candidateLockfileText,
+      "sha512-GHKPaDRaNYU24PHTLG8Bx8VMY9t+qNfxQbt/Yjp7aMWBkKU6766SR0n6TnYu7P5I1MfEuAMUadqiyDHyI4Yy9Q==",
+      "sha512-AAAA",
+    ),
+  }));
+  assertNonconformant("runtime import", audit({
+    sourceFiles: { ...sourceFiles, "src/runtime.ts": 'import "react-test-renderer";' },
+  }));
+
+  const productionPackage = JSON.parse(candidatePackageText) as Record<string, unknown>;
+  productionPackage.dependencies = {
+    ...(productionPackage.dependencies as Record<string, string>),
+    [packageName]: packageVersion,
+  };
+  assertNonconformant("production-graph overlap", audit({
+    candidatePackageText: JSON.stringify(productionPackage, null, 2) + "\n",
+    candidateLockfileText: replaceOnce(
+      candidateLockfileText,
+      "      sharp:\n",
+      "      react-test-renderer:\n        specifier: 19.2.8\n        version: 19.2.8(react@19.2.8)\n      sharp:\n",
+    ),
+  }));
+  assertNonconformant("unrelated lockfile entry", audit({
+    candidateLockfileText: replaceOnce(
+      candidateLockfileText,
+      "sha512-DTg4MJbGMWkfi6VZFdNt2/caMbQy4Ou+Op/hJQvGEWcnVfoA1QA+xzRKAzw9jD6+GVOOeYr/mIcuDSdug6F6+w==",
+      "sha512-" + "A".repeat(86) + "==",
+    ),
+  }));
+  assertNonconformant("missing Web authority", audit({
+    dependencyAuthority: { authorityRefs: [] },
+  }));
+});
 
 test("S4 mask and preservation fixtures use deterministic exact geometry", async () => {
   const first = materializeS4Mask(EDIT_PRIMITIVES);
