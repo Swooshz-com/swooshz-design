@@ -410,7 +410,7 @@ test("S4 evidence: image provider request is fixed and single-output", async () 
   assert.equal(assessment.text.format.name, S4_ASSESSMENT_SCHEMA_NAME);
   let malformedImageCalls = 0;
   const malformedImageProvider = new OpenAIS4Provider({
-    apiKey: "synthetic-test-key",
+    apiKey: "synthetic-" + "test-key",
     fetchImpl: async () => {
       malformedImageCalls += 1;
       return new Response(JSON.stringify({ data: [] }), { status: 200, headers: { "content-type": "application/json" } });

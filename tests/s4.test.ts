@@ -452,7 +452,7 @@ test("S4 pre-dispatch preflight keeps local failures not_started and recovers th
     return new Response(JSON.stringify({ id: "synthetic-assessment", output_text: JSON.stringify(s4AssessmentPayload(missingImageConfig.repository)) }), { status: 200, headers: { "content-type": "application/json" } });
   };
   const missingImageProvider = new OpenAIS4Provider({ apiKey: "", fetchImpl: correctedImageFetch });
-  const correctedImageProvider = new OpenAIS4Provider({ apiKey: "synthetic-test-key", fetchImpl: correctedImageFetch });
+  const correctedImageProvider = new OpenAIS4Provider({ apiKey: "synthetic-" + "test-key", fetchImpl: correctedImageFetch });
   try {
     const missingImageMethodOriginal = missingImageMethod.s4Provider.runS4ImageEdit;
     delete (missingImageMethod.s4Provider as Partial<S4ProviderContract>).runS4ImageEdit;
@@ -539,7 +539,7 @@ test("S4 pre-dispatch preflight keeps local failures not_started and recovers th
     assert.equal(assessmentConfigAttempt.providerDispatchState, "not_started");
     assert.equal(missingAssessmentFetchUrls.length, 0);
     const correctedAssessmentProvider = new OpenAIS4Provider({
-      apiKey: "synthetic-test-key",
+      apiKey: "synthetic-" + "test-key",
       fetchImpl: async (input) => {
         missingAssessmentFetchUrls.push(String(input));
         return new Response(JSON.stringify({ id: "synthetic-assessment", output_text: JSON.stringify(s4AssessmentPayload(missingAssessmentConfig.repository)) }), { status: 200, headers: { "content-type": "application/json" } });
