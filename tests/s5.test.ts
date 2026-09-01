@@ -10,8 +10,9 @@ import { AppError, type BoothGeometry, type S5LayoutRequirement, type S5Mutation
 import { handleApiRequest, type ApiRequestDependencies } from "../src/lib/api";
 import { createExactS3FixturePng } from "../src/lib/s3-media";
 import { JsonRepository, PrivateObjectStore } from "../src/lib/store";
-import { compileConceptLayoutPlan, canonicalPlanBytes, canonicalPlanJson, verifyPlanHash, S5_MAX_INSTANCES_PER_REQUIREMENT, S5_MAX_PLACED_INSTANCES, S5_MAX_REQUIREMENT_ITEMS, S5_MAX_ZONE_CANDIDATES, S5_Q16_MAX, type S5LayoutCompilerInput } from "../src/lib/s5-layout";
+import { compileConceptLayoutPlan, canonicalPlanBytes, canonicalPlanJson, layoutS5Label, validatePlanGeometry, verifyPlanHash, S5_MAX_INSTANCES_PER_REQUIREMENT, S5_MAX_PLACED_INSTANCES, S5_MAX_REQUIREMENT_ITEMS, S5_MAX_ZONE_CANDIDATES, S5_Q16_CIRCULATION_BAND_END, S5_Q16_CIRCULATION_BAND_START, S5_Q16_MAX, S5_Q16_MIN_GUTTER, S5_Q16_OUTER_MARGIN, type S5LayoutCompilerInput } from "../src/lib/s5-layout";
 import { loadApprovedNotoSansFont, pdfPageCount, renderConceptPresentationPdf, S5_NOTO_SANS_SHA256, S5_PDF_HEIGHT, S5_PDF_MAX_BYTES, S5_PDF_MAX_PAGES, S5_PDF_MIN_PAGES, S5_PDF_WIDTH } from "../src/lib/s5-pdf";
+import { renderConceptLayoutSvg } from "../src/lib/s5-svg";
 import { S5PublicationInterruption, generationContextHash, validateCurrentS5Approval } from "../src/lib/s5";
 import { validateS5Graph } from "../src/lib/s5-persistence";
 import { buildS5Telemetry } from "../src/lib/s5-telemetry";
@@ -67,6 +68,14 @@ function compilerInput(requirements: S5LayoutRequirement[], geometry = GEOMETRY)
   };
 }
 
+function rehashPlan(plan: ReturnType<typeof compileConceptLayoutPlan>): ReturnType<typeof compileConceptLayoutPlan> {
+  const copy = JSON.parse(JSON.stringify(plan)) as ReturnType<typeof compileConceptLayoutPlan>;
+  const unsigned = JSON.parse(JSON.stringify(copy)) as Record<string, unknown>;
+  delete unsigned.planHash;
+  copy.planHash = sha256(jcs(unsigned));
+  return copy;
+}
+
 function errorCode(error: unknown): string | null {
   return error instanceof AppError ? error.code : error instanceof Error ? error.message : null;
 }
@@ -106,6 +115,27 @@ async function extractPdfText(bytes: Uint8Array): Promise<string> {
       pages.push(content.items.map((item) => "str" in item ? item.str : "").join(" "));
     }
     return pages.join("\n");
+  } finally {
+    await task.destroy().catch(() => undefined);
+  }
+}
+
+async function assertPdfTextBounds(bytes: Uint8Array): Promise<void> {
+  const task = getDocument({ data: new Uint8Array(bytes), disableAutoFetch: true, disableStream: true, stopAtErrors: true, useWasm: false, useWorkerFetch: false, verbosity: 0 });
+  try {
+    const document = await task.promise;
+    for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+      const page = await document.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1 });
+      const content = await page.getTextContent();
+      for (const item of content.items) {
+        if (!("str" in item) || !item.str) continue;
+        const x = item.transform[4] ?? 0;
+        const y = item.transform[5] ?? 0;
+        assert.ok(x >= -0.5 && x + item.width <= viewport.width + 0.5);
+        assert.ok(y >= -1 && y + item.height <= viewport.height + 1);
+      }
+    }
   } finally {
     await task.destroy().catch(() => undefined);
   }
@@ -302,6 +332,79 @@ test("S5 layout allocates globally in mandatory-first order and enforces every a
   assert.equal(exactRequirementCap.coverage.length, S5_MAX_REQUIREMENT_ITEMS);
   expectCode(() => compileConceptLayoutPlan(compilerInput(Array.from({ length: S5_MAX_REQUIREMENT_ITEMS + 1 }, (_, index) => requirement(index + 1, "Future activation pod")))), "S5_LAYOUT_INPUT_INVALID");
 });
+
+test("S5 full placement grid proves outer margin, gutter, circulation exclusion, and no overlap", () => {
+  const plan = compileConceptLayoutPlan(compilerInput(Array.from({ length: S5_MAX_PLACED_INSTANCES }, (_, index) => requirement(index + 1, "Demo table"))));
+  const placed = plan.zones.flatMap((zone) => zone.instances.filter((instance) => instance.status === "placed"));
+  assert.equal(placed.length, S5_MAX_PLACED_INSTANCES);
+  for (const instance of placed) {
+    assert.ok(instance.xQ16! >= S5_Q16_OUTER_MARGIN);
+    assert.ok(instance.yQ16! >= S5_Q16_OUTER_MARGIN);
+    assert.ok(instance.xQ16! + instance.widthQ16! <= 65_536 - S5_Q16_OUTER_MARGIN);
+    assert.ok(instance.yQ16! + instance.heightQ16! <= 65_536 - S5_Q16_OUTER_MARGIN);
+    assert.ok(instance.xQ16! + instance.widthQ16! <= S5_Q16_CIRCULATION_BAND_START || instance.xQ16! >= S5_Q16_CIRCULATION_BAND_END);
+  }
+  for (let leftIndex = 0; leftIndex < placed.length; leftIndex += 1) for (let rightIndex = leftIndex + 1; rightIndex < placed.length; rightIndex += 1) {
+    const left = placed[leftIndex]!;
+    const right = placed[rightIndex]!;
+    const xOverlap = left.xQ16! < right.xQ16! + right.widthQ16! && right.xQ16! < left.xQ16! + left.widthQ16!;
+    const yOverlap = left.yQ16! < right.yQ16! + right.heightQ16! && right.yQ16! < left.yQ16! + left.heightQ16!;
+    const xGap = left.xQ16! >= right.xQ16! + right.widthQ16! ? left.xQ16! - (right.xQ16! + right.widthQ16!) : right.xQ16! - (left.xQ16! + left.widthQ16!);
+    const yGap = left.yQ16! >= right.yQ16! + right.heightQ16! ? left.yQ16! - (right.yQ16! + right.heightQ16!) : right.yQ16! - (left.yQ16! + left.heightQ16!);
+    assert.equal(xOverlap && yOverlap, false);
+    if (xOverlap) assert.ok(yGap >= S5_Q16_MIN_GUTTER);
+    if (yOverlap) assert.ok(xGap >= S5_Q16_MIN_GUTTER);
+    if (!xOverlap && !yOverlap) assert.ok(xGap >= S5_Q16_MIN_GUTTER && yGap >= S5_Q16_MIN_GUTTER);
+  }
+});
+
+test("S5 invalid margin, gutter, and collision geometry fails closed", () => {
+  const base = compileConceptLayoutPlan(compilerInput([requirement(1, "Demo table"), requirement(2, "Reception")]));
+  const margin = JSON.parse(JSON.stringify(base)) as typeof base;
+  margin.zones[0]!.instances[0]!.xQ16 = S5_Q16_OUTER_MARGIN - 1;
+  expectCode(() => validatePlanGeometry(margin), "S5_LAYOUT_OVERCONSTRAINED");
+  expectCode(() => verifyPlanHash(rehashPlan(margin)), "S5_LAYOUT_OVERCONSTRAINED");
+
+  const gutter = JSON.parse(JSON.stringify(base)) as typeof base;
+  const first = gutter.zones[0]!.instances[0]!;
+  const second = gutter.zones[1]!.instances[0]!;
+  second.xQ16 = first.xQ16! + first.widthQ16!;
+  expectCode(() => validatePlanGeometry(gutter), "S5_LAYOUT_OVERCONSTRAINED");
+
+  const collision = JSON.parse(JSON.stringify(base)) as typeof base;
+  collision.zones[1]!.instances[0]!.xQ16 = collision.zones[0]!.instances[0]!.xQ16;
+  collision.zones[1]!.instances[0]!.yQ16 = collision.zones[0]!.instances[0]!.yQ16;
+  expectCode(() => verifyPlanHash(rehashPlan(collision)), "S5_LAYOUT_OVERCONSTRAINED");
+});
+
+test("S5 maximum-length labels are bounded deterministically without truncation", () => {
+  const maximumLabel = "A".repeat(80);
+  expectCode(() => layoutS5Label(maximumLabel), "S5_LAYOUT_OVERCONSTRAINED");
+  expectCode(() => compileConceptLayoutPlan(compilerInput([requirement(1, maximumLabel)])), "S5_LAYOUT_OVERCONSTRAINED");
+  const boundedLabel = "Reception desk";
+  const lines = layoutS5Label(boundedLabel);
+  assert.equal(lines.join(""), boundedLabel);
+  assert.ok(lines.length <= 3);
+});
+
+test("S5 SVG bounds maximum unknown coverage and remains byte deterministic", () => {
+  const plan = compileConceptLayoutPlan(compilerInput(Array.from({ length: S5_MAX_ZONE_CANDIDATES }, (_, index) => requirement(index + 1, "Future activation pod"))));
+  const first = renderConceptLayoutSvg(plan);
+  const second = renderConceptLayoutSvg(plan);
+  assert.deepEqual(first, second);
+  assert.equal(sha256(first), sha256(second));
+  const svg = first.toString("utf8");
+  assert.match(svg, /id="unplaced-panel"/u);
+  assert.equal((svg.match(/data-status="unplaced"/gu) ?? []).length, S5_MAX_ZONE_CANDIDATES);
+  assert.doesNotMatch(svg, /y="808"/u);
+  for (const match of svg.matchAll(/\b(?:x|x1|x2)="([0-9]+(?:\.[0-9]+)?)"/gu)) assert.ok(Number(match[1]) >= 0 && Number(match[1]) <= 1_200);
+  for (const match of svg.matchAll(/\b(?:y|y1|y2)="([0-9]+(?:\.[0-9]+)?)"/gu)) assert.ok(Number(match[1]) >= 0 && Number(match[1]) <= 800);
+  const disclaimerY = Number(svg.match(/<text id="disclaimer"[^>]*\by="([0-9.]+)"/u)?.[1]);
+  const nonDisclaimerTextY = Array.from(svg.matchAll(/<text\b[^>]*\by="([0-9.]+)"[^>]*>/gu)).filter((match) => !match[0].includes('id="disclaimer"')).map((match) => Number(match[1]));
+  assert.ok(nonDisclaimerTextY.every((value) => value < disclaimerY));
+  assert.doesNotMatch(svg, /<script|https?:\/\/(?!www\.w3\.org\/2000\/svg)|on[a-z]+="/iu);
+});
+
 test("S5 PDF uses the approved font, five sections, A4 pages, searchable Unicode, no dates, and byte determinism", async () => {
   const heroBytes = await createExactS3FixturePng();
   const plan = compileConceptLayoutPlan(compilerInput([
@@ -331,7 +434,9 @@ test("S5 PDF uses the approved font, five sections, A4 pages, searchable Unicode
   const text = await extractPdfText(first);
   for (const heading of ["1. Cover / hero", "2. Project and booth", "3. Confirmed requirements", "4. Concept Layout Plan", "5. Concept-stage verification notes"]) assert.match(text, new RegExp(heading.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   assert.match(text, /Café/iu);
+  assert.match(text, /Demo table 1/iu);
   assert.match(text, /origin north-west/iu);
+  await assertPdfTextBounds(first);
   assert.doesNotMatch(readFileSync("src/lib/s5-pdf.ts", "utf8"), /playwright|puppeteer|chromium|printToPDF|wkhtmltopdf/iu);
 });
 

@@ -7,6 +7,15 @@ export const S5_LAYOUT_SCHEMA = "s5-concept-layout-v1" as const;
 export const S5_LAYOUT_RENDERER_VERSION = "s5-concept-layout-v1" as const;
 export const S5_Q16_DENOMINATOR = 65_536;
 export const S5_Q16_MAX = S5_Q16_DENOMINATOR - 1;
+export const S5_Q16_OUTER_MARGIN = 4_096;
+export const S5_Q16_MIN_GUTTER = 1_024;
+export const S5_Q16_CIRCULATION_BAND_START = 24_576;
+export const S5_Q16_CIRCULATION_BAND_END = 40_960;
+export const S5_Q16_ZONE_WIDTH = 8_192;
+export const S5_Q16_ZONE_HEIGHT = 8_192;
+export const S5_LAYOUT_LABEL_MAX_CODEPOINTS = 80;
+export const S5_LAYOUT_LABEL_MAX_WIDTH_UNITS = 12;
+export const S5_LAYOUT_LABEL_MAX_LINES = 3;
 export const S5_MAX_REQUIREMENT_ITEMS = 64;
 export const S5_MAX_ZONE_CANDIDATES = 32;
 export const S5_MAX_INSTANCES_PER_REQUIREMENT = 8;
@@ -50,6 +59,42 @@ const DISCLAIMERS = [
 ] as const;
 
 function layoutError(code: string, field = "layout"): AppError { return new AppError(422, code, [{ field, code }]); }
+function labelWidthUnit(value: string): number {
+  const codePoint = value.codePointAt(0) ?? 0;
+  if (/\p{M}/u.test(value)) return 0;
+  if (/\s/u.test(value)) return 0.5;
+  if (codePoint >= 0x2e80) return 2;
+  if (/[,.;:!?()[\]{}\-_/]/u.test(value)) return 0.45;
+  return 1;
+}
+export function layoutS5Label(value: string): string[] {
+  const codePoints = Array.from(value);
+  if (!codePoints.length || codePoints.length > S5_LAYOUT_LABEL_MAX_CODEPOINTS || /[\u0000-\u001f\u007f]/u.test(value)) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "label");
+  const lines: string[] = [];
+  let current = "";
+  let width = 0;
+  for (const character of codePoints) {
+    if (character === "\n") {
+      lines.push(current);
+      current = "";
+      width = 0;
+      continue;
+    }
+    const nextWidth = width + labelWidthUnit(character);
+    if (current && nextWidth > S5_LAYOUT_LABEL_MAX_WIDTH_UNITS) {
+      lines.push(current);
+      current = "";
+      width = 0;
+    }
+    current += character;
+    width += labelWidthUnit(character);
+  }
+  if (current || value.endsWith("\n")) lines.push(current);
+  if (!lines.length || lines.length > S5_LAYOUT_LABEL_MAX_LINES || lines.join("") !== value) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "label");
+  return lines;
+}
+function labelWidthUnits(value: string): number { return Array.from(value).reduce((total, character) => total + labelWidthUnit(character), 0); }
+export function s5LabelLineWidthUnits(value: string): number[] { return layoutS5Label(value).map(labelWidthUnits); }
 function normalizeWords(value: string): string[] { return value.normalize("NFKC").toLocaleLowerCase("en-US").replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/u).filter(Boolean); }
 function containsAlias(tokens: readonly string[], alias: string): boolean {
   const aliasTokens = alias.split(" ");
@@ -84,8 +129,10 @@ function circulationFor(openSides: readonly OpenSide[]): S5LayoutPlan["circulati
   });
 }
 function positionFor(slot: number): { xQ16: number; yQ16: number; widthQ16: number; heightQ16: number } {
+  if (!Number.isSafeInteger(slot) || slot < 0 || slot >= S5_MAX_PLACED_INSTANCES) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "placement");
   const column = slot % 4; const row = Math.floor(slot / 4);
-  return { xQ16: [6_144, 16_384, 45_056, 55_296][column], yQ16: 8_192 + row * 13_312, widthQ16: 8_192, heightQ16: 8_192 };
+  const xQ16 = [S5_Q16_OUTER_MARGIN, S5_Q16_OUTER_MARGIN + S5_Q16_ZONE_WIDTH + 2_048, S5_Q16_CIRCULATION_BAND_END + 2_048, S5_Q16_DENOMINATOR - S5_Q16_OUTER_MARGIN - S5_Q16_ZONE_WIDTH][column]!;
+  return { xQ16, yQ16: S5_Q16_OUTER_MARGIN + row * (S5_Q16_ZONE_HEIGHT + 2_048), widthQ16: S5_Q16_ZONE_WIDTH, heightQ16: S5_Q16_ZONE_HEIGHT };
 }
 function unknownItem(requirement: S5LayoutRequirement, reason: S5UnknownItem["reason"]): S5UnknownItem {
   return { unknownId: `${requirement.requirementId}.${reason}`, requirementId: requirement.requirementId, label: requirement.name, mandatory: requirement.mandatory, status: "unplaced", reason };
@@ -94,7 +141,7 @@ function instanceFor(requirement: S5LayoutRequirement, category: S5ZoneCategory,
   return { instanceId: `${requirement.requirementId}.instance.${String(index + 1).padStart(2, "0")}`, requirementId: requirement.requirementId, label: requirement.countIsExact ? `${requirement.name} ${index + 1}` : requirement.name, mandatory: requirement.mandatory, countIndex: index + 1, status: placement ? "placed" : "unplaced", unplacedReason: placement ? null : reason, xQ16: placement?.xQ16 ?? null, yQ16: placement?.yQ16 ?? null, widthQ16: placement?.widthQ16 ?? null, heightQ16: placement?.heightQ16 ?? null, symbols: placement ? symbolsFor(requirement, category, index) : [] };
 }
 function verifyRequirement(value: S5LayoutRequirement, index: number): void {
-  if (!/^brief\.functional\.\d{3}$/u.test(value.requirementId) || typeof value.name !== "string" || !value.name.trim() || Array.from(value.name).length > 80 || typeof value.mandatory !== "boolean" || typeof value.countIsExact !== "boolean") throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements[" + index + "]");
+  if (!/^brief\.functional\.\d{3}$/u.test(value.requirementId) || typeof value.name !== "string" || !value.name.trim() || Array.from(value.name).length > S5_LAYOUT_LABEL_MAX_CODEPOINTS || typeof value.mandatory !== "boolean" || typeof value.countIsExact !== "boolean") throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements[" + index + "]");
   if (value.details !== null && (typeof value.details !== "string" || Array.from(value.details).length > 400)) throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements[" + index + "].details");
   if (value.count !== null && (!Number.isSafeInteger(value.count) || value.count < 0)) throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements[" + index + "].count");
   if (value.countIsExact && value.count === null) throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements[" + index + "].count");
@@ -161,30 +208,38 @@ export function compileConceptLayoutPlan(input: S5LayoutCompilerInput): S5Layout
   validatePlanGeometry(working);
   return withPlanHash(working);
 }
-function validatePlanGeometry(plan: S5LayoutPlan): void {
+export function validatePlanGeometry(plan: S5LayoutPlan): void {
   if (plan.zones.length > S5_MAX_ZONE_CANDIDATES) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
   const boxes: Array<{ x: number; y: number; width: number; height: number; instanceId: string }> = [];
   const instanceIds = new Set<string>();
   let placedCount = 0;
   for (const zone of plan.zones) {
     if (zone.instances.length > S5_MAX_INSTANCES_PER_REQUIREMENT) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+    layoutS5Label(zone.label);
     for (const instance of zone.instances) {
       if (instanceIds.has(instance.instanceId)) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
       instanceIds.add(instance.instanceId);
-      if (Array.from(instance.label).length > 80) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+      layoutS5Label(instance.label);
+      for (const symbol of instance.symbols) layoutS5Label(symbol.label);
       if (instance.status !== "placed") continue;
-      if (instance.xQ16 === null || instance.yQ16 === null || instance.widthQ16 === null || instance.heightQ16 === null || instance.widthQ16 < 4_096 || instance.heightQ16 < 4_096 || ![instance.xQ16, instance.yQ16, instance.widthQ16, instance.heightQ16].every((value) => Number.isSafeInteger(value) && value >= 0 && value <= S5_Q16_MAX) || instance.xQ16 + instance.widthQ16 > S5_Q16_DENOMINATOR || instance.yQ16 + instance.heightQ16 > S5_Q16_DENOMINATOR) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
-      const inLeftRail = instance.xQ16 + instance.widthQ16 <= 24_576;
-      const inRightRail = instance.xQ16 >= 40_960;
+      if (instance.xQ16 === null || instance.yQ16 === null || instance.widthQ16 === null || instance.heightQ16 === null || instance.widthQ16 < 4_096 || instance.heightQ16 < 4_096 || ![instance.xQ16, instance.yQ16, instance.widthQ16, instance.heightQ16].every((value) => Number.isSafeInteger(value) && value >= 0 && value <= S5_Q16_MAX) || instance.xQ16 < S5_Q16_OUTER_MARGIN || instance.yQ16 < S5_Q16_OUTER_MARGIN || instance.xQ16 + instance.widthQ16 > S5_Q16_DENOMINATOR - S5_Q16_OUTER_MARGIN || instance.yQ16 + instance.heightQ16 > S5_Q16_DENOMINATOR - S5_Q16_OUTER_MARGIN) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+      const inLeftRail = instance.xQ16 + instance.widthQ16 <= S5_Q16_CIRCULATION_BAND_START;
+      const inRightRail = instance.xQ16 >= S5_Q16_CIRCULATION_BAND_END;
       if (!inLeftRail && !inRightRail) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
       boxes.push({ x: instance.xQ16, y: instance.yQ16, width: instance.widthQ16, height: instance.heightQ16, instanceId: instance.instanceId });
       placedCount += 1;
     }
   }
+  for (const unknown of plan.unknowns) layoutS5Label(unknown.label);
   if (placedCount > S5_MAX_PLACED_INSTANCES) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
   for (let leftIndex = 0; leftIndex < boxes.length; leftIndex += 1) for (let rightIndex = leftIndex + 1; rightIndex < boxes.length; rightIndex += 1) {
     const left = boxes[leftIndex]; const right = boxes[rightIndex];
-    if (left.x < right.x + right.width && right.x < left.x + left.width && left.y < right.y + right.height && right.y < left.y + left.height) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones." + left.instanceId);
+    const xOverlap = left.x < right.x + right.width && right.x < left.x + left.width;
+    const yOverlap = left.y < right.y + right.height && right.y < left.y + left.height;
+    if (xOverlap && yOverlap) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones." + left.instanceId);
+    const xGap = left.x >= right.x + right.width ? left.x - (right.x + right.width) : right.x - (left.x + left.width);
+    const yGap = left.y >= right.y + right.height ? left.y - (right.y + right.height) : right.y - (left.y + left.height);
+    if ((xOverlap && yGap < S5_Q16_MIN_GUTTER) || (yOverlap && xGap < S5_Q16_MIN_GUTTER) || (!xOverlap && !yOverlap && (xGap < S5_Q16_MIN_GUTTER || yGap < S5_Q16_MIN_GUTTER))) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones." + left.instanceId);
   }
 }
 function withoutPlanHash(plan: S5LayoutPlan): Record<string, unknown> { const copy = cloneJson(plan) as Record<string, unknown>; delete copy.planHash; return copy; }

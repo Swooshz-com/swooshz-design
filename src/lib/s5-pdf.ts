@@ -4,7 +4,7 @@ import { PDFDocument, rgb, type PDFFont, type PDFPage } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import { AppError } from "./types";
 import type { BoothGeometry, S5LayoutPlan, S5LayoutRequirement, S5UnknownItem } from "./types";
-import { S5_Q16_DENOMINATOR, verifyPlanHash } from "./s5-layout";
+import { layoutS5Label, S5_Q16_DENOMINATOR, verifyPlanHash } from "./s5-layout";
 import { sha256 } from "./utils";
 
 export const S5_PDF_RENDERER_VERSION = "s5-presentation-pdf-v1" as const;
@@ -75,7 +75,18 @@ function displayPlan(document: PDFDocument, cursor: Cursor, font: PDFFont, plan:
   const colors: Record<string, ReturnType<typeof rgb>> = { reception_welcome: rgb(0.06, 0.46, 0.43), presentation_display: rgb(0.86, 0.12, 0.47), demo_product: rgb(0.49, 0.24, 0.70), consultation_meeting: rgb(0.15, 0.39, 0.78), storage: rgb(0.39, 0.45, 0.55), interactive_activity: rgb(0.03, 0.57, 0.70), photo_branding: rgb(0.31, 0.27, 0.78), giveaway_brochure: rgb(0.40, 0.64, 0.05), other_confirmed: rgb(0.71, 0.33, 0.05) };
   for (const zone of plan.zones) for (const instance of zone.instances) if (instance.status === "placed" && instance.xQ16 !== null && instance.yQ16 !== null && instance.widthQ16 !== null && instance.heightQ16 !== null) {
     const boxX = pxX(instance.xQ16); const boxY = pxY(instance.yQ16 + instance.heightQ16); const boxWidth = instance.widthQ16 / S5_Q16_DENOMINATOR * width; const boxHeight = instance.heightQ16 / S5_Q16_DENOMINATOR * height; const color = colors[zone.category] ?? colors.other_confirmed;
-    cursor.page.drawRectangle({ x: boxX, y: boxY, width: boxWidth, height: boxHeight, borderColor: color, borderWidth: 1.5, color, opacity: 0.15 }); ensureGlyphs(font, instance.label); cursor.page.drawText(instance.label, { x: boxX + 4, y: boxY + boxHeight - 13, size: 7, font, color: rgb(0.09, 0.12, 0.16) });
+    cursor.page.drawRectangle({ x: boxX, y: boxY, width: boxWidth, height: boxHeight, borderColor: color, borderWidth: 1.5, color, opacity: 0.15 });
+    const labelLines = layoutS5Label(instance.label);
+    const labelSize = 7;
+    const labelLineHeight = 8.5;
+    const labelWidth = boxWidth - 8;
+    labelLines.forEach((label, lineIndex) => {
+      ensureGlyphs(font, label);
+      if (font.widthOfTextAtSize(label, labelSize) > labelWidth) throw pdfError("S5_LAYOUT_OVERCONSTRAINED", "plan.label");
+      const labelY = boxY + boxHeight - 11 - lineIndex * labelLineHeight;
+      if (labelY < boxY + 4) throw pdfError("S5_LAYOUT_OVERCONSTRAINED", "plan.label");
+      cursor.page.drawText(label, { x: boxX + 4, y: labelY, size: labelSize, font, color: rgb(0.09, 0.12, 0.16) });
+    });
   }
   return line(document, { page: cursor.page, y: 180 }, font, `${plan.zones.length} conceptual zone(s); ${plan.circulation.length} symbolic open-side route(s).`, { size: 9, color: rgb(0.40, 0.45, 0.49) });
 }
