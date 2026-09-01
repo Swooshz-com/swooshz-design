@@ -43,6 +43,7 @@ import { S2_QA_MODEL, S2_QA_SCHEMA, type S2ProviderContract, type S2QaProviderIn
 import { ProviderFailure } from "./openai";
 import { deriveSourceQaLifecycle, isSourceQaTerminalStatus, latestSourceQaResults } from "./s2-lifecycle";
 import { eligibleS2RepairFindingIds, reduceS2Findings, S2_CONFIDENCE_THRESHOLD } from "./s2-findings";
+import { assertS5MutationAllowed, isS5ApprovalLocked } from "./s5-lock";
 import {
   canonicalRepairInputHash,
   repairAssetProjection,
@@ -687,6 +688,7 @@ export class S2WorkflowService {
     this.clearClaim(operation);
   }
   private commitRepairPublication(state: StoreState, publication: S2RepairPublication): void {
+    if (isS5ApprovalLocked(state, publication.projectId)) throw fail(409, "S5_APPROVAL_LOCKED");
     const operation = state.s2Operations.find((item) => item.id === publication.operationId);
     const reQaCreated = !state.s2Operations.some((item) => item.id === publication.intendedReQaOperation.id);
     if (!state.s2DerivedCandidates.some((item) => item.id === publication.intendedDerived.id)) {
@@ -786,11 +788,13 @@ export class S2WorkflowService {
     Promise<S2Mutation<{ asset: S2PublicAsset; draft: S2PublicDraft }>> {
     if (kind !== "reference" && kind !== "logo") throw fail(400, "INVALID_ASSET_KIND", "kind");
     const before = this.state(); this.project(before, projectId);
+    assertS5MutationAllowed(before, projectId);
     if (before.s2Drafts.find((item) => item.projectId === projectId)?.status === "frozen") throw fail(409, "DRAFT_FROZEN");
     const media = await normalizeS2Media({ kind, fileName, mimeType, bytes, maxInputBytes: 8_388_608 });
     const inputHash = operationInputHash("s2_asset_upload", projectId, { kind, originalSha256: media.originalSha256, originalBytes: media.originalBytes.byteLength });
     const replayId = this.repository.transact((state) => {
       this.project(state, projectId);
+      assertS5MutationAllowed(state, projectId);
       if (this.draft(state, projectId, true).status === "frozen") throw fail(409, "DRAFT_FROZEN");
       const replay = this.idem(state, key, "s2_asset_upload", projectId, inputHash);
       return replay ? String(replay.result.assetId) : null;
@@ -823,7 +827,7 @@ export class S2WorkflowService {
       this.objects.put(stagedOriginal, media.originalBytes); this.verify(stagedOriginal, media.originalBytes.byteLength, media.originalSha256);
       this.objects.put(stagedNormalized, media.normalizedBytes); this.verify(stagedNormalized, media.normalizedBytes.byteLength, media.normalizedSha256);
       this.repository.transact((state) => {
-        this.project(state, projectId); if (this.draft(state, projectId, true).status === "frozen") throw fail(409, "DRAFT_FROZEN");
+        this.project(state, projectId); assertS5MutationAllowed(state, projectId); if (this.draft(state, projectId, true).status === "frozen") throw fail(409, "DRAFT_FROZEN");
         state.s2Publications.push(cloneJson(publication));
       });
       await this.notify("after-publication-staged", publication);
@@ -857,7 +861,7 @@ export class S2WorkflowService {
     const refs = referenceAssetIds.map((id) => { assertUuid(id, "referenceAssetIds"); return id; });
     const logos = logoAssetIds.map((id) => { assertUuid(id, "logoAssetIds"); return id; });
     const result = this.repository.transact((state) => {
-      this.project(state, projectId); const draft = this.draft(state, projectId, true);
+      this.project(state, projectId); assertS5MutationAllowed(state, projectId); const draft = this.draft(state, projectId, true);
       const inputHash = operationInputHash("s2_draft_update", projectId, { draftId: draft.id, expectedRevision, referenceAssetIds: refs, logoAssetIds: logos });
       if (draft.status === "frozen") throw fail(409, "DRAFT_FROZEN");
       if (this.idem(state, key, "s2_draft_update", projectId, inputHash)) return { draft: cloneJson(draft), replayed: true };
@@ -928,6 +932,7 @@ export class S2WorkflowService {
     const sources = await this.sourcesFor(projectId, sourceGenerationSetId);
     const result = this.repository.transact((state) => {
       this.project(state, projectId);
+      assertS5MutationAllowed(state, projectId);
       const project = state.projects.find((item) => item.projectId === projectId)!;
       const briefId = project.confirmedBriefVersionId;
       if (!briefId) throw fail(409, "S2_NOT_AVAILABLE");
@@ -1104,6 +1109,7 @@ export class S2WorkflowService {
     return this.repository.transact((state) => {
       const operation = state.s2Operations.find((item) => item.id === operationId);
       if (!operation || operation.status !== "queued") return null;
+      if (isS5ApprovalLocked(state, operation.projectId)) return null;
       const token = this.uuid();
       const run = state.s2QaRuns.find((item) => item.id === operation.qaRunId);
       const sourceResult = operation.phase === "qa"
@@ -1183,6 +1189,9 @@ export class S2WorkflowService {
         const currentRun = current.s2QaRuns.find((item) => item.id === claim.operation.qaRunId);
         const result = currentRun?.candidateResults.find((item) => item.id === claim.operation.resultId);
         if (!operation || !currentRun || !result || !this.claimMatches(operation, claim.token) || result.status !== "running") return;
+        if (isS5ApprovalLocked(current, operation.projectId)) {
+          result.status = "qa_unavailable_terminal"; result.verdict = "QA_UNAVAILABLE"; result.completedAt = this.clock(); this.transition(current, operation.projectId, operation.id, operation.phase, operation.attempt, "running", result.status, operation.referenceId); operation.status = "failed"; operation.providerDispatchState = "consumed"; operation.failureCode = "S5_APPROVAL_LOCKED"; operation.completedAt = this.clock(); this.clearClaim(operation); this.recompute(currentRun); return;
+        }
         result.status = value.verdict === "PASS" ? "pass" : value.verdict === "WARNING" ? "warning" : "material_fail";
         result.verdict = value.verdict; result.requirementObservations = value.requirements; result.designObservations = value.designRules;
         result.materialFindingIds = value.material; result.warningFindingIds = value.warning; result.uncertainFindingIds = value.uncertain;
@@ -1213,7 +1222,7 @@ export class S2WorkflowService {
   }
   async retryQa(projectId: UUID, qaRunId: UUID, candidateId: UUID, key: UUID, referenceId: UUID): Promise<S2Mutation<Record<string, unknown>>> {
     const result = this.repository.transact((state) => {
-      this.project(state, projectId); const run = state.s2QaRuns.find((item) => item.id === qaRunId);
+      this.project(state, projectId); assertS5MutationAllowed(state, projectId); const run = state.s2QaRuns.find((item) => item.id === qaRunId);
       if (!run || run.projectId !== projectId) throw fail(404, "QA_NOT_FOUND");
       const current = this.latest(run, candidateId);
       const inputHash = operationInputHash("s2_qa_retry", projectId, { qaRunId, candidateId, expectedAttempt: 1 });
@@ -1279,7 +1288,7 @@ export class S2WorkflowService {
     Promise<S2Mutation<Record<string, unknown>>> {
     if (typeof expectedInputVersionId !== "string") throw fail(400, "INVALID_REQUEST");
     const result = this.repository.transact((state) => {
-      this.project(state, projectId); const run = state.s2QaRuns.find((item) => item.id === qaRunId);
+      this.project(state, projectId); assertS5MutationAllowed(state, projectId); const run = state.s2QaRuns.find((item) => item.id === qaRunId);
       if (!run || run.projectId !== projectId) throw fail(404, "QA_NOT_FOUND");
       if (run.inputVersionId !== expectedInputVersionId) throw fail(409, "QA_BINDING_CONFLICT");
       const input = this.inputFor(state, run); const current = this.latest(run, candidateId); const findings = this.eligible(current, input);
@@ -1365,6 +1374,7 @@ export class S2WorkflowService {
       this.repository.transact((current) => {
         const stored = current.s2Operations.find((item) => item.id === operationId);
         if (!stored || !this.claimMatches(stored, claim.token)) throw fail(409, "STATE_CONFLICT");
+        assertS5MutationAllowed(current, stored.projectId);
         current.s2Publications.push(cloneJson(publication!));
       });
       await this.notify("after-publication-intent", publication);
@@ -1463,6 +1473,9 @@ export class S2WorkflowService {
         const storedResult = current.s2ReQaResults.find((item) => item.id === operation.resultId);
         const storedRepair = stored?.repairAttemptId ? current.s2Repairs.find((item) => item.id === stored.repairAttemptId) : null;
         if (!stored || !storedResult || !storedRepair || !this.claimMatches(stored, claim.token)) return;
+        if (isS5ApprovalLocked(current, stored.projectId)) {
+          storedResult.status = "re_qa_unavailable"; storedResult.verdict = "QA_UNAVAILABLE"; storedResult.completedAt = this.clock(); storedRepair.status = "re_qa_unavailable"; storedRepair.completedAt = this.clock(); this.transition(current, stored.projectId, stored.id, stored.phase, stored.attempt, "running", storedRepair.status, stored.referenceId); stored.status = "failed"; stored.providerDispatchState = "consumed"; stored.failureCode = "S5_APPROVAL_LOCKED"; stored.completedAt = this.clock(); this.clearClaim(stored); return;
+        }
         storedResult.status = value.verdict === "PASS" ? "pass" : value.verdict === "WARNING" ? "warning" : "material_fail";
         storedResult.verdict = value.verdict; storedResult.requirementObservations = value.requirements;
         storedResult.designObservations = value.designRules; storedResult.materialFindingIds = value.material;

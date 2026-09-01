@@ -69,7 +69,7 @@ export type S4DependencyAuthority = {
   packageName: string;
   packageVersion: string;
   baseManifestValue: string | null;
-  manifestPath: "devDependencies";
+  manifestPath: "dependencies" | "devDependencies";
   purpose: string;
   allowedImportSurface: string[];
   authorityRefs: string[];
@@ -110,6 +110,7 @@ export type S4RepositoryAuditInput = {
   candidateLockfileText: string;
   sourceFiles: Record<string, string>;
   dependencyAuthority: S4DependencyAuthority;
+  additionalDependencyAuthorities?: S4DependencyAuthority[];
   scriptAuthority: S4ScriptAuthority;
 };
 
@@ -980,6 +981,136 @@ function buildDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage
   };
 }
 
+function buildMultiDependencyAudit(input: S4RepositoryAuditInput, base: ParsedPackage, candidate: ParsedPackage, baseLock: JsonRecord, candidateLock: JsonRecord): S4DependencyAudit {
+  const authorities = [input.dependencyAuthority, ...(input.additionalDependencyAuthorities ?? [])];
+  if (authorities.length < 2 || new Set(authorities.map((authority) => authority.manifestPath + ":" + authority.packageName)).size !== authorities.length) throw new Error("ambiguous dependency authorities");
+  const metadata = authorities.map((authority) => ({ authority, expected: validatedExpectedMetadata(authority) }));
+  const authorityIsValid = authorities.every((authority) => Boolean(authority.packageName && authority.packageVersion && authority.purpose && (authority.manifestPath === "dependencies" || authority.manifestPath === "devDependencies") && authority.authorityRefs.includes(authority.requiredAuthorityRef) && authority.allowedImportSurface.length > 0 && /^[0-9a-f]{40}$/.test(authority.baselineSha) && /^[0-9a-f]{40}$/.test(authority.baselineTree)));
+  const baseManifestSha256 = sha256(Buffer.from(input.basePackageText, "utf8"));
+  const candidateManifestSha256 = sha256(Buffer.from(input.candidatePackageText, "utf8"));
+  const baseLockfileSha256 = sha256(Buffer.from(input.baseLockfileText, "utf8"));
+  const candidateLockfileSha256 = sha256(Buffer.from(input.candidateLockfileText, "utf8"));
+  const manifestDelta = manifestChanges(base, candidate);
+  const lockDelta = lockChanges(baseLock, candidateLock);
+  if (baseLockfileSha256 !== candidateLockfileSha256 && lockDelta.length === 0) lockDelta.push({ surface: "lockfile", path: "pnpm-lock.yaml", name: null, baseValue: baseLockfileSha256, candidateValue: candidateLockfileSha256, lockKind: "other" });
+  const expectedManifest = metadata.map(({ authority }) => ({
+    surface: authority.manifestPath === "devDependencies" ? "test-only-dependency" : "production-runtime-dependency",
+    path: "package.json." + authority.manifestPath + "." + authority.packageName,
+    name: authority.packageName,
+    baseValue: authority.baseManifestValue,
+    candidateValue: authority.packageVersion,
+  }));
+  const manifestConformant = manifestDelta.length === expectedManifest.length && expectedManifest.every((expected) => manifestDelta.some((change) => change.surface === expected.surface && change.path === expected.path && change.name === expected.name && change.baseValue === expected.baseValue && change.candidateValue === expected.candidateValue));
+  const baseImporter = mapAt(mapAt(baseLock.importers, "base importers")["."], "base root importer");
+  const candidateImporter = mapAt(mapAt(candidateLock.importers, "candidate importers")["."], "candidate root importer");
+  const baseProductionImporter = Object.fromEntries(["dependencies", "optionalDependencies", "peerDependencies"].map((key) => [key, baseImporter[key] ?? {}]));
+  const candidateProductionImporter = Object.fromEntries(["dependencies", "optionalDependencies", "peerDependencies"].map((key) => [key, candidateImporter[key] ?? {}]));
+  const baseProductionGraph = buildGraph(baseLock, "dependencies");
+  const candidateProductionGraph = buildGraph(candidateLock, "dependencies");
+  const baseOptionalGraph = buildGraph(baseLock, "optionalDependencies");
+  const candidateOptionalGraph = buildGraph(candidateLock, "optionalDependencies");
+  const basePeerGraph = buildGraph(baseLock, "peerDependencies");
+  const candidatePeerGraph = buildGraph(candidateLock, "peerDependencies");
+  const productionGraphUnchanged = sectionSnapshotEqual({ ...base.sections, devDependencies: {} }, { ...candidate.sections, devDependencies: {} }) && canonical(baseProductionImporter) === canonical(candidateProductionImporter) && graphEqual(baseProductionGraph, candidateProductionGraph) && graphEqual(baseOptionalGraph, candidateOptionalGraph) && graphEqual(basePeerGraph, candidatePeerGraph);
+  const candidateGraphs = new Map<"dependencies" | "devDependencies", Graph>([["dependencies", candidateProductionGraph], ["devDependencies", buildGraph(candidateLock, "devDependencies")]]);
+  const candidatePackages = mapAt(candidateLock.packages, "candidate packages");
+  const candidateSnapshots = mapAt(candidateLock.snapshots, "candidate snapshots");
+  const basePackages = mapAt(baseLock.packages, "base packages");
+  const baseSnapshots = mapAt(baseLock.snapshots, "base snapshots");
+  const expectedPackageEntries = new Map<string, Record<string, unknown>>();
+  const expectedSnapshotEntries = new Map<string, Record<string, unknown>>();
+  for (const { expected } of metadata) {
+    for (const entry of expected.packageEntries) { const prior = expectedPackageEntries.get(entry.locator); if (prior && !equalValue(prior, entry.value)) throw new Error("conflicting expected package metadata"); expectedPackageEntries.set(entry.locator, entry.value); }
+    for (const entry of expected.snapshotEntries) { const prior = expectedSnapshotEntries.get(entry.locator); if (prior && !equalValue(prior, entry.value)) throw new Error("conflicting expected snapshot metadata"); expectedSnapshotEntries.set(entry.locator, entry.value); }
+  }
+  const expectedNewPackageKeys = new Set(Array.from(expectedPackageEntries.keys()).filter((key) => !Object.prototype.hasOwnProperty.call(basePackages, key)));
+  const expectedNewSnapshotKeys = new Set(Array.from(expectedSnapshotEntries.keys()).filter((key) => !Object.prototype.hasOwnProperty.call(baseSnapshots, key)));
+  const newPackageKeys = new Set(Object.keys(candidatePackages).filter((key) => !Object.prototype.hasOwnProperty.call(basePackages, key)));
+  const newSnapshotKeys = new Set(Object.keys(candidateSnapshots).filter((key) => !Object.prototype.hasOwnProperty.call(baseSnapshots, key)));
+  const actualPackageChanges = new Set(lockDelta.filter((change) => change.lockKind === "package").map((change) => change.lockKey));
+  const actualSnapshotChanges = new Set(lockDelta.filter((change) => change.lockKind === "snapshot").map((change) => change.lockKey));
+  const allCandidatePackageKeys = new Set([...candidateProductionGraph.packageKeys, ...candidateGraphs.get("devDependencies")!.packageKeys]);
+  const allCandidateSnapshotKeys = new Set([...candidateProductionGraph.snapshotKeys, ...candidateGraphs.get("devDependencies")!.snapshotKeys]);
+  const expectedPackageValues = Array.from(expectedPackageEntries).map(([key, value]) => ({ key, present: Object.prototype.hasOwnProperty.call(candidatePackages, key), equal: equalValue(candidatePackages[key], value), reachable: allCandidatePackageKeys.has(key) }));
+  const expectedSnapshotValues = Array.from(expectedSnapshotEntries).map(([key, value]) => ({ key, present: Object.prototype.hasOwnProperty.call(candidateSnapshots, key), equal: equalValue(candidateSnapshots[key], value), reachable: allCandidateSnapshotKeys.has(key) }));
+  const expectedMetadataIsConformant = expectedPackageValues.every((item) => item.present && item.equal && item.reachable) && expectedSnapshotValues.every((item) => item.present && item.equal && item.reachable) && canonical(Array.from(newPackageKeys).sort()) === canonical(Array.from(expectedNewPackageKeys).sort()) && canonical(Array.from(newSnapshotKeys).sort()) === canonical(Array.from(expectedNewSnapshotKeys).sort());
+  const resolvedIdentities = metadata.map(({ authority, expected }) => {
+    const importerSection = mapAt(candidateImporter[authority.manifestPath], "candidate " + authority.manifestPath);
+    const importerEntry = mapAt(importerSection[authority.packageName], "candidate importer entry " + authority.packageName);
+    const candidateVersion = checkedString(importerEntry.version, "candidate version " + authority.packageName);
+    const candidateSpecifier = checkedString(importerEntry.specifier, "candidate specifier " + authority.packageName);
+    const directPackageKey = resolvePackageKey(authority.packageName, authority.packageVersion, candidatePackages);
+    const directSnapshotKey = resolveSnapshotKey(authority.packageName, candidateVersion, candidateSnapshots);
+    const directPackage = mapAt(candidatePackages[directPackageKey], "candidate package " + authority.packageName);
+    const directSnapshot = mapAt(candidateSnapshots[directSnapshotKey], "candidate snapshot " + authority.packageName);
+    const directPackageExpected = expected.packageEntries.filter((entry) => entry.locator === directPackageKey).length === 1 && equalValue(directPackage, expected.packageEntries.find((entry) => entry.locator === directPackageKey)?.value);
+    const directSnapshotExpected = expected.snapshotEntries.filter((entry) => entry.locator === directSnapshotKey).length === 1 && equalValue(directSnapshot, expected.snapshotEntries.find((entry) => entry.locator === directSnapshotKey)?.value);
+    const graph = candidateGraphs.get(authority.manifestPath)!;
+    const packageIdentity = parsePnpmLocator(directPackageKey, "resolved package " + authority.packageName);
+    const importerIdentity = directLocator(authority.packageName, candidateVersion, "resolved importer " + authority.packageName);
+    const snapshotIdentity = parsePnpmLocator(directSnapshotKey, "resolved snapshot " + authority.packageName);
+    const peerContext = peerContextConformant(directPackageKey, directPackage, directSnapshotKey, directSnapshot, candidateLock, candidatePackages, candidateSnapshots, graph);
+    const integrity = isRecord(directPackage.resolution) && validSha512Integrity(directPackage.resolution.integrity);
+    return candidateSpecifier === authority.packageVersion && packageIdentity.name === authority.packageName && packageIdentity.version === authority.packageVersion && packageIdentity.peers.length === 0 && locatorsEqual(importerIdentity, snapshotIdentity) && directPackageExpected && directSnapshotExpected && peerContext && integrity && graph.packageKeys.has(directPackageKey) && graph.snapshotKeys.has(directSnapshotKey);
+  });
+  const allowedImporterPaths = new Set(authorities.map((authority) => "pnpm-lock.yaml.importers[\".\"]." + authority.manifestPath + "." + authority.packageName));
+  const unrelatedLockChanges = lockDelta.filter((change) => !((change.lockKind === "importer" && allowedImporterPaths.has(change.path)) || (change.lockKind === "package" && expectedNewPackageKeys.has(change.lockKey ?? "")) || (change.lockKind === "snapshot" && expectedNewSnapshotKeys.has(change.lockKey ?? ""))));
+  const exactImporterChanges = authorities.every((authority) => lockDelta.filter((change) => change.lockKind === "importer" && change.path === "pnpm-lock.yaml.importers[\".\"]." + authority.manifestPath + "." + authority.packageName && change.name === authority.packageName && change.baseValue === null && change.candidateValue !== null).length === 1);
+  const exactLockChanges = actualPackageChanges.size === expectedNewPackageKeys.size && actualSnapshotChanges.size === expectedNewSnapshotKeys.size && canonical(Array.from(actualPackageChanges).sort()) === canonical(Array.from(expectedNewPackageKeys).sort()) && canonical(Array.from(actualSnapshotChanges).sort()) === canonical(Array.from(expectedNewSnapshotKeys).sort()) && unrelatedLockChanges.length === 0 && lockDelta.length === authorities.length + expectedNewPackageKeys.size + expectedNewSnapshotKeys.size;
+  const importsConformant = authorities.every((authority) => {
+    const imports = allImportFacts(input.sourceFiles, authority.packageName);
+    if (imports.length === 0 || imports.some((item) => !allowedPath(item.file, authority.allowedImportSurface))) return false;
+    return authority.manifestPath === "dependencies" ? imports.every((item) => productionImport(item)) : imports.every((item) => !productionImport(item));
+  });
+  const candidateProductionKeys = new Set([...candidateProductionGraph.snapshotKeys, ...candidateOptionalGraph.snapshotKeys, ...candidatePeerGraph.snapshotKeys, ...candidateProductionGraph.packageKeys, ...candidateOptionalGraph.packageKeys, ...candidatePeerGraph.packageKeys]);
+  const testOnlyRuntimeReachabilityDetails = metadata.filter(({ authority }) => authority.manifestPath === "devDependencies").map(({ authority }) => {
+    const graph = candidateGraphs.get(authority.manifestPath)!;
+    const packageKey = resolvePackageKey(authority.packageName, authority.packageVersion, candidatePackages);
+    const importer = mapAt(candidateImporter[authority.manifestPath], "candidate dev dependency");
+    const snapshotKey = resolveSnapshotKey(authority.packageName, checkedString(mapAt(importer[authority.packageName], "candidate dev entry").version, "candidate dev version"), candidateSnapshots);
+    return { packageKey, snapshotKey, inProductionPackage: candidateProductionKeys.has(packageKey), inProductionSnapshot: candidateProductionKeys.has(snapshotKey), inDevGraph: graph.packageKeys.has(packageKey) };
+  });
+  const testOnlyRuntimeReachabilityAbsent = importsConformant && testOnlyRuntimeReachabilityDetails.every((item) => !item.inProductionPackage && !item.inProductionSnapshot && item.inDevGraph);
+  const authorized = authorityIsValid && manifestConformant && resolvedIdentities.every(Boolean) && expectedMetadataIsConformant && exactImporterChanges && exactLockChanges && testOnlyRuntimeReachabilityAbsent;
+  const authorityForChange = (change: RawChange): S4DependencyAuthority | null => {
+    if (change.surface === "production-runtime-dependency" || change.surface === "test-only-dependency") return authorities.find((authority) => change.path === "package.json." + authority.manifestPath + "." + authority.packageName) ?? null;
+    if (change.lockKind === "importer") return authorities.find((authority) => change.path === "pnpm-lock.yaml.importers[\".\"]." + authority.manifestPath + "." + authority.packageName) ?? null;
+    if (change.lockKind === "package") return metadata.find(({ expected }) => expected.packageEntries.some((entry) => entry.locator === change.lockKey))?.authority ?? null;
+    if (change.lockKind === "snapshot") return metadata.find(({ expected }) => expected.snapshotEntries.some((entry) => entry.locator === change.lockKey))?.authority ?? null;
+    return null;
+  };
+  const facts = [
+    "authorizedAuthorities=" + authorities.map((authority) => authority.manifestPath + ":" + authority.packageName + "@" + authority.packageVersion).join(","),
+    "productionGraphUnchanged=" + productionGraphUnchanged,
+    "testOnlyRuntimeReachabilityAbsent=" + testOnlyRuntimeReachabilityAbsent,
+    "manifestConformant=" + manifestConformant,
+    "expectedMetadataIsConformant=" + expectedMetadataIsConformant,
+    "resolvedIdentities=" + resolvedIdentities.join(","),
+    "exactImporterChanges=" + exactImporterChanges,
+    "exactLockChanges=" + exactLockChanges,
+    "newPackageKeys=" + Array.from(newPackageKeys).sort().join(","),
+    "newSnapshotKeys=" + Array.from(newSnapshotKeys).sort().join(","),
+    "candidateManifestSha256=" + candidateManifestSha256,
+    "candidateLockfileSha256=" + candidateLockfileSha256,
+  ];
+  const deltas = [...manifestDelta, ...lockDelta].map((change) => {
+    const authority = authorityForChange(change);
+    const conformant = authorized && authority !== null;
+    return {
+      surface: change.surface,
+      path: change.path,
+      name: change.name,
+      baseValue: change.baseValue,
+      candidateValue: change.candidateValue,
+      disposition: conformant ? "changed_authorized_conformant" : "changed_unauthorized_nonconformant",
+      purpose: conformant ? authority!.purpose : null,
+      authorityRefs: conformant ? Array.from(authority!.authorityRefs) : [],
+      evidenceFacts: [...facts, "deltaPath=" + change.path, "deltaBaseValue=" + (change.baseValue ?? "null"), "deltaCandidateValue=" + (change.candidateValue ?? "null")],
+    } satisfies S4RepositoryDelta;
+  });
+  return { auditState: "complete", packageManifestPath: "package.json", lockfilePath: "pnpm-lock.yaml", baseManifestSha256, candidateManifestSha256, baseLockfileSha256, candidateLockfileSha256, baseDependencySections: base.sections, candidateDependencySections: candidate.sections, productionGraphUnchanged, testOnlyRuntimeReachabilityAbsent, deltas, disposition: !manifestDelta.length && !lockDelta.length ? "unchanged" : authorized ? "changed_authorized_conformant" : "changed_unauthorized_nonconformant" };
+}
+
 function scriptChanges(base: Record<string, string>, candidate: Record<string, string>): string[] {
   return Array.from(new Set([...Object.keys(base), ...Object.keys(candidate)])).filter((key) => base[key] !== candidate[key]).sort();
 }
@@ -1064,7 +1195,7 @@ export function auditRepositorySurfaces(input: S4RepositoryAuditInput): S4Reposi
   try { baseLock = parseLockfile(input.baseLockfileText); } catch { baseLock = null; }
   try { candidateLock = parseLockfile(input.candidateLockfileText); } catch { candidateLock = null; }
   const dependencyAudit = basePackage && candidatePackage && baseLock && candidateLock
-    ? (() => { try { return buildDependencyAudit(input, basePackage!, candidatePackage!, baseLock!, candidateLock!); } catch { return incompleteDependencyAudit(input, basePackage!.sections, candidatePackage!.sections); } })()
+    ? (() => { try { return input.additionalDependencyAuthorities?.length ? buildMultiDependencyAudit(input, basePackage!, candidatePackage!, baseLock!, candidateLock!) : buildDependencyAudit(input, basePackage!, candidatePackage!, baseLock!, candidateLock!); } catch { return incompleteDependencyAudit(input, basePackage!.sections, candidatePackage!.sections); } })()
     : incompleteDependencyAudit(input, basePackage?.sections, candidatePackage?.sections);
   const scriptAudit = basePackage && candidatePackage
     ? (() => { try { return buildScriptAudit(input, basePackage!, candidatePackage!); } catch { return incompleteScriptAudit(); } })()

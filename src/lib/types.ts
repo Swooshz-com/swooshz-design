@@ -315,6 +315,8 @@ export type StoreState = {
   s4AssessmentAttempts: S4AssessmentAttempt[];
   s4Publications: S4Publication[];
   s4Transitions: S4StateTransition[];
+  s5ApprovalEvents: S5ApprovalEvent[];
+  s5Artifacts: S5Artifact[];
 };
 
 export type FieldError = {
@@ -1671,4 +1673,258 @@ export type S4ToS5Handoff = {
   designRuleSnapshotHash: Sha256;
   s4StageStatus: "not_started" | "started";
   s4CyclesConsumed: 0 | 1 | 2;
+};
+
+export type S5ActiveRevisionKind = "s3_source" | "s3_refinement" | "s4_local_edit";
+export type S5ApprovalEventKind = "approved" | "reopened";
+export type S5ReopenReason = "user_requested" | "upstream_change_detected" | "artifact_invalidated";
+export type S5SourceQualityEvidence = S4SourceQualityProof;
+
+export type S5MutationFence = {
+  expectedGenerationSetId: UUID;
+  expectedSelectionStateId: UUID;
+  expectedSelectionVersion: number;
+  expectedActiveRevisionId: UUID;
+  expectedApprovalEventId: UUID | null;
+  expectedApprovalGeneration: number;
+  expectedApprovalEventSequence: number;
+};
+
+export type S5ApprovalEvent = {
+  schemaVersion: "s5-approval-event-v1";
+  eventId: UUID;
+  projectId: UUID;
+  generationSetId: UUID;
+  selectionStateId: UUID;
+  eventSequence: number;
+  approvalId: UUID;
+  priorApprovalEventId: UUID | null;
+  approvalGeneration: number;
+  observedSelectionVersion: number;
+  observedActiveRevisionId: UUID;
+  observedLineageRootRevisionId: UUID;
+  kind: S5ApprovalEventKind;
+  reopenReason: S5ReopenReason | null;
+  generationContext: S5FrozenGenerationContext | null;
+  generationContextHash: Sha256;
+  idempotencyKey: UUID;
+  requestReferenceId: UUID;
+  occurredAt: Timestamp;
+};
+
+export type S5LayoutRequirement = {
+  requirementId: `brief.functional.${string}`;
+  name: string;
+  details: string | null;
+  mandatory: boolean;
+  count: number | null;
+  countIsExact: boolean;
+};
+
+export type S5FrozenGenerationContext = {
+  schemaVersion: "s5-generation-context-v1";
+  projectId: UUID;
+  generationSetId: UUID;
+  selectionStateId: UUID;
+  selectionVersion: number;
+  approvalEventId: UUID;
+  approvalGeneration: number;
+  eventSequence: number;
+  activeRevisionId: UUID;
+  activeRevisionKind: S5ActiveRevisionKind;
+  sourceSnapshotId: UUID;
+  lineageRootRevisionId: UUID;
+  sourceBindingHash: Sha256;
+  quality: "PASS" | "WARNING";
+  sourceQualityEvidence: S5SourceQualityEvidence;
+  activeAssetId: UUID;
+  activeAssetStorageKey: string;
+  activeAssetSha256: Sha256;
+  activeAssetByteSize: number;
+  activeAssetWidth: 1536;
+  activeAssetHeight: 1024;
+  activeAssetPixelCount: 1572864;
+  confirmedBriefVersionId: UUID;
+  briefContentHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  canonicalRequirements: S2Requirement[];
+  requirementHash: Sha256;
+  layoutRequirements: S5LayoutRequirement[];
+  layoutRequirementsHash: Sha256;
+  designRulesVersion: "s2-design-rules-v1";
+  designRuleSnapshot: S2DesignRuleSnapshot[];
+  designRuleSnapshotHash: Sha256;
+  presentationFacts: {
+    projectName: string;
+    clientName: string | null;
+    eventName: string | null;
+    venueName: string | null;
+    eventLocation: string | null;
+    eventStartDate: string | null;
+    eventEndDate: string | null;
+  };
+  presentationFactsHash: Sha256;
+  layoutRendererVersion: "s5-concept-layout-v1";
+  svgRendererVersion: "s5-layout-svg-v1";
+  pdfRendererVersion: "s5-presentation-pdf-v1";
+};
+
+export type S5ZoneCategory =
+  | "reception_welcome"
+  | "presentation_display"
+  | "demo_product"
+  | "consultation_meeting"
+  | "storage"
+  | "interactive_activity"
+  | "photo_branding"
+  | "giveaway_brochure"
+  | "other_confirmed";
+
+export type S5CoverageRole = "zone_candidate" | "geometry_constraint" | "prohibited_constraint";
+export type S5CoverageStatus = "represented" | "symbolic" | "unknown" | "unplaced";
+export type S5CoverageReason = "not_applicable" | "not_grounded" | "optional_overflow" | "mandatory_overconstraint" | "unknown_semantic" | null;
+
+export type S5LayoutCoverage = {
+  requirementId: string;
+  role: S5CoverageRole;
+  status: S5CoverageStatus;
+  reason: S5CoverageReason;
+  mandatory: boolean;
+  count: number | null;
+  countIsExact: boolean;
+  representedCount: number;
+};
+
+export type S5LayoutSymbol = {
+  symbolId: string;
+  kind: "counter" | "table" | "screen" | "display" | "storage" | "seat" | "equipment" | "marker";
+  label: string;
+  physicalDimensionsMm: null;
+  semantics: "conceptual-zone-marker-not-to-scale";
+};
+
+export type S5LayoutInstance = {
+  instanceId: string;
+  requirementId: string;
+  label: string;
+  mandatory: boolean;
+  countIndex: number;
+  status: "placed" | "unplaced";
+  unplacedReason: "unknown-semantic" | "optional-overflow" | "mandatory-overconstraint" | null;
+  xQ16: number | null;
+  yQ16: number | null;
+  widthQ16: number | null;
+  heightQ16: number | null;
+  symbols: S5LayoutSymbol[];
+};
+
+export type S5LayoutZone = {
+  zoneId: string;
+  category: S5ZoneCategory;
+  label: string;
+  requirementIds: string[];
+  mandatory: boolean;
+  count: number | null;
+  countIsExact: boolean;
+  representedCount: number;
+  placementStatus: "represented" | "symbolic" | "unknown" | "unplaced";
+  placementReason: S5CoverageReason;
+  instances: S5LayoutInstance[];
+};
+
+export type S5CirculationPath = {
+  pathId: string;
+  fromOpenSide: OpenSide;
+  startXQ16: number;
+  startYQ16: number;
+  endXQ16: number;
+  endYQ16: number;
+  widthQ16: null;
+  semantics: "symbolic-primary-route-not-a-measured-aisle";
+};
+
+export type S5UnknownItem = {
+  unknownId: string;
+  requirementId: string | null;
+  label: string;
+  mandatory: boolean;
+  status: "unknown" | "unplaced";
+  reason: "unknown-semantic" | "optional-overflow" | "mandatory-overconstraint";
+};
+
+export type S5LayoutPlan = {
+  schemaVersion: "s5-concept-layout-v1";
+  projectId: UUID;
+  generationSetId: UUID;
+  selectionStateId: UUID;
+  selectionVersion: number;
+  activeRevisionId: UUID;
+  activeRevisionKind: S5ActiveRevisionKind;
+  approvalEventId: UUID;
+  approvalGeneration: number;
+  approvalEventSequence: number;
+  coordinateConvention: {
+    units: "mm";
+    origin: "north-west";
+    x: "east";
+    y: "south";
+    north: "diagram-top-not-surveyed-bearing";
+    displaySpace: "normalized-Q16-conceptual";
+  };
+  booth: BoothGeometry;
+  coverage: S5LayoutCoverage[];
+  zones: S5LayoutZone[];
+  circulation: S5CirculationPath[];
+  unknowns: S5UnknownItem[];
+  disclaimers: string[];
+  planHash: Sha256;
+};
+
+export type S5ArtifactKind = "plan_json" | "plan_svg" | "presentation_pdf";
+export type S5ArtifactStatus = "queued" | "running" | "staged" | "committed" | "failed_retryable" | "failed_terminal" | "aborted";
+export type S5PublicationPhase = "none" | "staged" | "promoted" | "committed" | "aborted";
+
+export type S5Artifact = {
+  schemaVersion: "s5-artifact-v1";
+  artifactId: UUID;
+  artifactGroupId: UUID;
+  projectId: UUID;
+  generationSetId: UUID;
+  selectionStateId: UUID;
+  selectionVersion: number;
+  activeRevisionId: UUID;
+  approvalEventId: UUID;
+  approvalGeneration: number;
+  generationContextHash: Sha256;
+  planHash: Sha256;
+  kind: S5ArtifactKind;
+  rendererVersion: "s5-concept-layout-v1" | "s5-layout-svg-v1" | "s5-presentation-pdf-v1";
+  mimeType: "application/json" | "image/svg+xml" | "application/pdf";
+  fileExtension: ".json" | ".svg" | ".pdf";
+  fileName: "swooshz-concept-layout-plan.json" | "swooshz-concept-layout-plan.svg" | "swooshz-concept-presentation.pdf";
+  sourceLayoutGroupId: UUID | null;
+  artifactKey: string;
+  stagingKey: string;
+  outputSha256: Sha256 | null;
+  outputByteSize: number | null;
+  pageCount: number | null;
+  attempt: 1 | 2;
+  retryOfArtifactId: UUID | null;
+  status: S5ArtifactStatus;
+  publicationPhase: S5PublicationPhase;
+  workerId: string | null;
+  processId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  stagedAt: Timestamp | null;
+  promotedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  terminalAt: Timestamp | null;
+  failureCode: string | null;
+  idempotencyKey: UUID;
+  requestReferenceId: UUID;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
 };

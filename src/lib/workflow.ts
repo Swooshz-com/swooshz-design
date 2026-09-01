@@ -41,6 +41,8 @@ import { S3WorkflowService, type S3WorkflowServiceOptions } from "./s3";
 import type { S3ProviderContract } from "./s3-provider";
 import { S4WorkflowService, type S4WorkflowServiceOptions } from "./s4";
 import type { S4ProviderContract } from "./s4-provider";
+import { S5WorkflowService, type S5WorkflowServiceOptions } from "./s5";
+import { assertS5MutationAllowed } from "./s5-lock";
 
 
 export type WorkflowServiceOptions = {
@@ -61,6 +63,7 @@ export type WorkflowServiceOptions = {
   onS3PublicationPhase?: S3WorkflowServiceOptions["onPublicationPhase"];
   onS4ProviderDispatchPhase?: S4WorkflowServiceOptions["onProviderDispatchPhase"];
   onS4PublicationPhase?: S4WorkflowServiceOptions["onPublicationPhase"];
+  onS5PublicationPhase?: S5WorkflowServiceOptions["onPublicationPhase"];
 };
 
 export type PublicGeneration = {
@@ -167,6 +170,7 @@ export class WorkflowService {
   readonly s2: S2WorkflowService;
   readonly s3: S3WorkflowService;
   readonly s4: S4WorkflowService;
+  readonly s5: S5WorkflowService;
   private readonly clock: () => string;
   private readonly uuid: () => UUID;
   private readonly workerId: string;
@@ -229,6 +233,16 @@ export class WorkflowService {
       isProcessAlive: this.isProcessAlive,
       onProviderDispatchPhase: options.onS4ProviderDispatchPhase,
       onPublicationPhase: options.onS4PublicationPhase,
+    });
+    this.s5 = new S5WorkflowService({
+      repository: this.repository,
+      objects: this.objects,
+      clock: this.clock,
+      uuid: this.uuid,
+      workerId: this.workerId,
+      processId: this.processId,
+      isProcessAlive: this.isProcessAlive,
+      onPublicationPhase: options.onS5PublicationPhase,
     });
   }
 
@@ -495,6 +509,7 @@ export class WorkflowService {
   saveGeometry(projectId: UUID, input: unknown): Project {
     const project = this.repository.transact((state) => {
       const current = this.projectIn(state, projectId);
+      assertS5MutationAllowed(state, projectId);
       if (current.confirmedBriefVersionId || ["generating", "generation_failed", "concepts_ready"].includes(current.status)) {
         throw new AppError(409, "GEOMETRY_FROZEN");
       }
@@ -514,6 +529,9 @@ export class WorkflowService {
 
   async uploadBrief(projectId: UUID, key: unknown, input: PdfUpload, referenceId: UUID): Promise<UploadResult> {
     assertUuid(key, "idempotencyKey");
+    const beforeUpload = this.repository.state();
+    this.projectIn(beforeUpload, projectId);
+    assertS5MutationAllowed(beforeUpload, projectId);
     const validated = await validatePdfUpload(input);
     const inputHash = operationInputHash("brief_upload", projectId, {
       fileSha256: validated.sha256,
@@ -527,6 +545,7 @@ export class WorkflowService {
     try {
       const result = this.repository.transact((state) => {
         const project = this.projectIn(state, projectId);
+        assertS5MutationAllowed(state, projectId);
         if (!project.boothGeometry || !geometryIsValid(project.boothGeometry)) {
           throw new AppError(409, "GEOMETRY_REQUIRED");
         }
@@ -722,6 +741,7 @@ export class WorkflowService {
     assertUuid(key, "idempotencyKey");
     const result = this.repository.transact((state) => {
       const project = this.projectIn(state, projectId);
+      assertS5MutationAllowed(state, projectId);
       const asset = this.assetIn(state, assetId);
       if (asset.projectId !== projectId || project.briefAssetId !== assetId) {
         throw new AppError(404, "ASSET_NOT_FOUND");
@@ -784,6 +804,7 @@ export class WorkflowService {
   editDraft(projectId: UUID, data: unknown, expectedRevision: unknown): StructuredBriefDraft {
     const draft = this.repository.transact((state) => {
       const project = this.projectIn(state, projectId);
+      assertS5MutationAllowed(state, projectId);
       if (project.status !== "brief_review" || !project.briefDraftId) {
         throw new AppError(409, "BRIEF_REVIEW_REQUIRED");
       }
@@ -823,6 +844,7 @@ export class WorkflowService {
     assertUuid(key, "idempotencyKey");
     const version = this.repository.transact((state) => {
       const project = this.projectIn(state, projectId);
+      assertS5MutationAllowed(state, projectId);
       const draft = this.draftIn(state, draftId);
       const inputHash = operationInputHash("brief_confirm", projectId, {
         draftId,
@@ -985,6 +1007,7 @@ export class WorkflowService {
     assertUuid(key, "idempotencyKey");
     const result = this.repository.transact((state) => {
       const project = this.projectIn(state, projectId);
+      assertS5MutationAllowed(state, projectId);
       if (!project.confirmedBriefVersionId) throw new AppError(409, "BRIEF_CONFIRMATION_REQUIRED");
       const version = this.versionIn(state, project.confirmedBriefVersionId);
       if (!geometryIsValid(version.geometrySnapshot)) throw new AppError(409, "GEOMETRY_INVALID");
@@ -1229,6 +1252,7 @@ export class WorkflowService {
     assertUuid(key, "idempotencyKey");
     const result = this.repository.transact((state) => {
       const project = this.projectIn(state, projectId);
+      assertS5MutationAllowed(state, projectId);
       const failed = this.generationSetIn(state, generationSetId);
       if (failed.projectId !== projectId || failed.status !== "failed" || failed.attempt !== 1) {
         throw new AppError(409, "RETRY_NOT_ALLOWED");
