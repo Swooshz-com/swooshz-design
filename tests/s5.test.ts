@@ -250,6 +250,33 @@ test("S5 concept layout is deterministic and preserves grounded requirements", (
   expectCode(() => verifyPlanHash(tampered), "S5_PLAN_HASH_MISMATCH");
 });
 
+test("S5 category resolution uses global longest aliases, category-order ties, and locked normalization", () => {
+  const longestInput = compilerInput([requirement(1, "reception product demo")]);
+  const first = compileConceptLayoutPlan(longestInput);
+  const second = compileConceptLayoutPlan(longestInput);
+  const longestZone = first.zones[0]!;
+  assert.equal(longestZone.category, "demo_product");
+  assert.equal(longestZone.instances[0]?.symbols[0]?.kind, "equipment");
+  assert.equal(first.planHash, second.planHash);
+  assert.deepEqual(canonicalPlanBytes(first), canonicalPlanBytes(second));
+
+  const tie = compileConceptLayoutPlan(compilerInput([requirement(2, "presentation reception")]));
+  assert.equal(tie.zones[0]?.category, "reception_welcome");
+  assert.equal(tie.zones[0]?.instances[0]?.symbols[0]?.kind, "counter");
+
+  const normalized = compileConceptLayoutPlan(compilerInput([requirement(3, "ＰＲＯＤＵＣＴ，　ＤＥＭＯ", { details: "\t" })]));
+  assert.equal(normalized.zones[0]?.category, "demo_product");
+  assert.equal(normalized.zones[0]?.instances[0]?.symbols[0]?.kind, "equipment");
+
+  const substring = compileConceptLayoutPlan(compilerInput([requirement(4, "receptionist productdemo")]));
+  assert.equal(substring.zones[0]?.category, "other_confirmed");
+  assert.equal(substring.zones[0]?.instances[0]?.symbols[0]?.kind, undefined);
+
+  const noMatch = compileConceptLayoutPlan(compilerInput([requirement(5, "Future activation pod")]));
+  assert.equal(noMatch.zones[0]?.category, "other_confirmed");
+  assert.equal(noMatch.unknowns[0]?.reason, "unknown-semantic");
+});
+
 test("S5 layout fails closed for zero-zone, unknown, zero-count, and mandatory overconstraint cases", () => {
   const zero = compileConceptLayoutPlan(compilerInput([]));
   assert.equal(zero.zones.length, 0);

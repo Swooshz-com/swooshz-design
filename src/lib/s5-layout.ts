@@ -96,18 +96,24 @@ export function layoutS5Label(value: string): string[] {
 function labelWidthUnits(value: string): number { return Array.from(value).reduce((total, character) => total + labelWidthUnit(character), 0); }
 export function s5LabelLineWidthUnits(value: string): number[] { return layoutS5Label(value).map(labelWidthUnits); }
 function normalizeWords(value: string): string[] { return value.normalize("NFKC").toLocaleLowerCase("en-US").replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/u).filter(Boolean); }
-function containsAlias(tokens: readonly string[], alias: string): boolean {
-  const aliasTokens = alias.split(" ");
+function containsAlias(tokens: readonly string[], aliasTokens: readonly string[]): boolean {
   for (let index = 0; index <= tokens.length - aliasTokens.length; index += 1) if (aliasTokens.every((token, offset) => tokens[index + offset] === token)) return true;
   return false;
 }
 function classify(name: string, details: string | null): S5ZoneCategory {
   const tokens = normalizeWords(`${name} ${details ?? ""}`);
+  let bestMatch: { category: S5ZoneCategory; tokenLength: number; categoryIndex: number } | null = null;
   for (const entry of CATEGORY_ALIASES) {
-    const aliases = entry.aliases.slice().sort((left, right) => right.split(" ").length - left.split(" ").length || left.localeCompare(right));
-    if (aliases.some((alias) => containsAlias(tokens, alias))) return entry.category;
+    const categoryIndex = CATEGORY_ORDER.indexOf(entry.category);
+    for (const alias of entry.aliases) {
+      const aliasTokens = normalizeWords(alias);
+      if (!aliasTokens.length || !containsAlias(tokens, aliasTokens)) continue;
+      if (bestMatch === null || aliasTokens.length > bestMatch.tokenLength || (aliasTokens.length === bestMatch.tokenLength && categoryIndex < bestMatch.categoryIndex)) {
+        bestMatch = { category: entry.category, tokenLength: aliasTokens.length, categoryIndex };
+      }
+    }
   }
-  return "other_confirmed";
+  return bestMatch?.category ?? "other_confirmed";
 }
 function symbolKind(tokens: readonly string[], category: S5ZoneCategory): S5LayoutSymbol["kind"] {
   if (tokens.includes("counter") || tokens.includes("desk") || category === "reception_welcome") return "counter";
