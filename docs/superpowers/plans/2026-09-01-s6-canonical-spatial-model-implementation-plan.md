@@ -59,20 +59,20 @@ Each new file has one responsibility. The implementation must not introduce a ca
 
 ### New test files
 
-| File | Responsibility |
-|---|---|
-| tests/s6-fixture.ts | Build a fresh S1-S5-ready fixture, deterministic clocks/UUIDs, S6 source projection, and isolated object/repository roots. |
-| tests/s6-canonical.test.ts | Canonical integer representation, rounding, overflow, equality, hashes, stable IDs, and serialization limits. |
-| tests/s6-persistence.test.ts | Legacy defaults, strict records, lineage, no ID reuse, artifact graph, and malformed-state rejection. |
-| tests/s6-source.test.ts | Typed S5 projection, source fingerprint inclusion/exclusion, readiness, and every stale fence. |
-| tests/s6-compiler.test.ts | All open-side variants, known/unknown height, exact counts, deterministic placement, primitive families, and compiler IDs. |
-| tests/s6-validation.test.ts | Every validation order category, blocking matrix, hierarchy, containment, collision, unknowns, and hash receipt. |
-| tests/s6-correction.test.ts | Move/rotate/resize/material/map/resolve/add/remove restrictions, child identity continuity, and conflict tokens. |
-| tests/s6-renderer.test.ts | Camera formulas, byte-deterministic views, scene evidence, material shading, and view-preservation checks. |
-| tests/s6-lifecycle.test.ts | Generation, revision lineage, acceptance, idempotency, concurrent CAS, jobs, publication, and restart recovery. |
-| tests/s6-api.test.ts | Exact HTTP routes, auth-first construction, DTO errors, safe errors, headers, stale downloads, and handoff. |
-| tests/s6-security.test.ts | Cross-project access, path traversal, SVG injection, remote-resource rejection, payload bounds, and private storage. |
-| tests/s6-handoff.test.ts | Exact S7 handoff fields, accepted/current eligibility, unknown height, footprints, and no hero reinterpretation. |
+| File | Responsibility | Consumes | Exposes | Why an existing file is insufficient |
+|---|---|---|---|---|
+| tests/s6-fixture.ts | Build a fresh S1-S5-ready fixture, deterministic clocks/UUIDs, S6 source projection, and isolated object/repository roots. | Existing S1-S5 fixture builders plus S6 source/model types and test stores | readyS6Fixture, deterministic clock/UUID helpers, isolated repositories | No existing fixture combines a fully-ready S5 source with S6 model state and private objects. |
+| tests/s6-canonical.test.ts | Canonical integer representation, rounding, overflow, equality, hashes, stable IDs, and serialization limits. | s6-canonical.ts and S6 types | node:test assertions for canonical bytes, hashes, and IDs | Existing utils.jcs tests intentionally permit general JSON numbers and cannot assert S6 fixed-point rules. |
+| tests/s6-persistence.test.ts | Legacy defaults, strict records, lineage, no ID reuse, artifact graph, and malformed-state rejection. | JsonRepository, StoreState, s6-persistence.ts, and S6 fixtures | load/transact graph assertions | Existing S5 persistence tests do not cover S6 revision, view, job, or idempotency graphs. |
+| tests/s6-source.test.ts | Typed S5 projection, source fingerprint inclusion/exclusion, readiness, and every stale fence. | S5WorkflowService, S6SourceReader, S5 fixtures, and object store | projection/fingerprint/stale-boundary assertions | Existing S5 handoff tests do not define the S6 source projection or fingerprint boundary. |
+| tests/s6-compiler.test.ts | All open-side variants, known/unknown height, exact counts, deterministic placement, primitive families, and compiler IDs. | S5ToS6Projection, compileS6Draft, and fixture matrices | compiled model assertions | s5-layout.ts is conceptual Q16 and cannot test metric S6 geometry. |
+| tests/s6-validation.test.ts | Every validation order category, blocking matrix, hierarchy, containment, collision, unknowns, and hash receipt. | compileS6Draft, validateS6Model, canonical model fixtures | ordered issue and outcome assertions | Existing S5 validation does not validate S6 hierarchy, transformed containment, or canonical model hashes. |
+| tests/s6-correction.test.ts | Move/rotate/resize/material/map/resolve/add/remove restrictions, child identity continuity, and conflict tokens. | applyS6Corrections, S6CorrectionOperation, and model fixtures | immutable child/event assertions | Existing S1-S5 stages have no S6 correction allowlist or object-lineage contract. |
+| tests/s6-renderer.test.ts | Camera formulas, byte-deterministic views, scene evidence, material shading, and view-preservation checks. | buildS6Cameras, renderS6View, checkS6ViewPreservation, and visual fixtures | SVG bytes, scene DTO, camera, and preservation assertions | s5-svg.ts is explicitly conceptual and cannot prove coherent metric views. |
+| tests/s6-lifecycle.test.ts | Generation, revision lineage, acceptance, idempotency, concurrent CAS, jobs, publication, and restart recovery. | S6WorkflowService, JsonRepository, PrivateObjectStore, and recovery fixtures | service result, event, job, and final-object assertions | No existing stage owns this S6 source fence, accepted-pointer CAS, or view publication lifecycle. |
+| tests/s6-api.test.ts | Exact HTTP routes, auth-first construction, DTO errors, safe errors, headers, stale downloads, and handoff. | api.ts, S6 DTOs, authorization boundary, and service doubles | route/status/body/header assertions | Existing S3-S5 API tests do not cover S6 routes or redacted spatial DTOs. |
+| tests/s6-security.test.ts | Cross-project access, path traversal, SVG injection, remote-resource rejection, payload bounds, and private storage. | API/service/storage/render fixtures and hostile inputs | denial, sanitization, bound, and privacy assertions | No existing regression suite covers S6 scene-content and storage-key attack surfaces. |
+| tests/s6-handoff.test.ts | Exact S7 handoff fields, accepted/current eligibility, unknown height, footprints, and no hero reinterpretation. | buildS6ToS7Handoff, accepted model, receipt, and typed source | handoff field and eligibility assertions | S7 is not implemented; this contract needs an isolated consumer-facing test before handoff. |
 
 ## Locked persisted contract
 
@@ -99,6 +99,7 @@ export const S6_VALIDATOR_VERSION = "s6-validator-v1" as const;
 export const S6_VALIDATION_ORDER_VERSION = "s6-validation-order-v1" as const;
 export const S6_RENDERER_VERSION = "s6-svg-axonometric-v1" as const;
 export const S6_ID_VERSION = "s6-object-id-v1" as const;
+export const S6_TELEMETRY_SCHEMA_VERSION = "s6-telemetry-v1" as const;
 
 export const S6_MAX_OBJECTS = 256;
 export const S6_MAX_ZONES = 64;
@@ -723,7 +724,7 @@ s5.ts adds this read-only method:
 getS6ReadOnlyProjection(projectId: UUID): S5ToS6Projection
 ~~~
 
-S5ToS6Projection is the one typed S5-to-S6 projection. It is a returned value with no callbacks, write methods, or mutable S5 object references:
+S5ToS6Projection is the one typed S5-to-S6 projection. Define it in src/lib/types.ts beside the persisted S6 types; s6-source.ts implements only the reader and fence. It is a returned value with no callbacks, write methods, or mutable S5 object references:
 
 ~~~ts
 export type S5ToS6Projection = {
@@ -831,7 +832,7 @@ s6o_ plus the first 32 lowercase hex characters of sha256("s6-object-id-v1|" + p
 Stable keys are:
 
 - booth-floor;
-- booth-wall:<openSide-opposite-side> for each closed side in north/east/south/west order;
+- booth-wall:<closed-side> for each closed side in north/east/south/west order;
 - zone:<zoneId> for zone regions;
 - requirement:<requirementId>:<objectRole>:<one-based-instance-index> for countable requirement objects.
 
@@ -961,7 +962,7 @@ Lifecycle transitions are:
 
 generated_draft -> corrected_draft -> accepted_current -> superseded
 
-Any revision whose S5 fingerprint no longer equals the current ready source is effectively stale; a transaction at generation, correction, acceptance, rendering, publication, or an explicit stale reconciliation may persist stale. A validation-failed draft can become rejected; an interrupted terminal job can mark a generated draft aborted. No accepted record is edited in place. Only one revision per project may be accepted_current for the current source fingerprint.
+Any revision whose S5 fingerprint no longer equals the current ready source is effectively stale; a transaction at generation, correction, acceptance, rendering, publication, or an explicit stale reconciliation may persist only a stale marker for an existing record, never a new model or artifact. A validation-failed draft can become rejected; an interrupted terminal job can mark a generated draft aborted. No accepted record is edited in place. Only one revision per project may be accepted_current for the current source fingerprint.
 
 generate creates a root generated_draft when there is no current accepted revision for the current source. A repeated same-input generation replays its idempotent result. A separate generation against the same current source conflicts rather than branching. When S5 has a new source fingerprint, a new root draft is allowed and the old current revision is marked stale in the same transaction.
 
@@ -1081,7 +1082,50 @@ Camera hash is the canonical hash of the camera with cameraHash removed. Camera 
 
 ## View-preservation contract
 
-renderS6View(model, camera) returns a S6RenderedView with SVG bytes, the camera hash, a scene hash, projected bounds, visible object IDs, material IDs, and scene evidence. The SVG contains only escaped text, inline geometry, validated hex colors, and data-s6-* metadata. It contains no image, external href, url(...), script, foreignObject, arbitrary CSS, or user-provided markup.
+renderS6View(model, camera) returns a S6RenderedView with SVG bytes, the camera hash, a scene hash, projected bounds, visible object IDs, material IDs, and scene evidence. The exact ephemeral interfaces are:
+
+~~~ts
+export type S6SceneEvidence = {
+  schemaVersion: "s6-view-preservation-v1";
+  booth: {
+    widthMm: S6Mm;
+    depthMm: S6Mm;
+    openSides: OpenSide[];
+    coordinateConvention: S6CoordinateConvention;
+  };
+  objects: Array<{
+    objectId: string;
+    objectType: S6PrimitiveKind;
+    dimensionsMm: S6Dimensions;
+    transformedBoundsMm: { min: S6Vector3Mm; max: S6Vector3Mm };
+    materialIds: string[];
+    visible: boolean;
+  }>;
+  overheadObjectIds: string[];
+  materialIds: string[];
+  cameraHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  modelHash: Sha256;
+  rendererVersion: "s6-svg-axonometric-v1";
+  externalResourceCount: 0;
+  unsafeElementCount: 0;
+};
+
+export type S6RenderedView = {
+  viewId: S6ViewId;
+  cameraHash: Sha256;
+  sceneHash: Sha256;
+  svgBytes: Uint8Array;
+  outputSha256: Sha256;
+  outputByteSize: number;
+  projectedBoundsQ16: { minX: number; minY: number; maxX: number; maxY: number };
+  visibleObjectIds: string[];
+  materialIds: string[];
+  sceneEvidence: S6SceneEvidence;
+};
+~~~
+
+The SVG contains only escaped text, inline geometry, validated hex colors, and data-s6-* metadata. It contains no image, external href, url(...), script, foreignObject, arbitrary CSS, or user-provided markup.
 
 The renderer applies the locked local transform convention Rz * Ry * Rx to rectangular primitive corners, then projects with the camera, quantizes each SVG coordinate to signed Q16 integers, sorts faces by quantized depth and object ID, and emits stable XML attributes/child order. Face shading is a deterministic function of material color and face normal. Finish kinds change only the deterministic shade/opacity; they never change dimensions or topology.
 
@@ -1454,8 +1498,8 @@ for (const openSides of allNonEmptyOpenSideSubsets()) {
 
 **Files:** implementation files in the map only; no new status/report file.
 
-- [ ] Run rg -n "\\bT[A-Z]{2}\\b|F.I.X.M.E" src app tests docs/superpowers/plans/2026-09-01-s6-canonical-spatial-model-implementation-plan.md and expect no unfinished-work markers in implementation or plan content.
-- [ ] Run rg -n "s6-spatial-model-v1|S6SpatialModelRecord|S6ConcurrencyToken|S6_VIEW_IDS|S6_SOURCE_PROJECTION_SCHEMA_VERSION|S6_SOURCE_FINGERPRINT_VERSION|s6-svg-axonometric-v1" src/lib tests app and verify every symbol has one consistent definition and the same spelling in producers/consumers/tests.
+- [ ] Run rg -n "\\bT(?:ODO|BD)\\b|F.I.X.M.E" src app tests docs/superpowers/plans/2026-09-01-s6-canonical-spatial-model-implementation-plan.md and expect no unfinished-work markers in implementation or plan content.
+- [ ] Run rg -n "s6-spatial-model-v1|S6SpatialModelRecord|S6ConcurrencyToken|S6_VIEW_IDS|S6_SOURCE_PROJECTION_SCHEMA_VERSION|S6_SOURCE_FINGERPRINT_VERSION|S6_TELEMETRY_SCHEMA_VERSION|S6RenderedView|s6-svg-axonometric-v1" src/lib tests app and verify every symbol has one consistent definition and the same spelling in producers/consumers/tests.
 - [ ] Run rg --files src app tests | Sort-Object plus the file-map checklist and verify every proposed path exists, every modified path is intentional, and no S7/S8 export path or dependency was added.
 - [ ] Run git diff --check, pnpm typecheck, and pnpm test; record exact counts and failures, without calling absent checks green.
 - [ ] Run a secret-value audit over the diff and confirm no credentials, .env values, private asset bytes, prompts, or tokens are present.
@@ -1491,7 +1535,7 @@ The following matrix is the minimum evidence Web should use to accept implementa
 
 - Spec coverage: complete. The plan locks source projection, numeric representation, schema, stable IDs, primitives, compiler, validation, revision/concurrency/idempotency, correction UX/API, acceptance/supersession audit, renderer alternatives and choice, cameras, preservation, storage/publication/recovery, telemetry, errors, security, dependencies, S7 handoff, and exact tests.
 - Unfinished-work scan: clear; every task has a concrete file, interface, test name, command, expected result, and commit.
-- Type/signature consistency: S6SpatialModelRecord, S6PublicSpatialModel, S6ConcurrencyToken, S6SourceReader, S5ToS6Projection, S6ViewId, S6ValidationReceipt, S6SupersessionEvent, and S6ToS7Handoff are used consistently across the file map, contract, and tasks.
+- Type/signature consistency: S6SpatialModelRecord, S6PublicSpatialModel, S6ConcurrencyToken, S6SourceReader, S5ToS6Projection, S6RenderedView, S6ViewId, S6ValidationReceipt, S6SupersessionEvent, and S6ToS7Handoff are used consistently across the file map, contract, and tasks.
 - File-path validity: all proposed implementation and test paths are listed before tasks and correspond to the existing repository layout or explicitly named new files.
 - Scope: no S7 CAD, S8 production 3D, APS, provider, deployment, credential, or production mutation is included.
 - Secret audit: no secret values, prompts, image bytes, tokens, or private asset contents are part of the plan.
