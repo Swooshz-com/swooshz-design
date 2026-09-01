@@ -1,7 +1,7 @@
 # Swooshz Design Full-Suite MVP Architecture Decision
 
 Date: 2026-09-01
-Status: **APPROVED BY USER/WEB — CANONICAL DOCS RECONCILED ON PR #33**
+Status: **APPROVED BY USER/WEB — written-spec approval was recorded through historical Draft #33; canonical docs reconciled by final PR #34**
 Programme parent: #1
 Slices: S6 #11, S7 #28, S8 #29, S9 #30
 
@@ -235,7 +235,7 @@ Question: `Does one booth remain the same design from brief through concept, vie
 
 ## Canonical-doc reconciliation
 
-Following User/Web written-spec approval, PR #33 reconciles the current programme definition into:
+Following User/Web written-spec approval (recorded through historical Draft #33), final PR #34 reconciles the current programme definition into:
 - `docs/PRD.md`;
 - `docs/MVP_SCOPE.md`;
 - `docs/ARCHITECTURE.md`.
@@ -247,10 +247,9 @@ These programme-level docs now extend the MVP through S6-S9 while preserving S1-
 Satisfied before S6 G1:
 - S5 terminal accepted/merged/canonical.
 - Full-suite written architecture approved by User/Web.
-- Canonical PRD/MVP scope/architecture reconciled through docs PR #33.
+- Canonical PRD/MVP scope/architecture reconciled through final docs PR #34.
 
 Still required before S6 implementation:
-1. Docs PR #33 reaches terminal Web merge/canonical verification.
 2. S6 receives fresh G1 architecture/authority acceptance.
 3. S6 receives G2 implementation-contract acceptance.
 
