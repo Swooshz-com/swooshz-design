@@ -51,6 +51,7 @@ import {
 } from "./revision-resolver";
 import { ProviderFailure } from "./openai";
 import { inspectExactS3Png } from "./s3-media";
+import { assertS5MutationAllowed, isS5ApprovalLocked } from "./s5-lock";
 
 export type PublicS4StageStatus = "not_started" | "started";
 export type PublicS4RevisionKind = "s3" | "s4";
@@ -513,6 +514,7 @@ export class S4WorkflowService {
       const { selection } = this.generation(state, projectId);
       const replay = this.idempotency(state, key, "s4_edit_admission", projectId, requestHash);
       if (replay) return { replayed: true, result: cloneJson(replay.result) as unknown as PublicS4EditAdmission };
+      assertS5MutationAllowed(state, projectId);
       if (selection.selectionVersion !== parsed.expectedSelectionVersion) throw fail(409, "S4_SELECTION_VERSION_CONFLICT");
       if (!selection.activeRevisionId || selection.activeRevisionId !== parsed.baseRevisionId ||
           !selection.lineageRootRevisionId) throw fail(409, "S4_STALE_SOURCE");
@@ -699,6 +701,9 @@ export class S4WorkflowService {
         const currentMask = currentEdit ? state.s4Masks.find((item) => item.maskId === currentEdit.maskId) : undefined;
         const selection = currentEdit ? state.s3Selections.find((item) => item.selectionStateId === currentEdit.selectionStateId) : undefined;
         if (!currentEdit || !currentMask || !selection || currentEdit.maskMaterializationStatus !== "pending") return null;
+        if (isS5ApprovalLocked(state, currentEdit.projectId)) {
+          currentEdit.status = "stale"; currentEdit.terminalAt = this.clock(); currentEdit.updatedAt = this.clock(); return null;
+        }
         if (selection.selectionVersion !== currentEdit.baseSelectionVersion ||
             selection.activeRevisionId !== currentEdit.baseRevisionId) {
           currentEdit.status = "stale";
@@ -1045,6 +1050,9 @@ export class S4WorkflowService {
       const operation = state.s4ImageOperations.find((item) => item.operationId === operationId);
       const edit = operation ? state.s4Edits.find((item) => item.editId === operation.editId) : undefined;
       if (!operation || !edit || operation.status !== "queued" || edit.status !== "image_queued") return null;
+      if (isS5ApprovalLocked(state, operation.projectId)) {
+        operation.status = "failed"; operation.failureCode = "S4_FENCE_STALE"; operation.completedAt = this.clock(); edit.status = "stale"; edit.retryState = "none"; edit.terminalAt = this.clock(); edit.updatedAt = this.clock(); return null;
+      }
       const token = this.uuid();
       operation.status = "running";
       operation.claimedBy = this.workerId;
@@ -1154,6 +1162,9 @@ export class S4WorkflowService {
       if (!operation || !this.claimMatches(operation, token) || operation.providerDispatchState !== "not_started") return null;
       const edit = state.s4Edits.find((item) => item.editId === operation.editId);
       if (!edit) return null;
+      if (isS5ApprovalLocked(state, operation.projectId)) {
+        operation.status = "failed"; operation.failureCode = "S4_FENCE_STALE"; operation.completedAt = this.clock(); clearClaim(operation); edit.status = "stale"; edit.retryState = "none"; edit.terminalAt = this.clock(); edit.updatedAt = this.clock(); return null;
+      }
       if (state.s4ImageOperations.filter((item) => dispatchInLineage(state, item, {
         projectId: operation.projectId,
         generationSetId: operation.generationSetId,
@@ -1212,6 +1223,7 @@ export class S4WorkflowService {
       if (operation.publicationId !== null) {
         return state.s4Publications.find((item) => item.publicationId === operation.publicationId) ?? null;
       }
+      assertS5MutationAllowed(state, edit.projectId);
       const publicationId = this.uuid();
       const intendedAssetId = this.uuid();
       const intendedRevisionId = this.uuid();
@@ -1280,6 +1292,7 @@ export class S4WorkflowService {
       if (!publication || !operation || !edit || !mask || publication.state === "committed") return null;
       if (publication.state !== "staged" && publication.state !== "promoted") return null;
       if (!this.claimMatches(operation, token) || operation.providerDispatchState !== "consumed") return null;
+      if (isS5ApprovalLocked(state, edit.projectId)) throw fail(409, "S4_STALE_SOURCE");
       const selection = state.s3Selections.find((item) => item.selectionStateId === edit.selectionStateId);
       if (!selection || selection.selectionVersion !== edit.baseSelectionVersion ||
           selection.activeRevisionId !== edit.baseRevisionId) throw fail(409, "S4_FENCE_STALE");
@@ -1765,6 +1778,7 @@ export class S4WorkflowService {
       const check = state.s4PreservationChecks.find((item) => item.preservationCheckId === preservationCheckId);
       const edit = check && state.s4Edits.find((item) => item.editId === check.editId);
       if (!check || !edit || check.status !== "pending") return null;
+      if (isS5ApprovalLocked(state, check.projectId)) return null;
       const token = this.uuid();
       check.status = "running";
       check.claimedBy = this.workerId;
@@ -1933,6 +1947,9 @@ export class S4WorkflowService {
       const requestReferenceId = state.s4ImageOperations.find((item) =>
         item.editId === edit.editId && item.attempt === 1)?.requestReferenceId ?? this.uuid();
       const previousEditStatus = edit.status;
+      if (isS5ApprovalLocked(state, edit.projectId)) {
+        edit.status = "stale"; edit.retryState = "none"; edit.retryWaivedReason = null; edit.terminalAt = this.clock(); edit.updatedAt = this.clock(); return null;
+      }
       if (run.status === "PASS" && !run.noOpDetected) {
         const attemptId = this.uuid();
         const attempt = this.assessmentAttempt(state, assessment, edit, attemptId, requestReferenceId);
@@ -2085,6 +2102,7 @@ export class S4WorkflowService {
       if (!attempt || !assessment || !edit || attempt.status !== "queued" ||
           attempt.disposition !== "pending" || assessment.status !== "pending" ||
           edit.status !== "assessment_pending") return null;
+      if (isS5ApprovalLocked(state, attempt.projectId)) return null;
       const token = this.uuid();
       attempt.status = "running";
       attempt.disposition = "running";
@@ -2476,7 +2494,7 @@ export class S4WorkflowService {
           ? state.s4PreservationChecks.find((item) => item.preservationCheckId === edit.preservationCheckId)
           : undefined;
         const identityReady = this.activationIdentityMatches(state, edit, assessment, attempt, reduction);
-        const current = Boolean(identityReady && selection && selection.selectionVersion === edit.baseSelectionVersion &&
+        const current = Boolean(!isS5ApprovalLocked(state, edit.projectId) && identityReady && selection && selection.selectionVersion === edit.baseSelectionVersion &&
           selection.activeRevisionId === edit.baseRevisionId && check?.status === "PASS" &&
           check.noOpDetected === false && (reduction.status === "pass" || reduction.status === "warning") &&
           reduction.requestedEditSatisfaction === "satisfied");
@@ -2688,6 +2706,7 @@ export class S4WorkflowService {
       if (!edit) throw fail(404, "S4_EDIT_NOT_FOUND", "editId");
       const replay = this.idempotency(state, key, "s4_image_retry", projectId, requestHash);
       if (replay) return { replayed: true, result: cloneJson(replay.result) as unknown as PublicS4RetryAdmission };
+      assertS5MutationAllowed(state, projectId);
       if (edit.retryState === "waived" || edit.status === "waived") throw fail(409, "S4_RETRY_WAIVED");
       const firstId = edit.imageOperationIds[0];
       const first = firstId && state.s4ImageOperations.find((item) => item.operationId === firstId);
@@ -2781,6 +2800,7 @@ export class S4WorkflowService {
       if (!edit) throw fail(404, "S4_EDIT_NOT_FOUND", "editId");
       const replay = this.idempotency(state, key, "s4_assessment_retry", projectId, requestHash);
       if (replay) return { replayed: true, result: cloneJson(replay.result) as unknown as PublicS4RetryAdmission };
+      assertS5MutationAllowed(state, projectId);
       if (edit.retryState === "waived" || edit.status === "waived") throw fail(409, "S4_RETRY_WAIVED");
        const assessment = edit.assessmentId ? state.s4Assessments.find((item) => item.assessmentId === edit.assessmentId) : undefined;
       const firstId = assessment?.attemptIds[0];

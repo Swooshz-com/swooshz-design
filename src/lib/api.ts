@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { AppError, type UUID } from "./types";
+import { AppError, type S5MutationFence, type UUID } from "./types";
 import { assertUuid, uuidV4Pattern } from "./utils";
 import { MAX_BRIEF_BYTES } from "./media";
 import { S2_MAX_MULTIPART_BODY_BYTES, S2_MAX_SOURCE_BYTES } from "./s2-media";
@@ -67,9 +67,19 @@ const PUBLIC_S4_ERROR_CODES = new Set<string>([
   "METHOD_NOT_ALLOWED",
   "S4_INTERNAL_ERROR",
 ]);
+const PUBLIC_S5_ERROR_CODES = new Set<string>([
+  "INVALID_REQUEST", "IDEMPOTENCY_KEY_REQUIRED", "PROJECT_NOT_FOUND", "METHOD_NOT_ALLOWED", "S5_NOT_READY",
+  "S5_FINAL_VISUAL_INELIGIBLE", "S5_APPROVAL_REQUIRED", "S5_APPROVAL_LOCKED", "S5_APPROVAL_STALE", "S5_REOPEN_NOT_ALLOWED",
+  "S5_APPROVED_ASSET_CORRUPT", "S5_FROZEN_CONTEXT_MISMATCH", "S5_LAYOUT_INPUT_INVALID", "S5_LAYOUT_CONVENTION_INVALID",
+  "S5_PLAN_HASH_MISMATCH", "S5_LAYOUT_OVERCONSTRAINED", "S5_LAYOUT_NOT_READY", "S5_PDF_OVERFLOW", "S5_PDF_SIZE_EXCEEDED",
+  "S5_PDF_UNICODE_UNSUPPORTED", "S5_FONT_UNAVAILABLE", "S5_RENDER_FAILURE", "S5_PUBLICATION_BUSY", "S5_PUBLICATION_MISMATCH",
+  "S5_PUBLICATION_FAILED", "S5_PUBLICATION_UNCERTAIN", "S5_CLAIM_FENCED", "S5_RETRY_EXHAUSTED", "S5_TELEMETRY_UNAVAILABLE",
+  "S5_TELEMETRY_SOURCE_CORRUPT", "S5_PERSISTENCE_FAILED", "S5_ARTIFACT_NOT_FOUND", "S5_IDEMPOTENCY_KEY_REUSE", "S5_INTERNAL_ERROR",
+]);
 
 const S4_PUBLIC_FIELDS = new Set(["body", "projectId", "baseRevisionId", "expectedSelectionVersion", "primitives", "instructionText", "editId", "targetId", "Idempotency-Key", "x-request-id", "request"]);
 const S4_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
+const S5_PUBLIC_FIELDS = new Set(["body", "projectId", "layoutGroupId", "artifactId", "expectedGenerationSetId", "expectedSelectionStateId", "expectedSelectionVersion", "expectedActiveRevisionId", "expectedApprovalEventId", "expectedApprovalGeneration", "expectedApprovalEventSequence", "reopenReason", "Idempotency-Key", "x-request-id", "request"]);
 
 function safeS4Field(field: string): string {
   if (S4_PUBLIC_FIELDS.has(field) || /^primitives(?:\[\d+\])?(?:\.(?:kind|xQ16|yQ16|widthQ16|heightQ16|radiusQ8|points)(?:\[\d+\])?(?:\.(?:xQ16|yQ16))?)?$/.test(field)) return field;
@@ -80,26 +90,31 @@ function safeS4FieldErrors(fieldErrors: readonly { field: string; code: string }
   return fieldErrors.map((item) => ({ field: safeS4Field(item.field), code: S4_PUBLIC_FIELD_CODES.has(item.code) ? item.code : "INVALID_REQUEST" }));
 }
 
+function safeS5Field(field: string): string { return S5_PUBLIC_FIELDS.has(field) ? field : "body"; }
+function safeS5FieldErrors(fieldErrors: readonly { field: string; code: string }[]): { field: string; code: string }[] { return fieldErrors.map((item) => ({ field: safeS5Field(item.field), code: item.code === "REQUIRED" || item.code === "UNKNOWN_FIELD" || item.code === "UUID_REQUIRED" || item.code === "IDEMPOTENCY_KEY_REQUIRED" || item.code === "INVALID_VALUE" ? item.code : "INVALID_REQUEST" })); }
+
 function requestReferenceId(request: Request): UUID {
   const supplied = request.headers.get("x-request-id");
   return supplied && uuidV4Pattern.test(supplied) ? supplied : crypto.randomUUID();
 }
 
-function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false): NextResponse {
+function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false, s5 = false): NextResponse {
   const candidate = error instanceof AppError
     ? error
-    : new AppError(500, s4 ? "S4_INTERNAL_ERROR" : s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
-  const appError = s4 && !PUBLIC_S4_ERROR_CODES.has(candidate.code)
-    ? new AppError(500, "S4_INTERNAL_ERROR")
-    : s3 && !PUBLIC_S3_ERROR_CODES.has(candidate.code)
-      ? new AppError(500, "S3_INTERNAL_ERROR")
-      : candidate;
+    : new AppError(500, s5 ? "S5_INTERNAL_ERROR" : s4 ? "S4_INTERNAL_ERROR" : s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
+  const appError = s5 && !PUBLIC_S5_ERROR_CODES.has(candidate.code)
+    ? new AppError(500, "S5_INTERNAL_ERROR")
+    : s4 && !PUBLIC_S4_ERROR_CODES.has(candidate.code)
+      ? new AppError(500, "S4_INTERNAL_ERROR")
+      : s3 && !PUBLIC_S3_ERROR_CODES.has(candidate.code)
+        ? new AppError(500, "S3_INTERNAL_ERROR")
+        : candidate;
   const body = {
     error: {
       code: appError.code,
       message: "The request could not be completed. Try again or contact support with the reference ID.",
       referenceId,
-      fieldErrors: s4 ? safeS4FieldErrors(appError.fieldErrors) : appError.fieldErrors,
+      fieldErrors: s5 ? safeS5FieldErrors(appError.fieldErrors) : s4 ? safeS4FieldErrors(appError.fieldErrors) : appError.fieldErrors,
     },
   };
   console.error(JSON.stringify({ referenceId, operation: "api_request", status: appError.status, code: appError.code }));
@@ -536,6 +551,10 @@ function isS4Path(segments: string[]): boolean {
   return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s4";
 }
 
+function isS5Path(segments: string[]): boolean {
+  return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s5";
+}
+
 async function authorizedS3Service(
   request: Request,
   segments: string[],
@@ -593,6 +612,28 @@ async function authorizedS4Service(
     if (!(await dependencies.s3Authorization.authorizeProject(context, projectId))) {
       throw new AppError(404, "PROJECT_NOT_FOUND");
     }
+  } catch (error) {
+    if (error instanceof AppError && error.code === "PROJECT_NOT_FOUND") throw error;
+    throw new AppError(404, "PROJECT_NOT_FOUND");
+  }
+  return dependencies.workflowService ?? serviceForRequest();
+}
+
+async function authorizedS5Service(
+  request: Request,
+  segments: string[],
+  supplied: WorkflowService | ApiRequestDependencies | undefined,
+): Promise<WorkflowService> {
+  const projectId = segments[1];
+  if (typeof projectId !== "string" || !uuidV4Pattern.test(projectId)) throw new AppError(404, "PROJECT_NOT_FOUND");
+  const dependencies = isApiRequestDependencies(supplied)
+    ? supplied
+    : { workflowService: supplied, s3Authorization: productionS3Authorization };
+  let context: S3AccessContext | null;
+  try { context = await dependencies.s3Authorization.resolveContext(request); } catch { throw new AppError(404, "PROJECT_NOT_FOUND"); }
+  if (!context || typeof context.subjectId !== "string" || context.subjectId.length === 0) throw new AppError(404, "PROJECT_NOT_FOUND");
+  try {
+    if (!(await dependencies.s3Authorization.authorizeProject(context, projectId))) throw new AppError(404, "PROJECT_NOT_FOUND");
   } catch (error) {
     if (error instanceof AppError && error.code === "PROJECT_NOT_FOUND") throw error;
     throw new AppError(404, "PROJECT_NOT_FOUND");
@@ -753,6 +794,76 @@ async function handleS4(
   throw new AppError(400, "INVALID_REQUEST");
 }
 
+const S5_FENCE_KEYS = ["expectedGenerationSetId", "expectedSelectionStateId", "expectedSelectionVersion", "expectedActiveRevisionId", "expectedApprovalEventId", "expectedApprovalGeneration", "expectedApprovalEventSequence"] as const;
+
+function s5Fence(body: Record<string, unknown>, includeReason = false): S5MutationFence {
+  exactKeys(body, includeReason ? [...S5_FENCE_KEYS, "reopenReason"] : S5_FENCE_KEYS);
+  assertUuid(body.expectedGenerationSetId, "expectedGenerationSetId"); assertUuid(body.expectedSelectionStateId, "expectedSelectionStateId"); assertUuid(body.expectedActiveRevisionId, "expectedActiveRevisionId");
+  if (body.expectedApprovalEventId !== null) assertUuid(body.expectedApprovalEventId, "expectedApprovalEventId");
+  for (const key of ["expectedSelectionVersion", "expectedApprovalGeneration", "expectedApprovalEventSequence"] as const) if (!Number.isSafeInteger(body[key]) || (body[key] as number) < 0) throw new AppError(400, "INVALID_REQUEST", [{ field: key, code: "INVALID_VALUE" }]);
+  if ((body.expectedSelectionVersion as number) < 1) throw new AppError(400, "INVALID_REQUEST", [{ field: "expectedSelectionVersion", code: "INVALID_VALUE" }]);
+  return { expectedGenerationSetId: body.expectedGenerationSetId as UUID, expectedSelectionStateId: body.expectedSelectionStateId as UUID, expectedSelectionVersion: body.expectedSelectionVersion as number, expectedActiveRevisionId: body.expectedActiveRevisionId as UUID, expectedApprovalEventId: body.expectedApprovalEventId as UUID | null, expectedApprovalGeneration: body.expectedApprovalGeneration as number, expectedApprovalEventSequence: body.expectedApprovalEventSequence as number };
+}
+
+function s5JsonResponse(result: { replayed?: boolean; artifacts?: Array<{ status: string }> }): number {
+  return result.replayed || result.artifacts?.every((item) => item.status === "committed") ? 200 : 202;
+}
+
+function s5DownloadResponse(result: { bytes: Buffer; contentType: string; fileName: string }): NextResponse {
+  return new NextResponse(new Uint8Array(result.bytes), { status: 200, headers: { "content-type": result.contentType, "content-disposition": `attachment; filename="${result.fileName}"`, "cache-control": "private, no-store", "x-content-type-options": "nosniff", "content-length": String(result.bytes.byteLength) } });
+}
+
+async function handleS5(
+  request: Request,
+  method: string,
+  segments: string[],
+  service: WorkflowService,
+  referenceId: UUID,
+): Promise<NextResponse> {
+  const projectId = segments[1] as UUID;
+  if (segments.length === 3) {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED"); await requireEmptyBody(request);
+    return NextResponse.json({ ...service.s5.getState(projectId), fence: service.s5.getFence(projectId) }, { status: 200 });
+  }
+  if (segments.length === 4 && segments[3] === "approval") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED"); const result = service.s5.approve(projectId, s5Fence(await s4JsonBody(request)), s2IdempotencyKeyFromHeader(request), referenceId); return NextResponse.json(result, { status: 200 });
+  }
+  if (segments.length === 4 && segments[3] === "reopen") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED"); const body = await s4JsonBody(request); const fence = s5Fence(body, true); const reason = body.reopenReason; if (reason !== "user_requested" && reason !== "upstream_change_detected" && reason !== "artifact_invalidated") throw new AppError(400, "INVALID_REQUEST", [{ field: "reopenReason", code: "INVALID_VALUE" }]); const result = service.s5.reopen(projectId, fence, s2IdempotencyKeyFromHeader(request), referenceId, reason); return NextResponse.json(result, { status: 200 });
+  }
+  if (segments.length === 4 && segments[3] === "hero") {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED"); await requireEmptyBody(request); return NextResponse.json(service.s5.getHeroStatus(projectId), { status: 200 });
+  }
+  if (segments.length === 5 && segments[3] === "hero" && segments[4] === "download") {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED"); await requireEmptyBody(request); return s5DownloadResponse(service.s5.getHeroDownload(projectId));
+  }
+  if (segments.length === 4 && segments[3] === "layout") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED"); const result = service.s5.generateLayout(projectId, s5Fence(await s4JsonBody(request)), s2IdempotencyKeyFromHeader(request), referenceId); const { planHash: _planHash, ...response } = result; return NextResponse.json(response, { status: s5JsonResponse(result) });
+  }
+  if (segments.length === 5 && segments[3] === "layout") {
+    assertUuid(segments[4], "layoutGroupId"); if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED"); await requireEmptyBody(request); return NextResponse.json(service.s5.getLayout(projectId, segments[4]), { status: 200 });
+  }
+  if (segments.length === 6 && segments[3] === "layout" && segments[5] === "retry") {
+    assertUuid(segments[4], "layoutGroupId"); if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED"); const result = service.s5.retryLayout(projectId, segments[4], s5Fence(await s4JsonBody(request)), s2IdempotencyKeyFromHeader(request), referenceId); return NextResponse.json(result, { status: s5JsonResponse(result) });
+  }
+  if (segments.length === 4 && segments[3] === "presentation") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED"); const result = await service.s5.generatePresentation(projectId, s5Fence(await s4JsonBody(request)), s2IdempotencyKeyFromHeader(request), referenceId); return NextResponse.json(result, { status: s5JsonResponse(result) });
+  }
+  if (segments.length === 5 && segments[3] === "presentation") {
+    assertUuid(segments[4], "artifactId"); if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED"); await requireEmptyBody(request); return NextResponse.json(service.s5.getPresentation(projectId, segments[4]), { status: 200 });
+  }
+  if (segments.length === 6 && segments[3] === "presentation" && segments[5] === "retry") {
+    assertUuid(segments[4], "artifactId"); if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED"); const result = await service.s5.retryPresentation(projectId, segments[4], s5Fence(await s4JsonBody(request)), s2IdempotencyKeyFromHeader(request), referenceId); return NextResponse.json(result, { status: s5JsonResponse(result) });
+  }
+  if (segments.length === 6 && segments[3] === "presentation" && segments[5] === "download") {
+    assertUuid(segments[4], "artifactId"); if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED"); await requireEmptyBody(request); return s5DownloadResponse(service.s5.getPresentationDownload(projectId, segments[4]));
+  }
+  if (segments.length === 4 && segments[3] === "telemetry") {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED"); await requireEmptyBody(request); return NextResponse.json(service.s5.getTelemetry(projectId), { status: 200 });
+  }
+  throw new AppError(400, "INVALID_REQUEST");
+}
+
 async function handle(
   request: Request,
   method: string,
@@ -869,6 +980,10 @@ export async function handleApiRequest(
 ): Promise<NextResponse> {
   const referenceId = requestReferenceId(request);
   try {
+    if (isS5Path(path)) {
+      const service = await authorizedS5Service(request, path, supplied);
+      return await handleS5(request, request.method.toUpperCase(), path, service, referenceId);
+    }
     if (isS4Path(path)) {
       const service = await authorizedS4Service(request, path, supplied);
       return await handleS4(request, request.method.toUpperCase(), path, service, referenceId);
@@ -882,6 +997,6 @@ export async function handleApiRequest(
       : supplied ?? serviceForRequest();
     return await handle(request, request.method.toUpperCase(), path, service, referenceId);
   } catch (error) {
-    return jsonError(referenceId, error, isS3Path(path), isS4Path(path));
+    return jsonError(referenceId, error, isS3Path(path), isS4Path(path), isS5Path(path));
   }
 }

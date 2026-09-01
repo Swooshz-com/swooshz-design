@@ -24,6 +24,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { proveS4Claims } from "./s4-proof";
 import { auditRepositorySurfaces, s4DependencyMetadataReferenceHash, type S4RepositoryAuditInput } from "./s4-repository-audit";
 import { S4_G3_AUTHORIZED_DEPENDENCY_METADATA } from "./s4-dependency-authority";
+import { S5_PDF_DEPENDENCIES } from "./s5-dependency-authority";
 
 const WIDTH = 1536;
 const HEIGHT = 1024;
@@ -333,7 +334,7 @@ test("S4 repository audit enforces exact resolved package identity and fails clo
   const baseLockfileText = execFileSync("git", ["show", baseSha + ":pnpm-lock.yaml"], { encoding: "utf8" });
   const candidatePackageText = readFileSync("package.json", "utf8");
   const candidateLockfileText = readFileSync("pnpm-lock.yaml", "utf8").replace(/\r\n/g, "\n");
-  const sourceFiles = { "tests/s4.test.ts": 'import { create } from "react-test-renderer";' };
+  const sourceFiles = { "tests/s4.test.ts": 'import { create } from "react-test-renderer";', "src/lib/s5-pdf.ts": 'import { PDFDocument } from "pdf-lib"; import fontkit from "@pdf-lib/fontkit";' };
   type AuditOverrides = {
     basePackageText?: string;
     candidatePackageText?: string;
@@ -404,6 +405,7 @@ test("S4 repository audit enforces exact resolved package identity and fails clo
         expectedMetadata: S4_G3_AUTHORIZED_DEPENDENCY_METADATA,
         ...overrides.dependencyAuthority,
       },
+      additionalDependencyAuthorities: S5_PDF_DEPENDENCIES,
       scriptAuthority: {
         scriptName: "test",
         baseValue: baseScript,
@@ -687,7 +689,7 @@ test("S4 successful edit persists one stage, one cycle, and activates through th
       "quality": () => assert.equal(handoff.quality, "PASS"),
       "selection-version": () => assert.equal(handoff.selectionVersion, state.selectionVersion),
       "projection": () => assert.equal(handoff.activeRevisionId, state.activeRevisionId),
-      "no-s5": () => assert.equal(Object.keys(value.repository.state()).some((key) => key.startsWith("s5")), false),
+      "no-s5": () => assert.deepEqual({ approvalEvents: value.repository.state().s5ApprovalEvents, artifacts: value.repository.state().s5Artifacts }, { approvalEvents: [], artifacts: [] }),
     });
     assert.throws(() => value.service.s3.refine(value.projectId, state.activeRevisionId!, state.selectionVersion, "S3 must be closed", randomUUID(), randomUUID()), (error: unknown) => error instanceof AppError && error.code === "S3_LINEAGE_CONFLICT");
   } finally { cleanup(value); }

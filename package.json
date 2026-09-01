@@ -8,11 +8,13 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
-    "test": "tsx --test tests/g3.test.ts tests/s2-evidence.test.ts tests/s2-lifecycle.test.ts tests/s3.test.ts tests/s3-evidence.test.ts tests/s4.test.ts tests/s4-evidence.test.ts"
+    "test": "tsx --test tests/g3.test.ts tests/s2-evidence.test.ts tests/s2-lifecycle.test.ts tests/s3.test.ts tests/s3-evidence.test.ts tests/s4.test.ts tests/s4-evidence.test.ts tests/s5.test.ts"
   },
   "dependencies": {
+    "@pdf-lib/fontkit": "1.1.1",
     "fs-ext-extra-prebuilt": "2.2.13",
     "next": "16.3.2",
+    "pdf-lib": "1.17.1",
     "pdfjs-dist": "6.2.108",
     "react": "19.2.8",
     "react-dom": "19.2.8",

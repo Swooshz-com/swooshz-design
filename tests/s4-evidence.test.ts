@@ -1509,9 +1509,10 @@ test("S4 evidence: client requests retain operation keys", async () => {
   ]);
 });
 
-test("S4 evidence: optional S5 handoff has no S5 writes", async () => {
+test("S4 evidence: optional S5 handoff preserves empty S5 collections", async () => {
   const state = emptyStoreState();
+  assert.deepEqual(state.s5ApprovalEvents, []);
+  assert.deepEqual(state.s5Artifacts, []);
   const keys = Object.keys(state);
-  assert.equal(keys.some((key) => key.startsWith("s5")), false);
   assert.equal(keys.some((key) => key === "s4Selections" || key === "s4Activations"), false);
 });

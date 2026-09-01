@@ -9,6 +9,7 @@ import { designRuleSnapshotHash, compileS3Assessment, compileS3Refinement, norma
 import { decodeS3Rgba, inspectExactS3Png, s3PixelsChanged, type S3ExactPng } from "./s3-media";
 import { OpenAIS3Provider, type S3AssessmentProviderInput, type S3AssessmentProviderResult, type S3ImageProviderInput, type S3ImageProviderResult, type S3ProviderContract } from "./s3-provider";
 import { resolveVisualRevision } from "./revision-resolver";
+import { assertS5MutationAllowed, isS5ApprovalLocked } from "./s5-lock";
 
 export type PublicS3ScreenedCandidate = {
   candidateIndex: 1 | 2 | 3 | 4;
@@ -725,6 +726,7 @@ export class S3WorkflowService {
       const { generationSet } = this.generation(state, projectId);
       const replay = this.idempotency(state, key, "s3_selection", projectId, requestHash);
       if (replay) return { replayed: true, result: cloneJson(replay.result) as unknown as PublicS3SelectionResult };
+      assertS5MutationAllowed(state, projectId);
       const current = state.s3Selections.find((item) => item.projectId === projectId && item.generationSetId === generationSet.generationSetId) ?? null;
       if (!current) {
         if (targetKind !== "source_root" || expectedSelectionVersion !== 0) throw fail(409, "S3_SELECTION_VERSION_CONFLICT");
@@ -805,6 +807,7 @@ export class S3WorkflowService {
       const { generationSet } = this.generation(state, projectId); const selection = state.s3Selections.find((item) => item.projectId === projectId && item.generationSetId === generationSet.generationSetId);
       if (!selection) throw fail(409, "S3_SOURCE_NOT_FOUND");
       const replay = this.idempotency(state, key, "s3_refinement", projectId, requestHash); if (replay) return { replayed: true, result: cloneJson(replay.result) as unknown as PublicS3RefinementAdmission };
+      assertS5MutationAllowed(state, projectId);
       if (this.s4StageForSelection(state, selection)) throw fail(409, "S3_LINEAGE_CONFLICT");
       if (selection.selectionVersion !== expectedSelectionVersion) throw fail(409, "S3_SELECTION_VERSION_CONFLICT");
       if (selection.activeRevisionId !== baseRevisionId) throw fail(409, "S3_LINEAGE_CONFLICT");
@@ -957,6 +960,7 @@ export class S3WorkflowService {
 
   private insertPublicationIntent(bundle: ReturnType<S3WorkflowService["createPublicationBundle"]>, claim: ImageClaim): void {
     this.repository.transact((state) => {
+      assertS5MutationAllowed(state, bundle.publication.projectId);
       const operation = state.s3ImageOperations.find((item) => item.operationId === claim.operation.operationId);
       const cycle = operation ? state.s3Cycles.find((item) => item.cycleId === operation.cycleId) : undefined;
       const selection = cycle ? state.s3Selections.find((item) => item.selectionStateId === cycle.selectionStateId) : undefined;
@@ -979,6 +983,7 @@ export class S3WorkflowService {
   }
 
   private commitPublicationInState(state: StoreState, publication: S3Publication, requestReferenceId: UUID): UUID | null {
+    if (isS5ApprovalLocked(state, publication.projectId)) throw fail(409, "S3_FENCE_STALE");
     const operation = state.s3ImageOperations.find((item) => item.operationId === publication.operationId);
     const cycle = state.s3Cycles.find((item) => item.cycleId === publication.cycleId);
     if (!operation || !cycle) throw fail(500, "S3_INTERNAL_ERROR");
@@ -1056,6 +1061,7 @@ export class S3WorkflowService {
       if (!cycle) throw fail(404, "S3_CYCLE_NOT_FOUND");
       const replay = this.idempotency(state, key, "s3_image_retry", projectId, requestHash);
       if (replay) return { replayed: true, result: cloneJson(replay.result) as unknown as PublicS3RetryAdmission };
+      assertS5MutationAllowed(state, projectId);
       if (cycle.retryState === "waived" || cycle.status === "waived") throw fail(409, "S3_RETRY_WAIVED");
       const selection = state.s3Selections.find((item) => item.selectionStateId === cycle.selectionStateId);
       const operation = state.s3ImageOperations.find((item) => item.operationId === cycle.imageOperationIds[0]);
@@ -1150,7 +1156,9 @@ export class S3WorkflowService {
       attempt.status = "succeeded"; attempt.disposition = status; attempt.providerDispatchState = "consumed"; attempt.requirementObservations = cloneJson(result.requirements); attempt.designObservations = cloneJson(result.designRules); attempt.materialFindingIds = result.material; attempt.warningFindingIds = result.warning; attempt.uncertainFindingIds = result.uncertain; attempt.providerMetadata = cloneJson(metadata); attempt.completedAt = this.clock(); this.clearClaim(attempt); assessment.status = publicStatus; assessment.retryState = "none"; assessment.retryWaivedReason = null; assessment.latestAttemptId = attempt.assessmentAttemptId; assessment.updatedAt = this.clock();
       const current = this.assessmentFenceCurrent(state, assessment, revision); const priorCycle = cycle.status;
       if (status === "pass" || status === "warning") {
-        if (current) {
+        if (isS5ApprovalLocked(state, assessment.projectId)) {
+          cycle.status = "stale"; cycle.terminalAt = this.clock();
+        } else if (current) {
           const selection = state.s3Selections.find((item) => item.selectionStateId === cycle.selectionStateId); if (!selection || selection.successfulRefinementCount >= 2) { cycle.status = "stale"; cycle.terminalAt = this.clock(); } else { const resultingCount = (selection.successfulRefinementCount + 1) as 1 | 2; const expectedVersion = selection.selectionVersion; selection.activeRevisionId = revision.revisionId; selection.selectionVersion += 1; selection.successfulRefinementCount = resultingCount; selection.updatedAt = this.clock(); cycle.status = "completed"; cycle.terminalAt = this.clock(); cycle.retryState = "none"; state.s3SelectionEvents.push({ eventId: this.uuid(), projectId: assessment.projectId, selectionStateId: selection.selectionStateId, kind: "activate_refinement", fromRevisionId: cycle.baseRevisionId, toRevisionId: revision.revisionId, sourceSnapshotId: assessment.sourceSnapshotId, cycleId: cycle.cycleId, assessmentId: assessment.assessmentId, expectedSelectionVersion: expectedVersion, resultingSelectionVersion: selection.selectionVersion, resultingSuccessfulRefinementCount: resultingCount, idempotencyKey: null, requestReferenceId: attempt.requestReferenceId, at: this.clock() }); this.transition(state, assessment.projectId, { cycleId: cycle.cycleId, assessmentId: assessment.assessmentId, assessmentAttemptId, phase: "selection", attempt: attempt.attempt, from: "assessment_running", to: "activate_refinement", requestReferenceId: attempt.requestReferenceId }); } }
         else { cycle.status = "stale"; cycle.terminalAt = this.clock(); }
       } else { cycle.status = "material_fail"; cycle.retryState = "none"; cycle.terminalAt = this.clock(); }
@@ -1184,7 +1192,7 @@ export class S3WorkflowService {
   assessmentRetry(projectId: UUID, cycleId: UUID, key: UUID, referenceId: UUID): PublicS3Mutation<PublicS3RetryAdmission> {
     assertUuid(cycleId, "cycleId"); const requestHash = operationHash("s3_assessment_retry_request", projectId, { cycleId, attemptNumber: 2 });
     const result = this.repository.transact((state) => {
-      const cycle = state.s3Cycles.find((item) => item.cycleId === cycleId && item.projectId === projectId); if (!cycle) throw fail(404, "S3_CYCLE_NOT_FOUND"); const replay = this.idempotency(state, key, "s3_assessment_retry", projectId, requestHash); if (replay) return { replayed: true, result: cloneJson(replay.result) as unknown as PublicS3RetryAdmission };
+      const cycle = state.s3Cycles.find((item) => item.cycleId === cycleId && item.projectId === projectId); if (!cycle) throw fail(404, "S3_CYCLE_NOT_FOUND"); const replay = this.idempotency(state, key, "s3_assessment_retry", projectId, requestHash); if (replay) return { replayed: true, result: cloneJson(replay.result) as unknown as PublicS3RetryAdmission }; assertS5MutationAllowed(state, projectId);
       if (cycle.retryState === "waived" || cycle.status === "waived") throw fail(409, "S3_RETRY_WAIVED");
       const assessment = cycle.assessmentId ? state.s3Assessments.find((item) => item.assessmentId === cycle.assessmentId) : undefined; const firstId = assessment?.attemptIds[0]; const first = firstId ? state.s3AssessmentAttempts.find((item) => item.assessmentAttemptId === firstId) : undefined; const selection = state.s3Selections.find((item) => item.selectionStateId === cycle.selectionStateId); const revision = assessment ? state.s3Revisions.find((item) => item.revisionId === assessment.revisionId) : undefined;
       if (!assessment || !first || !selection || !revision || revision.kind !== "refinement" || cycle.status !== "assessment_retry_available" || cycle.retryState !== "assessment_available" || assessment.status !== "qa_unavailable_retryable" || assessment.retryState !== "available" || first.status !== "failed" || selection.selectionVersion !== cycle.baseSelectionVersion || selection.activeRevisionId !== cycle.baseRevisionId) throw fail(409, "S3_ASSESSMENT_RETRY_NOT_AVAILABLE");
