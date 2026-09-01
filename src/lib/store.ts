@@ -20,6 +20,7 @@ import { AppError, type StoreState } from "./types";
 import { codePointLength, uuidV4Pattern } from "./utils";
 import { validateS2Graph } from "./s2-persistence";
 import { validateS3Collections, validateS3Graph } from "./s3-persistence";
+import { validateS4Collections, validateS4Graph } from "./s4-persistence";
 
 const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
@@ -123,6 +124,17 @@ export function emptyStoreState(): StoreState {
     s3AssessmentAttempts: [],
     s3Publications: [],
     s3Transitions: [],
+    s4Stages: [],
+    s4Masks: [],
+    s4Edits: [],
+    s4Revisions: [],
+    s4Assets: [],
+    s4ImageOperations: [],
+    s4PreservationChecks: [],
+    s4Assessments: [],
+    s4AssessmentAttempts: [],
+    s4Publications: [],
+    s4Transitions: [],
   };
 }
 
@@ -591,9 +603,6 @@ export class PrivateObjectStore {
   put(key: string, bytes: Uint8Array): void {
     const path = this.pathFor(key);
     mkdirSync(dirname(path), { recursive: true });
-    if (existsSync(path)) {
-      throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: key });
-    }
     const temporary = path + "." + randomUUID() + ".tmp";
     let descriptor: number | null = null;
     try {
@@ -602,7 +611,8 @@ export class PrivateObjectStore {
       fsyncSync(descriptor);
       closeSync(descriptor);
       descriptor = null;
-      renameSync(temporary, path);
+      linkSync(temporary, path);
+      rmSync(temporary, { force: true });
     } catch {
       if (descriptor !== null) closeSync(descriptor);
       try {
@@ -618,13 +628,51 @@ export class PrivateObjectStore {
     const source = this.pathFor(stagingKey);
     const target = this.pathFor(finalKey);
     mkdirSync(dirname(target), { recursive: true });
-    if (existsSync(target)) {
+    try {
+      linkSync(source, target);
+    } catch {
       throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: finalKey });
     }
     try {
-      renameSync(source, target);
+      rmSync(source, { force: false });
     } catch {
-      throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: finalKey });
+      // The final link is already exclusive and complete; recovery can clean staging.
+    }
+  }
+
+  putExact(key: string, bytes: Uint8Array): void {
+    const expected = Buffer.from(bytes);
+    if (this.exists(key)) {
+      let actual: Buffer;
+      try { actual = this.read(key); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
+      if (!actual.equals(expected)) throw new AppError(500, "PERSISTENCE_FAILED");
+      return;
+    }
+    try {
+      this.put(key, expected);
+    } catch (error) {
+      if (!this.exists(key)) throw error;
+      let actual: Buffer;
+      try { actual = this.read(key); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
+      if (!actual.equals(expected)) throw new AppError(500, "PERSISTENCE_FAILED");
+    }
+  }
+
+  promoteExact(stagingKey: string, finalKey: string, expected: Uint8Array): void {
+    const bytes = Buffer.from(expected);
+    if (this.exists(finalKey)) {
+      let actual: Buffer;
+      try { actual = this.read(finalKey); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
+      if (!actual.equals(bytes)) throw new AppError(500, "PUBLICATION_OBJECT_MISMATCH");
+      return;
+    }
+    try {
+      this.promote(stagingKey, finalKey);
+    } catch (error) {
+      if (!this.exists(finalKey)) throw error;
+      let actual: Buffer;
+      try { actual = this.read(finalKey); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
+      if (!actual.equals(bytes)) throw new AppError(500, "PUBLICATION_OBJECT_MISMATCH");
     }
   }
 
@@ -707,8 +755,10 @@ export class JsonRepository {
       }
       validateS2Collections(parsedRecord, merged);
       validateS3Collections(parsedRecord, merged);
+      validateS4Collections(parsedRecord, merged);
       validateS2Graph(merged);
       validateS3Graph(merged);
+      validateS4Graph(merged);
       return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
@@ -1060,6 +1110,7 @@ export class JsonRepository {
       try {
         validateS2Graph(fresh);
         validateS3Graph(fresh);
+        validateS4Graph(fresh);
       } catch {
         throw new AppError(500, "PERSISTENCE_FAILED");
       }

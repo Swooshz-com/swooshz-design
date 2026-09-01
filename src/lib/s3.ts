@@ -1,4 +1,4 @@
-import { AppError, type CanonicalSourceBinding, type ConceptAsset, type ConceptCandidate, type IdempotencyRecord, type S2DerivedCandidate, type S2InputVersion, type S2QaCandidateResult, type S2QaRun, type S2ReQaResult, type S2RepairAttempt, type S3Assessment, type S3AssessmentAttempt, type S3AssessmentAggregateStatus, type S3AssessmentProviderMetadata, type S3AssessmentRetryState, type S3CycleRetryState, type S3CycleStatus, type S3GeneratedAsset, type S3ImageOperation, type S3ImageOperationStatus, type S3ImageProviderMetadata, type S3OperationFailureCode, type S3Publication, type S3PublicationObject, type S3RefinementCycle, type S3RefinementRevision, type S3RetryWaivedReason, type S3SelectionEvent, type S3SelectionEventKind, type S3SelectionState, type S3SourceKind, type S3SourceSnapshot, type S3StateTransition, type S3TransitionValue, type S3Revision, type S3SourceRevision, type StoreState, type UUID } from "./types";
+import { AppError, type CanonicalSourceBinding, type ConceptAsset, type ConceptCandidate, type IdempotencyRecord, type S2DerivedCandidate, type S2InputVersion, type S2QaCandidateResult, type S2QaRun, type S2ReQaResult, type S2RepairAttempt, type S3Assessment, type S3AssessmentAttempt, type S3AssessmentAggregateStatus, type S3AssessmentProviderMetadata, type S3AssessmentRetryState, type S3CycleRetryState, type S3CycleStatus, type S3GeneratedAsset, type S3ImageOperation, type S3ImageOperationStatus, type S3ImageProviderMetadata, type S3OperationFailureCode, type S3Publication, type S3PublicationObject, type S3RefinementCycle, type S3RefinementRevision, type S3RetryWaivedReason, type S3SelectionEvent, type S3SelectionEventKind, type S3SelectionState, type S3SourceKind, type S3SourceSnapshot, type S3StateTransition, type S3TransitionValue, type S3Revision, type S3SourceRevision, type S4RetryWaivedReason, type StoreState, type UUID } from "./types";
 import { JsonRepository, PrivateObjectStore } from "./store";
 import { assertS2Png, inspectCanonicalS1Png } from "./s2-media";
 import { latestSourceQaResults } from "./s2-lifecycle";
@@ -8,6 +8,7 @@ import { assertUuid, cloneJson, codePointLength, jcs, newUuid, nowUtc, privateSt
 import { designRuleSnapshotHash, compileS3Assessment, compileS3Refinement, normalizeS3Intent, type S3AssessmentCompilerContext, type S3BaseAssetIdentity, type S3CanonicalAssessmentInput, type S3CanonicalRefinementInput, type S3RefinementCompilerContext } from "./s3-compiler";
 import { decodeS3Rgba, inspectExactS3Png, s3PixelsChanged, type S3ExactPng } from "./s3-media";
 import { OpenAIS3Provider, type S3AssessmentProviderInput, type S3AssessmentProviderResult, type S3ImageProviderInput, type S3ImageProviderResult, type S3ProviderContract } from "./s3-provider";
+import { resolveVisualRevision } from "./revision-resolver";
 
 export type PublicS3ScreenedCandidate = {
   candidateIndex: 1 | 2 | 3 | 4;
@@ -541,6 +542,86 @@ export class S3WorkflowService {
     }
   }
 
+  private s4StageForSelection(state: StoreState, selection: S3SelectionState) {
+    return state.s4Stages.find((item) => item.projectId === selection.projectId &&
+      item.generationSetId === selection.generationSetId &&
+      item.selectionStateId === selection.selectionStateId &&
+      item.lineageRootRevisionId === selection.lineageRootRevisionId);
+  }
+
+  private s4RollbackInProgress(state: StoreState, selectionStateId: UUID): boolean {
+    const liveEditStatuses = new Set([
+      "mask_materialization_pending", "image_queued", "image_running", "publication_pending",
+      "preservation_pending", "preservation_running", "assessment_pending", "assessment_running",
+    ]);
+    if (state.s4Edits.some((item) => item.selectionStateId === selectionStateId && liveEditStatuses.has(item.status))) return true;
+    if (state.s4ImageOperations.some((item) => item.selectionStateId === selectionStateId &&
+        (item.status === "queued" || item.status === "running" || item.claimedBy !== null || item.claimedProcessId !== null || item.claimToken !== null))) return true;
+    if (state.s4AssessmentAttempts.some((item) => item.selectionStateId === selectionStateId &&
+        (item.status === "queued" || item.status === "running" || item.claimedBy !== null || item.claimedProcessId !== null || item.claimToken !== null))) return true;
+    if (state.s4PreservationChecks.some((item) => item.selectionStateId === selectionStateId &&
+        (item.status === "pending" || item.status === "running" || item.claimedBy !== null || item.claimedProcessId !== null || item.claimToken !== null))) return true;
+    return state.s4Publications.some((item) => item.selectionStateId === selectionStateId &&
+      (item.state === "staged" || item.state === "promoted" || item.ownerProcessId !== null || item.ownerClaimToken !== null));
+  }
+
+  private waiveS4Retries(state: StoreState, selection: S3SelectionState, reason: S4RetryWaivedReason, referenceId: UUID): void {
+    for (const edit of state.s4Edits.filter((item) => item.selectionStateId === selection.selectionStateId &&
+        (item.status === "image_retry_available" || item.status === "assessment_retry_available"))) {
+      const previous = edit.status;
+      edit.status = "waived";
+      edit.retryState = "waived";
+      edit.retryWaivedReason = reason;
+      edit.terminalAt = edit.terminalAt ?? this.clock();
+      edit.updatedAt = this.clock();
+      if (edit.assessmentId) {
+        const assessment = state.s4Assessments.find((item) => item.assessmentId === edit.assessmentId);
+        if (assessment?.retryState === "available") {
+          assessment.retryState = "waived";
+          assessment.retryWaivedReason = reason;
+          assessment.updatedAt = this.clock();
+        }
+      }
+      state.s4Transitions.push({
+        transitionId: this.uuid(), at: this.clock(), projectId: edit.projectId,
+        generationSetId: edit.generationSetId, selectionStateId: edit.selectionStateId,
+        editId: edit.editId, operationId: null, publicationId: null,
+        preservationCheckId: edit.preservationCheckId, assessmentId: edit.assessmentId,
+        assessmentAttemptId: null, phase: "edit", attempt: null,
+        from: previous, to: "waived", reason: "retry_waived",
+        priorRevisionId: edit.baseRevisionId, resultingRevisionId: edit.outputRevisionId,
+        expectedSelectionVersion: selection.selectionVersion,
+        resultingSelectionVersion: selection.selectionVersion, requestReferenceId: referenceId,
+      });
+    }
+  }
+
+  private recordS4Rollback(
+    state: StoreState,
+    selection: S3SelectionState,
+    fromRevisionId: UUID,
+    toRevisionId: UUID,
+    expectedSelectionVersion: number,
+    resultingSelectionVersion: number,
+    targetRevisionKind: "s3" | "s4",
+    referenceId: UUID,
+  ): void {
+    const currentS4 = state.s4Revisions.find((item) => item.revisionId === fromRevisionId);
+    const targetS4 = state.s4Revisions.find((item) => item.revisionId === toRevisionId);
+    const s4Revision = targetRevisionKind === "s4" ? targetS4 : currentS4;
+    const edit = s4Revision ? state.s4Edits.find((item) => item.editId === s4Revision.editId) : undefined;
+    state.s4Transitions.push({
+      transitionId: this.uuid(), at: this.clock(), projectId: selection.projectId,
+      generationSetId: selection.generationSetId, selectionStateId: selection.selectionStateId,
+      editId: edit?.editId ?? null, operationId: null, publicationId: null,
+      preservationCheckId: edit?.preservationCheckId ?? null, assessmentId: edit?.assessmentId ?? null,
+      assessmentAttemptId: null, phase: "rollback", attempt: null,
+      from: "activation", to: "rollback", reason: "rollback",
+      priorRevisionId: fromRevisionId, resultingRevisionId: toRevisionId,
+      expectedSelectionVersion, resultingSelectionVersion, requestReferenceId: referenceId,
+    });
+  }
+
   private activeTip(state: StoreState, selection: S3SelectionState): UUID | null {
     const events = state.s3SelectionEvents.filter((item) => item.selectionStateId === selection.selectionStateId && item.kind === "activate_refinement");
     return events.sort((left, right) => right.resultingSuccessfulRefinementCount - left.resultingSuccessfulRefinementCount)[0]?.toRevisionId ?? null;
@@ -557,10 +638,15 @@ export class S3WorkflowService {
   private publicStateFrom(state: StoreState, projectId: UUID): PublicS3State {
     const { generationSet } = this.generation(state, projectId);
     const selection = state.s3Selections.find((item) => item.projectId === projectId && item.generationSetId === generationSet.generationSetId) ?? null;
+    let activeSourceSnapshotId: UUID | null = null;
+    if (selection?.activeRevisionId) {
+      try { activeSourceSnapshotId = resolveVisualRevision(state, projectId, selection.activeRevisionId, this.objects).sourceSnapshotId; }
+      catch { activeSourceSnapshotId = null; }
+    }
     const screened = this.sourceOptionsSync(state, projectId).screened;
     const sources: PublicS3Source[] = state.s3Sources.filter((item) => item.projectId === projectId && item.generationSetId === generationSet.generationSetId).map((source) => ({
       sourceId: source.sourceSnapshotId, sourceKind: source.sourceKind, candidateIndex: source.candidateIndex, sourceRevisionId: source.sourceRootRevisionId,
-      qaStatus: this.sourceStatusForRevision(source), selected: Boolean(selection?.activeRevisionId && state.s3Revisions.find((item) => item.revisionId === selection.activeRevisionId)?.sourceSnapshotId === source.sourceSnapshotId),
+      qaStatus: this.sourceStatusForRevision(source), selected: activeSourceSnapshotId === source.sourceSnapshotId,
       eligible: true, previewAvailable: this.objects.exists(source.selectedStorageKey),
     }));
     const activated = new Map<UUID, 1 | 2>();
@@ -618,13 +704,18 @@ export class S3WorkflowService {
 
   async getPreview(projectId: UUID, revisionId: UUID): Promise<{ bytes: Buffer; contentLength: number }> {
     const state = this.state(); this.generation(state, projectId);
-    const revision = state.s3Revisions.find((item) => item.revisionId === revisionId && item.projectId === projectId);
-    if (!revision) throw fail(404, "S3_REVISION_NOT_FOUND");
-    const source = state.s3Sources.find((item) => item.sourceSnapshotId === revision.sourceSnapshotId);
-    const key = revision.kind === "source_selection" ? source?.selectedStorageKey : state.s3Assets.find((item) => item.assetId === revision.outputAssetId)?.storageKeyNormalized;
-    const expectedSha = revision.outputSha256; const expectedBytes = revision.outputByteSize;
-    if (!key) throw fail(500, "S3_INTERNAL_ERROR");
-    try { const bytes = this.objects.read(key); if (bytes.byteLength !== expectedBytes || sha256(bytes) !== expectedSha) throw new Error("identity"); if (revision.kind === "refinement") await inspectExactS3Png(bytes); return { bytes, contentLength: bytes.byteLength }; } catch { throw fail(500, "S3_INTERNAL_ERROR"); }
+    const known = state.s3Revisions.some((item) => item.revisionId === revisionId && item.projectId === projectId) ||
+      state.s4Revisions.some((item) => item.revisionId === revisionId && item.projectId === projectId);
+    if (!known) throw fail(404, "S3_REVISION_NOT_FOUND");
+    try {
+      const resolved = resolveVisualRevision(state, projectId, revisionId, this.objects);
+      const bytes = this.objects.read(resolved.storageKey);
+      if (bytes.byteLength !== resolved.byteSize || sha256(bytes) !== resolved.sha256) throw new Error("identity");
+      await inspectExactS3Png(bytes);
+      return { bytes, contentLength: bytes.byteLength };
+    } catch {
+      throw fail(500, "S3_INTERNAL_ERROR");
+    }
   }
 
   selectSource(projectId: UUID, targetKind: "source_root" | "revision", targetId: UUID, expectedSelectionVersion: number, key: UUID, referenceId: UUID): PublicS3Mutation<PublicS3SelectionResult> {
@@ -650,6 +741,7 @@ export class S3WorkflowService {
       }
       if (current.selectionVersion !== expectedSelectionVersion) throw fail(409, "S3_SELECTION_VERSION_CONFLICT");
       if (targetKind === "source_root") {
+        if (this.s4StageForSelection(state, current)) throw fail(409, "S3_LINEAGE_CONFLICT");
         if (current.successfulRefinementCount > 0) throw fail(409, "S3_SOURCE_RESELECTION_CLOSED");
         const oldRevision = current.activeRevisionId ? state.s3Revisions.find((item) => item.revisionId === current.activeRevisionId) : null;
         const existingSource = state.s3Sources.find((item) => item.sourceSnapshotId === oldRevision?.sourceSnapshotId);
@@ -672,19 +764,35 @@ export class S3WorkflowService {
         state.s3SelectionEvents.push({ eventId: this.uuid(), projectId, selectionStateId: current.selectionStateId, kind: "reselect_source", fromRevisionId, toRevisionId: context.revision.revisionId, sourceSnapshotId: context.source.sourceSnapshotId, cycleId: null, assessmentId: null, expectedSelectionVersion: expected, resultingSelectionVersion: current.selectionVersion, resultingSuccessfulRefinementCount: current.successfulRefinementCount, idempotencyKey: key, requestReferenceId: referenceId, at: this.clock() });
         const response: PublicS3SelectionResult = { selectionVersion: current.selectionVersion, activeRevisionId: context.revision.revisionId, activeSourceId: context.source.sourceSnapshotId, eventKind: "reselect_source" }; this.remember(state, key, "s3_selection", projectId, requestHash, response as unknown as Record<string, unknown>); return { replayed: false, result: response };
       }
-      const target = state.s3Revisions.find((item) => item.revisionId === targetId);
-      if (!target || target.projectId !== projectId || target.generationSetId !== generationSet.generationSetId) throw fail(409, "S3_SELECTION_TARGET_INVALID");
-      const source = state.s3Sources.find((item) => item.sourceSnapshotId === target.sourceSnapshotId);
-      if (!source || target.lineageRootRevisionId !== current.lineageRootRevisionId) throw fail(409, "S3_LINEAGE_CONFLICT");
-      if (target.kind === "refinement") {
-        const assessment = state.s3Assessments.find((item) => item.assessmentId === target.assessmentId);
-        const activated = state.s3SelectionEvents.some((item) => item.kind === "activate_refinement" && item.toRevisionId === target.revisionId);
-        if (!assessment || (assessment.status !== "pass" && assessment.status !== "warning") || !activated) throw fail(409, "S3_SELECTION_TARGET_INVALID");
+      if (this.s4RollbackInProgress(state, current.selectionStateId)) throw fail(409, "S4_ROLLBACK_IN_PROGRESS");
+      const targetS3 = state.s3Revisions.find((item) => item.revisionId === targetId && item.projectId === projectId && item.generationSetId === generationSet.generationSetId);
+      const targetS4 = state.s4Revisions.find((item) => item.revisionId === targetId && item.projectId === projectId && item.generationSetId === generationSet.generationSetId);
+      if ((targetS3 ? 1 : 0) + (targetS4 ? 1 : 0) !== 1) throw fail(409, "S3_SELECTION_TARGET_INVALID");
+      let currentResolved;
+      let targetResolved;
+      try {
+        currentResolved = resolveVisualRevision(state, projectId, current.activeRevisionId!, this.objects);
+        targetResolved = resolveVisualRevision(state, projectId, targetId, this.objects);
+      } catch {
+        throw fail(409, "S3_SELECTION_TARGET_INVALID");
       }
+      if (targetResolved.lineageRootRevisionId !== currentResolved.lineageRootRevisionId) throw fail(409, "S3_LINEAGE_CONFLICT");
+      const source = state.s3Sources.find((item) => item.sourceSnapshotId === targetResolved.sourceSnapshotId &&
+        item.projectId === projectId && item.generationSetId === generationSet.generationSetId);
+      if (!source) throw fail(409, "S3_SELECTION_TARGET_INVALID");
       if (state.s3Cycles.some((item) => item.selectionStateId === current.selectionStateId && ["image_queued", "image_running", "publication_pending", "assessment_pending", "assessment_running"].includes(item.status))) throw fail(409, "S3_REFINEMENT_IN_PROGRESS");
-      this.waiveRetries(state, current.selectionStateId, "rolled_back", referenceId); const fromRevisionId = current.activeRevisionId; const expected = current.selectionVersion; current.activeRevisionId = target.revisionId; current.selectionVersion += 1; current.updatedAt = this.clock();
-      state.s3SelectionEvents.push({ eventId: this.uuid(), projectId, selectionStateId: current.selectionStateId, kind: "rollback", fromRevisionId, toRevisionId: target.revisionId, sourceSnapshotId: source.sourceSnapshotId, cycleId: null, assessmentId: target.kind === "refinement" ? target.assessmentId : null, expectedSelectionVersion: expected, resultingSelectionVersion: current.selectionVersion, resultingSuccessfulRefinementCount: current.successfulRefinementCount, idempotencyKey: key, requestReferenceId: referenceId, at: this.clock() });
-      const response: PublicS3SelectionResult = { selectionVersion: current.selectionVersion, activeRevisionId: target.revisionId, activeSourceId: source.sourceSnapshotId, eventKind: "rollback" }; this.remember(state, key, "s3_selection", projectId, requestHash, response as unknown as Record<string, unknown>); return { replayed: false, result: response };
+      this.waiveRetries(state, current.selectionStateId, "rolled_back", referenceId);
+      this.waiveS4Retries(state, current, "rolled_back", referenceId);
+      const fromRevisionId = current.activeRevisionId;
+      const expected = current.selectionVersion;
+      current.activeRevisionId = targetResolved.revisionId;
+      current.selectionVersion += 1;
+      current.updatedAt = this.clock();
+      if (currentResolved.kind === "s4" || targetResolved.kind === "s4") {
+        this.recordS4Rollback(state, current, fromRevisionId!, targetResolved.revisionId, expected, current.selectionVersion, targetResolved.kind, referenceId);
+      }
+      state.s3SelectionEvents.push({ eventId: this.uuid(), projectId, selectionStateId: current.selectionStateId, kind: "rollback", fromRevisionId, toRevisionId: targetResolved.revisionId, sourceSnapshotId: source.sourceSnapshotId, cycleId: null, assessmentId: targetResolved.kind === "s3" && targetS3?.kind === "refinement" ? targetS3.assessmentId : targetResolved.kind === "s4" ? targetResolved.assessmentId : null, expectedSelectionVersion: expected, resultingSelectionVersion: current.selectionVersion, resultingSuccessfulRefinementCount: current.successfulRefinementCount, idempotencyKey: key, requestReferenceId: referenceId, at: this.clock() });
+      const response: PublicS3SelectionResult = { selectionVersion: current.selectionVersion, activeRevisionId: targetResolved.revisionId, activeSourceId: source.sourceSnapshotId, eventKind: "rollback" }; this.remember(state, key, "s3_selection", projectId, requestHash, response as unknown as Record<string, unknown>); return { replayed: false, result: response };
     });
     return result;
   }
@@ -697,6 +805,7 @@ export class S3WorkflowService {
       const { generationSet } = this.generation(state, projectId); const selection = state.s3Selections.find((item) => item.projectId === projectId && item.generationSetId === generationSet.generationSetId);
       if (!selection) throw fail(409, "S3_SOURCE_NOT_FOUND");
       const replay = this.idempotency(state, key, "s3_refinement", projectId, requestHash); if (replay) return { replayed: true, result: cloneJson(replay.result) as unknown as PublicS3RefinementAdmission };
+      if (this.s4StageForSelection(state, selection)) throw fail(409, "S3_LINEAGE_CONFLICT");
       if (selection.selectionVersion !== expectedSelectionVersion) throw fail(409, "S3_SELECTION_VERSION_CONFLICT");
       if (selection.activeRevisionId !== baseRevisionId) throw fail(409, "S3_LINEAGE_CONFLICT");
       const activeTip = this.activeTip(state, selection); if (selection.successfulRefinementCount > 0 && activeTip !== baseRevisionId) throw fail(409, "S3_LINEAGE_CONFLICT");

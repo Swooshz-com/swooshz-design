@@ -6,6 +6,7 @@ import { S2_MAX_MULTIPART_BODY_BYTES, S2_MAX_SOURCE_BYTES } from "./s2-media";
 import { createWorkflowService, type WorkflowService } from "./workflow";
 
 const MAX_MULTIPART_BODY_BYTES = MAX_BRIEF_BYTES + 1024 * 1024;
+const MAX_S4_BODY_BYTES = 131072;
 const PUBLIC_S3_ERROR_CODES = new Set<string>([
   "INVALID_REQUEST",
   "IDEMPOTENCY_KEY_REQUIRED",
@@ -27,30 +28,78 @@ const PUBLIC_S3_ERROR_CODES = new Set<string>([
   "S3_IMAGE_RETRY_NOT_AVAILABLE",
   "S3_ASSESSMENT_RETRY_NOT_AVAILABLE",
   "S3_RETRY_WAIVED",
+  "S4_ROLLBACK_IN_PROGRESS",
   "S3_INTENT_INVALID",
   "IDEMPOTENCY_KEY_REUSE",
   "METHOD_NOT_ALLOWED",
   "S3_INTERNAL_ERROR",
 ]);
+const PUBLIC_S4_ERROR_CODES = new Set<string>([
+  "INVALID_REQUEST",
+  "IDEMPOTENCY_KEY_REQUIRED",
+  "PROJECT_NOT_FOUND",
+  "S4_NOT_AVAILABLE",
+  "S4_SOURCE_NOT_FOUND",
+  "S4_REVISION_NOT_FOUND",
+  "S4_EDIT_NOT_FOUND",
+  "S4_SOURCE_NOT_ELIGIBLE",
+  "S4_SOURCE_INTEGRITY_MISMATCH",
+  "S4_MASK_INVALID",
+  "S4_MASK_EMPTY",
+  "S4_MASK_AREA_TOO_SMALL",
+  "S4_MASK_AREA_TOO_LARGE",
+  "S4_MASK_FULL_IMAGE",
+  "S4_MASK_COMPARISON_TOO_SMALL",
+  "S4_INSTRUCTION_INVALID",
+  "S4_SELECTION_VERSION_CONFLICT",
+  "S4_STALE_SOURCE",
+  "S4_EDIT_IN_PROGRESS",
+  "S4_BUDGET_EXHAUSTED",
+  "S4_DUPLICATE_EDIT",
+  "S4_IMAGE_RETRY_NOT_AVAILABLE",
+  "S4_ASSESSMENT_RETRY_NOT_AVAILABLE",
+  "S4_RETRY_WAIVED",
+  "S4_PRESERVATION_FAILED",
+  "S4_NOOP_OUTPUT",
+  "S4_ROLLBACK_TARGET_INVALID",
+  "S4_ROLLBACK_IN_PROGRESS",
+  "S4_IDEMPOTENCY_KEY_REUSE",
+  "METHOD_NOT_ALLOWED",
+  "S4_INTERNAL_ERROR",
+]);
+
+const S4_PUBLIC_FIELDS = new Set(["body", "projectId", "baseRevisionId", "expectedSelectionVersion", "primitives", "instructionText", "editId", "targetId", "Idempotency-Key", "x-request-id", "request"]);
+const S4_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
+
+function safeS4Field(field: string): string {
+  if (S4_PUBLIC_FIELDS.has(field) || /^primitives(?:\[\d+\])?(?:\.(?:kind|xQ16|yQ16|widthQ16|heightQ16|radiusQ8|points)(?:\[\d+\])?(?:\.(?:xQ16|yQ16))?)?$/.test(field)) return field;
+  return "body";
+}
+
+function safeS4FieldErrors(fieldErrors: readonly { field: string; code: string }[]): { field: string; code: string }[] {
+  return fieldErrors.map((item) => ({ field: safeS4Field(item.field), code: S4_PUBLIC_FIELD_CODES.has(item.code) ? item.code : "INVALID_REQUEST" }));
+}
 
 function requestReferenceId(request: Request): UUID {
   const supplied = request.headers.get("x-request-id");
   return supplied && uuidV4Pattern.test(supplied) ? supplied : crypto.randomUUID();
 }
 
-function jsonError(referenceId: UUID, error: unknown, s3 = false): NextResponse {
+function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false): NextResponse {
   const candidate = error instanceof AppError
     ? error
-    : new AppError(500, s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
-  const appError = s3 && !PUBLIC_S3_ERROR_CODES.has(candidate.code)
-    ? new AppError(500, "S3_INTERNAL_ERROR")
-    : candidate;
+    : new AppError(500, s4 ? "S4_INTERNAL_ERROR" : s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
+  const appError = s4 && !PUBLIC_S4_ERROR_CODES.has(candidate.code)
+    ? new AppError(500, "S4_INTERNAL_ERROR")
+    : s3 && !PUBLIC_S3_ERROR_CODES.has(candidate.code)
+      ? new AppError(500, "S3_INTERNAL_ERROR")
+      : candidate;
   const body = {
     error: {
       code: appError.code,
       message: "The request could not be completed. Try again or contact support with the reference ID.",
       referenceId,
-      fieldErrors: appError.fieldErrors,
+      fieldErrors: s4 ? safeS4FieldErrors(appError.fieldErrors) : appError.fieldErrors,
     },
   };
   console.error(JSON.stringify({ referenceId, operation: "api_request", status: appError.status, code: appError.code }));
@@ -63,6 +112,48 @@ async function jsonBody(request: Request): Promise<Record<string, unknown>> {
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
       throw new Error("object required");
     }
+    return body as Record<string, unknown>;
+  } catch {
+    throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "JSON_OBJECT_REQUIRED" }]);
+  }
+}
+
+async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
+    throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "JSON_REQUIRED" }]);
+  }
+  const suppliedLength = request.headers.get("content-length");
+  if (suppliedLength !== null) {
+    const parsedLength = Number(suppliedLength);
+    if (!Number.isSafeInteger(parsedLength) || parsedLength < 0) {
+      throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_LENGTH_INVALID" }]);
+    }
+    if (parsedLength > MAX_S4_BODY_BYTES) {
+      throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
+    }
+  }
+  if (!request.body) throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "JSON_OBJECT_REQUIRED" }]);
+  const reader = request.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > MAX_S4_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
+      }
+      chunks.push(Buffer.from(next.value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  try {
+    const body: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, total)));
+    if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Error("object required");
     return body as Record<string, unknown>;
   } catch {
     throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "JSON_OBJECT_REQUIRED" }]);
@@ -441,7 +532,43 @@ function isS3Path(segments: string[]): boolean {
   return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s3";
 }
 
+function isS4Path(segments: string[]): boolean {
+  return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s4";
+}
+
 async function authorizedS3Service(
+  request: Request,
+  segments: string[],
+  supplied: WorkflowService | ApiRequestDependencies | undefined,
+): Promise<WorkflowService> {
+  const projectId = segments[1];
+  if (typeof projectId !== "string" || !uuidV4Pattern.test(projectId)) {
+    throw new AppError(404, "PROJECT_NOT_FOUND");
+  }
+  const dependencies = isApiRequestDependencies(supplied)
+    ? supplied
+    : { workflowService: supplied, s3Authorization: productionS3Authorization };
+  let context: S3AccessContext | null;
+  try {
+    context = await dependencies.s3Authorization.resolveContext(request);
+  } catch {
+    throw new AppError(404, "PROJECT_NOT_FOUND");
+  }
+  if (!context || typeof context.subjectId !== "string" || context.subjectId.length === 0) {
+    throw new AppError(404, "PROJECT_NOT_FOUND");
+  }
+  try {
+    if (!(await dependencies.s3Authorization.authorizeProject(context, projectId))) {
+      throw new AppError(404, "PROJECT_NOT_FOUND");
+    }
+  } catch (error) {
+    if (error instanceof AppError && error.code === "PROJECT_NOT_FOUND") throw error;
+    throw new AppError(404, "PROJECT_NOT_FOUND");
+  }
+  return dependencies.workflowService ?? serviceForRequest();
+}
+
+async function authorizedS4Service(
   request: Request,
   segments: string[],
   supplied: WorkflowService | ApiRequestDependencies | undefined,
@@ -571,6 +698,61 @@ async function handleS3(
   throw new AppError(400, "INVALID_REQUEST");
 }
 
+async function handleS4(
+  request: Request,
+  method: string,
+  segments: string[],
+  service: WorkflowService,
+  referenceId: UUID,
+): Promise<NextResponse> {
+  const projectId = segments[1] as UUID;
+
+  if (segments.length === 3) {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s4.getState(projectId), { status: 200 });
+  }
+
+  if (segments.length === 4 && segments[3] === "edits") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    const body = await s4JsonBody(request);
+    exactKeys(body, ["baseRevisionId", "expectedSelectionVersion", "primitives", "instructionText"]);
+    assertUuid(body.baseRevisionId, "baseRevisionId");
+    const result = service.s4.admitEdit(
+      projectId,
+      body,
+      s2IdempotencyKeyFromHeader(request),
+      referenceId,
+    );
+    return NextResponse.json(result, { status: result.replayed ? 200 : 202 });
+  }
+
+  if (segments.length === 5 && segments[3] === "edits") {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    assertUuid(segments[4], "editId");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s4.getEdit(projectId, segments[4]), { status: 200 });
+  }
+
+  if (segments.length === 6 && segments[3] === "edits" && segments[5] === "image-retry") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    assertUuid(segments[4], "editId");
+    await requireEmptyBody(request);
+    const result = service.s4.imageRetry(projectId, segments[4], s2IdempotencyKeyFromHeader(request), referenceId);
+    return NextResponse.json(result, { status: result.replayed ? 200 : 202 });
+  }
+
+  if (segments.length === 6 && segments[3] === "edits" && segments[5] === "assessment-retry") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    assertUuid(segments[4], "editId");
+    await requireEmptyBody(request);
+    const result = service.s4.assessmentRetry(projectId, segments[4], s2IdempotencyKeyFromHeader(request), referenceId);
+    return NextResponse.json(result, { status: result.replayed ? 200 : 202 });
+  }
+
+  throw new AppError(400, "INVALID_REQUEST");
+}
+
 async function handle(
   request: Request,
   method: string,
@@ -687,6 +869,10 @@ export async function handleApiRequest(
 ): Promise<NextResponse> {
   const referenceId = requestReferenceId(request);
   try {
+    if (isS4Path(path)) {
+      const service = await authorizedS4Service(request, path, supplied);
+      return await handleS4(request, request.method.toUpperCase(), path, service, referenceId);
+    }
     if (isS3Path(path)) {
       const service = await authorizedS3Service(request, path, supplied);
       return await handleS3(request, request.method.toUpperCase(), path, service, referenceId);
@@ -696,6 +882,6 @@ export async function handleApiRequest(
       : supplied ?? serviceForRequest();
     return await handle(request, request.method.toUpperCase(), path, service, referenceId);
   } catch (error) {
-    return jsonError(referenceId, error, isS3Path(path));
+    return jsonError(referenceId, error, isS3Path(path), isS4Path(path));
   }
 }

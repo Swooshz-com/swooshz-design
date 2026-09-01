@@ -39,6 +39,8 @@ import { assertUuid, cloneJson, jcs, newUuid, nowUtc, privateStorageKey, sha256 
 import { S2WorkflowService, type S2WorkflowServiceOptions } from "./s2";
 import { S3WorkflowService, type S3WorkflowServiceOptions } from "./s3";
 import type { S3ProviderContract } from "./s3-provider";
+import { S4WorkflowService, type S4WorkflowServiceOptions } from "./s4";
+import type { S4ProviderContract } from "./s4-provider";
 
 
 export type WorkflowServiceOptions = {
@@ -47,6 +49,7 @@ export type WorkflowServiceOptions = {
   dataRoot?: string;
   provider?: OpenAIProviderContract;
   s3Provider?: S3ProviderContract;
+  s4Provider?: S4ProviderContract;
   clock?: () => string;
   uuid?: () => UUID;
   workerId?: string;
@@ -56,6 +59,8 @@ export type WorkflowServiceOptions = {
   onPublicationPhase?: S2WorkflowServiceOptions["onPublicationPhase"];
   onS3ProviderDispatchPhase?: S3WorkflowServiceOptions["onProviderDispatchPhase"];
   onS3PublicationPhase?: S3WorkflowServiceOptions["onPublicationPhase"];
+  onS4ProviderDispatchPhase?: S4WorkflowServiceOptions["onProviderDispatchPhase"];
+  onS4PublicationPhase?: S4WorkflowServiceOptions["onPublicationPhase"];
 };
 
 export type PublicGeneration = {
@@ -161,6 +166,7 @@ export class WorkflowService {
   readonly provider: OpenAIProviderContract;
   readonly s2: S2WorkflowService;
   readonly s3: S3WorkflowService;
+  readonly s4: S4WorkflowService;
   private readonly clock: () => string;
   private readonly uuid: () => UUID;
   private readonly workerId: string;
@@ -211,6 +217,18 @@ export class WorkflowService {
       isProcessAlive: this.isProcessAlive,
       onProviderDispatchPhase: options.onS3ProviderDispatchPhase,
       onPublicationPhase: options.onS3PublicationPhase,
+    });
+    this.s4 = new S4WorkflowService({
+      repository: this.repository,
+      objects: this.objects,
+      provider: options.s4Provider,
+      clock: this.clock,
+      uuid: this.uuid,
+      workerId: this.workerId,
+      processId: this.processId,
+      isProcessAlive: this.isProcessAlive,
+      onProviderDispatchPhase: options.onS4ProviderDispatchPhase,
+      onPublicationPhase: options.onS4PublicationPhase,
     });
   }
 
