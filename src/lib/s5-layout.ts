@@ -4,9 +4,13 @@ import { OPEN_SIDE_ORDER } from "./geometry";
 import { cloneJson, jcs, sha256 } from "./utils";
 
 export const S5_LAYOUT_SCHEMA = "s5-concept-layout-v1" as const;
-export const S5_LAYOUT_RENDERER_VERSION = "s5-layout-v1" as const;
+export const S5_LAYOUT_RENDERER_VERSION = "s5-concept-layout-v1" as const;
 export const S5_Q16_DENOMINATOR = 65_536;
 export const S5_Q16_MAX = S5_Q16_DENOMINATOR - 1;
+export const S5_MAX_REQUIREMENT_ITEMS = 64;
+export const S5_MAX_ZONE_CANDIDATES = 32;
+export const S5_MAX_INSTANCES_PER_REQUIREMENT = 8;
+export const S5_MAX_PLACED_INSTANCES = 16;
 
 export type S5LayoutCompilerInput = {
   projectId: UUID;
@@ -81,7 +85,7 @@ function circulationFor(openSides: readonly OpenSide[]): S5LayoutPlan["circulati
 }
 function positionFor(slot: number): { xQ16: number; yQ16: number; widthQ16: number; heightQ16: number } {
   const column = slot % 4; const row = Math.floor(slot / 4);
-  return { xQ16: [6_144, 16_384, 49_152, 59_392][column], yQ16: 8_192 + row * 13_312, widthQ16: 8_192, heightQ16: 8_192 };
+  return { xQ16: [6_144, 16_384, 45_056, 55_296][column], yQ16: 8_192 + row * 13_312, widthQ16: 8_192, heightQ16: 8_192 };
 }
 function unknownItem(requirement: S5LayoutRequirement, reason: S5UnknownItem["reason"]): S5UnknownItem {
   return { unknownId: `${requirement.requirementId}.${reason}`, requirementId: requirement.requirementId, label: requirement.name, mandatory: requirement.mandatory, status: "unplaced", reason };
@@ -90,11 +94,12 @@ function instanceFor(requirement: S5LayoutRequirement, category: S5ZoneCategory,
   return { instanceId: `${requirement.requirementId}.instance.${String(index + 1).padStart(2, "0")}`, requirementId: requirement.requirementId, label: requirement.countIsExact ? `${requirement.name} ${index + 1}` : requirement.name, mandatory: requirement.mandatory, countIndex: index + 1, status: placement ? "placed" : "unplaced", unplacedReason: placement ? null : reason, xQ16: placement?.xQ16 ?? null, yQ16: placement?.yQ16 ?? null, widthQ16: placement?.widthQ16 ?? null, heightQ16: placement?.heightQ16 ?? null, symbols: placement ? symbolsFor(requirement, category, index) : [] };
 }
 function verifyRequirement(value: S5LayoutRequirement, index: number): void {
-  if (value.requirementId !== `brief.functional.${String(index + 1).padStart(3, "0")}` || !value.name.trim() || Array.from(value.name).length > 80 || typeof value.mandatory !== "boolean" || typeof value.countIsExact !== "boolean") throw layoutError("S5_LAYOUT_INPUT_INVALID", `requirements[${index}]`);
-  if (value.details !== null && (typeof value.details !== "string" || Array.from(value.details).length > 400)) throw layoutError("S5_LAYOUT_INPUT_INVALID", `requirements[${index}].details`);
-  if (value.count !== null && (!Number.isSafeInteger(value.count) || value.count < 0)) throw layoutError("S5_LAYOUT_INPUT_INVALID", `requirements[${index}].count`);
-  if (value.countIsExact && value.count === null) throw layoutError("S5_LAYOUT_INPUT_INVALID", `requirements[${index}].count`);
+  if (!/^brief\.functional\.\d{3}$/u.test(value.requirementId) || typeof value.name !== "string" || !value.name.trim() || Array.from(value.name).length > 80 || typeof value.mandatory !== "boolean" || typeof value.countIsExact !== "boolean") throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements[" + index + "]");
+  if (value.details !== null && (typeof value.details !== "string" || Array.from(value.details).length > 400)) throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements[" + index + "].details");
+  if (value.count !== null && (!Number.isSafeInteger(value.count) || value.count < 0)) throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements[" + index + "].count");
+  if (value.countIsExact && value.count === null) throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements[" + index + "].count");
 }
+
 function geometryCoverage(requirement: S2Requirement): S5LayoutCoverage {
   const prohibited = requirement.category === "prohibited";
   return { requirementId: requirement.requirementId, role: prohibited ? "prohibited_constraint" : "geometry_constraint", status: "represented", reason: null, mandatory: false, count: null, countIsExact: false, representedCount: 1 };
@@ -102,36 +107,85 @@ function geometryCoverage(requirement: S2Requirement): S5LayoutCoverage {
 
 export function compileConceptLayoutPlan(input: S5LayoutCompilerInput): S5LayoutPlan {
   if (!Number.isSafeInteger(input.selectionVersion) || input.selectionVersion < 1 || !Number.isSafeInteger(input.approvalGeneration) || input.approvalGeneration < 1 || !Number.isSafeInteger(input.approvalEventSequence) || input.approvalEventSequence < 1 || !Number.isSafeInteger(input.geometry.widthMm) || input.geometry.widthMm < 1 || !Number.isSafeInteger(input.geometry.depthMm) || input.geometry.depthMm < 1) throw layoutError("S5_LAYOUT_INPUT_INVALID", "geometry");
-  if (input.requirements.length > 64) throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements");
+  if (input.requirements.length > S5_MAX_REQUIREMENT_ITEMS) throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements");
   input.requirements.forEach(verifyRequirement);
   if (new Set(input.requirements.map((item) => item.requirementId)).size !== input.requirements.length) throw layoutError("S5_LAYOUT_INPUT_INVALID", "requirements");
-  const sorted = input.requirements.slice().sort((left, right) => left.requirementId.localeCompare(right.requirementId));
+  const sorted = input.requirements.slice().sort((left, right) => Number(right.mandatory) - Number(left.mandatory) || (left.requirementId < right.requirementId ? -1 : left.requirementId > right.requirementId ? 1 : 0));
   const working: S5LayoutPlan = {
     schemaVersion: S5_LAYOUT_SCHEMA, projectId: input.projectId, generationSetId: input.generationSetId, selectionStateId: input.selectionStateId, selectionVersion: input.selectionVersion,
     activeRevisionId: input.activeRevisionId, activeRevisionKind: input.activeRevisionKind, approvalEventId: input.approvalEventId, approvalGeneration: input.approvalGeneration, approvalEventSequence: input.approvalEventSequence,
-    coordinateConvention: { units: "mm", origin: "north-west", x: "east", y: "south", north: "diagram-top-not-surveyed-bearing", displaySpace: "normalized-Q16-conceptual" }, booth: cloneJson(input.geometry), coverage: [], zones: [], circulation: circulationFor(input.geometry.openSides), unknowns: [], disclaimers: [...DISCLAIMERS, input.geometry.maxHeightMm === null ? "Confirmed maximum height was not specified in the brief." : `Confirmed maximum height: ${input.geometry.maxHeightMm} mm.`], planHash: "" as Sha256,
+    coordinateConvention: { units: "mm", origin: "north-west", x: "east", y: "south", north: "diagram-top-not-surveyed-bearing", displaySpace: "normalized-Q16-conceptual" }, booth: cloneJson(input.geometry), coverage: [], zones: [], circulation: circulationFor(input.geometry.openSides), unknowns: [], disclaimers: [...DISCLAIMERS, input.geometry.maxHeightMm === null ? "Confirmed maximum height was not specified in the brief." : "Confirmed maximum height: " + input.geometry.maxHeightMm + " mm."], planHash: "" as Sha256,
   };
-  const canonicalById = new Map((input.canonicalRequirements ?? []).map((item) => [item.requirementId, item]));
+  let placementCursor = 0;
+  let zoneCandidateCount = 0;
   for (const requirement of sorted) {
-    const category = classify(requirement.name, requirement.details); const requested = requirement.countIsExact ? requirement.count! : 1; const zoneInstances: S5LayoutInstance[] = []; let representedCount = 0; let reason: S5CoverageReason = null;
-    if (category === "other_confirmed") reason = "unknown_semantic";
-    if (requested > 8) { if (requirement.mandatory) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", `requirements.${requirement.requirementId}`); reason = "optional_overflow"; }
-    const bounded = Math.min(requested, 8);
-    for (let index = 0; index < bounded; index += 1) {
-      if (category === "other_confirmed") { zoneInstances.push(instanceFor(requirement, category, index, null, "unknown-semantic")); continue; }
-      if (representedCount >= 16) { if (requirement.mandatory) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", `requirements.${requirement.requirementId}`); zoneInstances.push(instanceFor(requirement, category, index, null, "optional-overflow")); reason = "optional_overflow"; continue; }
-      zoneInstances.push(instanceFor(requirement, category, index, positionFor(representedCount), null)); representedCount += 1;
+    const category = classify(requirement.name, requirement.details);
+    const requested = requirement.countIsExact ? requirement.count! : 1;
+    const bounded = Math.min(requested, S5_MAX_INSTANCES_PER_REQUIREMENT);
+    if (requested > S5_MAX_INSTANCES_PER_REQUIREMENT && requirement.mandatory) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "requirements." + requirement.requirementId);
+    let reason: S5CoverageReason = category === "other_confirmed" ? "unknown_semantic" : null;
+    if (requested > bounded) reason = "optional_overflow";
+    if (zoneCandidateCount >= S5_MAX_ZONE_CANDIDATES) {
+      if (requirement.mandatory) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "requirements." + requirement.requirementId);
+      working.coverage.push({ requirementId: requirement.requirementId, role: "zone_candidate", status: "unplaced", reason: "optional_overflow", mandatory: requirement.mandatory, count: requirement.count, countIsExact: requirement.countIsExact, representedCount: 0 });
+      working.unknowns.push(unknownItem(requirement, "optional-overflow"));
+      continue;
     }
-    if (requested > bounded && bounded > 0) zoneInstances.push(instanceFor(requirement, category, bounded, null, "optional-overflow"));
-    const placementStatus = category === "other_confirmed" ? "unknown" : requested === 0 ? "represented" : representedCount > 0 && representedCount >= Math.min(requested, 16) ? "symbolic" : "unplaced";
-    const zone: S5LayoutZone = { zoneId: `zone.${requirement.requirementId}`, category, label: requirement.name, requirementIds: [requirement.requirementId], mandatory: requirement.mandatory, count: requirement.count, countIsExact: requirement.countIsExact, representedCount, placementStatus, placementReason: reason, instances: zoneInstances };
+    zoneCandidateCount += 1;
+    const zoneInstances: S5LayoutInstance[] = [];
+    let representedCount = 0;
+    for (let index = 0; index < bounded; index += 1) {
+      if (category === "other_confirmed") {
+        zoneInstances.push(instanceFor(requirement, category, index, null, "unknown-semantic"));
+        continue;
+      }
+      if (placementCursor >= S5_MAX_PLACED_INSTANCES) {
+        if (requirement.mandatory) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "requirements." + requirement.requirementId);
+        zoneInstances.push(instanceFor(requirement, category, index, null, "optional-overflow"));
+        reason = "optional_overflow";
+        continue;
+      }
+      zoneInstances.push(instanceFor(requirement, category, index, positionFor(placementCursor), null));
+      placementCursor += 1;
+      representedCount += 1;
+    }
+    const placementStatus: S5LayoutZone["placementStatus"] = category === "other_confirmed" ? "unknown" : requested === 0 ? "represented" : representedCount > 0 ? "symbolic" : "unplaced";
+    const zone: S5LayoutZone = { zoneId: "zone." + requirement.requirementId, category, label: requirement.name, requirementIds: [requirement.requirementId], mandatory: requirement.mandatory, count: requirement.count, countIsExact: requirement.countIsExact, representedCount, placementStatus, placementReason: reason, instances: zoneInstances };
     working.zones.push(zone);
     working.coverage.push({ requirementId: requirement.requirementId, role: "zone_candidate", status: placementStatus, reason, mandatory: requirement.mandatory, count: requirement.count, countIsExact: requirement.countIsExact, representedCount });
-    if (reason !== null || category === "other_confirmed") working.unknowns.push(unknownItem(requirement, reason === "optional_overflow" ? "optional-overflow" : "unknown-semantic"));
+    if (category === "other_confirmed") working.unknowns.push(unknownItem(requirement, "unknown-semantic"));
+    if (requested > bounded || zoneInstances.some((item) => item.status === "unplaced" && item.unplacedReason === "optional-overflow")) working.unknowns.push(unknownItem(requirement, "optional-overflow"));
   }
   for (const requirement of input.canonicalRequirements ?? []) if (!working.coverage.some((item) => item.requirementId === requirement.requirementId)) working.coverage.push(geometryCoverage(requirement));
-  working.coverage.sort((left, right) => left.requirementId.localeCompare(right.requirementId));
+  working.coverage.sort((left, right) => left.requirementId < right.requirementId ? -1 : left.requirementId > right.requirementId ? 1 : 0);
+  validatePlanGeometry(working);
   return withPlanHash(working);
+}
+function validatePlanGeometry(plan: S5LayoutPlan): void {
+  if (plan.zones.length > S5_MAX_ZONE_CANDIDATES) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+  const boxes: Array<{ x: number; y: number; width: number; height: number; instanceId: string }> = [];
+  const instanceIds = new Set<string>();
+  let placedCount = 0;
+  for (const zone of plan.zones) {
+    if (zone.instances.length > S5_MAX_INSTANCES_PER_REQUIREMENT) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+    for (const instance of zone.instances) {
+      if (instanceIds.has(instance.instanceId)) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+      instanceIds.add(instance.instanceId);
+      if (Array.from(instance.label).length > 80) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+      if (instance.status !== "placed") continue;
+      if (instance.xQ16 === null || instance.yQ16 === null || instance.widthQ16 === null || instance.heightQ16 === null || instance.widthQ16 < 4_096 || instance.heightQ16 < 4_096 || ![instance.xQ16, instance.yQ16, instance.widthQ16, instance.heightQ16].every((value) => Number.isSafeInteger(value) && value >= 0 && value <= S5_Q16_MAX) || instance.xQ16 + instance.widthQ16 > S5_Q16_DENOMINATOR || instance.yQ16 + instance.heightQ16 > S5_Q16_DENOMINATOR) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+      const inLeftRail = instance.xQ16 + instance.widthQ16 <= 24_576;
+      const inRightRail = instance.xQ16 >= 40_960;
+      if (!inLeftRail && !inRightRail) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+      boxes.push({ x: instance.xQ16, y: instance.yQ16, width: instance.widthQ16, height: instance.heightQ16, instanceId: instance.instanceId });
+      placedCount += 1;
+    }
+  }
+  if (placedCount > S5_MAX_PLACED_INSTANCES) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones");
+  for (let leftIndex = 0; leftIndex < boxes.length; leftIndex += 1) for (let rightIndex = leftIndex + 1; rightIndex < boxes.length; rightIndex += 1) {
+    const left = boxes[leftIndex]; const right = boxes[rightIndex];
+    if (left.x < right.x + right.width && right.x < left.x + left.width && left.y < right.y + right.height && right.y < left.y + left.height) throw layoutError("S5_LAYOUT_OVERCONSTRAINED", "zones." + left.instanceId);
+  }
 }
 function withoutPlanHash(plan: S5LayoutPlan): Record<string, unknown> { const copy = cloneJson(plan) as Record<string, unknown>; delete copy.planHash; return copy; }
 function withPlanHash(plan: S5LayoutPlan): S5LayoutPlan { plan.planHash = sha256(jcs(withoutPlanHash(plan))); return plan; }
@@ -140,5 +194,5 @@ export function canonicalPlanBytes(plan: S5LayoutPlan): Buffer { return Buffer.f
 export function verifyPlanHash(plan: S5LayoutPlan): void {
   if (plan.schemaVersion !== S5_LAYOUT_SCHEMA || plan.coordinateConvention.units !== "mm" || plan.coordinateConvention.origin !== "north-west" || plan.coordinateConvention.x !== "east" || plan.coordinateConvention.y !== "south" || plan.coordinateConvention.north !== "diagram-top-not-surveyed-bearing" || plan.coordinateConvention.displaySpace !== "normalized-Q16-conceptual") throw layoutError("S5_LAYOUT_CONVENTION_INVALID", "coordinateConvention");
   if (!/^[0-9a-f]{64}$/u.test(plan.planHash) || sha256(jcs(withoutPlanHash(plan))) !== plan.planHash) throw layoutError("S5_PLAN_HASH_MISMATCH", "planHash");
-  for (const zone of plan.zones) for (const instance of zone.instances) for (const value of [instance.xQ16, instance.yQ16, instance.widthQ16, instance.heightQ16]) if (value !== null && (!Number.isSafeInteger(value) || value < 0 || value > S5_Q16_MAX)) throw layoutError("S5_LAYOUT_INPUT_INVALID", "zones");
+  validatePlanGeometry(plan);
 }

@@ -1678,6 +1678,7 @@ export type S4ToS5Handoff = {
 export type S5ActiveRevisionKind = "s3_source" | "s3_refinement" | "s4_local_edit";
 export type S5ApprovalEventKind = "approved" | "reopened";
 export type S5ReopenReason = "user_requested" | "upstream_change_detected" | "artifact_invalidated";
+export type S5SourceQualityEvidence = S4SourceQualityProof;
 
 export type S5MutationFence = {
   expectedGenerationSetId: UUID;
@@ -1697,6 +1698,7 @@ export type S5ApprovalEvent = {
   selectionStateId: UUID;
   eventSequence: number;
   approvalId: UUID;
+  priorApprovalEventId: UUID | null;
   approvalGeneration: number;
   observedSelectionVersion: number;
   observedActiveRevisionId: UUID;
@@ -1734,6 +1736,7 @@ export type S5FrozenGenerationContext = {
   lineageRootRevisionId: UUID;
   sourceBindingHash: Sha256;
   quality: "PASS" | "WARNING";
+  sourceQualityEvidence: S5SourceQualityEvidence;
   activeAssetId: UUID;
   activeAssetStorageKey: string;
   activeAssetSha256: Sha256;
@@ -1762,9 +1765,9 @@ export type S5FrozenGenerationContext = {
     eventEndDate: string | null;
   };
   presentationFactsHash: Sha256;
-  layoutRendererVersion: "s5-layout-v1";
-  svgRendererVersion: "s5-svg-v1";
-  pdfRendererVersion: "s5-pdf-v1";
+  layoutRendererVersion: "s5-concept-layout-v1";
+  svgRendererVersion: "s5-layout-svg-v1";
+  pdfRendererVersion: "s5-presentation-pdf-v1";
 };
 
 export type S5ZoneCategory =

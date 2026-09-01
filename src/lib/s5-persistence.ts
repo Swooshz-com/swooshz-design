@@ -72,9 +72,26 @@ function validateRule(value: unknown): void { const item = record(value, RULE_KE
 const FACT_KEYS = ["projectName", "clientName", "eventName", "venueName", "eventLocation", "eventStartDate", "eventEndDate"] as const;
 function validateFacts(value: unknown): void { const item = record(value, FACT_KEYS); codePointString(item.projectName, 200); for (const key of FACT_KEYS.slice(1)) if (item[key] !== null) codePointString(item[key], 240); }
 
+function validateSourceQualityEvidence(value: unknown): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return invalid();
+  const kind = (value as Record<string, unknown>).kind;
+  if (kind === "s3_source") {
+    const item = record(value, ["kind", "sourceSnapshotId", "sourceRevisionId", "sourceBindingHash", "status", "verdictRecordId"]);
+    uuid(item.sourceSnapshotId); uuid(item.sourceRevisionId); sha(item.sourceBindingHash); enumValue(item.status, ["PASS", "WARNING"]); uuid(item.verdictRecordId); return;
+  }
+  if (kind === "s3_refinement") {
+    const item = record(value, ["kind", "sourceSnapshotId", "sourceRevisionId", "sourceBindingHash", "assessmentId", "status", "verdictRecordId"]);
+    uuid(item.sourceSnapshotId); uuid(item.sourceRevisionId); sha(item.sourceBindingHash); uuid(item.assessmentId); enumValue(item.status, ["PASS", "WARNING"]); uuid(item.verdictRecordId); return;
+  }
+  if (kind === "s4_local_edit") {
+    const item = record(value, ["kind", "sourceSnapshotId", "sourceRevisionId", "preservationCheckId", "assessmentId", "status", "verdictRecordId"]);
+    uuid(item.sourceSnapshotId); uuid(item.sourceRevisionId); uuid(item.preservationCheckId); uuid(item.assessmentId); enumValue(item.status, ["PASS", "WARNING"]); uuid(item.verdictRecordId); return;
+  }
+  return invalid();
+}
 const CONTEXT_KEYS = [
   "schemaVersion", "projectId", "generationSetId", "selectionStateId", "selectionVersion", "approvalEventId", "approvalGeneration", "eventSequence",
-  "activeRevisionId", "activeRevisionKind", "sourceSnapshotId", "lineageRootRevisionId", "sourceBindingHash", "quality", "activeAssetId", "activeAssetStorageKey",
+  "activeRevisionId", "activeRevisionKind", "sourceSnapshotId", "lineageRootRevisionId", "sourceBindingHash", "quality", "sourceQualityEvidence", "activeAssetId", "activeAssetStorageKey",
   "activeAssetSha256", "activeAssetByteSize", "activeAssetWidth", "activeAssetHeight", "activeAssetPixelCount", "confirmedBriefVersionId", "briefContentHash",
   "geometrySnapshot", "geometryHash", "canonicalRequirements", "requirementHash", "layoutRequirements", "layoutRequirementsHash", "designRulesVersion",
   "designRuleSnapshot", "designRuleSnapshotHash", "presentationFacts", "presentationFactsHash", "layoutRendererVersion", "svgRendererVersion", "pdfRendererVersion",
@@ -82,26 +99,26 @@ const CONTEXT_KEYS = [
 function validateContext(value: unknown): void {
   const item = record(value, CONTEXT_KEYS); enumValue(item.schemaVersion, ["s5-generation-context-v1"]);
   uuid(item.projectId); uuid(item.generationSetId); uuid(item.selectionStateId); integer(item.selectionVersion, 1); uuid(item.approvalEventId); integer(item.approvalGeneration, 1); integer(item.eventSequence, 1);
-  uuid(item.activeRevisionId); enumValue(item.activeRevisionKind, ["s3_source", "s3_refinement", "s4_local_edit"]); uuid(item.sourceSnapshotId); uuid(item.lineageRootRevisionId); sha(item.sourceBindingHash); enumValue(item.quality, ["PASS", "WARNING"]);
+  uuid(item.activeRevisionId); enumValue(item.activeRevisionKind, ["s3_source", "s3_refinement", "s4_local_edit"]); uuid(item.sourceSnapshotId); uuid(item.lineageRootRevisionId); sha(item.sourceBindingHash); enumValue(item.quality, ["PASS", "WARNING"]); validateSourceQualityEvidence(item.sourceQualityEvidence); if ((item.sourceQualityEvidence as RecordValue).status !== item.quality) return invalid();
   uuid(item.activeAssetId); pathValue(item.activeAssetStorageKey); sha(item.activeAssetSha256); integer(item.activeAssetByteSize, 0); if (item.activeAssetWidth !== 1536 || item.activeAssetHeight !== 1024 || item.activeAssetPixelCount !== 1572864) return invalid();
   uuid(item.confirmedBriefVersionId); sha(item.briefContentHash); validateGeometry(item.geometrySnapshot); sha(item.geometryHash);
   const requirements = array(item.canonicalRequirements); if (requirements.length > 128) return invalid(); requirements.forEach(validateRequirement); sha(item.requirementHash);
   const layout = array(item.layoutRequirements); if (layout.length > 64) return invalid(); layout.forEach(validateLayoutRequirement); sha(item.layoutRequirementsHash);
   enumValue(item.designRulesVersion, ["s2-design-rules-v1"]); const rules = array(item.designRuleSnapshot); if (rules.length > 128) return invalid(); rules.forEach(validateRule); sha(item.designRuleSnapshotHash);
-  validateFacts(item.presentationFacts); sha(item.presentationFactsHash); enumValue(item.layoutRendererVersion, ["s5-layout-v1"]); enumValue(item.svgRendererVersion, ["s5-svg-v1"]); enumValue(item.pdfRendererVersion, ["s5-pdf-v1"]);
+  validateFacts(item.presentationFacts); sha(item.presentationFactsHash); enumValue(item.layoutRendererVersion, ["s5-concept-layout-v1"]); enumValue(item.svgRendererVersion, ["s5-layout-svg-v1"]); enumValue(item.pdfRendererVersion, ["s5-presentation-pdf-v1"]);
 }
 
 const APPROVAL_KEYS = [
-  "schemaVersion", "eventId", "projectId", "generationSetId", "selectionStateId", "eventSequence", "approvalId", "approvalGeneration",
+  "schemaVersion", "eventId", "projectId", "generationSetId", "selectionStateId", "eventSequence", "approvalId", "priorApprovalEventId", "approvalGeneration",
   "observedSelectionVersion", "observedActiveRevisionId", "observedLineageRootRevisionId", "kind", "reopenReason", "generationContext", "generationContextHash",
   "idempotencyKey", "requestReferenceId", "occurredAt",
 ] as const;
 function validateApprovalEvent(value: unknown): void {
   const item = record(value, APPROVAL_KEYS); enumValue(item.schemaVersion, ["s5-approval-event-v1"]); uuid(item.eventId); uuid(item.projectId); uuid(item.generationSetId); uuid(item.selectionStateId);
-  integer(item.eventSequence, 1); uuid(item.approvalId); integer(item.approvalGeneration, 1); integer(item.observedSelectionVersion, 1); uuid(item.observedActiveRevisionId); uuid(item.observedLineageRootRevisionId);
+  integer(item.eventSequence, 1); uuid(item.approvalId); nullableUuid(item.priorApprovalEventId); integer(item.approvalGeneration, 1); integer(item.observedSelectionVersion, 1); uuid(item.observedActiveRevisionId); uuid(item.observedLineageRootRevisionId);
   const kind = enumValue(item.kind, ["approved", "reopened"]); if (item.reopenReason !== null) enumValue(item.reopenReason, ["user_requested", "upstream_change_detected", "artifact_invalidated"]);
-  if (kind === "approved") { if (item.reopenReason !== null || item.generationContext === null) return invalid(); validateContext(item.generationContext); if (item.generationContextHash !== sha256(jcs(item.generationContext))) return invalid(); }
-  else if (item.reopenReason === null || item.generationContext !== null) return invalid();
+  if (kind === "approved") { if (item.reopenReason !== null || item.generationContext === null || item.priorApprovalEventId !== null || item.approvalId !== item.eventId) return invalid(); validateContext(item.generationContext); if (item.generationContextHash !== sha256(jcs(item.generationContext))) return invalid(); }
+  else if (item.reopenReason === null || item.generationContext !== null || item.priorApprovalEventId === null || item.approvalId !== item.priorApprovalEventId) return invalid();
   sha(item.generationContextHash); uuid(item.idempotencyKey); uuid(item.requestReferenceId); timestamp(item.occurredAt);
 }
 
@@ -148,6 +165,29 @@ function historicalSelectionObservationExists(state: StoreState, event: S5Approv
   return state.s4Transitions.some((item) => item.projectId === event.projectId && item.selectionStateId === event.selectionStateId && item.resultingSelectionVersion === event.observedSelectionVersion && item.resultingRevisionId === event.observedActiveRevisionId);
 }
 
+function validateSourceQualityGraph(state: StoreState, event: S5ApprovalEvent, context: S5FrozenGenerationContext): void {
+  const evidence = context.sourceQualityEvidence;
+  if (evidence.status !== context.quality || evidence.sourceSnapshotId !== context.sourceSnapshotId || evidence.sourceRevisionId !== context.activeRevisionId) return invalid();
+  const expectedKind = evidence.kind === "s3_source" ? "s3_source" : evidence.kind === "s3_refinement" ? "s3_refinement" : "s4_local_edit";
+  if (context.activeRevisionKind !== expectedKind) return invalid();
+  const source = state.s3Sources.find((item) => item.projectId === event.projectId && item.sourceSnapshotId === evidence.sourceSnapshotId && item.generationSetId === event.generationSetId);
+  if (!source || source.sourceRootRevisionId !== context.lineageRootRevisionId || source.sourceBindingHash !== context.sourceBindingHash || sha256(jcs(source.canonicalSourceBinding)) !== source.sourceBindingHash || source.canonicalSourceBinding.eligibilityVerdict !== (source.canonicalSourceBinding.eligibilityStatus === "pass" ? "PASS" : "WARNING")) return invalid();
+  if (evidence.kind === "s3_source") {
+    const revision = state.s3Revisions.find((item) => item.projectId === event.projectId && item.revisionId === evidence.sourceRevisionId);
+    if (!revision || revision.kind !== "source_selection" || revision.generationSetId !== event.generationSetId || revision.lineageRootRevisionId !== revision.revisionId || revision.revisionId !== context.activeRevisionId || revision.sourceSnapshotId !== source.sourceSnapshotId || revision.sourceBindingHash !== source.sourceBindingHash || revision.outputAssetId !== context.activeAssetId || revision.outputSha256 !== context.activeAssetSha256 || revision.outputByteSize !== context.activeAssetByteSize || evidence.sourceBindingHash !== source.sourceBindingHash || evidence.verdictRecordId !== source.canonicalSourceBinding.eligibilityResultId || evidence.status !== source.canonicalSourceBinding.eligibilityVerdict) return invalid();
+    return;
+  }
+  if (evidence.kind === "s3_refinement") {
+    const revision = state.s3Revisions.find((item) => item.projectId === event.projectId && item.revisionId === evidence.sourceRevisionId);
+    const assessment = state.s3Assessments.find((item) => item.projectId === event.projectId && item.assessmentId === evidence.assessmentId && item.revisionId === evidence.sourceRevisionId);
+    if (!revision || revision.kind !== "refinement" || revision.generationSetId !== event.generationSetId || revision.lineageRootRevisionId !== context.lineageRootRevisionId || revision.revisionId !== context.activeRevisionId || revision.sourceSnapshotId !== source.sourceSnapshotId || revision.sourceBindingHash !== source.sourceBindingHash || revision.assessmentId !== evidence.assessmentId || revision.outputAssetId !== context.activeAssetId || revision.outputSha256 !== context.activeAssetSha256 || revision.outputByteSize !== context.activeAssetByteSize || !assessment || assessment.generationSetId !== event.generationSetId || assessment.sourceSnapshotId !== source.sourceSnapshotId || assessment.sourceBindingHash !== source.sourceBindingHash || assessment.outputAssetId !== context.activeAssetId || assessment.outputSha256 !== context.activeAssetSha256 || (assessment.status !== "pass" && assessment.status !== "warning") || evidence.sourceBindingHash !== source.sourceBindingHash || evidence.verdictRecordId !== assessment.assessmentId || evidence.status !== (assessment.status === "pass" ? "PASS" : "WARNING")) return invalid();
+    return;
+  }
+  const revision = state.s4Revisions.find((item) => item.projectId === event.projectId && item.revisionId === evidence.sourceRevisionId);
+  const preservation = state.s4PreservationChecks.find((item) => item.projectId === event.projectId && item.preservationCheckId === evidence.preservationCheckId && item.revisionId === evidence.sourceRevisionId);
+  const assessment = state.s4Assessments.find((item) => item.projectId === event.projectId && item.assessmentId === evidence.assessmentId && item.revisionId === evidence.sourceRevisionId);
+  if (!revision || revision.kind !== "s4_local_edit" || revision.generationSetId !== event.generationSetId || revision.selectionStateId !== event.selectionStateId || revision.lineageRootRevisionId !== context.lineageRootRevisionId || revision.revisionId !== context.activeRevisionId || revision.sourceSnapshotId !== source.sourceSnapshotId || revision.preservationCheckId !== evidence.preservationCheckId || revision.assessmentId !== evidence.assessmentId || revision.outputAssetId !== context.activeAssetId || revision.outputSha256 !== context.activeAssetSha256 || revision.outputByteSize !== context.activeAssetByteSize || !preservation || preservation.generationSetId !== event.generationSetId || preservation.selectionStateId !== event.selectionStateId || preservation.editId !== revision.editId || preservation.outputAssetId !== context.activeAssetId || preservation.outputSha256 !== context.activeAssetSha256 || preservation.status !== "PASS" || preservation.completedAt === null || !assessment || assessment.generationSetId !== event.generationSetId || assessment.selectionStateId !== event.selectionStateId || assessment.editId !== revision.editId || assessment.outputAssetId !== context.activeAssetId || assessment.outputSha256 !== context.activeAssetSha256 || (assessment.status !== "pass" && assessment.status !== "warning") || evidence.verdictRecordId !== assessment.assessmentId || evidence.status !== (assessment.status === "pass" ? "PASS" : "WARNING")) return invalid();
+}
 export function validateS5Graph(state: StoreState): void {
   unique(state.s5ApprovalEvents.map((item) => item.eventId)); unique(state.s5Artifacts.map((item) => item.artifactId));
   const eventsByProject = new Map<string, S5ApprovalEvent[]>();
@@ -157,18 +197,21 @@ export function validateS5Graph(state: StoreState): void {
     for (let index = 0; index < ordered.length; index += 1) {
       const event = ordered[index]; if (event.eventSequence !== index + 1 || event.projectId !== projectId) return invalid();
       const previous = ordered[index - 1];
-      if (index === 0) { if (event.kind !== "approved" || event.approvalGeneration !== 1 || event.approvalId !== event.eventId || event.generationContext === null) return invalid(); }
-      else if (event.kind === "reopened") { if (!previous || previous.kind !== "approved" || event.approvalGeneration !== previous.approvalGeneration || event.approvalId !== previous.approvalId || event.generationContext !== null || event.generationContextHash !== previous.generationContextHash || event.reopenReason === null) return invalid(); }
-      else if (!previous || previous.kind !== "reopened" || event.approvalGeneration !== previous.approvalGeneration + 1 || event.approvalId !== event.eventId || event.generationContext === null) return invalid();
+      if (index === 0) {
+        if (event.kind !== "approved" || event.approvalGeneration !== 1 || event.approvalId !== event.eventId || event.priorApprovalEventId !== null || event.generationContext === null) return invalid();
+      } else if (event.kind === "reopened") {
+        const prior = event.priorApprovalEventId === null ? null : state.s5ApprovalEvents.find((candidate) => candidate.eventId === event.priorApprovalEventId);
+        if (!previous || previous.kind !== "approved" || !prior || prior.eventId !== previous.eventId || prior.projectId !== event.projectId || prior.generationSetId !== event.generationSetId || prior.selectionStateId !== event.selectionStateId || prior.approvalId !== event.approvalId || prior.approvalGeneration !== event.approvalGeneration || prior.observedSelectionVersion !== event.observedSelectionVersion || prior.observedActiveRevisionId !== event.observedActiveRevisionId || prior.observedLineageRootRevisionId !== event.observedLineageRootRevisionId || event.approvalGeneration !== previous.approvalGeneration || event.approvalId !== previous.approvalId || event.generationContext !== null || event.generationContextHash !== previous.generationContextHash || event.reopenReason === null) return invalid();
+      } else if (!previous || previous.kind !== "reopened" || event.approvalGeneration !== previous.approvalGeneration + 1 || event.approvalId !== event.eventId || event.priorApprovalEventId !== null || event.generationContext === null) return invalid();
       const project = state.projects.find((item) => item.projectId === projectId); if (!project || !historicalSelectionObservationExists(state, event)) return invalid();
-      if (event.kind === "approved") { if (!event.generationContext) return invalid(); sameContextIdentity(event, event.generationContext); if (event.generationContextHash !== sha256(jcs(event.generationContext))) return invalid(); }
+      if (event.kind === "approved") { if (!event.generationContext) return invalid(); sameContextIdentity(event, event.generationContext); if (event.generationContextHash !== sha256(jcs(event.generationContext))) return invalid(); validateSourceQualityGraph(state, event, event.generationContext); }
     }
   }
   const groups = new Map<string, S5Artifact[]>();
   for (const artifact of state.s5Artifacts) {
     const event = state.s5ApprovalEvents.find((item) => item.eventId === artifact.approvalEventId && item.projectId === artifact.projectId); if (!event || event.generationSetId !== artifact.generationSetId || event.selectionStateId !== artifact.selectionStateId || event.observedSelectionVersion !== artifact.selectionVersion || event.observedActiveRevisionId !== artifact.activeRevisionId || event.approvalGeneration !== artifact.approvalGeneration || event.generationContextHash !== artifact.generationContextHash) return invalid();
-    const groupKey = `${artifact.projectId}:${artifact.artifactGroupId}`; const values = groups.get(groupKey) ?? []; values.push(artifact); groups.set(groupKey, values);
-    if (["queued", "running", "staged"].includes(artifact.status)) { const activeKey = `${groupKey}:${artifact.kind}`; if (values.filter((item) => item.kind === artifact.kind && ["queued", "running", "staged"].includes(item.status)).length > 1) return invalid(); void activeKey; }
+    const groupKey = artifact.projectId + ":" + artifact.artifactGroupId; const values = groups.get(groupKey) ?? []; values.push(artifact); groups.set(groupKey, values);
+    if (["queued", "running", "staged"].includes(artifact.status) && values.filter((item) => item.kind === artifact.kind && ["queued", "running", "staged"].includes(item.status)).length > 1) return invalid();
     if (artifact.retryOfArtifactId !== null) { const prior = state.s5Artifacts.find((item) => item.artifactId === artifact.retryOfArtifactId); if (!prior || prior.artifactGroupId !== artifact.artifactGroupId || prior.kind !== artifact.kind || prior.attempt !== 1 || artifact.attempt !== 2 || prior.status === "queued" || prior.status === "running" || prior.status === "staged") return invalid(); }
   }
   for (const values of groups.values()) {

@@ -2,7 +2,7 @@ import type { S5LayoutPlan } from "./types";
 import { canonicalPlanJson, S5_Q16_DENOMINATOR, verifyPlanHash } from "./s5-layout";
 import { sha256 } from "./utils";
 
-export const S5_SVG_RENDERER_VERSION = "s5-svg-v1" as const;
+export const S5_SVG_RENDERER_VERSION = "s5-layout-svg-v1" as const;
 
 const PALETTE = {
   paper: "#fffdf8",
