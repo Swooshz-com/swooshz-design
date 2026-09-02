@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { buildS6Cameras, hashS6Camera } from "../src/lib/s6-camera";
 import { compileS6Draft } from "../src/lib/s6-compiler";
-import { hashS6Model } from "../src/lib/s6-canonical";
+import { containsS6WorldGeometry, deriveS6WorldGeometry, hashS6Model, type S6WorldGeometry } from "../src/lib/s6-canonical";
 import { validateS6Model } from "../src/lib/s6-validation";
 import {
   deterministicClock,
@@ -223,6 +223,99 @@ test("hierarchy-aware containment uses the transformed parent shape", () => {
   child.transform = { positionMm: { xMm: 500, yMm: 0, zMm: 300 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } };
   const receipt = checked(model, source);
   assert.equal(receipt.errors.some((item) => item.code === "CONTAINMENT_INVALID" && item.objectId === child.objectId), false);
+});
+
+test("exact union containment rejects a narrow concave notch and preserves valid union coverage", () => {
+  const source = makeS6Source({ widthMm: 6000, depthMm: 5000 });
+  const makeNotchModel = (childX: number): { model: S6SpatialModelRecord; parentId: string; childId: string } => {
+    const model = clone(draft(source));
+    const physical = model.objects.filter((item) => item.role !== "booth_floor" && item.role !== "booth_wall" && item.role !== "zone");
+    assert.ok(physical[0] && physical[1]);
+    const parent = physical[0]!;
+    const child = physical[1]!;
+    parent.primitive = {
+      kind: "profile_extrusion",
+      profile: {
+        winding: "ccw-from-positive-y-v1",
+        vertices: [
+          { xMm: 0, zMm: 0 },
+          { xMm: 1950, zMm: 0 },
+          { xMm: 1950, zMm: 2000 },
+          { xMm: 2050, zMm: 2000 },
+          { xMm: 2050, zMm: 0 },
+          { xMm: 4000, zMm: 0 },
+          { xMm: 4000, zMm: 3000 },
+          { xMm: 0, zMm: 3000 },
+        ],
+      },
+      heightMm: 1000,
+      geometryState: "exact",
+      localAnchor: "floor",
+    };
+    parent.transform = { positionMm: { xMm: 500, yMm: 0, zMm: 500 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } };
+    child.primitive = { kind: "rect_prism", dimensionsMm: { widthMm: 100, depthMm: 500, heightMm: 500 }, geometryState: "exact", localAnchor: "floor" };
+    child.parentObjectId = parent.objectId;
+    child.transform = { positionMm: { xMm: childX, yMm: 100, zMm: 1900 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } };
+    refreshModelHash(model);
+    return { model, parentId: parent.objectId, childId: child.objectId };
+  };
+
+  const invalid = makeNotchModel(1950);
+  const invalidWorld = deriveS6WorldGeometry(invalid.model);
+  const invalidParent = invalidWorld.find((item) => item.objectId === invalid.parentId)!;
+  const invalidChild = invalidWorld.find((item) => item.objectId === invalid.childId)!;
+  assert.equal(containsS6WorldGeometry(invalidParent, invalidChild), false);
+  const invalidReceipt = checked(invalid.model, source);
+  assert.equal(invalidReceipt.errors.some((item) => item.code === "CONTAINMENT_INVALID" && item.objectId === invalid.childId), true);
+
+  const validNearNotch = makeNotchModel(1800);
+  const validNearWorld = deriveS6WorldGeometry(validNearNotch.model);
+  const validNearParent = validNearWorld.find((item) => item.objectId === validNearNotch.parentId)!;
+  const validNearChild = validNearWorld.find((item) => item.objectId === validNearNotch.childId)!;
+  assert.equal(containsS6WorldGeometry(validNearParent, validNearChild), true);
+  assert.equal(codes(checked(validNearNotch.model, source)).some((code) => code === "CONTAINMENT_INVALID"), false);
+
+  const rectangle = (left: number, right: number): S6WorldGeometry["parts"][number] => ({
+    kind: "polygon",
+    points: [{ xMm: left, zMm: 0 }, { xMm: right, zMm: 0 }, { xMm: right, zMm: 1000 }, { xMm: left, zMm: 1000 }],
+  });
+  const unionParts = [rectangle(0, 1020), rectangle(1030, 2000)];
+  const unionOuter: S6WorldGeometry = {
+    objectId: "union-parent",
+    points: [],
+    footprint: unionParts[0]!,
+    parts: unionParts,
+    boundsMm: { min: { xMm: 0, yMm: 0, zMm: 0 }, max: { xMm: 2000, yMm: 1000, zMm: 1000 } },
+    verticalInterval: { base: 0, top: 1000 },
+  };
+  const spanningChildPart = rectangle(0, 2000);
+  const spanningChild: S6WorldGeometry = {
+    objectId: "union-child",
+    points: [],
+    footprint: spanningChildPart,
+    parts: [spanningChildPart],
+    boundsMm: { min: { xMm: 0, yMm: 0, zMm: 0 }, max: { xMm: 2000, yMm: 500, zMm: 1000 } },
+    verticalInterval: { base: 0, top: 500 },
+  };
+  assert.equal(containsS6WorldGeometry(unionOuter, spanningChild), false);
+
+  const seamOuterParts = [rectangle(0, 1000), rectangle(1000, 2000)];
+  const seamOuter = { ...unionOuter, objectId: "seam-parent", footprint: seamOuterParts[0]!, parts: seamOuterParts };
+  const seamChildPart = rectangle(900, 1100);
+  const seamChild = { ...spanningChild, objectId: "seam-child", footprint: seamChildPart, parts: [seamChildPart] };
+  assert.equal(containsS6WorldGeometry(seamOuter, seamChild), true);
+
+  const rectangleOuterPart = rectangle(0, 2000);
+  const rectangleOuter: S6WorldGeometry = { ...unionOuter, objectId: "rectangle-parent", footprint: rectangleOuterPart, parts: [rectangleOuterPart] };
+  const circleInsidePart: S6WorldGeometry["parts"][number] = { kind: "circle", center: { xMm: 1000, zMm: 500 }, radiusMm: 200 };
+  const circleInside: S6WorldGeometry = { ...spanningChild, objectId: "circle-child", footprint: circleInsidePart, parts: [circleInsidePart] };
+  assert.equal(containsS6WorldGeometry(rectangleOuter, circleInside), true);
+
+  const circleOuterPart: S6WorldGeometry["parts"][number] = { kind: "circle", center: { xMm: 1000, zMm: 500 }, radiusMm: 1000 };
+  const circleOuter: S6WorldGeometry = { ...unionOuter, objectId: "round-parent", footprint: circleOuterPart, parts: [circleOuterPart] };
+  const polygonInsidePart = rectangle(900, 1100);
+  const polygonInside: S6WorldGeometry = { ...spanningChild, objectId: "polygon-child", footprint: polygonInsidePart, parts: [polygonInsidePart] };
+  assert.equal(containsS6WorldGeometry(circleOuter, polygonInside), true);
 });
 
 test("shape-aware collision rejects separated 45-degree strips despite overlapping AABBs", () => {

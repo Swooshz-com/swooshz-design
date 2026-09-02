@@ -692,23 +692,278 @@ function pointInParts(point: S6WorldPoint2D, parts: readonly S6WorldShapePart[])
     : pointInPolygon(point, part.points, false));
 }
 
-function partSamples(part: S6WorldShapePart): S6WorldPoint2D[] {
-  if (part.kind === "circle") {
-    return Array.from({ length: 32 }, (_value, index) => {
-      const angle = index * Math.PI * 2 / 32;
-      return { xMm: part.center.xMm + Math.cos(angle) * part.radiusMm, zMm: part.center.zMm + Math.sin(angle) * part.radiusMm };
-    });
+type S6WorldBoundary =
+  | { kind: "segment"; start: S6WorldPoint2D; end: S6WorldPoint2D }
+  | { kind: "circle"; center: S6WorldPoint2D; radiusMm: number };
+
+function numericCross(left: S6WorldPoint2D, middle: S6WorldPoint2D, right: S6WorldPoint2D): number {
+  return (middle.xMm - left.xMm) * (right.zMm - left.zMm) - (middle.zMm - left.zMm) * (right.xMm - left.xMm);
+}
+
+function boundaryDistance(point: S6WorldPoint2D, boundary: S6WorldBoundary): number {
+  if (boundary.kind === "segment") return Math.sqrt(distanceSquaredToSegment(point, boundary.start, boundary.end));
+  return Math.abs(Math.hypot(point.xMm - boundary.center.xMm, point.zMm - boundary.center.zMm) - boundary.radiusMm);
+}
+
+function boundariesEquivalent(left: S6WorldBoundary, right: S6WorldBoundary): boolean {
+  if (left.kind === "circle" && right.kind === "circle") {
+    return Math.abs(left.center.xMm - right.center.xMm) <= WORLD_GEOMETRY_EPSILON &&
+      Math.abs(left.center.zMm - right.center.zMm) <= WORLD_GEOMETRY_EPSILON &&
+      Math.abs(left.radiusMm - right.radiusMm) <= WORLD_GEOMETRY_EPSILON;
   }
-  const samples: S6WorldPoint2D[] = [];
-  for (let index = 0; index < part.points.length; index += 1) {
-    const left = part.points[index]!;
-    const right = part.points[(index + 1) % part.points.length]!;
-    for (let step = 0; step < 8; step += 1) {
-      const ratio = step / 8;
-      samples.push({ xMm: left.xMm + (right.xMm - left.xMm) * ratio, zMm: left.zMm + (right.zMm - left.zMm) * ratio });
+  if (left.kind !== "segment" || right.kind !== "segment") return false;
+  if (Math.abs(numericCross(left.start, left.end, right.start)) > WORLD_GEOMETRY_EPSILON ||
+      Math.abs(numericCross(left.start, left.end, right.end)) > WORLD_GEOMETRY_EPSILON) return false;
+  const overlapX = Math.min(left.end.xMm, left.start.xMm, right.end.xMm, right.start.xMm) <= Math.max(left.end.xMm, left.start.xMm, right.end.xMm, right.start.xMm) + WORLD_GEOMETRY_EPSILON &&
+    Math.max(Math.min(left.end.xMm, left.start.xMm), Math.min(right.end.xMm, right.start.xMm)) <= Math.min(Math.max(left.end.xMm, left.start.xMm), Math.max(right.end.xMm, right.start.xMm)) + WORLD_GEOMETRY_EPSILON;
+  const overlapZ = Math.max(Math.min(left.end.zMm, left.start.zMm), Math.min(right.end.zMm, right.start.zMm)) <= Math.min(Math.max(left.end.zMm, left.start.zMm), Math.max(right.end.zMm, right.start.zMm)) + WORLD_GEOMETRY_EPSILON;
+  return overlapX && overlapZ;
+}
+
+function segmentParameter(point: S6WorldPoint2D, start: S6WorldPoint2D, end: S6WorldPoint2D): number {
+  const dx = end.xMm - start.xMm;
+  const dz = end.zMm - start.zMm;
+  if (Math.abs(dx) >= Math.abs(dz) && Math.abs(dx) > WORLD_GEOMETRY_EPSILON) return (point.xMm - start.xMm) / dx;
+  if (Math.abs(dz) > WORLD_GEOMETRY_EPSILON) return (point.zMm - start.zMm) / dz;
+  return 0;
+}
+
+function addParameter(parameters: number[], value: number): void {
+  if (Number.isFinite(value) && value >= -WORLD_GEOMETRY_EPSILON && value <= 1 + WORLD_GEOMETRY_EPSILON) {
+    parameters.push(Math.max(0, Math.min(1, value)));
+  }
+}
+
+function addSegmentSegmentParameters(left: S6WorldBoundary & { kind: "segment" }, right: S6WorldBoundary & { kind: "segment" }, parameters: number[]): void {
+  const rX = left.end.xMm - left.start.xMm;
+  const rZ = left.end.zMm - left.start.zMm;
+  const sX = right.end.xMm - right.start.xMm;
+  const sZ = right.end.zMm - right.start.zMm;
+  const denominator = rX * sZ - rZ * sX;
+  const qX = right.start.xMm - left.start.xMm;
+  const qZ = right.start.zMm - left.start.zMm;
+  if (Math.abs(denominator) <= WORLD_GEOMETRY_EPSILON) {
+    if (Math.abs(qX * rZ - qZ * rX) <= WORLD_GEOMETRY_EPSILON) {
+      addParameter(parameters, segmentParameter(right.start, left.start, left.end));
+      addParameter(parameters, segmentParameter(right.end, left.start, left.end));
+    }
+    return;
+  }
+  const t = (qX * sZ - qZ * sX) / denominator;
+  const u = (qX * rZ - qZ * rX) / denominator;
+  if (u >= -WORLD_GEOMETRY_EPSILON && u <= 1 + WORLD_GEOMETRY_EPSILON) addParameter(parameters, t);
+}
+
+function addSegmentCircleParameters(segment: S6WorldBoundary & { kind: "segment" }, circle: S6WorldBoundary & { kind: "circle" }, parameters: number[]): void {
+  const dx = segment.end.xMm - segment.start.xMm;
+  const dz = segment.end.zMm - segment.start.zMm;
+  const fx = segment.start.xMm - circle.center.xMm;
+  const fz = segment.start.zMm - circle.center.zMm;
+  const coefficientA = dx * dx + dz * dz;
+  if (coefficientA <= WORLD_GEOMETRY_EPSILON) return;
+  const coefficientB = 2 * (fx * dx + fz * dz);
+  const coefficientC = fx * fx + fz * fz - circle.radiusMm * circle.radiusMm;
+  const discriminant = coefficientB * coefficientB - 4 * coefficientA * coefficientC;
+  if (discriminant < -WORLD_GEOMETRY_EPSILON) return;
+  const root = Math.sqrt(Math.max(0, discriminant));
+  addParameter(parameters, (-coefficientB - root) / (2 * coefficientA));
+  addParameter(parameters, (-coefficientB + root) / (2 * coefficientA));
+}
+
+function addBoundaryParameters(segment: S6WorldBoundary & { kind: "segment" }, other: S6WorldBoundary, parameters: number[]): void {
+  if (other.kind === "segment") addSegmentSegmentParameters(segment, other, parameters);
+  else addSegmentCircleParameters(segment, other, parameters);
+}
+
+function uniqueParameters(parameters: readonly number[]): number[] {
+  const sorted = parameters.slice().sort((left, right) => left - right);
+  const result: number[] = [];
+  for (const value of sorted) {
+    if (result.length === 0 || Math.abs(value - result[result.length - 1]!) > WORLD_GEOMETRY_EPSILON) result.push(value);
+  }
+  return result;
+}
+
+function normalizeAngle(value: number): number {
+  const fullTurn = Math.PI * 2;
+  const result = value % fullTurn;
+  return result < 0 ? result + fullTurn : result;
+}
+
+function addCircleBoundaryAngles(circle: S6WorldBoundary & { kind: "circle" }, other: S6WorldBoundary, angles: number[]): void {
+  if (other.kind === "segment") {
+    const parameters: number[] = [];
+    addSegmentCircleParameters(other, circle, parameters);
+    for (const parameter of parameters) {
+      const point = {
+        xMm: other.start.xMm + (other.end.xMm - other.start.xMm) * parameter,
+        zMm: other.start.zMm + (other.end.zMm - other.start.zMm) * parameter,
+      };
+      angles.push(normalizeAngle(Math.atan2(point.zMm - circle.center.zMm, point.xMm - circle.center.xMm)));
+    }
+    return;
+  }
+  const dx = other.center.xMm - circle.center.xMm;
+  const dz = other.center.zMm - circle.center.zMm;
+  const distance = Math.hypot(dx, dz);
+  if (distance <= WORLD_GEOMETRY_EPSILON || distance > circle.radiusMm + other.radiusMm + WORLD_GEOMETRY_EPSILON || distance < Math.abs(circle.radiusMm - other.radiusMm) - WORLD_GEOMETRY_EPSILON) return;
+  const base = Math.atan2(dz, dx);
+  const cosine = Math.max(-1, Math.min(1, (circle.radiusMm ** 2 + distance ** 2 - other.radiusMm ** 2) / (2 * circle.radiusMm * distance)));
+  const offset = Math.acos(cosine);
+  angles.push(normalizeAngle(base - offset), normalizeAngle(base + offset));
+}
+
+function boundariesForPart(part: S6WorldShapePart): S6WorldBoundary[] {
+  if (part.kind === "circle") return [{ kind: "circle", center: part.center, radiusMm: part.radiusMm }];
+  return part.points.map((start, index) => ({ kind: "segment" as const, start, end: part.points[(index + 1) % part.points.length]! }));
+}
+
+function pointInBoundaryShape(point: S6WorldPoint2D, part: S6WorldShapePart, strict: boolean): boolean {
+  if (part.kind === "polygon") return pointInPolygon(point, part.points, strict);
+  const distanceSquared = (point.xMm - part.center.xMm) ** 2 + (point.zMm - part.center.zMm) ** 2;
+  return strict ? distanceSquared < part.radiusMm ** 2 - WORLD_GEOMETRY_EPSILON : distanceSquared <= part.radiusMm ** 2 + WORLD_GEOMETRY_EPSILON;
+}
+
+function splitSegmentBoundary(boundary: S6WorldBoundary & { kind: "segment" }, allBoundaries: readonly S6WorldBoundary[]): number[] {
+  const parameters = [0, 1];
+  for (const other of allBoundaries) if (other !== boundary) addBoundaryParameters(boundary, other, parameters);
+  return uniqueParameters(parameters);
+}
+
+function splitCircleBoundary(boundary: S6WorldBoundary & { kind: "circle" }, allBoundaries: readonly S6WorldBoundary[]): number[] {
+  const angles = [0];
+  for (const other of allBoundaries) if (other !== boundary) addCircleBoundaryAngles(boundary, other, angles);
+  const sorted = angles.map(normalizeAngle).sort((left, right) => left - right);
+  const result: number[] = [];
+  for (const value of sorted) {
+    if (result.length === 0 || Math.abs(value - result[result.length - 1]!) > WORLD_GEOMETRY_EPSILON) result.push(value);
+  }
+  return result;
+}
+
+function pointOnCircle(circle: S6WorldBoundary & { kind: "circle" }, angle: number, radius = circle.radiusMm): S6WorldPoint2D {
+  return {
+    xMm: circle.center.xMm + Math.cos(angle) * radius,
+    zMm: circle.center.zMm + Math.sin(angle) * radius,
+  };
+}
+
+function polygonInteriorWitness(points: readonly S6WorldPoint2D[]): S6WorldPoint2D | null {
+  try {
+    for (const triangle of triangulate(points)) {
+      const witness = {
+        xMm: (triangle[0]!.xMm + triangle[1]!.xMm + triangle[2]!.xMm) / 3,
+        zMm: (triangle[0]!.zMm + triangle[1]!.zMm + triangle[2]!.zMm) / 3,
+      };
+      if (pointInPolygon(witness, points, true)) return witness;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function boundaryOffsetDistance(point: S6WorldPoint2D, current: S6WorldBoundary, allBoundaries: readonly S6WorldBoundary[], maximum: number): number {
+  let result = maximum;
+  for (const other of allBoundaries) {
+    if (other === current || boundariesEquivalent(current, other)) continue;
+    const distance = boundaryDistance(point, other);
+    if (distance <= WORLD_GEOMETRY_EPSILON) return 0;
+    result = Math.min(result, distance / 4);
+  }
+  return result;
+}
+
+function checkSegmentBoundarySides(
+  boundary: S6WorldBoundary & { kind: "segment" },
+  point: S6WorldPoint2D,
+  inner: S6WorldShapePart,
+  outerParts: readonly S6WorldShapePart[],
+  allBoundaries: readonly S6WorldBoundary[],
+): boolean {
+  const dx = boundary.end.xMm - boundary.start.xMm;
+  const dz = boundary.end.zMm - boundary.start.zMm;
+  const length = Math.hypot(dx, dz);
+  if (length <= WORLD_GEOMETRY_EPSILON) return true;
+  const distance = boundaryOffsetDistance(point, boundary, allBoundaries, length / 8);
+  if (distance <= WORLD_GEOMETRY_EPSILON) return true;
+  const normal = { xMm: -dz / length, zMm: dx / length };
+  for (const sign of [-1, 1]) {
+    const candidate = { xMm: point.xMm + normal.xMm * distance * sign, zMm: point.zMm + normal.zMm * distance * sign };
+    if (pointInBoundaryShape(candidate, inner, false) && !pointInParts(candidate, outerParts)) return false;
+  }
+  return true;
+}
+
+function checkCircleBoundarySides(
+  boundary: S6WorldBoundary & { kind: "circle" },
+  angle: number,
+  inner: S6WorldShapePart,
+  outerParts: readonly S6WorldShapePart[],
+  allBoundaries: readonly S6WorldBoundary[],
+): boolean {
+  const point = pointOnCircle(boundary, angle);
+  const distance = boundaryOffsetDistance(point, boundary, allBoundaries, boundary.radiusMm / 8);
+  if (distance <= WORLD_GEOMETRY_EPSILON) return true;
+  for (const sign of [-1, 1]) {
+    const candidate = pointOnCircle(boundary, angle, boundary.radiusMm + distance * sign);
+    if (pointInBoundaryShape(candidate, inner, false) && !pointInParts(candidate, outerParts)) return false;
+  }
+  return true;
+}
+
+function innerBoundaryCovered(inner: S6WorldShapePart, outerParts: readonly S6WorldShapePart[], outerBoundaries: readonly S6WorldBoundary[]): boolean {
+  for (const boundary of boundariesForPart(inner)) {
+    if (boundary.kind === "segment") {
+      const breakpoints = splitSegmentBoundary(boundary, outerBoundaries);
+      for (let index = 0; index + 1 < breakpoints.length; index += 1) {
+        const start = breakpoints[index]!;
+        const end = breakpoints[index + 1]!;
+        if (end - start <= WORLD_GEOMETRY_EPSILON) continue;
+        const ratio = (start + end) / 2;
+        const point = { xMm: boundary.start.xMm + (boundary.end.xMm - boundary.start.xMm) * ratio, zMm: boundary.start.zMm + (boundary.end.zMm - boundary.start.zMm) * ratio };
+        if (!pointInParts(point, outerParts)) return false;
+      }
+    } else {
+      const angles = splitCircleBoundary(boundary, outerBoundaries);
+      for (let index = 0; index < angles.length; index += 1) {
+        const start = angles[index]!;
+        const end = index + 1 < angles.length ? angles[index + 1]! : angles[0]! + Math.PI * 2;
+        if (end - start <= WORLD_GEOMETRY_EPSILON) continue;
+        if (!pointInParts(pointOnCircle(boundary, (start + end) / 2), outerParts)) return false;
+      }
     }
   }
-  return samples;
+  return true;
+}
+
+function outerBoundaryLeavesInnerGap(inner: S6WorldShapePart, outerParts: readonly S6WorldShapePart[]): boolean {
+  const innerBoundaries = boundariesForPart(inner);
+  const outerBoundaries = outerParts.flatMap(boundariesForPart);
+  const allBoundaries = innerBoundaries.concat(outerBoundaries);
+  for (const boundary of outerBoundaries) {
+    if (boundary.kind === "segment") {
+      const breakpoints = splitSegmentBoundary(boundary, allBoundaries);
+      for (let index = 0; index + 1 < breakpoints.length; index += 1) {
+        const start = breakpoints[index]!;
+        const end = breakpoints[index + 1]!;
+        if (end - start <= WORLD_GEOMETRY_EPSILON) continue;
+        const ratio = (start + end) / 2;
+        const point = { xMm: boundary.start.xMm + (boundary.end.xMm - boundary.start.xMm) * ratio, zMm: boundary.start.zMm + (boundary.end.zMm - boundary.start.zMm) * ratio };
+        if (pointInBoundaryShape(point, inner, true) && !checkSegmentBoundarySides(boundary, point, inner, outerParts, allBoundaries)) return true;
+      }
+    } else {
+      const angles = splitCircleBoundary(boundary, allBoundaries);
+      for (let index = 0; index < angles.length; index += 1) {
+        const start = angles[index]!;
+        const end = index + 1 < angles.length ? angles[index + 1]! : angles[0]! + Math.PI * 2;
+        if (end - start <= WORLD_GEOMETRY_EPSILON) continue;
+        const angle = (start + end) / 2;
+        if (pointInBoundaryShape(pointOnCircle(boundary, angle), inner, true) && !checkCircleBoundarySides(boundary, angle, inner, outerParts, allBoundaries)) return true;
+      }
+    }
+  }
+  return false;
 }
 
 function convexHull(points: readonly S6WorldPoint2D[]): S6WorldPoint2D[] {
@@ -886,8 +1141,10 @@ export function deriveS6WorldGeometry(model: S6SpatialModelRecord): S6WorldGeome
 }
 
 function shapeContainedByParts(inner: S6WorldShapePart, outerParts: readonly S6WorldShapePart[]): boolean {
-  if (outerParts.some((outer) => partContains(outer, inner))) return true;
-  return partSamples(inner).every((point) => pointInParts(point, outerParts));
+  if (outerParts.length === 0 || !innerBoundaryCovered(inner, outerParts, outerParts.flatMap(boundariesForPart))) return false;
+  const witness = inner.kind === "circle" ? inner.center : polygonInteriorWitness(inner.points);
+  if (witness === null || !pointInParts(witness, outerParts)) return false;
+  return !outerBoundaryLeavesInnerGap(inner, outerParts);
 }
 
 export function containsS6WorldGeometry(outer: S6WorldGeometry, inner: S6WorldGeometry): boolean {
