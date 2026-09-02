@@ -79,10 +79,15 @@ test("confirm_design_inference records user acceptance without relabelling prove
   const parent = model();
   const object = physical(parent);
   const originalKind = object.provenance.kind;
+  const originalSourceRef = object.provenance.sourceRef;
+  const originalSourceFingerprint = object.provenance.sourceFingerprint;
   const child = apply(parent, [{ kind: "confirm_design_inference", objectIds: [object.objectId], note: "Use the reviewed bounded form." }]);
   const corrected = child.model.objects.find((item) => item.objectId === object.objectId);
   assert.equal(corrected?.provenance.kind, originalKind);
-  assert.equal(corrected?.provenance.acceptedByUser, false);
+  assert.equal(corrected?.provenance.sourceRef, originalSourceRef);
+  assert.equal(corrected?.provenance.sourceFingerprint, originalSourceFingerprint);
+  assert.equal(corrected?.provenance.acceptedByUser, true);
+  assert.match(corrected?.provenance.note ?? "", /Use the reviewed bounded form\./u);
   assert.equal(child.model.designFormReview.reviewedObjectIds.includes(object.objectId), true);
 });
 

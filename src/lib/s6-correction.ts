@@ -281,6 +281,11 @@ function applyOperation(model: S6SpatialModelRecord, operation: S6CorrectionOper
       if (!object || object.provenance.kind !== "bounded_design_inference") throw correctionError("S6_DESIGN_FORM_CONFIRMATION_INVALID");
       const linked = model.unknowns.find((item) => item.kind === "design_form" && item.status === "unresolved" && object.unknownIds.includes(item.unknownId));
       if (!linked) throw correctionError("S6_DESIGN_FORM_CONFIRMATION_INVALID");
+      object.provenance = {
+        ...object.provenance,
+        acceptedByUser: true,
+        note: (object.provenance.note ? object.provenance.note + " " : "") + "User confirmed bounded design inference: " + note,
+      };
       linked.status = "resolved";
       linked.resolutionKind = "represented";
       linked.resolutionNote = note;
