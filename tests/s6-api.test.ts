@@ -226,6 +226,18 @@ test("S6 handoff requires the current accepted revision", async () => {
   assert.deepEqual(fixture.calls.map((call) => call[0]), ["getS7Handoff"]);
 });
 
+test("S6 telemetry and S7 handoff routes return their exact public DTO roots", async () => {
+  const fixture = stubService();
+  const auth = dependencies(fixture.service);
+  const telemetry = await handleApiRequest(request("GET"), path("telemetry"), auth);
+  const handoff = await handleApiRequest(request("GET"), path("handoff"), auth);
+  assert.equal(telemetry.status, 200);
+  assert.equal(handoff.status, 200);
+  assert.deepEqual(await json(telemetry), { schemaVersion: "s6-telemetry-v1", projectId: PROJECT_ID });
+  assert.deepEqual(await json(handoff), { schemaVersion: "s6-to-s7-handoff-v1", projectId: PROJECT_ID });
+  assert.deepEqual(fixture.calls.map((call) => call[0]), ["getTelemetry", "getS7Handoff"]);
+});
+
 test("S6 client retains keys through uncertain mutation", async () => {
   const keys: string[] = [];
   let calls = 0;

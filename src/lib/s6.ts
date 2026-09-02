@@ -11,7 +11,6 @@ import {
   type S6IdempotencyOperation,
   type S6IdempotencyState,
   type S6JobState,
-  type S6Metric,
   type S6MutationResult,
   type S6PublicRevision,
   type S6PublicSpatialModel,
@@ -36,7 +35,6 @@ import { JsonRepository, PrivateObjectStore } from "./store";
 import { assertUuid, cloneJson, newUuid, nowUtc, sha256 } from "./utils";
 import {
   canonicalS6Json,
-  deriveS6Footprint,
   hashS6Model,
   S6_MAX_REVISIONS_PER_PROJECT,
   S6_RENDERER_VERSION,
@@ -56,6 +54,8 @@ import {
   s6ViewFileName,
   s6ViewStorageKeys,
 } from "./s6-publication";
+import { buildS6Telemetry } from "./s6-telemetry";
+import { buildS6ToS7Handoff } from "./s6-handoff";
 
 export type S6PublicationPhaseHook = (phase: string, artifact: S6ViewArtifact) => void;
 
@@ -201,14 +201,6 @@ function modelPublic(model: S6SpatialModelRecord): S6PublicSpatialModel {
 
 function operationHash(operation: S6IdempotencyOperation, projectId: UUID, sourceFingerprint: Sha256, input: unknown): Sha256 {
   return sha256(canonicalS6Json({ operation, projectId, sourceFingerprint, input }));
-}
-
-function metric<T>(value: T, reason: string | null = null): S6Metric<T> {
-  return { availability: "available", value, reason };
-}
-
-function unavailable<T>(reason: string): S6Metric<T> {
-  return { availability: "unavailable", value: null, reason };
 }
 
 function jobBase(
@@ -1092,50 +1084,7 @@ export class S6WorkflowService {
   getTelemetry(projectId: UUID): S6Telemetry {
     const state = this.repository.state();
     projectIn(state, projectId);
-    const source = this.sourceState(projectId);
-    const fingerprint = source.sourceS5Fingerprint;
-    const models = state.s6SpatialModels.filter((item) => item.projectId === projectId);
-    const jobs = state.s6Jobs.filter((item) => item.projectId === projectId);
-    const corrections = state.s6CorrectionEvents.filter((item) => item.projectId === projectId);
-    const acceptances = state.s6AcceptanceEvents.filter((item) => item.projectId === projectId);
-    const sourceModels = fingerprint === null ? [] : models.filter((item) => item.sourceS5Fingerprint === fingerprint);
-    const accepted = fingerprint === null ? null : currentAccepted(state, projectId, fingerprint);
-    const acceptedViewCount = fingerprint === null ? 0 : state.s6ViewArtifacts.filter((item) =>
-      item.projectId === projectId &&
-      item.sourceS5Fingerprint === fingerprint &&
-      item.purpose === "accepted_view" &&
-      item.status === "committed",
-    ).length;
-    const renderJobs = jobs.filter((item) => item.kind === "render");
-    const renderFailures = renderJobs.filter((item) => item.status === "failed_terminal" || item.status === "failed_retryable").length;
-    const publicationFailures = jobs.filter((item) => item.kind === "publication" && (item.status === "failed_terminal" || item.status === "failed_retryable")).length;
-    const preservationFailures = state.s6ViewPreservationReceipts.filter((item) => item.projectId === projectId && item.outcome === "fail").length;
-    return {
-      schemaVersion: "s6-telemetry-v1",
-      projectId,
-      sourceReadiness: metric(source.readiness),
-      generationCount: metric(jobs.filter((item) => item.kind === "generation" && item.status === "committed").length),
-      correctionCount: metric(corrections.filter((item) => item.operations.length > 0).length),
-      correctionFailureCount: metric(0),
-      reopenCount: metric(corrections.filter((item) => item.operations.length === 0).length),
-      acceptanceCount: metric(acceptances.length),
-      revisionConflictCount: metric(0),
-      staleFenceCount: metric(0),
-      renderRequestCount: metric(renderJobs.length),
-      renderSuccessCount: metric(renderJobs.filter((item) => item.status === "committed").length),
-      renderFailureCount: metric(renderFailures),
-      viewPreservationFailureCount: metric(preservationFailures),
-      publicationFailureCount: metric(publicationFailures),
-      acceptedViewCount: metric(acceptedViewCount),
-      fullModelByteSize: accepted?.modelArtifact.byteSize !== null && accepted?.modelArtifact.byteSize !== undefined
-        ? metric(accepted.modelArtifact.byteSize)
-        : sourceModels.length > 0 && sourceModels.at(-1)?.modelArtifact.byteSize !== null
-          ? metric(sourceModels.at(-1)!.modelArtifact.byteSize!)
-          : unavailable("no_current_model"),
-      providerCost: unavailable("no_provider_used"),
-      toolCost: unavailable("no_billed_tool_amount"),
-      generatedAt: this.clock(),
-    };
+    return buildS6Telemetry(state, projectId, this.sourceState(projectId));
   }
 
   getS7Handoff(projectId: UUID): S6ToS7Handoff {
@@ -1147,57 +1096,8 @@ export class S6WorkflowService {
     const receipt = model.validationReceiptId === null
       ? null
       : state.s6ValidationReceipts.find((item) => item.receiptId === model.validationReceiptId) ?? null;
-    if (!receipt || (receipt.outcome !== "pass" && receipt.outcome !== "pass_with_warnings") || receipt.errors.length > 0 || !reviewReady(model)) return fail(409, "S6_ACCEPTANCE_CONFLICT");
-    const cameras = buildS6Cameras(model);
-    const top = cameras.find((item) => item.viewId === "top-orthographic");
-    if (!top) return fail(500, "S6_INTERNAL_ERROR");
-    const evidence = renderS6View(model, top).sceneEvidence;
-    const objects = model.objects.map((object) => {
-      const objectEvidence = evidence.objects.find((item) => item.objectId === object.objectId);
-      if (!objectEvidence) return fail(500, "S6_INTERNAL_ERROR");
-      return {
-        objectId: object.objectId,
-        identityKey: object.identityKey,
-        parentObjectId: object.parentObjectId,
-        objectType: object.objectType,
-        role: object.role,
-        geometry: objectEvidence.geometry,
-        footprint: deriveS6Footprint(object.primitive),
-        transform: object.transform,
-        boundsMm: objectEvidence.boundsMm,
-        zoneIds: object.zoneIds.slice(),
-        requirementIds: object.requirementIds.slice(),
-        materialIds: object.materialIds.slice(),
-        provenance: object.provenance,
-        unknownIds: object.unknownIds.slice(),
-      };
-    });
-    return {
-      schemaVersion: "s6-to-s7-handoff-v1",
-      projectId,
-      acceptedRevisionId: model.modelRevisionId,
-      acceptedRevisionHash: model.modelHash,
-      sourceS5Fingerprint: source.sourceFingerprint,
-      spatialSchemaVersion: "s6-spatial-model-v1",
-      units: "millimetres",
-      coordinateConvention: model.booth.coordinateConvention,
-      booth: {
-        widthMm: model.booth.widthMm,
-        depthMm: model.booth.depthMm,
-        openSides: model.booth.openSides.slice(),
-        maxHeightMm: model.booth.maxHeightMm,
-        heightState: model.booth.heightState,
-      },
-      objects,
-      hierarchy: model.objects.map((object) => ({ objectId: object.objectId, parentObjectId: object.parentObjectId })),
-      zones: cloneJson(model.zones),
-      requirements: cloneJson(source.canonicalRequirements),
-      materials: cloneJson(model.materials),
-      assumptions: cloneJson(model.assumptions),
-      unknowns: cloneJson(model.unknowns),
-      validationReceipt: { receiptId: receipt.receiptId, validationHash: receipt.validationHash, outcome: receipt.outcome },
-      eligibility: { currentAccepted: true, sourceCurrent: true, stale: false },
-    };
+    if (!receipt) return fail(409, "S6_ACCEPTANCE_CONFLICT");
+    return buildS6ToS7Handoff(model, receipt, source);
   }
 
   private ownerIsLive(job: S6JobState): boolean {
