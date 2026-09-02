@@ -179,6 +179,16 @@ function updateReview(model: S6SpatialModelRecord): void {
   model.designFormReview.status = unresolved.length === 0 ? "complete" : model.designFormReview.status === "unsupported" ? "unsupported" : "required";
 }
 
+function boundedInferenceNote(existing: string | null, confirmation: string): string {
+  const prefix = "User confirmed bounded design inference: ";
+  const confirmationBudget = Math.max(0, S6_MAX_NOTE_CODE_POINTS - Array.from(prefix).length);
+  const boundedConfirmation = prefix + Array.from(confirmation).slice(0, confirmationBudget).join("");
+  const existingPoints = Array.from(existing ?? "");
+  const existingBudget = Math.max(0, S6_MAX_NOTE_CODE_POINTS - Array.from(boundedConfirmation).length - (existingPoints.length > 0 ? 1 : 0));
+  const boundedExisting = existingPoints.slice(0, existingBudget).join("");
+  return boundedExisting ? boundedExisting + " " + boundedConfirmation : boundedConfirmation;
+}
+
 function resolveUnknown(
   model: S6SpatialModelRecord,
   operation: Extract<S6CorrectionOperation, { kind: "resolve_unknown" }>,
@@ -284,7 +294,7 @@ function applyOperation(model: S6SpatialModelRecord, operation: S6CorrectionOper
       object.provenance = {
         ...object.provenance,
         acceptedByUser: true,
-        note: (object.provenance.note ? object.provenance.note + " " : "") + "User confirmed bounded design inference: " + note,
+        note: boundedInferenceNote(object.provenance.note, note),
       };
       linked.status = "resolved";
       linked.resolutionKind = "represented";

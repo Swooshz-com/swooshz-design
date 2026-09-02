@@ -89,6 +89,9 @@ test("confirm_design_inference records user acceptance without relabelling prove
   assert.equal(corrected?.provenance.acceptedByUser, true);
   assert.match(corrected?.provenance.note ?? "", /Use the reviewed bounded form\./u);
   assert.equal(child.model.designFormReview.reviewedObjectIds.includes(object.objectId), true);
+
+  const bounded = apply(parent, [{ kind: "confirm_design_inference", objectIds: [object.objectId], note: "x".repeat(400) }]);
+  assert.ok(Array.from(bounded.model.objects.find((item) => item.objectId === object.objectId)?.provenance.note ?? "").length <= 400);
 });
 
 test("design-form unknown resolution requires typed replacement or explicit simplification", () => {
