@@ -1,5 +1,5 @@
 import { AppError, type S5ToS6Projection, type S6SpatialModelRecord, type S6ToS7Handoff, type S6ValidationReceipt, type S6Dimensions, type S6GeometryPrimitive, type UUID } from "./types";
-import { deriveS6Footprint, deriveS6WorldGeometry, hashS6Model, normalizeS6Geometry, S6_HANDOFF_SCHEMA_VERSION, S6_SPATIAL_SCHEMA_VERSION } from "./s6-canonical";
+import { deriveS6Footprint, deriveS6WorldGeometry, hashS6Model, hashS6ValidationReceipt, normalizeS6Geometry, S6_HANDOFF_SCHEMA_VERSION, S6_OPEN_SIDE_ORDER, S6_SPATIAL_SCHEMA_VERSION } from "./s6-canonical";
 import { cloneJson } from "./utils";
 
 function reject(code: string): never {
@@ -28,17 +28,26 @@ function assertEligible(model: S6SpatialModelRecord, receipt: S6ValidationReceip
     model.sourceS5ApprovalEventId !== source.approvalEventId ||
     model.sourceS5ApprovalGeneration !== source.approvalGeneration
   ) reject("S6_SOURCE_STALE");
-  if (model.booth.widthMm !== source.geometrySnapshot.widthMm || model.booth.depthMm !== source.geometrySnapshot.depthMm) {
+  const expectedOpenSides = S6_OPEN_SIDE_ORDER.filter((side) => source.geometrySnapshot.openSides.includes(side));
+  if (
+    model.booth.widthMm !== source.geometrySnapshot.widthMm ||
+    model.booth.depthMm !== source.geometrySnapshot.depthMm ||
+    JSON.stringify(model.booth.openSides) !== JSON.stringify(expectedOpenSides) ||
+    model.booth.maxHeightMm !== source.geometrySnapshot.maxHeightMm ||
+    (model.booth.maxHeightMm === null ? model.booth.heightState !== "unknown" : model.booth.heightState !== "known")
+  ) {
     reject("S6_ACCEPTANCE_CONFLICT");
   }
   if (model.status !== "accepted_current") reject("S6_ACCEPTANCE_CONFLICT");
   if (
     receipt.projectId !== model.projectId ||
+    model.validationReceiptId !== receipt.receiptId ||
     receipt.revisionId !== model.modelRevisionId ||
     receipt.revisionHash !== model.modelHash ||
     receipt.sourceS5Fingerprint !== source.sourceFingerprint ||
     (receipt.outcome !== "pass" && receipt.outcome !== "pass_with_warnings") ||
-    receipt.errors.length > 0
+    receipt.errors.length > 0 ||
+    hashS6ValidationReceipt(receipt) !== receipt.validationHash
   ) reject("S6_ACCEPTANCE_CONFLICT");
   if (
     model.designFormReview.status !== "complete" ||

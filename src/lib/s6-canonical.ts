@@ -12,6 +12,8 @@ import type {
   S6RoundPrismGeometry,
   S6SpatialObject,
   S6SpatialModelRecord,
+  S6ValidationReceipt,
+  Sha256,
 } from "./types";
 
 export const S6_SPATIAL_SCHEMA_VERSION = "s6-spatial-model-v1" as const;
@@ -380,6 +382,10 @@ function canonicalValue(value: unknown, fieldPath: string, parentKey: string | n
 
 export function canonicalS6Json(value: unknown): string {
   return canonicalValue(value, "", null);
+}
+
+export function hashS6ValidationReceipt(receipt: S6ValidationReceipt): Sha256 {
+  return sha256(canonicalS6Json({ ...receipt, validationHash: "" }));
 }
 
 export function hashS6Model(model: S6SpatialModelRecord): { modelHash: string; canonicalByteSize: number; canonicalJson: string } {

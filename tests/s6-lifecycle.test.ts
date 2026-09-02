@@ -3,10 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { AppError, type Project, type S6ConcurrencyToken, type UUID } from "../src/lib/types";
+import { AppError, type Project, type S6ConcurrencyToken, type S6SpatialModelRecord, type UUID } from "../src/lib/types";
 import { JsonRepository, PrivateObjectStore } from "../src/lib/store";
 import { S6WorkflowService } from "../src/lib/s6";
+import { canonicalS6Json, hashS6Model } from "../src/lib/s6-canonical";
 import { type S6SourceReader } from "../src/lib/s6-source";
+import { sha256 } from "../src/lib/utils";
 import { deterministicClock, makeS6Source } from "./s6-fixture";
 
 const PROJECT_ID = "20000000-0000-4000-8000-000000000001" as UUID;
@@ -228,6 +230,55 @@ test("correction creates immutable lineage and acceptance writes a supersession 
     assert.equal(persisted.s6SpatialModels.find((item) => item.modelRevisionId === changed.revisionId)?.parentRevisionId, reopened.revisionId);
   } finally {
     harness.close();
+  }
+});
+
+test("acceptance re-establishes the complete current S5 booth fact set", async () => {
+  const mutations: Array<[string, (model: S6SpatialModelRecord) => void]> = [
+    ["open sides", (model) => {
+      model.booth.openSides = ["south", "west"];
+    }],
+    ["maximum height", (model) => {
+      model.booth.maxHeightMm = 3500;
+    }],
+    ["height state", (model) => {
+      model.booth.maxHeightMm = null;
+      model.booth.heightState = "unknown";
+    }],
+  ];
+
+  for (const [label, mutate] of mutations) {
+    const harness = makeHarness({ source: makeS6Source({ openSides: ["north", "east"], maxHeightMm: 3000, requirements: [{ name: "Welcome counter", expected: "present" }] }) });
+    try {
+      const generated = await harness.service.generate(PROJECT_ID, uuid(1200), uuid(1201), "subject-s6");
+      const corrected = await confirmDraft(harness, generated.revisionId, 1202);
+      const validation = await harness.service.validate(PROJECT_ID, corrected.revisionId, corrected.token, uuid(1203), uuid(1204));
+      assert.equal(validation.errors.length, 0, `${label}: ${JSON.stringify(validation.errors)}`);
+
+      const mutateState = (state: ReturnType<typeof harness.repository.state>): void => {
+        const model = state.s6SpatialModels.find((item) => item.modelRevisionId === corrected.revisionId);
+        assert.ok(model);
+        const receipt = state.s6ValidationReceipts.find((item) => item.receiptId === model.validationReceiptId);
+        assert.ok(receipt);
+        mutate(model);
+        const value = hashS6Model(model);
+        model.modelHash = value.modelHash;
+        model.canonicalByteSize = value.canonicalByteSize;
+        const correction = state.s6CorrectionEvents.find((item) => item.childRevisionId === model.modelRevisionId);
+        assert.ok(correction);
+        correction.childRevisionHash = model.modelHash;
+        receipt.revisionHash = model.modelHash;
+        receipt.validationHash = sha256(canonicalS6Json({ ...receipt, validationHash: "" }));
+      };
+      harness.repository.transact(mutateState);
+
+      await assert.rejects(
+        harness.service.accept(PROJECT_ID, corrected.revisionId, harness.service.getState(PROJECT_ID).concurrency!, uuid(1205), uuid(1206), "subject-s6"),
+        (error: unknown) => errorCode(error) === "S6_GEOMETRY_INVALID",
+      );
+    } finally {
+      harness.close();
+    }
   }
 });
 

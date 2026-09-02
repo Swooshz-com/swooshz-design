@@ -3,6 +3,7 @@ import {
   containsS6WorldBooth,
   containsS6WorldGeometry,
   deriveS6WorldGeometry,
+  hashS6ValidationReceipt,
   hashS6Model,
   normalizeS6Geometry,
   normalizeS6Rotation,
@@ -425,7 +426,7 @@ function makeReceipt(model: S6SpatialModelRecord, context: S6ValidationContext, 
     checkedAt: new Date(0).toISOString(),
     validationHash: "" as Sha256,
   };
-  receipt.validationHash = sha256(canonicalS6Json(receipt));
+  receipt.validationHash = hashS6ValidationReceipt(receipt);
   return receipt;
 }
 

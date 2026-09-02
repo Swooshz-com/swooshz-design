@@ -36,6 +36,7 @@ import { assertUuid, cloneJson, newUuid, nowUtc, sha256 } from "./utils";
 import {
   canonicalS6Json,
   hashS6Model,
+  hashS6ValidationReceipt,
   S6_MAX_REVISIONS_PER_PROJECT,
   S6_RENDERER_VERSION,
 } from "./s6-canonical";
@@ -698,7 +699,7 @@ export class S6WorkflowService {
       const receipt = validateS6Model(model, { source, priorModels, expectedSourceFingerprint: source.sourceFingerprint });
       receipt.receiptId = this.uuid();
       receipt.checkedAt = this.clock();
-      receipt.validationHash = sha256(canonicalS6Json({ ...receipt, validationHash: "" }));
+      receipt.validationHash = hashS6ValidationReceipt(receipt);
       const jobId = this.uuid();
       const at = this.clock();
       const job = jobBase(projectId, jobId, "validation", revisionId, null, source.sourceFingerprint, inputHash, key, referenceId, at);
@@ -721,8 +722,36 @@ export class S6WorkflowService {
     }
   }
 
-  private acceptanceGate(model: S6SpatialModelRecord, receipt: S6ValidationReceipt | null): void {
-    if (!receipt || receipt.revisionHash !== model.modelHash || (receipt.outcome !== "pass" && receipt.outcome !== "pass_with_warnings") || receipt.errors.length > 0) return fail(422, "S6_GEOMETRY_INVALID");
+  private acceptanceGate(
+    model: S6SpatialModelRecord,
+    receipt: S6ValidationReceipt | null,
+    source: S5ToS6Projection,
+    priorModels: readonly S6SpatialModelRecord[],
+  ): void {
+    if (
+      !receipt ||
+      model.validationReceiptId !== receipt.receiptId ||
+      receipt.projectId !== model.projectId ||
+      receipt.revisionId !== model.modelRevisionId ||
+      receipt.revisionHash !== model.modelHash ||
+      receipt.sourceS5Fingerprint !== source.sourceFingerprint ||
+      (receipt.outcome !== "pass" && receipt.outcome !== "pass_with_warnings") ||
+      receipt.errors.length > 0
+    ) return fail(422, "S6_GEOMETRY_INVALID");
+    try {
+      const current = validateS6Model(model, { source, priorModels, expectedSourceFingerprint: source.sourceFingerprint });
+      if (
+        current.errors.length > 0 ||
+        current.outcome !== receipt.outcome ||
+        canonicalS6Json(current.errors) !== canonicalS6Json(receipt.errors) ||
+        canonicalS6Json(current.warnings) !== canonicalS6Json(receipt.warnings) ||
+        current.validatorVersion !== receipt.validatorVersion ||
+        current.orderVersion !== receipt.orderVersion ||
+        hashS6ValidationReceipt(receipt) !== receipt.validationHash
+      ) return fail(422, "S6_GEOMETRY_INVALID");
+    } catch {
+      return fail(422, "S6_GEOMETRY_INVALID");
+    }
     if (!reviewReady(model)) {
       if (hasUnsupportedFormBlock(model)) return fail(422, "S6_UNSUPPORTED_FORM");
       return fail(422, "S6_DESIGN_FORM_UNREVIEWED");
@@ -743,7 +772,7 @@ export class S6WorkflowService {
     this.assertToken(initial, model, token, source.sourceFingerprint, true);
     if (model.status !== "generated_draft" && model.status !== "corrected_draft") return fail(409, "S6_ACCEPTANCE_CONFLICT");
     const receipt = model.validationReceiptId === null ? null : initial.s6ValidationReceipts.find((item) => item.receiptId === model.validationReceiptId) ?? null;
-    this.acceptanceGate(model, receipt);
+    this.acceptanceGate(model, receipt, source, initial.s6SpatialModels.filter((item) => item.projectId === projectId).sort((left, right) => left.revisionNumber - right.revisionNumber));
     try {
       const acceptanceEventId = this.uuid();
       const supersessionEventId = this.uuid();
@@ -754,7 +783,8 @@ export class S6WorkflowService {
         this.assertToken(state, candidate, token, source.sourceFingerprint, true);
         if (candidate.status !== "generated_draft" && candidate.status !== "corrected_draft") return fail(409, "S6_ACCEPTANCE_CONFLICT");
         const candidateReceipt = candidate.validationReceiptId === null ? null : state.s6ValidationReceipts.find((item) => item.receiptId === candidate.validationReceiptId) ?? null;
-        this.acceptanceGate(candidate, candidateReceipt);
+        const currentSource = this.currentSource(projectId, source.sourceFingerprint);
+        this.acceptanceGate(candidate, candidateReceipt, currentSource, state.s6SpatialModels.filter((item) => item.projectId === projectId).sort((left, right) => left.revisionNumber - right.revisionNumber));
         const prior = currentAccepted(state, projectId, source.sourceFingerprint);
         candidate.status = "accepted_current";
         candidate.acceptanceEventId = acceptanceEventId;
@@ -1575,7 +1605,7 @@ export class S6WorkflowService {
         receipt = validateS6Model(model, { source, priorModels, expectedSourceFingerprint: source.sourceFingerprint });
         receipt.receiptId = this.uuid();
         receipt.checkedAt = this.clock();
-        receipt.validationHash = sha256(canonicalS6Json({ ...receipt, validationHash: "" }));
+        receipt.validationHash = hashS6ValidationReceipt(receipt);
       }
       this.repository.transact((state) => {
         this.currentSource(job.projectId, job.sourceS5Fingerprint);

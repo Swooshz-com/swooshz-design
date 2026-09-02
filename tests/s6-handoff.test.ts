@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { emptyStoreState } from "../src/lib/store";
 import { compileS6Draft } from "../src/lib/s6-compiler";
-import { hashS6Model, normalizeS6Geometry } from "../src/lib/s6-canonical";
+import { hashS6Model, hashS6ValidationReceipt, normalizeS6Geometry } from "../src/lib/s6-canonical";
 import { makeS6Source, representativeSources } from "./s6-fixture";
 import { buildS6Telemetry } from "../src/lib/s6-telemetry";
 import { buildS6ToS7Handoff } from "../src/lib/s6-handoff";
@@ -18,7 +18,6 @@ const PROJECT_ID = "20000000-0000-4000-8000-000000000001" as UUID;
 const REVISION_ID = "30000000-0000-4000-8000-000000000001" as UUID;
 const RECEIPT_ID = "30000000-0000-4000-8000-000000000002" as UUID;
 const AT = "2026-09-02T00:00:00.000Z";
-const HASH = "a".repeat(64);
 
 function rehash(model: S6SpatialModelRecord): S6SpatialModelRecord {
   const value = hashS6Model(model);
@@ -74,11 +73,12 @@ function acceptedModel(source = makeS6Source({ maxHeightMm: null })): S6SpatialM
   model.designFormReview.unresolvedUnknownIds = [];
   model.designFormReview.explicitSimplificationUnknownIds = [];
   model.designFormReview.acceptedByUser = true;
+  model.validationReceiptId = RECEIPT_ID;
   return rehash(model);
 }
 
 function receipt(model: S6SpatialModelRecord, outcome: "pass" | "pass_with_warnings" = "pass"): S6ValidationReceipt {
-  return {
+  const value: S6ValidationReceipt = {
     schemaVersion: "s6-validation-receipt-v1",
     receiptId: RECEIPT_ID,
     projectId: model.projectId,
@@ -91,8 +91,10 @@ function receipt(model: S6SpatialModelRecord, outcome: "pass" | "pass_with_warni
     errors: [],
     warnings: outcome === "pass_with_warnings" ? [{ code: "BOUNDED_INFERENCE", severity: "warning", fieldPath: "objects", objectId: null, requirementId: null, detail: "Bounded fixture warning." }] : [],
     checkedAt: AT,
-    validationHash: HASH,
+    validationHash: "" as S6ValidationReceipt["validationHash"],
   };
+  value.validationHash = hashS6ValidationReceipt(value);
+  return value;
 }
 
 function readyStatus(source: ReturnType<typeof makeS6Source>): S6PublicState["source"] {
@@ -203,4 +205,20 @@ test("handoff refuses an accepted-looking model whose booth envelope contradicts
   model.booth.widthMm -= 1;
   rehash(model);
   assert.throws(() => buildS6ToS7Handoff(model, receipt(model), source), /S6_(?:ACCEPTANCE_CONFLICT|HANDOFF)/u);
+});
+
+test("handoff refuses recomputed accepted-looking models with any divergent confirmed S5 booth fact", () => {
+  const source = makeS6Source({ openSides: ["north", "east"], maxHeightMm: 3000 });
+  const mutations = [
+    (model: S6SpatialModelRecord) => { model.booth.openSides = ["south", "west"]; },
+    (model: S6SpatialModelRecord) => { model.booth.maxHeightMm = 3500; },
+    (model: S6SpatialModelRecord) => { model.booth.heightState = "unknown"; },
+  ];
+
+  for (const mutate of mutations) {
+    const model = acceptedModel(source);
+    mutate(model);
+    rehash(model);
+    assert.throws(() => buildS6ToS7Handoff(model, receipt(model), source), /S6_(?:ACCEPTANCE_CONFLICT|HANDOFF)/u);
+  }
 });
