@@ -1,4 +1,4 @@
-import { AppError, type Project, type S2InputVersion, type S5ApprovalEvent, type S5Artifact, type S5FrozenGenerationContext, type S5LayoutRequirement, type S5LayoutPlan, type S5MutationFence, type S5SourceQualityEvidence, type StoreState, type UUID } from "./types";
+import { AppError, type Project, type S2InputVersion, type S5ApprovalEvent, type S5Artifact, type S5FrozenGenerationContext, type S5LayoutRequirement, type S5LayoutPlan, type S5MutationFence, type S5SourceQualityEvidence, type S5ToS6Projection, type StoreState, type UUID } from "./types";
 import { geometryIsValid } from "./geometry";
 import { JsonRepository, PrivateObjectStore } from "./store";
 import { resolveActiveVisualRevision, type ResolvedVisualRevision } from "./revision-resolver";
@@ -9,6 +9,7 @@ import { renderConceptLayoutSvg, S5_SVG_RENDERER_VERSION } from "./s5-svg";
 import { loadApprovedNotoSansFont, pdfPageCount, renderConceptPresentationPdf, S5_PDF_RENDERER_VERSION } from "./s5-pdf";
 import { assertUuid, cloneJson, jcs, newUuid, nowUtc, privateStorageKey, sha256 } from "./utils";
 import { buildS5Telemetry, type S5Telemetry } from "./s5-telemetry";
+import { s6SourceFingerprint } from "./s6-source";
 
 export type S5PublicationPhaseHook = (phase: string, artifact: S5Artifact) => void;
 export class S5PublicationInterruption extends Error { constructor(message = "simulated S5 publication interruption") { super(message); this.name = "S5PublicationInterruption"; } }
@@ -461,6 +462,90 @@ export class S5WorkflowService {
     if (pdf) { if (pdf.sourceLayoutGroupId !== layoutGroupId) throw fail(409, "S5_APPROVAL_STALE"); assertCurrentArtifact(pdf, projectId, approval, context, plan); exactPublishedArtifact(this.objects, pdf); }
     const telemetry = buildS5Telemetry(state, projectId, (event) => validateCurrentS5Approval(state, projectId, event, this.objects));
     return { schemaVersion: "s5-to-s6-handoff-v1", projectId, readOnly: true, readiness: pdf ? "ready" : layoutGroupId ? "layout_ready" : "approved_visual_only", approvalEventId: approval.eventId, approvalGeneration: approval.approvalGeneration, eventSequence: approval.eventSequence, generationContextHash: approval.generationContextHash, rendererVersions: { layout: context.layoutRendererVersion, svg: context.svgRendererVersion, pdf: context.pdfRendererVersion }, visual: { revisionId: context.activeRevisionId, revisionKind: context.activeRevisionKind, assetId: context.activeAssetId, sha256: context.activeAssetSha256, byteSize: context.activeAssetByteSize, width: context.activeAssetWidth, height: context.activeAssetHeight, pixelCount: context.activeAssetPixelCount, quality: context.quality }, layout: { planHash: plan.planHash, rendererVersion: context.layoutRendererVersion, svgRendererVersion: context.svgRendererVersion, artifactGroupId: layoutGroupId, artifacts: layout.map((item) => ({ artifactId: item.artifactId, kind: item.kind, rendererVersion: item.rendererVersion, sha256: item.outputSha256, byteSize: item.outputByteSize, status: item.status })) }, presentation: { artifactId: pdf?.artifactId ?? null, rendererVersion: context.pdfRendererVersion, sha256: pdf?.outputSha256 ?? null, byteSize: pdf?.outputByteSize ?? null, pageCount: pdf?.pageCount ?? null, status: pdf?.status ?? "not_started" }, telemetry: handoffTelemetry(telemetry) };
+  }
+
+  getS6ReadOnlyProjection(projectId: UUID): S5ToS6Projection {
+    const state = this.repository.state();
+    const project = projectIn(state, projectId);
+    const approval = currentS5ApprovalEvent(state, projectId);
+    if (!approval || approval.kind !== "approved") throw fail(409, "S6_SOURCE_NOT_READY");
+    const context = assertFrozenContextCurrent(state, projectId, approval, this.objects);
+    const plan = planFromContext(context);
+    const layoutGroupId = committedLayoutGroup(state, projectId, approval, plan.planHash);
+    if (!layoutGroupId) throw fail(409, "S6_SOURCE_NOT_READY");
+    const layoutValues = state.s5Artifacts.filter((item) => item.projectId === projectId && item.artifactGroupId === layoutGroupId);
+    const layoutJson = latestArtifactForKind(layoutValues, "plan_json");
+    const layoutSvg = latestArtifactForKind(layoutValues, "plan_svg");
+    if (!layoutJson || !layoutSvg || layoutJson.status !== "committed" || layoutSvg.status !== "committed") throw fail(409, "S6_SOURCE_NOT_READY");
+    assertCurrentArtifact(layoutJson, projectId, approval, context, plan);
+    assertCurrentArtifact(layoutSvg, projectId, approval, context, plan);
+    const planBytes = exactPublishedArtifact(this.objects, layoutJson);
+    const svgBytes = exactPublishedArtifact(this.objects, layoutSvg);
+    if (!planBytes.equals(canonicalPlanBytes(plan)) || !svgBytes.equals(renderConceptLayoutSvg(plan))) throw fail(409, "S6_SOURCE_NOT_READY");
+    const pdf = latestArtifactForKind(state.s5Artifacts.filter((item) => item.projectId === projectId && item.kind === "presentation_pdf" && item.approvalEventId === approval.eventId && item.planHash === plan.planHash), "presentation_pdf");
+    if (!pdf || pdf.status !== "committed" || pdf.sourceLayoutGroupId !== layoutGroupId) throw fail(409, "S6_SOURCE_NOT_READY");
+    assertCurrentArtifact(pdf, projectId, approval, context, plan);
+    exactPublishedArtifact(this.objects, pdf);
+    if (pdf.outputSha256 === null || pdf.outputByteSize === null || pdf.pageCount === null) throw fail(409, "S6_SOURCE_NOT_READY");
+    const layoutJsonSha256 = layoutJson.outputSha256;
+    const layoutJsonByteSize = layoutJson.outputByteSize;
+    const layoutSvgSha256 = layoutSvg.outputSha256;
+    const layoutSvgByteSize = layoutSvg.outputByteSize;
+    if (layoutJsonSha256 === null || layoutJsonByteSize === null || layoutSvgSha256 === null || layoutSvgByteSize === null) throw fail(409, "S6_SOURCE_NOT_READY");
+    const pdfSha256 = pdf.outputSha256;
+    const pdfByteSize = pdf.outputByteSize;
+    const pdfPageCount = pdf.pageCount;
+    const brief = briefFor(state, projectId, context.confirmedBriefVersionId);
+    const visualIntent = {
+      brandName: brief.data.brandStyle.brandName,
+      visualDirection: brief.data.brandStyle.visualDirection,
+      preferredColors: cloneJson(brief.data.brandStyle.preferredColors),
+      materials: cloneJson(brief.data.brandStyle.materials),
+      logoInstructions: brief.data.brandStyle.logoInstructions,
+      source: "confirmed_brief" as const,
+      sourceHash: sha256(jcs(brief.data.brandStyle)),
+    };
+    const projection = {
+      schemaVersion: "s5-to-s6-projection-v1" as const,
+      readOnly: true as const,
+      readiness: "ready" as const,
+      projectId,
+      generationSetId: context.generationSetId,
+      selectionStateId: context.selectionStateId,
+      selectionVersion: context.selectionVersion,
+      approvalEventId: context.approvalEventId,
+      approvalGeneration: context.approvalGeneration,
+      eventSequence: context.eventSequence,
+      generationContextHash: generationContextHash(context),
+      activeRevisionId: context.activeRevisionId,
+      activeRevisionKind: context.activeRevisionKind,
+      sourceSnapshotId: context.sourceSnapshotId,
+      lineageRootRevisionId: context.lineageRootRevisionId,
+      sourceBindingHash: context.sourceBindingHash,
+      quality: context.quality,
+      activeAsset: { assetId: context.activeAssetId, storageKey: context.activeAssetStorageKey, sha256: context.activeAssetSha256, byteSize: context.activeAssetByteSize, width: context.activeAssetWidth, height: context.activeAssetHeight, pixelCount: context.activeAssetPixelCount },
+      confirmedBriefVersionId: context.confirmedBriefVersionId,
+      briefContentHash: context.briefContentHash,
+      geometrySnapshot: cloneJson(context.geometrySnapshot),
+      geometryHash: context.geometryHash,
+      canonicalRequirements: cloneJson(context.canonicalRequirements),
+      requirementHash: context.requirementHash,
+      layoutRequirements: cloneJson(context.layoutRequirements),
+      layoutRequirementsHash: context.layoutRequirementsHash,
+      designRulesVersion: context.designRulesVersion,
+      designRuleSnapshot: cloneJson(context.designRuleSnapshot),
+      designRuleSnapshotHash: context.designRuleSnapshotHash,
+      presentationFacts: cloneJson(context.presentationFacts),
+      visualIntent,
+      layoutPlan: cloneJson(plan),
+      layoutArtifacts: {
+        planJson: { artifactId: layoutJson.artifactId, sha256: layoutJsonSha256, byteSize: layoutJsonByteSize, rendererVersion: layoutJson.rendererVersion, status: "committed" as const },
+        planSvg: { artifactId: layoutSvg.artifactId, sha256: layoutSvgSha256, byteSize: layoutSvgByteSize, rendererVersion: layoutSvg.rendererVersion, status: "committed" as const },
+      },
+      presentationArtifact: { artifactId: pdf.artifactId, sha256: pdfSha256, byteSize: pdfByteSize, pageCount: pdfPageCount, rendererVersion: pdf.rendererVersion, status: "committed" as const },
+      sourceFingerprint: "" as string,
+    } satisfies Omit<S5ToS6Projection, "sourceFingerprint"> & { sourceFingerprint: string };
+    return { ...projection, sourceFingerprint: s6SourceFingerprint(projection as S5ToS6Projection) };
   }
 
   getTelemetry(projectId: UUID): S5Telemetry {

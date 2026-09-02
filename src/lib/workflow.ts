@@ -42,6 +42,8 @@ import type { S3ProviderContract } from "./s3-provider";
 import { S4WorkflowService, type S4WorkflowServiceOptions } from "./s4";
 import type { S4ProviderContract } from "./s4-provider";
 import { S5WorkflowService, type S5WorkflowServiceOptions } from "./s5";
+import { S6WorkflowService, type S6WorkflowServiceOptions } from "./s6";
+import { createS6SourceReader, type S6SourceReader } from "./s6-source";
 import { assertS5MutationAllowed } from "./s5-lock";
 
 
@@ -64,6 +66,8 @@ export type WorkflowServiceOptions = {
   onS4ProviderDispatchPhase?: S4WorkflowServiceOptions["onProviderDispatchPhase"];
   onS4PublicationPhase?: S4WorkflowServiceOptions["onPublicationPhase"];
   onS5PublicationPhase?: S5WorkflowServiceOptions["onPublicationPhase"];
+  s6SourceReader?: S6SourceReader;
+  onS6PublicationPhase?: S6WorkflowServiceOptions["onPublicationPhase"];
 };
 
 export type PublicGeneration = {
@@ -171,6 +175,7 @@ export class WorkflowService {
   readonly s3: S3WorkflowService;
   readonly s4: S4WorkflowService;
   readonly s5: S5WorkflowService;
+  readonly s6: S6WorkflowService;
   private readonly clock: () => string;
   private readonly uuid: () => UUID;
   private readonly workerId: string;
@@ -243,6 +248,21 @@ export class WorkflowService {
       processId: this.processId,
       isProcessAlive: this.isProcessAlive,
       onPublicationPhase: options.onS5PublicationPhase,
+    });
+    this.s6 = new S6WorkflowService({
+      repository: this.repository,
+      objects: this.objects,
+      sourceReader: options.s6SourceReader ?? createS6SourceReader(
+        this.repository,
+        this.objects,
+        (projectId) => this.s5.getS6ReadOnlyProjection(projectId),
+      ),
+      clock: this.clock,
+      uuid: this.uuid,
+      workerId: this.workerId,
+      processId: this.processId,
+      isProcessAlive: this.isProcessAlive,
+      onPublicationPhase: options.onS6PublicationPhase,
     });
   }
 

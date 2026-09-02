@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { AppError, type S5MutationFence, type UUID } from "./types";
+import { AppError, type S5MutationFence, type S6ConcurrencyToken, type S6CorrectionOperation, type S6ViewId, type UUID } from "./types";
 import { assertUuid, uuidV4Pattern } from "./utils";
 import { MAX_BRIEF_BYTES } from "./media";
 import { S2_MAX_MULTIPART_BODY_BYTES, S2_MAX_SOURCE_BYTES } from "./s2-media";
@@ -7,6 +7,7 @@ import { createWorkflowService, type WorkflowService } from "./workflow";
 
 const MAX_MULTIPART_BODY_BYTES = MAX_BRIEF_BYTES + 1024 * 1024;
 const MAX_S4_BODY_BYTES = 131072;
+const MAX_S6_BODY_BYTES = 64000;
 const PUBLIC_S3_ERROR_CODES = new Set<string>([
   "INVALID_REQUEST",
   "IDEMPOTENCY_KEY_REQUIRED",
@@ -77,9 +78,24 @@ const PUBLIC_S5_ERROR_CODES = new Set<string>([
   "S5_TELEMETRY_SOURCE_CORRUPT", "S5_PERSISTENCE_FAILED", "S5_ARTIFACT_NOT_FOUND", "S5_IDEMPOTENCY_KEY_REUSE", "S5_INTERNAL_ERROR",
 ]);
 
+const PUBLIC_S6_ERROR_CODES = new Set<string>([
+  "S6_SOURCE_NOT_READY", "S6_SOURCE_STALE", "S6_SPATIAL_SCHEMA_INVALID", "S6_GEOMETRY_INVALID", "S6_PROFILE_INVALID",
+  "S6_DESIGN_FORM_UNREVIEWED", "S6_UNSUPPORTED_FORM", "S6_GEOMETRY_UNRESOLVED", "S6_REVISION_CONFLICT", "S6_ACCEPTANCE_CONFLICT",
+  "S6_VIEW_RENDER_FAILURE", "S6_VIEW_PRESERVATION_FAILED", "S6_PUBLICATION_FAILED", "S6_STALE_ARTIFACT", "S6_UNAUTHORIZED_OR_NOT_FOUND",
+  "S6_DEPENDENCY_UNAVAILABLE", "S6_IDEMPOTENCY_KEY_REUSE", "S6_PERSISTENCE_FAILED", "S6_CLAIM_FENCED", "S6_PUBLICATION_BUSY",
+  "S6_RETRY_EXHAUSTED", "S6_INVALID_REQUEST", "S6_INTERNAL_ERROR", "S6_PROFILE_SELF_INTERSECTION", "S6_PROFILE_TOO_COMPLEX",
+  "S6_CORRECTION_INVALID", "S6_CORRECTION_GEOMETRY_NOT_ALLOWED", "S6_HARD_FACT_IMMUTABLE", "S6_OBJECT_NOT_FOUND",
+  "S6_UNKNOWN_NOT_FOUND", "METHOD_NOT_ALLOWED", "IDEMPOTENCY_KEY_REQUIRED",
+]);
 const S4_PUBLIC_FIELDS = new Set(["body", "projectId", "baseRevisionId", "expectedSelectionVersion", "primitives", "instructionText", "editId", "targetId", "Idempotency-Key", "x-request-id", "request"]);
 const S4_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
 const S5_PUBLIC_FIELDS = new Set(["body", "projectId", "layoutGroupId", "artifactId", "expectedGenerationSetId", "expectedSelectionStateId", "expectedSelectionVersion", "expectedActiveRevisionId", "expectedApprovalEventId", "expectedApprovalGeneration", "expectedApprovalEventSequence", "reopenReason", "Idempotency-Key", "x-request-id", "request"]);
+const S6_PUBLIC_FIELDS = new Set([
+  "body", "projectId", "revisionId", "viewId", "operations", "expectedRevisionId", "expectedRevisionHash",
+  "expectedParentRevisionId", "expectedParentHash", "expectedCurrentAcceptedRevisionId", "expectedCurrentAcceptedHash",
+  "expectedSourceFingerprint", "Idempotency-Key", "x-request-id", "request",
+]);
+const S6_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INTEGER_REQUIRED", "INVALID_REQUEST"]);
 
 function safeS4Field(field: string): string {
   if (S4_PUBLIC_FIELDS.has(field) || /^primitives(?:\[\d+\])?(?:\.(?:kind|xQ16|yQ16|widthQ16|heightQ16|radiusQ8|points)(?:\[\d+\])?(?:\.(?:xQ16|yQ16))?)?$/.test(field)) return field;
@@ -92,29 +108,41 @@ function safeS4FieldErrors(fieldErrors: readonly { field: string; code: string }
 
 function safeS5Field(field: string): string { return S5_PUBLIC_FIELDS.has(field) ? field : "body"; }
 function safeS5FieldErrors(fieldErrors: readonly { field: string; code: string }[]): { field: string; code: string }[] { return fieldErrors.map((item) => ({ field: safeS5Field(item.field), code: item.code === "REQUIRED" || item.code === "UNKNOWN_FIELD" || item.code === "UUID_REQUIRED" || item.code === "IDEMPOTENCY_KEY_REQUIRED" || item.code === "INVALID_VALUE" ? item.code : "INVALID_REQUEST" })); }
+function safeS6Field(field: string): string {
+  if (S6_PUBLIC_FIELDS.has(field) || /^operations(?:\[\d+\])?(?:\.(?:objectId|objectIds|deltaMm|rotationMd|dimensionsMm|geometry|material|zoneIds|requirementIds|note|unknownId|resolutionKind|resolutionNote|replacement|objectType|role|label|positionMm|parentObjectId))?(?:\[\d+\])?(?:\.(?:xMm|yMm|zMm|xMd|yMd|widthMm|depthMm|heightMm|kind|profile|radiusMm|localAnchor|vertices|winding))?$/u.test(field)) return field;
+  return "body";
+}
+function safeS6FieldErrors(fieldErrors: readonly { field: string; code: string }[]): { field: string; code: string }[] {
+  return fieldErrors.map((item) => ({ field: safeS6Field(item.field), code: S6_PUBLIC_FIELD_CODES.has(item.code) ? item.code : "INVALID_REQUEST" }));
+}
 
 function requestReferenceId(request: Request): UUID {
   const supplied = request.headers.get("x-request-id");
   return supplied && uuidV4Pattern.test(supplied) ? supplied : crypto.randomUUID();
 }
 
-function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false, s5 = false): NextResponse {
+function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false, s5 = false, s6 = false): NextResponse {
   const candidate = error instanceof AppError
     ? error
-    : new AppError(500, s5 ? "S5_INTERNAL_ERROR" : s4 ? "S4_INTERNAL_ERROR" : s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
-  const appError = s5 && !PUBLIC_S5_ERROR_CODES.has(candidate.code)
-    ? new AppError(500, "S5_INTERNAL_ERROR")
-    : s4 && !PUBLIC_S4_ERROR_CODES.has(candidate.code)
+    : new AppError(500, s6 ? "S6_INTERNAL_ERROR" : s5 ? "S5_INTERNAL_ERROR" : s4 ? "S4_INTERNAL_ERROR" : s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
+  const surfaceCandidate = s6 && candidate.code === "INVALID_REQUEST"
+    ? new AppError(candidate.status, "S6_INVALID_REQUEST", candidate.fieldErrors, candidate.logContext)
+    : candidate;
+  const appError = s6 && !PUBLIC_S6_ERROR_CODES.has(surfaceCandidate.code)
+    ? new AppError(500, "S6_INTERNAL_ERROR", safeS6FieldErrors(surfaceCandidate.fieldErrors))
+    : s5 && !PUBLIC_S5_ERROR_CODES.has(surfaceCandidate.code)
+      ? new AppError(500, "S5_INTERNAL_ERROR")
+      : s4 && !PUBLIC_S4_ERROR_CODES.has(surfaceCandidate.code)
       ? new AppError(500, "S4_INTERNAL_ERROR")
-      : s3 && !PUBLIC_S3_ERROR_CODES.has(candidate.code)
+        : s3 && !PUBLIC_S3_ERROR_CODES.has(surfaceCandidate.code)
         ? new AppError(500, "S3_INTERNAL_ERROR")
-        : candidate;
+          : surfaceCandidate;
   const body = {
     error: {
       code: appError.code,
       message: "The request could not be completed. Try again or contact support with the reference ID.",
       referenceId,
-      fieldErrors: s5 ? safeS5FieldErrors(appError.fieldErrors) : s4 ? safeS4FieldErrors(appError.fieldErrors) : appError.fieldErrors,
+      fieldErrors: s6 ? safeS6FieldErrors(appError.fieldErrors) : s5 ? safeS5FieldErrors(appError.fieldErrors) : s4 ? safeS4FieldErrors(appError.fieldErrors) : appError.fieldErrors,
     },
   };
   console.error(JSON.stringify({ referenceId, operation: "api_request", status: appError.status, code: appError.code }));
@@ -133,18 +161,19 @@ async function jsonBody(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
+async function boundedJsonBody(request: Request, maxBytes: number): Promise<Record<string, unknown>> {
   const contentType = request.headers.get("content-type") ?? "";
   if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
     throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "JSON_REQUIRED" }]);
   }
   const suppliedLength = request.headers.get("content-length");
   if (suppliedLength !== null) {
-    const parsedLength = Number(suppliedLength);
-    if (!Number.isSafeInteger(parsedLength) || parsedLength < 0) {
+    if (!/^\d+$/u.test(suppliedLength)) {
       throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_LENGTH_INVALID" }]);
     }
-    if (parsedLength > MAX_S4_BODY_BYTES) {
+    const parsedLength = Number(suppliedLength);
+    if (!Number.isSafeInteger(parsedLength) || parsedLength > maxBytes) {
+      if (!Number.isSafeInteger(parsedLength)) throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_LENGTH_INVALID" }]);
       throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
     }
   }
@@ -157,7 +186,7 @@ async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
       const next = await reader.read();
       if (next.done) break;
       total += next.value.byteLength;
-      if (total > MAX_S4_BODY_BYTES) {
+      if (total > maxBytes) {
         await reader.cancel().catch(() => undefined);
         throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
       }
@@ -173,6 +202,10 @@ async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
   } catch {
     throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "JSON_OBJECT_REQUIRED" }]);
   }
+}
+
+async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
+  return boundedJsonBody(request, MAX_S4_BODY_BYTES);
 }
 
 function keyFromHeader(request: Request, header: string): UUID {
@@ -555,6 +588,48 @@ function isS5Path(segments: string[]): boolean {
   return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s5";
 }
 
+export function isS6Path(segments: string[]): boolean {
+  return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s6";
+}
+
+export type AuthorizedS6Service = {
+  service: WorkflowService;
+  subjectId: string;
+};
+
+export async function authorizedS6Service(
+  request: Request,
+  segments: string[],
+  supplied: WorkflowService | ApiRequestDependencies | undefined,
+): Promise<AuthorizedS6Service> {
+  const projectId = segments[1];
+  if (typeof projectId !== "string" || !uuidV4Pattern.test(projectId)) throw new AppError(404, "S6_UNAUTHORIZED_OR_NOT_FOUND");
+  const dependencies = isApiRequestDependencies(supplied)
+    ? supplied
+    : { workflowService: supplied, s3Authorization: productionS3Authorization };
+  let context: S3AccessContext | null;
+  try {
+    context = await dependencies.s3Authorization.resolveContext(request);
+  } catch {
+    throw new AppError(404, "S6_UNAUTHORIZED_OR_NOT_FOUND");
+  }
+  if (!context || typeof context.subjectId !== "string" || context.subjectId.length === 0) {
+    throw new AppError(404, "S6_UNAUTHORIZED_OR_NOT_FOUND");
+  }
+  try {
+    if (!(await dependencies.s3Authorization.authorizeProject(context, projectId))) {
+      throw new AppError(404, "S6_UNAUTHORIZED_OR_NOT_FOUND");
+    }
+  } catch (error) {
+    if (error instanceof AppError && error.code === "S6_UNAUTHORIZED_OR_NOT_FOUND") throw error;
+    throw new AppError(404, "S6_UNAUTHORIZED_OR_NOT_FOUND");
+  }
+  return {
+    service: dependencies.workflowService ?? serviceForRequest(),
+    subjectId: context.subjectId,
+  };
+}
+
 async function authorizedS3Service(
   request: Request,
   segments: string[],
@@ -813,6 +888,332 @@ function s5DownloadResponse(result: { bytes: Buffer; contentType: string; fileNa
   return new NextResponse(new Uint8Array(result.bytes), { status: 200, headers: { "content-type": result.contentType, "content-disposition": `attachment; filename="${result.fileName}"`, "cache-control": "private, no-store", "x-content-type-options": "nosniff", "content-length": String(result.bytes.byteLength) } });
 }
 
+const S6_TOKEN_KEYS = [
+  "expectedRevisionId",
+  "expectedRevisionHash",
+  "expectedParentRevisionId",
+  "expectedParentHash",
+  "expectedCurrentAcceptedRevisionId",
+  "expectedCurrentAcceptedHash",
+  "expectedSourceFingerprint",
+] as const;
+const S6_SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const S6_VIEW_ID_SET = new Set<S6ViewId>(["perspective-northwest", "perspective-southeast", "top-orthographic"]);
+const S6_PRIMITIVE_SET = new Set(["counter", "display_plinth", "screen", "storage_volume", "table", "seating_marker", "equipment_placeholder", "box", "overhead_volume", "partition"]);
+const S6_ROLE_SET = new Set(["furniture", "display", "screen", "storage", "seating", "equipment", "overhead", "booth_partition"]);
+const S6_FINISH_SET = new Set(["solid_color", "wood_like", "metal_like", "fabric_like", "glass_like", "brand_reference", "unknown"]);
+const S6_SOURCE_SET = new Set(["confirmed_project_input", "user_confirmed_design_decision", "s5_visual_intent", "bounded_design_inference", "unknown"]);
+
+function s6Record(value: unknown, field: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  return value as Record<string, unknown>;
+}
+
+function s6Integer(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || Object.is(value, -0)) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INTEGER_REQUIRED" }]);
+  return value;
+}
+
+function s6String(value: unknown, field: string, maximum = 240): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > maximum || /[\u0000-\u001f\u007f]/u.test(value)) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  return value;
+}
+
+function s6Hash(value: unknown, field: string): string {
+  if (typeof value !== "string" || !S6_SHA256_PATTERN.test(value)) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  return value;
+}
+
+function s6StringArray(value: unknown, field: string, maximum = 256): string[] {
+  if (!Array.isArray(value) || value.length > maximum) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  return value.map((item, index) => s6String(item, field + "[" + String(index) + "]"));
+}
+
+function s6Vector(value: unknown, field: string): { xMm: number; yMm: number; zMm: number } {
+  const record = s6Record(value, field);
+  exactKeys(record, ["xMm", "yMm", "zMm"]);
+  return { xMm: s6Integer(record.xMm, field + ".xMm"), yMm: s6Integer(record.yMm, field + ".yMm"), zMm: s6Integer(record.zMm, field + ".zMm") };
+}
+
+function s6Rotation(value: unknown, field: string): { xMd: number; yMd: number; zMd: number } {
+  const record = s6Record(value, field);
+  exactKeys(record, ["xMd", "yMd", "zMd"]);
+  return { xMd: s6Integer(record.xMd, field + ".xMd"), yMd: s6Integer(record.yMd, field + ".yMd"), zMd: s6Integer(record.zMd, field + ".zMd") };
+}
+
+function s6Dimensions(value: unknown, field: string): { widthMm: number; depthMm: number; heightMm: number } {
+  const record = s6Record(value, field);
+  exactKeys(record, ["widthMm", "depthMm", "heightMm"]);
+  return { widthMm: s6Integer(record.widthMm, field + ".widthMm"), depthMm: s6Integer(record.depthMm, field + ".depthMm"), heightMm: s6Integer(record.heightMm, field + ".heightMm") };
+}
+
+function s6Profile(value: unknown, field: string): { winding: "ccw-from-positive-y-v1"; vertices: Array<{ xMm: number; zMm: number }> } {
+  const record = s6Record(value, field);
+  exactKeys(record, ["winding", "vertices"]);
+  if (record.winding !== "ccw-from-positive-y-v1" || !Array.isArray(record.vertices) || record.vertices.length > 24) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  return {
+    winding: "ccw-from-positive-y-v1",
+    vertices: record.vertices.map((value, index) => {
+      const vertex = s6Record(value, field + ".vertices[" + String(index) + "]");
+      exactKeys(vertex, ["xMm", "zMm"]);
+      return { xMm: s6Integer(vertex.xMm, field + ".vertices[" + String(index) + "].xMm"), zMm: s6Integer(vertex.zMm, field + ".vertices[" + String(index) + "].zMm") };
+    }),
+  };
+}
+
+function s6Geometry(value: unknown, field: string): unknown {
+  const record = s6Record(value, field);
+  if (record.kind === "rect_prism") {
+    exactKeys(record, ["kind", "dimensionsMm", "localAnchor"]);
+    if (record.localAnchor !== "floor" && record.localAnchor !== "center") throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+    return { kind: "rect_prism", dimensionsMm: s6Dimensions(record.dimensionsMm, field + ".dimensionsMm"), localAnchor: record.localAnchor };
+  }
+  if (record.kind === "round_prism") {
+    exactKeys(record, ["kind", "radiusMm", "heightMm", "localAnchor"]);
+    if (record.localAnchor !== "floor" && record.localAnchor !== "center") throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+    return { kind: "round_prism", radiusMm: s6Integer(record.radiusMm, field + ".radiusMm"), heightMm: s6Integer(record.heightMm, field + ".heightMm"), localAnchor: record.localAnchor };
+  }
+  if (record.kind === "profile_extrusion") {
+    exactKeys(record, ["kind", "profile", "heightMm", "localAnchor"]);
+    if (record.localAnchor !== "floor" && record.localAnchor !== "center") throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+    return { kind: "profile_extrusion", profile: s6Profile(record.profile, field + ".profile"), heightMm: s6Integer(record.heightMm, field + ".heightMm"), localAnchor: record.localAnchor };
+  }
+  throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+}
+
+function s6Provenance(value: unknown, field: string): unknown {
+  const record = s6Record(value, field);
+  exactKeys(record, ["kind", "sourceRef", "sourceFingerprint", "acceptedByUser", "note"]);
+  if (!["confirmed_project_input", "user_confirmed_design_decision", "bounded_design_inference", "unknown_unresolved"].includes(String(record.kind)) ||
+      typeof record.sourceRef !== "string" || typeof record.acceptedByUser !== "boolean" ||
+      (record.sourceFingerprint !== null && !S6_SHA256_PATTERN.test(String(record.sourceFingerprint))) ||
+      (record.note !== null && typeof record.note !== "string")) {
+    throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  }
+  return record;
+}
+
+function s6Material(value: unknown, field: string): unknown {
+  const record = s6Record(value, field);
+  exactKeys(record, ["materialId", "label", "finishKind", "colorHex", "source", "sourceAssetId", "sourceAssetSha256", "notes", "provenance"]);
+  s6String(record.materialId, field + ".materialId");
+  s6String(record.label, field + ".label");
+  if (!S6_FINISH_SET.has(String(record.finishKind))) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  if (record.colorHex !== null && (typeof record.colorHex !== "string" || !/^#[0-9a-f]{6}$/iu.test(record.colorHex))) throw new AppError(400, "S6_INVALID_REQUEST", [{ field: field + ".colorHex", code: "INVALID_VALUE" }]);
+  if (!S6_SOURCE_SET.has(String(record.source))) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  if (record.sourceAssetId !== null) assertUuid(record.sourceAssetId, field + ".sourceAssetId");
+  if (record.sourceAssetSha256 !== null) s6Hash(record.sourceAssetSha256, field + ".sourceAssetSha256");
+  if (record.notes !== null && typeof record.notes !== "string") throw new AppError(400, "S6_INVALID_REQUEST", [{ field: field + ".notes", code: "INVALID_VALUE" }]);
+  s6Provenance(record.provenance, field + ".provenance");
+  return record;
+}
+
+function s6Replacement(value: unknown, field: string): unknown {
+  const record = s6Record(value, field);
+  exactKeys(record, ["objectType", "role", "label", "geometry", "positionMm", "rotationMd", "material"]);
+  if (!S6_PRIMITIVE_SET.has(String(record.objectType)) || !S6_ROLE_SET.has(String(record.role))) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  s6String(record.label, field + ".label");
+  s6Geometry(record.geometry, field + ".geometry");
+  s6Vector(record.positionMm, field + ".positionMm");
+  s6Rotation(record.rotationMd, field + ".rotationMd");
+  s6Material(record.material, field + ".material");
+  return record;
+}
+
+function s6Operation(value: unknown, index: number): S6CorrectionOperation {
+  const field = "operations[" + String(index) + "]";
+  const record = s6Record(value, field);
+  const kind = record.kind;
+  if (typeof kind !== "string") throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+  if (kind === "move") {
+    exactKeys(record, ["kind", "objectId", "deltaMm"]);
+    return { kind, objectId: s6String(record.objectId, field + ".objectId"), deltaMm: s6Vector(record.deltaMm, field + ".deltaMm") };
+  }
+  if (kind === "rotate") {
+    exactKeys(record, ["kind", "objectId", "rotationMd"]);
+    return { kind, objectId: s6String(record.objectId, field + ".objectId"), rotationMd: s6Rotation(record.rotationMd, field + ".rotationMd") };
+  }
+  if (kind === "resize") {
+    exactKeys(record, ["kind", "objectId", "dimensionsMm"]);
+    return { kind, objectId: s6String(record.objectId, field + ".objectId"), dimensionsMm: s6Dimensions(record.dimensionsMm, field + ".dimensionsMm") };
+  }
+  if (kind === "replace_geometry") {
+    exactKeys(record, ["kind", "objectId", "geometry"]);
+    return { kind, objectId: s6String(record.objectId, field + ".objectId"), geometry: s6Geometry(record.geometry, field + ".geometry") as any };
+  }
+  if (kind === "material") {
+    exactKeys(record, ["kind", "objectId", "material"]);
+    return { kind, objectId: s6String(record.objectId, field + ".objectId"), material: s6Material(record.material, field + ".material") as any };
+  }
+  if (kind === "zone_requirement_map") {
+    exactKeys(record, ["kind", "objectId", "zoneIds", "requirementIds"]);
+    return { kind, objectId: s6String(record.objectId, field + ".objectId"), zoneIds: s6StringArray(record.zoneIds, field + ".zoneIds"), requirementIds: s6StringArray(record.requirementIds, field + ".requirementIds") };
+  }
+  if (kind === "confirm_design_inference") {
+    exactKeys(record, ["kind", "objectIds", "note"]);
+    return { kind, objectIds: s6StringArray(record.objectIds, field + ".objectIds", 32), note: s6String(record.note, field + ".note", 1000) };
+  }
+  if (kind === "resolve_unknown") {
+    exactKeys(record, ["kind", "unknownId", "resolutionKind", "resolutionNote", "replacement"]);
+    if (record.resolutionKind !== "represented" && record.resolutionKind !== "explicit_simplification") throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+    return { kind, unknownId: s6String(record.unknownId, field + ".unknownId"), resolutionKind: record.resolutionKind, resolutionNote: s6String(record.resolutionNote, field + ".resolutionNote", 1000), replacement: record.replacement === null ? null : s6Replacement(record.replacement, field + ".replacement") as any };
+  }
+  if (kind === "add") {
+    exactKeys(record, ["kind", "objectType", "role", "label", "geometry", "positionMm", "rotationMd", "material", "parentObjectId", "zoneIds", "requirementIds"]);
+    if (!S6_PRIMITIVE_SET.has(String(record.objectType)) || !S6_ROLE_SET.has(String(record.role))) throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+    if (record.parentObjectId !== null) s6String(record.parentObjectId, field + ".parentObjectId");
+    return {
+      kind,
+      objectType: record.objectType as any,
+      role: record.role as any,
+      label: s6String(record.label, field + ".label"),
+      geometry: s6Geometry(record.geometry, field + ".geometry") as any,
+      positionMm: s6Vector(record.positionMm, field + ".positionMm"),
+      rotationMd: s6Rotation(record.rotationMd, field + ".rotationMd"),
+      material: s6Material(record.material, field + ".material") as any,
+      parentObjectId: record.parentObjectId as string | null,
+      zoneIds: s6StringArray(record.zoneIds, field + ".zoneIds"),
+      requirementIds: s6StringArray(record.requirementIds, field + ".requirementIds"),
+    };
+  }
+  if (kind === "remove") {
+    exactKeys(record, ["kind", "objectId"]);
+    return { kind, objectId: s6String(record.objectId, field + ".objectId") };
+  }
+  throw new AppError(400, "S6_INVALID_REQUEST", [{ field, code: "INVALID_VALUE" }]);
+}
+
+function s6Token(body: Record<string, unknown>, withOperations = false): S6ConcurrencyToken {
+  exactKeys(body, withOperations ? [...S6_TOKEN_KEYS, "operations"] : S6_TOKEN_KEYS);
+  assertUuid(body.expectedRevisionId, "expectedRevisionId");
+  s6Hash(body.expectedRevisionHash, "expectedRevisionHash");
+  if (body.expectedParentRevisionId !== null) assertUuid(body.expectedParentRevisionId, "expectedParentRevisionId");
+  if (body.expectedParentHash !== null) s6Hash(body.expectedParentHash, "expectedParentHash");
+  if ((body.expectedParentRevisionId === null) !== (body.expectedParentHash === null)) throw new AppError(400, "S6_INVALID_REQUEST", [{ field: "expectedParentRevisionId", code: "INVALID_VALUE" }]);
+  if (body.expectedCurrentAcceptedRevisionId !== null) assertUuid(body.expectedCurrentAcceptedRevisionId, "expectedCurrentAcceptedRevisionId");
+  if (body.expectedCurrentAcceptedHash !== null) s6Hash(body.expectedCurrentAcceptedHash, "expectedCurrentAcceptedHash");
+  if ((body.expectedCurrentAcceptedRevisionId === null) !== (body.expectedCurrentAcceptedHash === null)) throw new AppError(400, "S6_INVALID_REQUEST", [{ field: "expectedCurrentAcceptedRevisionId", code: "INVALID_VALUE" }]);
+  return {
+    expectedRevisionId: body.expectedRevisionId as UUID,
+    expectedRevisionHash: body.expectedRevisionHash as any,
+    expectedParentRevisionId: body.expectedParentRevisionId as UUID | null,
+    expectedParentHash: body.expectedParentHash as any,
+    expectedCurrentAcceptedRevisionId: body.expectedCurrentAcceptedRevisionId as UUID | null,
+    expectedCurrentAcceptedHash: body.expectedCurrentAcceptedHash as any,
+    expectedSourceFingerprint: s6Hash(body.expectedSourceFingerprint, "expectedSourceFingerprint") as any,
+  };
+}
+
+async function s6JsonBody(request: Request): Promise<Record<string, unknown>> {
+  return boundedJsonBody(request, MAX_S6_BODY_BYTES);
+}
+
+function s6ViewId(value: string): S6ViewId {
+  if (!S6_VIEW_ID_SET.has(value as S6ViewId)) throw new AppError(400, "S6_INVALID_REQUEST", [{ field: "viewId", code: "INVALID_VALUE" }]);
+  return value as S6ViewId;
+}
+
+function s6MutationStatus(result: { replayed?: boolean }): number {
+  return result.replayed ? 200 : 202;
+}
+
+export async function handleS6(
+  request: Request,
+  method: string,
+  segments: string[],
+  service: WorkflowService,
+  subjectId: string,
+  referenceId: UUID,
+): Promise<NextResponse> {
+  const projectId = segments[1] as UUID;
+  if (segments.length === 3) {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s6.getState(projectId), { status: 200 });
+  }
+  if (segments.length === 4 && segments[3] === "generation") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    const body = await s6JsonBody(request);
+    exactKeys(body, []);
+    const result = await service.s6.generate(projectId, s2IdempotencyKeyFromHeader(request), referenceId, subjectId);
+    return NextResponse.json(result, { status: s6MutationStatus(result) });
+  }
+  if (segments.length === 5 && segments[3] === "revisions") {
+    assertUuid(segments[4], "revisionId");
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s6.getRevision(projectId, segments[4]), { status: 200 });
+  }
+  if (segments.length === 6 && segments[3] === "revisions") {
+    assertUuid(segments[4], "revisionId");
+    const revisionId = segments[4] as UUID;
+    if (segments[5] === "reopen") {
+      if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+      const token = s6Token(await s6JsonBody(request));
+      const result = await service.s6.reopen(projectId, revisionId, token, s2IdempotencyKeyFromHeader(request), referenceId, subjectId);
+      return NextResponse.json(result, { status: s6MutationStatus(result) });
+    }
+    if (segments[5] === "corrections") {
+      if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+      const body = await s6JsonBody(request);
+      exactKeys(body, [...S6_TOKEN_KEYS, "operations"]);
+      if (!Array.isArray(body.operations) || body.operations.length > 32) throw new AppError(400, "S6_INVALID_REQUEST", [{ field: "operations", code: "INVALID_VALUE" }]);
+      const token = s6Token(body, true);
+      const operations = body.operations.map((value, index) => s6Operation(value, index));
+      const result = await service.s6.correct(projectId, revisionId, token, operations, s2IdempotencyKeyFromHeader(request), referenceId, subjectId);
+      return NextResponse.json(result, { status: s6MutationStatus(result) });
+    }
+    if (segments[5] === "validate") {
+      if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+      const token = s6Token(await s6JsonBody(request));
+      return NextResponse.json(await service.s6.validate(projectId, revisionId, token, s2IdempotencyKeyFromHeader(request), referenceId), { status: 200 });
+    }
+    if (segments[5] === "accept") {
+      if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+      const token = s6Token(await s6JsonBody(request));
+      return NextResponse.json(await service.s6.accept(projectId, revisionId, token, s2IdempotencyKeyFromHeader(request), referenceId, subjectId), { status: 200 });
+    }
+    if (segments[5] === "render") {
+      if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+      const token = s6Token(await s6JsonBody(request));
+      const result = await service.s6.render(projectId, revisionId, token, s2IdempotencyKeyFromHeader(request), referenceId);
+      return NextResponse.json(result, { status: s6MutationStatus(result) });
+    }
+  }
+  if (segments.length === 7 && segments[3] === "revisions" && segments[5] === "views") {
+    assertUuid(segments[4], "revisionId");
+    const viewId = s6ViewId(segments[6]);
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s6.getView(projectId, segments[4], viewId), { status: 200 });
+  }
+  if (segments.length === 8 && segments[3] === "revisions" && segments[5] === "views") {
+    assertUuid(segments[4], "revisionId");
+    const viewId = s6ViewId(segments[6]);
+    if (segments[7] === "publish") {
+      if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+      const token = s6Token(await s6JsonBody(request));
+      return NextResponse.json(await service.s6.publish(projectId, segments[4], viewId, token, s2IdempotencyKeyFromHeader(request), referenceId), { status: 200 });
+    }
+    if (segments[7] === "download") {
+      if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+      await requireEmptyBody(request);
+      return s5DownloadResponse(service.s6.getViewDownload(projectId, segments[4], viewId));
+    }
+  }
+  if (segments.length === 4 && segments[3] === "telemetry") {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s6.getTelemetry(projectId), { status: 200 });
+  }
+  if (segments.length === 4 && segments[3] === "handoff") {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s6.getS7Handoff(projectId), { status: 200 });
+  }
+  throw new AppError(400, "S6_INVALID_REQUEST");
+}
+
 async function handleS5(
   request: Request,
   method: string,
@@ -980,6 +1381,10 @@ export async function handleApiRequest(
 ): Promise<NextResponse> {
   const referenceId = requestReferenceId(request);
   try {
+    if (isS6Path(path)) {
+      const authorized = await authorizedS6Service(request, path, supplied);
+      return await handleS6(request, request.method.toUpperCase(), path, authorized.service, authorized.subjectId, referenceId);
+    }
     if (isS5Path(path)) {
       const service = await authorizedS5Service(request, path, supplied);
       return await handleS5(request, request.method.toUpperCase(), path, service, referenceId);
@@ -997,6 +1402,6 @@ export async function handleApiRequest(
       : supplied ?? serviceForRequest();
     return await handle(request, request.method.toUpperCase(), path, service, referenceId);
   } catch (error) {
-    return jsonError(referenceId, error, isS3Path(path), isS4Path(path), isS5Path(path));
+    return jsonError(referenceId, error, isS3Path(path), isS4Path(path), isS5Path(path), isS6Path(path));
   }
 }
