@@ -10,6 +10,7 @@ import type {
   S6RectPrismGeometry,
   S6RotationMd,
   S6RoundPrismGeometry,
+  S6SpatialObject,
   S6SpatialModelRecord,
 } from "./types";
 
@@ -414,4 +415,492 @@ export function userObjectId(objectUuid: string): string {
 
 export function normalizeS6Geometry(primitive: S6GeometryPrimitive): S6GeometryPrimitive {
   return normalizeGeometry(primitive);
+}
+
+export type S6WorldPoint = { xMm: number; yMm: number; zMm: number };
+export type S6WorldPoint2D = { xMm: number; zMm: number };
+export type S6WorldShapePart =
+  | { kind: "polygon"; points: S6WorldPoint2D[] }
+  | { kind: "circle"; center: S6WorldPoint2D; radiusMm: number };
+
+export type S6WorldGeometry = {
+  objectId: string;
+  points: S6WorldPoint[];
+  footprint: S6WorldShapePart;
+  parts: S6WorldShapePart[];
+  boundsMm: { min: S6WorldPoint; max: S6WorldPoint };
+  verticalInterval: { base: number; top: number };
+};
+
+type Affine3 = {
+  origin: S6WorldPoint;
+  xAxis: S6WorldPoint;
+  yAxis: S6WorldPoint;
+  zAxis: S6WorldPoint;
+};
+
+const WORLD_GEOMETRY_EPSILON = 1e-7;
+const WORLD_FIXED_SCALE = 1_000_000;
+
+function addPoint(left: S6WorldPoint, right: S6WorldPoint): S6WorldPoint {
+  return { xMm: left.xMm + right.xMm, yMm: left.yMm + right.yMm, zMm: left.zMm + right.zMm };
+}
+
+function scalePoint(value: S6WorldPoint, scale: number): S6WorldPoint {
+  return { xMm: value.xMm * scale, yMm: value.yMm * scale, zMm: value.zMm * scale };
+}
+
+function rotateS6Point(point: S6WorldPoint, rotation: S6RotationMd): S6WorldPoint {
+  const rx = rotation.xMd * Math.PI / 180_000;
+  const ry = rotation.yMd * Math.PI / 180_000;
+  const rz = rotation.zMd * Math.PI / 180_000;
+  const cx = Math.cos(rx);
+  const sx = Math.sin(rx);
+  const cy = Math.cos(ry);
+  const sy = Math.sin(ry);
+  const cz = Math.cos(rz);
+  const sz = Math.sin(rz);
+  const x1 = point.xMm;
+  const y1 = point.yMm * cx - point.zMm * sx;
+  const z1 = point.yMm * sx + point.zMm * cx;
+  const x2 = x1 * cy + z1 * sy;
+  const y2 = y1;
+  const z2 = -x1 * sy + z1 * cy;
+  return {
+    xMm: x2 * cz - y2 * sz,
+    yMm: x2 * sz + y2 * cz,
+    zMm: z2,
+  };
+}
+
+function localAffine(transform: S6SpatialObject["transform"]): Affine3 {
+  return {
+    origin: { ...transform.positionMm },
+    xAxis: rotateS6Point({ xMm: 1, yMm: 0, zMm: 0 }, transform.rotationMd),
+    yAxis: rotateS6Point({ xMm: 0, yMm: 1, zMm: 0 }, transform.rotationMd),
+    zAxis: rotateS6Point({ xMm: 0, yMm: 0, zMm: 1 }, transform.rotationMd),
+  };
+}
+
+function applyAffine(affine: Affine3, point: S6WorldPoint): S6WorldPoint {
+  return addPoint(
+    affine.origin,
+    addPoint(scalePoint(affine.xAxis, point.xMm), addPoint(scalePoint(affine.yAxis, point.yMm), scalePoint(affine.zAxis, point.zMm))),
+  );
+}
+
+function transformVector(affine: Affine3, vector: S6WorldPoint): S6WorldPoint {
+  return addPoint(
+    scalePoint(affine.xAxis, vector.xMm),
+    addPoint(scalePoint(affine.yAxis, vector.yMm), scalePoint(affine.zAxis, vector.zMm)),
+  );
+}
+
+function composeAffine(parent: Affine3, local: Affine3): Affine3 {
+  return {
+    origin: applyAffine(parent, local.origin),
+    xAxis: transformVector(parent, local.xAxis),
+    yAxis: transformVector(parent, local.yAxis),
+    zAxis: transformVector(parent, local.zAxis),
+  };
+}
+
+function affineFor(
+  object: S6SpatialObject,
+  byId: ReadonlyMap<string, S6SpatialObject>,
+  cache: Map<string, Affine3>,
+  visiting: Set<string>,
+): Affine3 {
+  const cached = cache.get(object.objectId);
+  if (cached) return cached;
+  if (visiting.has(object.objectId)) throw new Error("S6_WORLD_GEOMETRY_INVALID");
+  visiting.add(object.objectId);
+  const local = localAffine(object.transform);
+  const parent = object.parentObjectId === null ? null : byId.get(object.parentObjectId);
+  if (object.parentObjectId !== null && !parent) throw new Error("S6_WORLD_GEOMETRY_INVALID");
+  const result = parent ? composeAffine(affineFor(parent, byId, cache, visiting), local) : local;
+  visiting.delete(object.objectId);
+  cache.set(object.objectId, result);
+  return result;
+}
+
+function localFootprintVertices(primitive: S6GeometryPrimitive): S6WorldPoint2D[] {
+  if (primitive.kind === "rect_prism") {
+    return [
+      { xMm: 0, zMm: 0 },
+      { xMm: primitive.dimensionsMm.widthMm, zMm: 0 },
+      { xMm: primitive.dimensionsMm.widthMm, zMm: primitive.dimensionsMm.depthMm },
+      { xMm: 0, zMm: primitive.dimensionsMm.depthMm },
+    ];
+  }
+  if (primitive.kind === "profile_extrusion") return primitive.profile.vertices.map((vertex) => ({ xMm: vertex.xMm, zMm: vertex.zMm }));
+  return [];
+}
+
+function localHeight(primitive: S6GeometryPrimitive): number {
+  return primitive.kind === "rect_prism" ? primitive.dimensionsMm.heightMm : primitive.heightMm;
+}
+
+function localBaseY(primitive: S6GeometryPrimitive): number {
+  const height = localHeight(primitive);
+  return primitive.localAnchor === "center" ? -height / 2 : 0;
+}
+
+function cross2(left: S6WorldPoint2D, middle: S6WorldPoint2D, right: S6WorldPoint2D): bigint {
+  const lx = BigInt(Math.round(left.xMm * WORLD_FIXED_SCALE));
+  const lz = BigInt(Math.round(left.zMm * WORLD_FIXED_SCALE));
+  const mx = BigInt(Math.round(middle.xMm * WORLD_FIXED_SCALE));
+  const mz = BigInt(Math.round(middle.zMm * WORLD_FIXED_SCALE));
+  const rx = BigInt(Math.round(right.xMm * WORLD_FIXED_SCALE));
+  const rz = BigInt(Math.round(right.zMm * WORLD_FIXED_SCALE));
+  return (mx - lx) * (rz - lz) - (mz - lz) * (rx - lx);
+}
+
+function pointOnSegment2(point: S6WorldPoint2D, left: S6WorldPoint2D, right: S6WorldPoint2D): boolean {
+  return cross2(left, point, right) === 0n &&
+    point.xMm >= Math.min(left.xMm, right.xMm) - WORLD_GEOMETRY_EPSILON &&
+    point.xMm <= Math.max(left.xMm, right.xMm) + WORLD_GEOMETRY_EPSILON &&
+    point.zMm >= Math.min(left.zMm, right.zMm) - WORLD_GEOMETRY_EPSILON &&
+    point.zMm <= Math.max(left.zMm, right.zMm) + WORLD_GEOMETRY_EPSILON;
+}
+
+function pointInPolygon(point: S6WorldPoint2D, polygon: readonly S6WorldPoint2D[], strict: boolean): boolean {
+  if (polygon.length < 3) return false;
+  let inside = false;
+  for (let index = 0; index < polygon.length; index += 1) {
+    const left = polygon[index]!;
+    const right = polygon[(index + 1) % polygon.length]!;
+    if (pointOnSegment2(point, left, right)) return !strict;
+    const crosses = (left.zMm > point.zMm) !== (right.zMm > point.zMm);
+    if (crosses) {
+      const x = left.xMm + (right.xMm - left.xMm) * (point.zMm - left.zMm) / (right.zMm - left.zMm);
+      if (x > point.xMm) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function properSegmentsIntersect(leftStart: S6WorldPoint2D, leftEnd: S6WorldPoint2D, rightStart: S6WorldPoint2D, rightEnd: S6WorldPoint2D): boolean {
+  const first = cross2(leftStart, leftEnd, rightStart);
+  const second = cross2(leftStart, leftEnd, rightEnd);
+  const third = cross2(rightStart, rightEnd, leftStart);
+  const fourth = cross2(rightStart, rightEnd, leftEnd);
+  return ((first > 0n && second < 0n) || (first < 0n && second > 0n)) &&
+    ((third > 0n && fourth < 0n) || (third < 0n && fourth > 0n));
+}
+
+function polygonWitness(polygon: readonly S6WorldPoint2D[]): S6WorldPoint2D | null {
+  for (let index = 1; index + 1 < polygon.length; index += 1) {
+    if (cross2(polygon[0]!, polygon[index]!, polygon[index + 1]!) !== 0n) {
+      return {
+        xMm: (polygon[0]!.xMm + polygon[index]!.xMm + polygon[index + 1]!.xMm) / 3,
+        zMm: (polygon[0]!.zMm + polygon[index]!.zMm + polygon[index + 1]!.zMm) / 3,
+      };
+    }
+  }
+  return null;
+}
+
+function polygonOverlapPositive(left: readonly S6WorldPoint2D[], right: readonly S6WorldPoint2D[]): boolean {
+  for (let leftIndex = 0; leftIndex < left.length; leftIndex += 1) {
+    const leftNext = left[(leftIndex + 1) % left.length]!;
+    for (let rightIndex = 0; rightIndex < right.length; rightIndex += 1) {
+      if (properSegmentsIntersect(left[leftIndex]!, leftNext, right[rightIndex]!, right[(rightIndex + 1) % right.length]!)) return true;
+    }
+  }
+  if (left.some((point) => pointInPolygon(point, right, true)) || right.some((point) => pointInPolygon(point, left, true))) return true;
+  const leftWitness = polygonWitness(left);
+  const rightWitness = polygonWitness(right);
+  return (leftWitness !== null && pointInPolygon(leftWitness, right, true)) ||
+    (rightWitness !== null && pointInPolygon(rightWitness, left, true));
+}
+
+function distanceSquaredToSegment(point: S6WorldPoint2D, left: S6WorldPoint2D, right: S6WorldPoint2D): number {
+  const dx = right.xMm - left.xMm;
+  const dz = right.zMm - left.zMm;
+  const lengthSquared = dx * dx + dz * dz;
+  if (lengthSquared <= 0) {
+    const px = point.xMm - left.xMm;
+    const pz = point.zMm - left.zMm;
+    return px * px + pz * pz;
+  }
+  const ratio = Math.max(0, Math.min(1, ((point.xMm - left.xMm) * dx + (point.zMm - left.zMm) * dz) / lengthSquared));
+  const px = left.xMm + ratio * dx;
+  const pz = left.zMm + ratio * dz;
+  return (point.xMm - px) ** 2 + (point.zMm - pz) ** 2;
+}
+
+function shapePartOverlap(left: S6WorldShapePart, right: S6WorldShapePart): boolean {
+  if (left.kind === "circle" && right.kind === "circle") {
+    const dx = left.center.xMm - right.center.xMm;
+    const dz = left.center.zMm - right.center.zMm;
+    const radius = left.radiusMm + right.radiusMm;
+    return dx * dx + dz * dz < radius * radius - WORLD_GEOMETRY_EPSILON;
+  }
+  if (left.kind === "polygon" && right.kind === "polygon") return polygonOverlapPositive(left.points, right.points);
+  const circle = left.kind === "circle" ? left : right.kind === "circle" ? right : null;
+  const polygon = left.kind === "polygon" ? left : right.kind === "polygon" ? right : null;
+  if (!circle || !polygon) return false;
+  if (pointInPolygon(circle.center, polygon.points, true)) return true;
+  if (polygon.points.some((point) => (point.xMm - circle.center.xMm) ** 2 + (point.zMm - circle.center.zMm) ** 2 < circle.radiusMm ** 2 - WORLD_GEOMETRY_EPSILON)) return true;
+  for (let index = 0; index < polygon.points.length; index += 1) {
+    const distance = distanceSquaredToSegment(circle.center, polygon.points[index]!, polygon.points[(index + 1) % polygon.points.length]!);
+    if (distance < circle.radiusMm ** 2 - WORLD_GEOMETRY_EPSILON) return true;
+  }
+  return false;
+}
+
+function partContains(outer: S6WorldShapePart, inner: S6WorldShapePart): boolean {
+  if (outer.kind === "circle" && inner.kind === "circle") {
+    const dx = outer.center.xMm - inner.center.xMm;
+    const dz = outer.center.zMm - inner.center.zMm;
+    return Math.sqrt(dx * dx + dz * dz) + inner.radiusMm <= outer.radiusMm + WORLD_GEOMETRY_EPSILON;
+  }
+  if (outer.kind === "circle" && inner.kind === "polygon") {
+    return inner.points.every((point) => (point.xMm - outer.center.xMm) ** 2 + (point.zMm - outer.center.zMm) ** 2 <= outer.radiusMm ** 2 + WORLD_GEOMETRY_EPSILON);
+  }
+  if (outer.kind === "polygon" && inner.kind === "circle") {
+    if (!pointInPolygon(inner.center, outer.points, false)) return false;
+    for (let index = 0; index < outer.points.length; index += 1) {
+      if (distanceSquaredToSegment(inner.center, outer.points[index]!, outer.points[(index + 1) % outer.points.length]!) < inner.radiusMm ** 2 - WORLD_GEOMETRY_EPSILON) return false;
+    }
+    return true;
+  }
+  if (outer.kind === "polygon" && inner.kind === "polygon") {
+    if (!inner.points.every((point) => pointInPolygon(point, outer.points, false))) return false;
+    for (let leftIndex = 0; leftIndex < inner.points.length; leftIndex += 1) {
+      const left = inner.points[leftIndex]!;
+      const right = inner.points[(leftIndex + 1) % inner.points.length]!;
+      for (let rightIndex = 0; rightIndex < outer.points.length; rightIndex += 1) {
+        if (properSegmentsIntersect(left, right, outer.points[rightIndex]!, outer.points[(rightIndex + 1) % outer.points.length]!)) return false;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+function pointInParts(point: S6WorldPoint2D, parts: readonly S6WorldShapePart[]): boolean {
+  return parts.some((part) => part.kind === "circle"
+    ? (point.xMm - part.center.xMm) ** 2 + (point.zMm - part.center.zMm) ** 2 <= part.radiusMm ** 2 + WORLD_GEOMETRY_EPSILON
+    : pointInPolygon(point, part.points, false));
+}
+
+function partSamples(part: S6WorldShapePart): S6WorldPoint2D[] {
+  if (part.kind === "circle") {
+    return Array.from({ length: 32 }, (_value, index) => {
+      const angle = index * Math.PI * 2 / 32;
+      return { xMm: part.center.xMm + Math.cos(angle) * part.radiusMm, zMm: part.center.zMm + Math.sin(angle) * part.radiusMm };
+    });
+  }
+  const samples: S6WorldPoint2D[] = [];
+  for (let index = 0; index < part.points.length; index += 1) {
+    const left = part.points[index]!;
+    const right = part.points[(index + 1) % part.points.length]!;
+    for (let step = 0; step < 8; step += 1) {
+      const ratio = step / 8;
+      samples.push({ xMm: left.xMm + (right.xMm - left.xMm) * ratio, zMm: left.zMm + (right.zMm - left.zMm) * ratio });
+    }
+  }
+  return samples;
+}
+
+function convexHull(points: readonly S6WorldPoint2D[]): S6WorldPoint2D[] {
+  const sorted = points
+    .slice()
+    .sort((left, right) => left.xMm - right.xMm || left.zMm - right.zMm);
+  const unique: S6WorldPoint2D[] = [];
+  for (const point of sorted) {
+    if (!unique.some((item) => Math.abs(item.xMm - point.xMm) <= WORLD_GEOMETRY_EPSILON && Math.abs(item.zMm - point.zMm) <= WORLD_GEOMETRY_EPSILON)) unique.push(point);
+  }
+  if (unique.length <= 2) return unique;
+  const lower: S6WorldPoint2D[] = [];
+  for (const point of unique) {
+    while (lower.length >= 2 && cross2(lower[lower.length - 2]!, lower[lower.length - 1]!, point) <= 0n) lower.pop();
+    lower.push(point);
+  }
+  const upper: S6WorldPoint2D[] = [];
+  for (const point of unique.slice().reverse()) {
+    while (upper.length >= 2 && cross2(upper[upper.length - 2]!, upper[upper.length - 1]!, point) <= 0n) upper.pop();
+    upper.push(point);
+  }
+  return lower.slice(0, -1).concat(upper.slice(0, -1));
+}
+
+function triangulate(vertices: readonly S6WorldPoint2D[]): S6WorldPoint2D[][] {
+  if (vertices.length === 3) return [vertices.slice() as S6WorldPoint2D[]];
+  const area = vertices.reduce((total, point, index) => {
+    const next = vertices[(index + 1) % vertices.length]!;
+    return total + point.xMm * next.zMm - point.zMm * next.xMm;
+  }, 0);
+  const orientation = area >= 0 ? 1n : -1n;
+  const remaining = vertices.map((_point, index) => index);
+  const triangles: S6WorldPoint2D[][] = [];
+  while (remaining.length > 3) {
+    let earFound = false;
+    for (let index = 0; index < remaining.length; index += 1) {
+      const previous = vertices[remaining[(index + remaining.length - 1) % remaining.length]!]!;
+      const current = vertices[remaining[index]!]!;
+      const next = vertices[remaining[(index + 1) % remaining.length]!]!;
+      if (cross2(previous, current, next) * orientation <= 0n) continue;
+      const containsVertex = remaining.some((candidate, candidateIndex) => {
+        if (candidateIndex === index || candidateIndex === (index + remaining.length - 1) % remaining.length || candidateIndex === (index + 1) % remaining.length) return false;
+        const point = vertices[candidate]!;
+        const first = cross2(previous, current, point) * orientation;
+        const second = cross2(current, next, point) * orientation;
+        const third = cross2(next, previous, point) * orientation;
+        return first >= 0n && second >= 0n && third >= 0n;
+      });
+      if (containsVertex) continue;
+      triangles.push([previous, current, next]);
+      remaining.splice(index, 1);
+      earFound = true;
+      break;
+    }
+    if (!earFound) throw new Error("S6_WORLD_GEOMETRY_INVALID");
+  }
+  triangles.push(remaining.map((index) => vertices[index]!));
+  return triangles;
+}
+
+function shapePartForPrism(affine: Affine3, primitive: S6GeometryPrimitive): S6WorldShapePart[] {
+  const baseY = localBaseY(primitive);
+  const height = localHeight(primitive);
+  const vertices = localFootprintVertices(primitive);
+  const base = vertices.map((point) => applyAffine(affine, { xMm: point.xMm, yMm: baseY, zMm: point.zMm }));
+  if (Math.abs(affine.yAxis.xMm) <= WORLD_GEOMETRY_EPSILON && Math.abs(affine.yAxis.zMm) <= WORLD_GEOMETRY_EPSILON) {
+    return [{ kind: "polygon", points: base.map((point) => ({ xMm: point.xMm, zMm: point.zMm })) }];
+  }
+  const triangles = triangulate(vertices);
+  return triangles.map((triangle) => {
+    const projected = triangle.flatMap((point) => {
+      const bottom = applyAffine(affine, { xMm: point.xMm, yMm: baseY, zMm: point.zMm });
+      const upper = applyAffine(affine, { xMm: point.xMm, yMm: baseY + height, zMm: point.zMm });
+      return [{ xMm: bottom.xMm, zMm: bottom.zMm }, { xMm: upper.xMm, zMm: upper.zMm }];
+    });
+    return { kind: "polygon" as const, points: convexHull(projected) };
+  }).filter((part) => part.points.length >= 3);
+}
+
+function roundPartForCylinder(affine: Affine3, primitive: Extract<S6GeometryPrimitive, { kind: "round_prism" }>): S6WorldShapePart[] {
+  const baseY = localBaseY(primitive);
+  const topY = baseY + primitive.heightMm;
+  const horizontalCircle = Math.abs(affine.yAxis.xMm) <= WORLD_GEOMETRY_EPSILON &&
+    Math.abs(affine.yAxis.zMm) <= WORLD_GEOMETRY_EPSILON &&
+    Math.abs(affine.xAxis.yMm) <= WORLD_GEOMETRY_EPSILON &&
+    Math.abs(affine.zAxis.yMm) <= WORLD_GEOMETRY_EPSILON;
+  if (horizontalCircle) {
+    const center = applyAffine(affine, { xMm: 0, yMm: baseY, zMm: 0 });
+    return [{ kind: "circle", center: { xMm: center.xMm, zMm: center.zMm }, radiusMm: primitive.radiusMm }];
+  }
+  const points: S6WorldPoint2D[] = [];
+  for (const yMm of [baseY, topY]) {
+    for (let index = 0; index < 96; index += 1) {
+      const angle = index * Math.PI * 2 / 96;
+      const point = applyAffine(affine, { xMm: Math.cos(angle) * primitive.radiusMm, yMm, zMm: Math.sin(angle) * primitive.radiusMm });
+      points.push({ xMm: point.xMm, zMm: point.zMm });
+    }
+  }
+  return [{ kind: "polygon", points: convexHull(points) }];
+}
+
+function roundBounds(affine: Affine3, primitive: Extract<S6GeometryPrimitive, { kind: "round_prism" }>): { min: S6WorldPoint; max: S6WorldPoint } {
+  const baseY = localBaseY(primitive);
+  const topY = baseY + primitive.heightMm;
+  const min: S6WorldPoint = { xMm: Number.POSITIVE_INFINITY, yMm: Number.POSITIVE_INFINITY, zMm: Number.POSITIVE_INFINITY };
+  const max: S6WorldPoint = { xMm: Number.NEGATIVE_INFINITY, yMm: Number.NEGATIVE_INFINITY, zMm: Number.NEGATIVE_INFINITY };
+  for (const axis of ["xMm", "yMm", "zMm"] as const) {
+    const axisValue = (point: S6WorldPoint) => point[axis];
+    const circleRadius = primitive.radiusMm * Math.sqrt(axisValue(affine.xAxis) ** 2 + axisValue(affine.zAxis) ** 2);
+    const lowerY = affine.origin[axis] + affine.yAxis[axis] * baseY;
+    const upperY = affine.origin[axis] + affine.yAxis[axis] * topY;
+    min[axis] = Math.min(lowerY, upperY) - circleRadius;
+    max[axis] = Math.max(lowerY, upperY) + circleRadius;
+  }
+  return { min, max };
+}
+
+function boundsForPoints(points: readonly S6WorldPoint[]): { min: S6WorldPoint; max: S6WorldPoint } {
+  if (points.length === 0) throw new Error("S6_WORLD_GEOMETRY_INVALID");
+  return {
+    min: {
+      xMm: Math.min(...points.map((point) => point.xMm)),
+      yMm: Math.min(...points.map((point) => point.yMm)),
+      zMm: Math.min(...points.map((point) => point.zMm)),
+    },
+    max: {
+      xMm: Math.max(...points.map((point) => point.xMm)),
+      yMm: Math.max(...points.map((point) => point.yMm)),
+      zMm: Math.max(...points.map((point) => point.zMm)),
+    },
+  };
+}
+
+function buildWorldGeometry(object: S6SpatialObject, affine: Affine3): S6WorldGeometry {
+  const primitive = normalizeGeometry(object.primitive);
+  const baseY = localBaseY(primitive);
+  const height = localHeight(primitive);
+  let points: S6WorldPoint[];
+  let parts: S6WorldShapePart[];
+  let bounds: { min: S6WorldPoint; max: S6WorldPoint };
+  if (primitive.kind === "round_prism") {
+    points = [];
+    for (const yMm of [baseY, baseY + height]) {
+      for (let index = 0; index < S6_ROUND_RENDER_FACETS; index += 1) {
+        const angle = index * Math.PI * 2 / S6_ROUND_RENDER_FACETS;
+        points.push(applyAffine(affine, { xMm: Math.cos(angle) * primitive.radiusMm, yMm, zMm: Math.sin(angle) * primitive.radiusMm }));
+      }
+    }
+    parts = roundPartForCylinder(affine, primitive);
+    bounds = roundBounds(affine, primitive);
+  } else {
+    const vertices = localFootprintVertices(primitive);
+    const basePoints = vertices.map((point) => applyAffine(affine, { xMm: point.xMm, yMm: baseY, zMm: point.zMm }));
+    const topPoints = vertices.map((point) => applyAffine(affine, { xMm: point.xMm, yMm: baseY + height, zMm: point.zMm }));
+    points = basePoints.concat(topPoints);
+    parts = shapePartForPrism(affine, primitive);
+    bounds = boundsForPoints(points);
+  }
+  const footprint = parts[0];
+  if (!footprint) throw new Error("S6_WORLD_GEOMETRY_INVALID");
+  return {
+    objectId: object.objectId,
+    points,
+    footprint,
+    parts,
+    boundsMm: bounds,
+    verticalInterval: { base: bounds.min.yMm, top: bounds.max.yMm },
+  };
+}
+
+export function deriveS6WorldGeometry(model: S6SpatialModelRecord): S6WorldGeometry[] {
+  const byId = new Map(model.objects.map((object) => [object.objectId, object]));
+  const cache = new Map<string, Affine3>();
+  return model.objects.map((object) => buildWorldGeometry(object, affineFor(object, byId, cache, new Set())));
+}
+
+function shapeContainedByParts(inner: S6WorldShapePart, outerParts: readonly S6WorldShapePart[]): boolean {
+  if (outerParts.some((outer) => partContains(outer, inner))) return true;
+  return partSamples(inner).every((point) => pointInParts(point, outerParts));
+}
+
+export function containsS6WorldGeometry(outer: S6WorldGeometry, inner: S6WorldGeometry): boolean {
+  return inner.parts.every((part) => shapeContainedByParts(part, outer.parts));
+}
+
+export function containsS6WorldBooth(geometry: S6WorldGeometry, widthMm: number, depthMm: number): boolean {
+  const booth: S6WorldShapePart = {
+    kind: "polygon",
+    points: [
+      { xMm: 0, zMm: 0 },
+      { xMm: widthMm, zMm: 0 },
+      { xMm: widthMm, zMm: depthMm },
+      { xMm: 0, zMm: depthMm },
+    ],
+  };
+  return geometry.parts.every((part) => partContains(booth, part));
+}
+
+export function overlapsS6WorldGeometry(left: S6WorldGeometry, right: S6WorldGeometry): boolean {
+  return left.parts.some((leftPart) => right.parts.some((rightPart) => shapePartOverlap(leftPart, rightPart)));
 }

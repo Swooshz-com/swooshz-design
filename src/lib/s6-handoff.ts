@@ -1,5 +1,5 @@
 import { AppError, type S5ToS6Projection, type S6SpatialModelRecord, type S6ToS7Handoff, type S6ValidationReceipt, type S6Dimensions, type S6GeometryPrimitive, type UUID } from "./types";
-import { deriveS6Footprint, hashS6Model, normalizeS6Geometry, S6_HANDOFF_SCHEMA_VERSION, S6_SPATIAL_SCHEMA_VERSION } from "./s6-canonical";
+import { deriveS6Footprint, deriveS6WorldGeometry, hashS6Model, normalizeS6Geometry, S6_HANDOFF_SCHEMA_VERSION, S6_SPATIAL_SCHEMA_VERSION } from "./s6-canonical";
 import { cloneJson } from "./utils";
 
 function reject(code: string): never {
@@ -56,6 +56,11 @@ function assertEligible(model: S6SpatialModelRecord, receipt: S6ValidationReceip
     reject("S6_DESIGN_FORM_UNREVIEWED");
   }
   if (hashS6Model(model).modelHash !== model.modelHash) reject("S6_ACCEPTANCE_CONFLICT");
+  try {
+    deriveS6WorldGeometry(model);
+  } catch {
+    reject("S6_ACCEPTANCE_CONFLICT");
+  }
 }
 
 export function buildS6ToS7Handoff(

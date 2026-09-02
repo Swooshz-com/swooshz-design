@@ -3,19 +3,14 @@ import {
   normalizeS6Rotation,
   roundHalfAwayFromZero,
   S6_MAX_COORDINATE_MM,
-  S6_OPEN_SIDE_ORDER,
+  deriveS6WorldGeometry,
 } from "./s6-canonical";
 import { sha256 } from "./utils";
 import type { S6Camera, S6SpatialModelRecord, S6Vector3Mm, Sha256 } from "./types";
 
 function shapeHeight(model: S6SpatialModelRecord): number {
-  let maximum = 0;
-  for (const object of model.objects) {
-    const height = object.primitive.kind === "rect_prism" ? object.primitive.dimensionsMm.heightMm : object.primitive.heightMm;
-    const top = object.transform.positionMm.yMm + height;
-    maximum = Math.max(maximum, top);
-  }
-  return maximum;
+  const world = deriveS6WorldGeometry(model);
+  return world.reduce((maximum, item) => Math.max(maximum, item.boundsMm.max.yMm), 0);
 }
 function renderHeight(model: S6SpatialModelRecord): { value: number; basis: S6Camera["heightBasis"] } {
   if (model.booth.maxHeightMm !== null) return { value: model.booth.maxHeightMm, basis: "confirmed_max_height" };
@@ -36,6 +31,7 @@ function perspective(
   positionMm: S6Vector3Mm,
   targetMm: S6Vector3Mm,
   farMm: number,
+  paddingMm: number,
   heightBasis: S6Camera["heightBasis"],
   derivedRenderHeightMm: number,
 ): S6Camera {
@@ -47,7 +43,7 @@ function perspective(
     up: "world-y",
     fovMd: 45_000,
     orthoScaleMm: null,
-    paddingMm: 0,
+    paddingMm,
     nearMm: 100,
     farMm,
     heightBasis,
@@ -74,6 +70,7 @@ export function buildS6Cameras(model: S6SpatialModelRecord): S6Camera[] {
     { xMm: -padding - roundHalfAwayFromZero(width / 2), yMm: roundHalfAwayFromZero(height.value * 3 / 4), zMm: -padding - roundHalfAwayFromZero(depth / 2) },
     center,
     far,
+    padding,
     height.basis,
     height.value,
   );
@@ -82,6 +79,7 @@ export function buildS6Cameras(model: S6SpatialModelRecord): S6Camera[] {
     { xMm: width + padding + roundHalfAwayFromZero(width / 2), yMm: roundHalfAwayFromZero(height.value * 3 / 4), zMm: depth + padding + roundHalfAwayFromZero(depth / 2) },
     center,
     far,
+    padding,
     height.basis,
     height.value,
   );

@@ -202,6 +202,55 @@ test("meaningful physical collisions fail while floor and zone contact is allowe
   assert.equal(codes(checked(contact, source)).includes("MATERIAL_COLLISION"), false);
 });
 
+test("hierarchy-aware containment uses the transformed parent shape", () => {
+  const source = makeS6Source({
+    widthMm: 8000,
+    depthMm: 5000,
+    requirements: [
+      { name: "Welcome counter", expected: "present" },
+      { name: "Demo table", expected: "present" },
+    ],
+  });
+  const model = clone(draft(source));
+  const physical = model.objects.filter((item) => item.role !== "booth_floor" && item.role !== "booth_wall" && item.role !== "zone");
+  assert.ok(physical[0] && physical[1]);
+  const parent = physical[0]!;
+  const child = physical[1]!;
+  parent.primitive = { kind: "rect_prism", dimensionsMm: { widthMm: 2200, depthMm: 1000, heightMm: 1000 }, geometryState: "exact", localAnchor: "floor" };
+  parent.transform = { positionMm: { xMm: 1500, yMm: 0, zMm: 500 }, rotationMd: { xMd: 0, yMd: 45_000, zMd: 0 } };
+  child.primitive = { kind: "rect_prism", dimensionsMm: { widthMm: 500, depthMm: 300, heightMm: 500 }, geometryState: "exact", localAnchor: "floor" };
+  child.parentObjectId = parent.objectId;
+  child.transform = { positionMm: { xMm: 500, yMm: 0, zMm: 300 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } };
+  const receipt = checked(model, source);
+  assert.equal(receipt.errors.some((item) => item.code === "CONTAINMENT_INVALID" && item.objectId === child.objectId), false);
+});
+
+test("shape-aware collision rejects separated 45-degree strips despite overlapping AABBs", () => {
+  const source = makeS6Source({
+    widthMm: 8000,
+    depthMm: 5000,
+    requirements: [
+      { name: "Welcome counter", expected: "present" },
+      { name: "Demo table", expected: "present" },
+    ],
+  });
+  const makeStrips = (secondPosition: { xMm: number; zMm: number }): S6SpatialModelRecord => {
+    const model = clone(draft(source));
+    const physical = model.objects.filter((item) => item.role !== "booth_floor" && item.role !== "booth_wall" && item.role !== "zone");
+    assert.ok(physical[0] && physical[1]);
+    const primitive = { kind: "rect_prism" as const, dimensionsMm: { widthMm: 3000, depthMm: 100, heightMm: 500 }, geometryState: "exact" as const, localAnchor: "floor" as const };
+    physical[0]!.primitive = primitive;
+    physical[0]!.transform = { positionMm: { xMm: 1000, yMm: 0, zMm: 1000 }, rotationMd: { xMd: 0, yMd: 45_000, zMd: 0 } };
+    physical[1]!.primitive = structuredClone(primitive);
+    physical[1]!.transform = { positionMm: { xMm: secondPosition.xMm, yMm: 0, zMm: secondPosition.zMm }, rotationMd: { xMd: 0, yMd: 45_000, zMd: 0 } };
+    return model;
+  };
+  const separated = checked(makeStrips({ xMm: 1106, zMm: 1106 }), source);
+  assert.equal(separated.errors.some((item) => item.code === "MATERIAL_COLLISION"), false);
+  const overlapping = checked(makeStrips({ xMm: 1035, zMm: 1035 }), source);
+  assert.equal(overlapping.errors.some((item) => item.code === "MATERIAL_COLLISION"), true);
+});
+
 test("camera and canonical hash failures are reported", () => {
   const source = makeS6Source();
   const model = clone(draft(source));

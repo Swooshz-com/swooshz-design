@@ -51,6 +51,41 @@ test("camera formulas are stable for known and unknown height", () => {
   assert.ok((unknownCamera?.derivedRenderHeightMm ?? 0) >= 3000);
 });
 
+test("unknown camera height follows the transformed world maximum", () => {
+  const model = draft(makeS6Source({
+    widthMm: 8000,
+    depthMm: 5000,
+    maxHeightMm: null,
+    requirements: [{ name: "Tall rotated object", expected: "present" }],
+  }));
+  const object = physicalObject(model);
+  object.primitive = { kind: "rect_prism", dimensionsMm: { widthMm: 5000, depthMm: 500, heightMm: 1000 }, geometryState: "exact", localAnchor: "floor" };
+  object.transform = { positionMm: { xMm: 1000, yMm: 0, zMm: 1000 }, rotationMd: { xMd: 0, yMd: 0, zMd: 90_000 } };
+  assert.equal(buildS6Cameras(model)[0]!.derivedRenderHeightMm, 5000);
+});
+
+test("parent-local full-Euler transforms reach renderer scene evidence", () => {
+  const model = draft(makeS6Source({
+    widthMm: 8000,
+    depthMm: 5000,
+    requirements: [
+      { name: "Welcome counter", expected: "present" },
+      { name: "Demo table", expected: "present" },
+    ],
+  }));
+  const physical = model.objects.filter((item) => item.role !== "booth_floor" && item.role !== "booth_wall" && item.role !== "zone");
+  assert.ok(physical[0] && physical[1]);
+  physical[0]!.transform = { positionMm: { xMm: 1500, yMm: 0, zMm: 700 }, rotationMd: { xMd: 30_000, yMd: 45_000, zMd: 15_000 } };
+  physical[1]!.parentObjectId = physical[0]!.objectId;
+  physical[1]!.transform = { positionMm: { xMm: 500, yMm: 200, zMm: 300 }, rotationMd: { xMd: 15_000, yMd: 20_000, zMd: 10_000 } };
+  const camera = buildS6Cameras(model)[0]!;
+  const parented = renderS6View(model, camera).sceneEvidence.objects.find((item) => item.objectId === physical[1]!.objectId)!.transformedBoundsMm;
+  const flattenedModel = structuredClone(model);
+  flattenedModel.objects.find((item) => item.objectId === physical[1]!.objectId)!.parentObjectId = null;
+  const flattened = renderS6View(flattenedModel, camera).sceneEvidence.objects.find((item) => item.objectId === physical[1]!.objectId)!.transformedBoundsMm;
+  assert.notDeepEqual(parented, flattened);
+});
+
 test("same model and camera produce byte-identical s6-svg-geometry-v2 output", () => {
   const model = draft();
   const camera = buildS6Cameras(model)[0]!;
@@ -133,6 +168,24 @@ test("required geometry outside near or far clipping fails deterministically", (
   const farClipped = structuredClone(camera);
   farClipped.farMm = 200;
   assert.throws(() => renderS6View(model, farClipped), /S6_VIEW_RENDER_FAILURE/);
+});
+
+test("viewport overflow fails closed instead of emitting out-of-frame coordinates", () => {
+  const model = draft();
+  const camera = structuredClone(buildS6Cameras(model)[2]!);
+  camera.orthoScaleMm = 1000;
+  assert.throws(() => renderS6View(model, camera), /S6_VIEW_RENDER_FAILURE/);
+});
+
+test("projected bounds report actual content rather than the fixed SVG frame", () => {
+  const model = draft();
+  const rendered = renderS6View(model, buildS6Cameras(model)[2]!);
+  assert.ok(
+    rendered.projectedBoundsQ16.minX > 0 ||
+    rendered.projectedBoundsQ16.minY > 0 ||
+    rendered.projectedBoundsQ16.maxX < 65_536_000 ||
+    rendered.projectedBoundsQ16.maxY < 65_536_000,
+  );
 });
 
 test("rect, round, and profile geometry render as distinct filled silhouettes", () => {

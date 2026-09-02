@@ -1,8 +1,12 @@
 import {
   canonicalS6Json,
+  containsS6WorldBooth,
+  containsS6WorldGeometry,
+  deriveS6WorldGeometry,
   hashS6Model,
   normalizeS6Geometry,
   normalizeS6Rotation,
+  overlapsS6WorldGeometry,
   S6_MAX_ASSUMPTIONS,
   S6_MAX_CAMERAS,
   S6_MAX_COORDINATE_MM,
@@ -23,12 +27,10 @@ import type {
   OpenSide,
   S5ToS6Projection,
   S6GeometryPrimitive,
-  S6ObjectRole,
   S6SpatialModelRecord,
   S6SpatialObject,
   S6ValidationIssue,
   S6ValidationReceipt,
-  S6Vector3Mm,
   Sha256,
   UUID,
 } from "./types";
@@ -96,42 +98,6 @@ function geometryAllowed(object: S6SpatialObject): boolean {
     zone_region: ["rect_prism", "profile_extrusion"],
   };
   return (allowed[object.objectType] ?? []).includes(kind);
-}
-
-function transformedPoint(point: { xMm: number; zMm: number }, transform: { positionMm: S6Vector3Mm; rotationMd: { yMd: number } }): { xMm: number; zMm: number } {
-  const radians = transform.rotationMd.yMd * Math.PI / 180_000;
-  const cosine = Math.cos(radians);
-  const sine = Math.sin(radians);
-  return {
-    xMm: transform.positionMm.xMm + point.xMm * cosine - point.zMm * sine,
-    zMm: transform.positionMm.zMm + point.xMm * sine + point.zMm * cosine,
-  };
-}
-
-function footprint(object: S6SpatialObject): { kind: "polygon"; points: Array<{ xMm: number; zMm: number }>; radiusMm?: undefined } | { kind: "circle"; center: { xMm: number; zMm: number }; radiusMm: number } {
-  const primitive = object.primitive;
-  if (primitive.kind === "round_prism") return { kind: "circle", center: { xMm: object.transform.positionMm.xMm, zMm: object.transform.positionMm.zMm }, radiusMm: primitive.radiusMm };
-  const points = primitive.kind === "rect_prism"
-    ? [{ xMm: 0, zMm: 0 }, { xMm: primitive.dimensionsMm.widthMm, zMm: 0 }, { xMm: primitive.dimensionsMm.widthMm, zMm: primitive.dimensionsMm.depthMm }, { xMm: 0, zMm: primitive.dimensionsMm.depthMm }]
-    : primitive.profile.vertices.map((vertex) => ({ xMm: vertex.xMm, zMm: vertex.zMm }));
-  return { kind: "polygon", points: points.map((point) => transformedPoint(point, object.transform)) };
-}
-
-function bounds(value: ReturnType<typeof footprint>): { minX: number; maxX: number; minZ: number; maxZ: number } {
-  if (value.kind === "circle") return { minX: value.center.xMm - value.radiusMm, maxX: value.center.xMm + value.radiusMm, minZ: value.center.zMm - value.radiusMm, maxZ: value.center.zMm + value.radiusMm };
-  const xs = value.points.map((point) => point.xMm);
-  const zs = value.points.map((point) => point.zMm);
-  return { minX: Math.min(...xs), maxX: Math.max(...xs), minZ: Math.min(...zs), maxZ: Math.max(...zs) };
-}
-
-function verticalInterval(object: S6SpatialObject): { base: number; top: number } {
-  const height = geometryHeight(object.primitive);
-  if (object.primitive.localAnchor === "center") return { base: object.transform.positionMm.yMm - height / 2, top: object.transform.positionMm.yMm + height / 2 };
-  return { base: object.transform.positionMm.yMm, top: object.transform.positionMm.yMm + height };
-}
-
-function positiveOverlap(left: { minX: number; maxX: number; minZ: number; maxZ: number }, right: { minX: number; maxX: number; minZ: number; maxZ: number }): boolean {
-  return Math.min(left.maxX, right.maxX) - Math.max(left.minX, right.minX) > 0 && Math.min(left.maxZ, right.maxZ) - Math.max(left.minZ, right.minZ) > 0;
 }
 
 function materialIdsValid(model: S6SpatialModelRecord): boolean {
@@ -327,27 +293,29 @@ function validateRequirements(model: S6SpatialModelRecord, context: S6Validation
   }
 }
 
-function containsBounds(value: ReturnType<typeof bounds>, outer: { minX: number; maxX: number; minZ: number; maxZ: number }): boolean {
-  const epsilon = 1e-7;
-  return value.minX >= outer.minX - epsilon && value.maxX <= outer.maxX + epsilon && value.minZ >= outer.minZ - epsilon && value.maxZ <= outer.maxZ + epsilon;
-}
-
 function validateContainment(model: S6SpatialModelRecord, bag: IssueBag): void {
-  const floor = model.objects.find((item) => item.role === "booth_floor");
-  if (!floor || floor.primitive.kind !== "rect_prism") return;
-  const outer = { minX: 0, maxX: model.booth.widthMm, minZ: 0, maxZ: model.booth.depthMm };
+  let world: Map<string, ReturnType<typeof deriveS6WorldGeometry>[number]>;
+  try {
+    world = new Map(deriveS6WorldGeometry(model).map((item) => [item.objectId, item]));
+  } catch {
+    issue(bag, "TRANSFORM_INVALID", "objects");
+    return;
+  }
   const byId = objectById(model);
   for (const object of model.objects) {
-    if (object.role === "booth_floor" || object.role === "zone") continue;
-    const shape = footprint(object);
-    const shapeBounds = bounds(shape);
-    if (!containsBounds(shapeBounds, outer)) issue(bag, "CONTAINMENT_INVALID", "objects[" + object.objectId + "].transform", object.objectId);
+    const shape = world.get(object.objectId);
+    if (!shape) {
+      issue(bag, "TRANSFORM_INVALID", "objects[" + object.objectId + "].transform", object.objectId);
+      continue;
+    }
+    if (!containsS6WorldBooth(shape, model.booth.widthMm, model.booth.depthMm)) issue(bag, "CONTAINMENT_INVALID", "objects[" + object.objectId + "].transform", object.objectId);
     if (object.parentObjectId) {
       const parent = byId.get(object.parentObjectId);
-      if (parent && !containsBounds(shapeBounds, bounds(footprint(parent)))) issue(bag, "CONTAINMENT_INVALID", "objects[" + object.objectId + "].parentObjectId", object.objectId);
+      const parentShape = parent ? world.get(parent.objectId) : undefined;
+      if (parentShape && !containsS6WorldGeometry(parentShape, shape)) issue(bag, "CONTAINMENT_INVALID", "objects[" + object.objectId + "].parentObjectId", object.objectId);
     }
-    const interval = verticalInterval(object);
-    if (model.booth.maxHeightMm !== null && interval.base < 0) issue(bag, "CONTAINMENT_INVALID", "objects[" + object.objectId + "].transform.positionMm.yMm", object.objectId);
+    const interval = shape.verticalInterval;
+    if (interval.base < 0) issue(bag, "CONTAINMENT_INVALID", "objects[" + object.objectId + "].transform.positionMm.yMm", object.objectId);
     if (model.booth.maxHeightMm !== null && interval.top > model.booth.maxHeightMm) issue(bag, "MAX_HEIGHT_EXCEEDED", "objects[" + object.objectId + "].primitive.heightMm", object.objectId);
   }
   const wallSides = new Set(model.objects.filter((item) => item.role === "booth_wall").map((item) => item.identityKey.replace("booth-wall:", "")));
@@ -359,14 +327,24 @@ function validateContainment(model: S6SpatialModelRecord, bag: IssueBag): void {
 
 function validateCollisions(model: S6SpatialModelRecord, bag: IssueBag): void {
   const physical = model.objects.filter((item) => item.role !== "booth_floor" && item.role !== "zone" && item.role !== "booth_wall");
+  let world: Map<string, ReturnType<typeof deriveS6WorldGeometry>[number]>;
+  try {
+    world = new Map(deriveS6WorldGeometry(model).map((item) => [item.objectId, item]));
+  } catch {
+    issue(bag, "TRANSFORM_INVALID", "objects");
+    return;
+  }
   for (let leftIndex = 0; leftIndex < physical.length; leftIndex += 1) {
     for (let rightIndex = leftIndex + 1; rightIndex < physical.length; rightIndex += 1) {
       const left = physical[leftIndex]!;
       const right = physical[rightIndex]!;
-      const leftY = verticalInterval(left);
-      const rightY = verticalInterval(right);
+      const leftGeometry = world.get(left.objectId);
+      const rightGeometry = world.get(right.objectId);
+      if (!leftGeometry || !rightGeometry) continue;
+      const leftY = leftGeometry.verticalInterval;
+      const rightY = rightGeometry.verticalInterval;
       const vertical = Math.min(leftY.top, rightY.top) - Math.max(leftY.base, rightY.base) > 0;
-      if (vertical && positiveOverlap(bounds(footprint(left)), bounds(footprint(right)))) {
+      if (vertical && overlapsS6WorldGeometry(leftGeometry, rightGeometry)) {
         issue(bag, "MATERIAL_COLLISION", "objects[" + right.objectId + "]", right.objectId);
       }
     }
