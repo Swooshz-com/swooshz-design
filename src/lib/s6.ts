@@ -1152,6 +1152,48 @@ export class S6WorkflowService {
     return { model, artifact, source };
   }
 
+  private draftPreviewArtifact(
+    projectId: UUID,
+    revisionId: UUID,
+    viewId: S6ViewId,
+  ): { model: S6SpatialModelRecord; artifact: S6ViewArtifact; source: S5ToS6Projection } {
+    const state = this.repository.state();
+    projectIn(state, projectId);
+    const model = modelFor(state, projectId, revisionId);
+    if (model.status !== "generated_draft" && model.status !== "corrected_draft") return fail(409, "S6_STALE_ARTIFACT");
+    const source = this.currentSource(projectId, model.sourceS5Fingerprint);
+    const latest = latestEditable(state, projectId, source.sourceFingerprint);
+    if (!latest || latest.modelRevisionId !== revisionId) return fail(409, "S6_STALE_ARTIFACT");
+    const artifact = state.s6ViewArtifacts
+      .filter((item) =>
+        item.projectId === projectId &&
+        item.revisionId === revisionId &&
+        item.viewId === viewId &&
+        item.purpose === "draft_preview" &&
+        (item.status === "staged" || item.status === "promoted" || item.status === "committed"),
+      )
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ?? null;
+    if (!artifact || artifact.revisionHash !== model.modelHash || artifact.sourceS5Fingerprint !== source.sourceFingerprint) return fail(409, "S6_STALE_ARTIFACT");
+    const receipt = artifact.preservationReceiptId === null
+      ? null
+      : state.s6ViewPreservationReceipts.find((item) => item.receiptId === artifact.preservationReceiptId) ?? null;
+    if (!receipt || receipt.outcome !== "pass") return fail(409, "S6_STALE_ARTIFACT");
+    return { model, artifact, source };
+  }
+
+  private readDraftPreviewExact(artifact: S6ViewArtifact): Buffer {
+    if (artifact.outputSha256 === null || artifact.outputByteSize === null) return fail(409, "S6_STALE_ARTIFACT");
+    const key = artifact.publicationPhase === "staged" ? artifact.stagingKey : artifact.artifactKey;
+    let bytes: Buffer;
+    try {
+      bytes = this.objects.read(key);
+    } catch {
+      return fail(409, "S6_STALE_ARTIFACT");
+    }
+    if (sha256(bytes) !== artifact.outputSha256 || bytes.byteLength !== artifact.outputByteSize) return fail(409, "S6_STALE_ARTIFACT");
+    return bytes;
+  }
+
   getView(projectId: UUID, revisionId: UUID, viewId: S6ViewId): import("./types").S6PublicViewArtifact {
     const safeViewId = fixedViewId(viewId);
     const state = this.repository.state();
@@ -1176,6 +1218,13 @@ export class S6WorkflowService {
 
   getViewDownload(projectId: UUID, revisionId: UUID, viewId: S6ViewId): { bytes: Buffer; contentType: "image/svg+xml"; fileName: string } {
     const safeViewId = fixedViewId(viewId);
+    const state = this.repository.state();
+    projectIn(state, projectId);
+    const model = modelFor(state, projectId, revisionId);
+    if (model.status === "generated_draft" || model.status === "corrected_draft") {
+      const access = this.draftPreviewArtifact(projectId, revisionId, safeViewId);
+      return { bytes: this.readDraftPreviewExact(access.artifact), contentType: "image/svg+xml", fileName: access.artifact.fileName };
+    }
     const access = this.committedArtifact(projectId, revisionId, safeViewId);
     const bytes = readS6CommittedExact(this.objects, access.artifact);
     return { bytes, contentType: "image/svg+xml", fileName: access.artifact.fileName };
@@ -1210,111 +1259,555 @@ export class S6WorkflowService {
     }
   }
 
-  private recoverPending(): void {
-    const pending = this.repository.state().s6Jobs.filter((item) => item.status === "running" || item.status === "staged" || item.status === "promoted");
-    for (const job of pending) {
-      if (job.status === "running") {
-        if (this.ownerIsLive(job)) continue;
-        this.repository.transact((state) => {
-          const current = state.s6Jobs.find((item) => item.jobId === job.jobId && item.claimToken === job.claimToken);
-          if (!current || current.status !== "running") return;
-          const at = this.clock();
-          current.status = current.attempt === 1 ? "failed_retryable" : "failed_terminal";
-          current.publicationPhase = "aborted";
-          current.failureCode = "S6_PUBLICATION_UNCERTAIN";
-          current.terminalAt = at;
-          current.updatedAt = at;
-          current.claimToken = null;
-          current.workerId = null;
-          current.processId = null;
-          current.claimedAt = null;
-          if (current.attempt === 1) {
-            state.s6Jobs.push({
-              ...cloneJson(current),
-              jobId: this.uuid(),
-              attempt: 2,
-              retryOfJobId: current.jobId,
-              status: "queued",
-              publicationPhase: "none",
-              failureCode: null,
-              terminalAt: null,
-              updatedAt: this.clock(),
-            });
-          }
-        });
-        continue;
-      }
-      if (job.kind !== "publication") continue;
-      const artifact = job.artifactId === null
+  private clearRecoveryClaim(job: S6JobState): void {
+    job.claimToken = null;
+    job.workerId = null;
+    job.processId = null;
+    job.claimedAt = null;
+  }
+
+  private clearArtifactRecoveryClaim(artifact: S6ViewArtifact): void {
+    artifact.claimToken = null;
+    artifact.workerId = null;
+    artifact.processId = null;
+    artifact.claimedAt = null;
+  }
+
+  private failRecoveredJob(jobId: UUID, failureCode: string): void {
+    const cleanup = new Set<string>();
+    const stale = failureCode === "S6_SOURCE_STALE";
+    const terminalStatus: "aborted" | "failed_terminal" = stale ? "aborted" : "failed_terminal";
+    this.repository.transact((state) => {
+      const job = state.s6Jobs.find((item) => item.jobId === jobId);
+      const artifact = job?.artifactId === null || job === undefined
         ? null
-        : this.repository.state().s6ViewArtifacts.find((item) => item.artifactId === job.artifactId) ?? null;
-      if (!artifact) continue;
-      this.recoverViewJob(job, artifact);
+        : state.s6ViewArtifacts.find((item) => item.artifactId === job.artifactId) ?? null;
+      const model = job?.revisionId === null || job === undefined
+        ? null
+        : state.s6SpatialModels.find((item) => item.modelRevisionId === job.revisionId) ?? null;
+      const at = this.clock();
+      if (artifact && artifact.status !== "committed") {
+        cleanup.add(artifact.stagingKey);
+        cleanup.add(artifact.artifactKey);
+        artifact.status = terminalStatus;
+        artifact.publicationPhase = "aborted";
+        artifact.failureCode = failureCode;
+        artifact.terminalAt = at;
+        artifact.updatedAt = at;
+        this.clearArtifactRecoveryClaim(artifact);
+        for (const related of state.s6Jobs.filter((item) => item.artifactId === artifact.artifactId && item.jobId !== jobId && item.status !== "committed" && item.status !== "failed_terminal")) {
+          related.status = terminalStatus;
+          related.publicationPhase = "aborted";
+          related.failureCode = failureCode;
+          related.terminalAt = at;
+          related.updatedAt = at;
+          this.clearRecoveryClaim(related);
+        }
+      }
+      if (job && job.status !== "committed") {
+        job.status = terminalStatus;
+        job.publicationPhase = "aborted";
+        job.failureCode = failureCode;
+        job.terminalAt = at;
+        job.updatedAt = at;
+        this.clearRecoveryClaim(job);
+      }
+      if (model) {
+        if (stale && (model.status === "accepted_current" || model.status === "generated_draft" || model.status === "corrected_draft")) {
+          model.status = "stale";
+          model.staleAt = at;
+          model.updatedAt = at;
+        } else if (!stale && job?.kind === "generation" && (model.status === "generated_draft" || model.status === "corrected_draft")) {
+          model.status = "aborted";
+          model.updatedAt = at;
+        }
+        if (job?.kind === "generation" && model.modelArtifact.status !== "committed") {
+          cleanup.add(model.modelArtifact.stagingKey);
+          cleanup.add(model.modelArtifact.artifactKey);
+          model.modelArtifact.status = "failed_terminal";
+          model.modelArtifact.sha256 = null;
+          model.modelArtifact.byteSize = null;
+          model.updatedAt = at;
+        }
+      }
+    });
+    for (const key of cleanup) this.objects.remove(key);
+  }
+
+  private reclaimDeadJob(jobId: UUID): void {
+    const cleanup = new Set<string>();
+    this.repository.transact((state) => {
+      const current = state.s6Jobs.find((item) => item.jobId === jobId);
+      if (!current) return;
+      const orphanedRetry = current.status === "failed_retryable" && current.attempt === 1 &&
+        !state.s6Jobs.some((item) => item.retryOfJobId === current.jobId);
+      if (current.status !== "running" && !orphanedRetry) return;
+      const artifact = current.artifactId === null
+        ? null
+        : state.s6ViewArtifacts.find((item) => item.artifactId === current.artifactId) ?? null;
+      const at = this.clock();
+      const originalJobId = current.jobId;
+      if (current.status === "running") {
+        current.status = current.attempt === 1 ? "failed_retryable" : "failed_terminal";
+        current.publicationPhase = "aborted";
+        current.failureCode = "S6_PUBLICATION_UNCERTAIN";
+        current.terminalAt = current.attempt === 1 ? null : at;
+        current.updatedAt = at;
+        this.clearRecoveryClaim(current);
+      }
+      if (current.attempt === 2) {
+        if (artifact && artifact.status !== "committed") {
+          cleanup.add(artifact.stagingKey);
+          cleanup.add(artifact.artifactKey);
+          artifact.status = "failed_terminal";
+          artifact.publicationPhase = "aborted";
+          artifact.failureCode = "S6_PUBLICATION_UNCERTAIN";
+          artifact.terminalAt = at;
+          artifact.updatedAt = at;
+          artifact.claimToken = null;
+          artifact.workerId = null;
+          artifact.processId = null;
+          artifact.claimedAt = null;
+        }
+        const model = current.revisionId === null ? null : state.s6SpatialModels.find((item) => item.modelRevisionId === current.revisionId) ?? null;
+        if (model && current.kind === "generation" && (model.status === "generated_draft" || model.status === "corrected_draft")) {
+          model.status = "aborted";
+          model.updatedAt = at;
+          cleanup.add(model.modelArtifact.stagingKey);
+          cleanup.add(model.modelArtifact.artifactKey);
+          model.modelArtifact.status = "failed_terminal";
+          model.modelArtifact.sha256 = null;
+          model.modelArtifact.byteSize = null;
+        }
+        return;
+      }
+      const retryJobId = this.uuid();
+      if (artifact && current.kind === "render" && artifact.status !== "committed") {
+        const retryArtifactId = this.uuid();
+        const pendingClaimToken = this.uuid();
+        const keys = s6ViewStorageKeys(current.projectId, current.revisionId!, current.viewId!, retryJobId, pendingClaimToken);
+        cleanup.add(artifact.stagingKey);
+        cleanup.add(artifact.artifactKey);
+        artifact.status = "failed_retryable";
+        artifact.publicationPhase = "aborted";
+        artifact.failureCode = "S6_PUBLICATION_UNCERTAIN";
+        artifact.terminalAt = null;
+        artifact.updatedAt = at;
+        artifact.claimToken = null;
+        artifact.workerId = null;
+        artifact.processId = null;
+        artifact.claimedAt = null;
+        const retryArtifact: S6ViewArtifact = {
+          ...cloneJson(artifact),
+          artifactId: retryArtifactId,
+          artifactKey: artifact.artifactKey,
+          stagingKey: keys.stagingKey,
+          outputSha256: null,
+          outputByteSize: null,
+          sceneHash: null,
+          preservationReceiptId: null,
+          attempt: 2,
+          retryOfArtifactId: artifact.artifactId,
+          status: "queued",
+          publicationPhase: "none",
+          workerId: null,
+          processId: null,
+          claimToken: pendingClaimToken,
+          claimedAt: null,
+          startedAt: null,
+          stagedAt: null,
+          promotedAt: null,
+          completedAt: null,
+          terminalAt: null,
+          failureCode: null,
+          createdAt: at,
+          updatedAt: at,
+        };
+        const retryJob: S6JobState = {
+          ...cloneJson(current),
+          jobId: retryJobId,
+          artifactId: retryArtifactId,
+          attempt: 2,
+          retryOfJobId: originalJobId,
+          status: "queued",
+          publicationPhase: "none",
+          workerId: null,
+          processId: null,
+          claimToken: pendingClaimToken,
+          claimedAt: null,
+          startedAt: null,
+          stagedAt: null,
+          promotedAt: null,
+          completedAt: null,
+          terminalAt: null,
+          failureCode: null,
+          createdAt: at,
+          updatedAt: at,
+        };
+        state.s6ViewArtifacts.push(retryArtifact);
+        state.s6Jobs.push(retryJob);
+        return;
+      }
+      const retryJob: S6JobState = {
+        ...cloneJson(current),
+        jobId: retryJobId,
+        attempt: 2,
+        retryOfJobId: originalJobId,
+        status: "queued",
+        publicationPhase: "none",
+        workerId: null,
+        processId: null,
+        claimToken: null,
+        claimedAt: null,
+        startedAt: null,
+        stagedAt: null,
+        promotedAt: null,
+        completedAt: null,
+        terminalAt: null,
+        failureCode: null,
+        createdAt: at,
+        updatedAt: at,
+      };
+      state.s6Jobs.push(retryJob);
+    });
+    for (const key of cleanup) this.objects.remove(key);
+  }
+
+  private claimQueuedJob(jobId: UUID): S6JobState {
+    return this.repository.transact((state) => {
+      const current = state.s6Jobs.find((item) => item.jobId === jobId);
+      if (!current) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      if (current.status !== "queued") return current;
+      this.currentSource(current.projectId, current.sourceS5Fingerprint);
+      const at = this.clock();
+      current.status = "running";
+      current.publicationPhase = "none";
+      current.workerId = this.workerId;
+      current.processId = this.processId;
+      current.claimToken = current.claimToken ?? this.uuid();
+      current.claimedAt = at;
+      current.startedAt = at;
+      current.updatedAt = at;
+      return current;
+    });
+  }
+
+  private recoverGenerationJob(job: S6JobState): void {
+    try {
+      if (job.revisionId === null) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      this.currentSource(job.projectId, job.sourceS5Fingerprint);
+      let active = job;
+      if (active.status === "queued") active = this.claimQueuedJob(active.jobId);
+      let state = this.repository.state();
+      let model = modelFor(state, job.projectId, job.revisionId);
+      if (model.sourceS5Fingerprint !== job.sourceS5Fingerprint) throw new Error("S6_SOURCE_STALE");
+      const bytes = this.writeModel(model);
+      const expectedHash = sha256(bytes);
+      const pointer = model.modelArtifact;
+      if (pointer.status === "committed" || pointer.status === "promoted") {
+        const finalBytes = this.objects.read(pointer.artifactKey);
+        if (!finalBytes.equals(bytes) || pointer.sha256 !== expectedHash || pointer.byteSize !== bytes.byteLength) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      } else {
+        if (pointer.status === "staged") {
+          const stagedBytes = this.objects.read(pointer.stagingKey);
+          if (!stagedBytes.equals(bytes)) throw new Error("S6_PUBLICATION_UNCERTAIN");
+        } else if (pointer.status === "not_written") {
+          this.currentSource(job.projectId, job.sourceS5Fingerprint);
+          this.objects.putExact(pointer.stagingKey, bytes);
+        } else {
+          throw new Error("S6_PUBLICATION_UNCERTAIN");
+        }
+        this.repository.transact((nextState) => {
+          this.currentSource(job.projectId, job.sourceS5Fingerprint);
+          const currentModel = modelFor(nextState, job.projectId, job.revisionId!);
+          const currentJob = nextState.s6Jobs.find((item) => item.jobId === active.jobId);
+          if (!currentJob || (active.claimToken !== null && currentJob.claimToken !== active.claimToken)) throw new Error("S6_CLAIM_FENCED");
+          currentModel.modelArtifact.sha256 = expectedHash;
+          currentModel.modelArtifact.byteSize = bytes.byteLength;
+          currentModel.modelArtifact.status = "staged";
+          currentModel.updatedAt = this.clock();
+          currentJob.status = "staged";
+          currentJob.publicationPhase = "staged";
+          currentJob.stagedAt = this.clock();
+          currentJob.updatedAt = this.clock();
+        });
+      }
+      state = this.repository.state();
+      model = modelFor(state, job.projectId, job.revisionId);
+      this.currentSource(job.projectId, job.sourceS5Fingerprint);
+      if (model.modelArtifact.status === "staged") promoteS6Exact(this.objects, model.modelArtifact.stagingKey, model.modelArtifact.artifactKey, bytes);
+      this.repository.transact((nextState) => {
+        this.currentSource(job.projectId, job.sourceS5Fingerprint);
+        const currentModel = modelFor(nextState, job.projectId, job.revisionId!);
+        const currentJob = nextState.s6Jobs.find((item) => item.jobId === active.jobId);
+        if (!currentJob || (active.claimToken !== null && currentJob.claimToken !== active.claimToken)) throw new Error("S6_CLAIM_FENCED");
+        currentModel.modelArtifact.status = "committed";
+        currentModel.modelArtifact.sha256 = expectedHash;
+        currentModel.modelArtifact.byteSize = bytes.byteLength;
+        currentModel.updatedAt = this.clock();
+        currentJob.status = "committed";
+        currentJob.publicationPhase = "committed";
+        currentJob.promotedAt = this.clock();
+        currentJob.completedAt = this.clock();
+        currentJob.updatedAt = this.clock();
+        this.clearRecoveryClaim(currentJob);
+      });
+      this.objects.remove(pointer.stagingKey);
+    } catch (error) {
+      this.failRecoveredJob(job.jobId, errorCode(error));
     }
   }
 
-  private recoverViewJob(job: S6JobState, artifact: S6ViewArtifact): void {
+  private recoverValidationJob(job: S6JobState): void {
     try {
+      if (job.revisionId === null) throw new Error("S6_PUBLICATION_UNCERTAIN");
       const source = this.currentSource(job.projectId, job.sourceS5Fingerprint);
+      let active = job;
+      if (active.status === "queued") active = this.claimQueuedJob(active.jobId);
+      const initial = this.repository.state();
+      const model = modelFor(initial, job.projectId, job.revisionId);
+      if (model.sourceS5Fingerprint !== source.sourceFingerprint) throw new Error("S6_SOURCE_STALE");
+      let receipt = model.validationReceiptId === null
+        ? null
+        : initial.s6ValidationReceipts.find((item) => item.receiptId === model.validationReceiptId && item.revisionHash === model.modelHash) ?? null;
+      if (!receipt) {
+        const priorModels = initial.s6SpatialModels.filter((item) => item.projectId === job.projectId).sort((left, right) => left.revisionNumber - right.revisionNumber);
+        receipt = validateS6Model(model, { source, priorModels, expectedSourceFingerprint: source.sourceFingerprint });
+        receipt.receiptId = this.uuid();
+        receipt.checkedAt = this.clock();
+        receipt.validationHash = sha256(canonicalS6Json({ ...receipt, validationHash: "" }));
+      }
+      this.repository.transact((state) => {
+        this.currentSource(job.projectId, job.sourceS5Fingerprint);
+        const currentModel = modelFor(state, job.projectId, job.revisionId!);
+        const currentJob = state.s6Jobs.find((item) => item.jobId === active.jobId);
+        if (!currentJob || (active.claimToken !== null && currentJob.claimToken !== active.claimToken)) throw new Error("S6_CLAIM_FENCED");
+        if (!state.s6ValidationReceipts.some((item) => item.receiptId === receipt!.receiptId)) state.s6ValidationReceipts.push(receipt!);
+        currentModel.validationReceiptId = receipt!.receiptId;
+        currentModel.updatedAt = this.clock();
+        currentJob.status = "committed";
+        currentJob.completedAt = this.clock();
+        currentJob.updatedAt = this.clock();
+        this.clearRecoveryClaim(currentJob);
+      });
+    } catch (error) {
+      this.failRecoveredJob(job.jobId, errorCode(error));
+    }
+  }
+
+  private recoverRenderJob(job: S6JobState, artifact: S6ViewArtifact): void {
+    try {
+      if (job.revisionId === null || job.viewId === null) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      const source = this.currentSource(job.projectId, job.sourceS5Fingerprint);
+      let active = job;
+      if (active.status === "queued") active = this.claimQueuedJob(active.jobId);
+      if (active.status === "running") {
+        this.repository.transact((state) => {
+          this.currentSource(job.projectId, job.sourceS5Fingerprint);
+          const currentJob = state.s6Jobs.find((item) => item.jobId === active.jobId);
+          const currentArtifact = state.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId);
+          if (!currentJob || !currentArtifact || (active.claimToken !== null && currentJob.claimToken !== active.claimToken)) throw new Error("S6_CLAIM_FENCED");
+          if (currentArtifact.status === "queued" || currentArtifact.status === "running") {
+            currentArtifact.status = "running";
+            currentArtifact.workerId = this.workerId;
+            currentArtifact.processId = this.processId;
+            currentArtifact.claimToken = currentJob.claimToken;
+            currentArtifact.claimedAt = currentJob.claimedAt;
+            currentArtifact.startedAt = currentJob.startedAt;
+            currentArtifact.updatedAt = this.clock();
+          }
+        });
+      }
       const state = this.repository.state();
-      const model = modelFor(state, job.projectId, job.revisionId!);
-      if (model.status !== "accepted_current" || currentAccepted(state, job.projectId, source.sourceFingerprint)?.modelRevisionId !== model.modelRevisionId) throw new Error("S6_SOURCE_STALE");
-      if (artifact.outputSha256 === null || artifact.outputByteSize === null) throw new Error("S6_PUBLICATION_UNCERTAIN");
-      const bytes = artifact.publicationPhase === "promoted" ? this.objects.read(artifact.artifactKey) : this.objects.read(artifact.stagingKey);
-      if (sha256(bytes) !== artifact.outputSha256 || bytes.byteLength !== artifact.outputByteSize) throw new Error("S6_PUBLICATION_UNCERTAIN");
-      if (artifact.publicationPhase === "staged") promoteS6Exact(this.objects, artifact.stagingKey, artifact.artifactKey, bytes);
+      const model = modelFor(state, job.projectId, job.revisionId);
+      if (model.sourceS5Fingerprint !== source.sourceFingerprint) throw new Error("S6_SOURCE_STALE");
+      const camera = buildS6Cameras(model).find((item) => item.viewId === job.viewId);
+      if (!camera) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      const rendered = renderS6View(model, camera);
+      const preservation = checkS6ViewPreservation(model, camera, rendered);
+      if (preservation.outcome !== "pass") throw new Error("S6_VIEW_PRESERVATION_FAILED");
+      const bytes = Buffer.from(rendered.svgBytes);
+      const currentArtifact = this.repository.state().s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId);
+      if (!currentArtifact) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      if (currentArtifact.status === "staged" || currentArtifact.status === "promoted" || currentArtifact.status === "committed") {
+        const existingBytes = currentArtifact.publicationPhase === "promoted" || currentArtifact.status === "committed"
+          ? this.objects.read(currentArtifact.artifactKey)
+          : this.objects.read(currentArtifact.stagingKey);
+        if (!existingBytes.equals(bytes) || currentArtifact.outputSha256 !== sha256(bytes) || currentArtifact.outputByteSize !== bytes.byteLength) throw new Error("S6_PUBLICATION_UNCERTAIN");
+        const currentState = this.repository.state();
+        const storedArtifact = currentState.s6ViewArtifacts.find((item) => item.artifactId === currentArtifact.artifactId);
+        const storedReceipt = storedArtifact?.preservationReceiptId === null || storedArtifact === undefined
+          ? null
+          : currentState.s6ViewPreservationReceipts.find((item) => item.receiptId === storedArtifact.preservationReceiptId) ?? null;
+        if (!storedArtifact || storedArtifact.sceneHash !== rendered.sceneHash || !storedReceipt || canonicalS6Json(storedReceipt) !== canonicalS6Json(preservation)) throw new Error("S6_PUBLICATION_UNCERTAIN");
+        this.repository.transact((nextState) => {
+          this.currentSource(job.projectId, job.sourceS5Fingerprint);
+          const currentJob = nextState.s6Jobs.find((item) => item.jobId === active.jobId);
+          const artifactState = nextState.s6ViewArtifacts.find((item) => item.artifactId === currentArtifact.artifactId);
+          if (!currentJob || !artifactState || (active.claimToken !== null && currentJob.claimToken !== active.claimToken)) throw new Error("S6_CLAIM_FENCED");
+          currentJob.status = artifactState.status;
+          currentJob.publicationPhase = artifactState.publicationPhase;
+          currentJob.stagedAt = artifactState.stagedAt;
+          currentJob.promotedAt = artifactState.promotedAt;
+          currentJob.completedAt = artifactState.completedAt;
+          currentJob.terminalAt = null;
+          currentJob.failureCode = null;
+          currentJob.updatedAt = this.clock();
+          this.clearRecoveryClaim(currentJob);
+        });
+        return;
+      }
+      this.currentSource(job.projectId, job.sourceS5Fingerprint);
+      this.objects.putExact(currentArtifact.stagingKey, bytes);
       this.repository.transact((nextState) => {
-        const currentArtifact = nextState.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId);
-        const currentJob = nextState.s6Jobs.find((item) => item.jobId === job.jobId);
-        const renderJob = nextState.s6Jobs.find((item) => item.artifactId === artifact.artifactId && item.kind === "render");
-        if (!currentArtifact || !currentJob) return fail(409, "S6_CLAIM_FENCED");
-        currentArtifact.status = "committed";
-        currentArtifact.publicationPhase = "committed";
-        currentArtifact.promotedAt = this.clock();
-        currentArtifact.completedAt = this.clock();
-        currentArtifact.updatedAt = this.clock();
+        this.currentSource(job.projectId, job.sourceS5Fingerprint);
+        const currentJob = nextState.s6Jobs.find((item) => item.jobId === active.jobId);
+        const storedArtifact = nextState.s6ViewArtifacts.find((item) => item.artifactId === currentArtifact.artifactId);
+        if (!currentJob || !storedArtifact || (active.claimToken !== null && currentJob.claimToken !== active.claimToken)) throw new Error("S6_CLAIM_FENCED");
+        if (!nextState.s6ViewPreservationReceipts.some((item) => item.receiptId === preservation.receiptId)) nextState.s6ViewPreservationReceipts.push(preservation);
+        storedArtifact.outputSha256 = sha256(bytes);
+        storedArtifact.outputByteSize = bytes.byteLength;
+        storedArtifact.sceneHash = preservation.sceneHash;
+        storedArtifact.preservationReceiptId = preservation.receiptId;
+        storedArtifact.status = "staged";
+        storedArtifact.publicationPhase = "staged";
+        storedArtifact.stagedAt = this.clock();
+        storedArtifact.updatedAt = this.clock();
+        currentJob.status = "staged";
+        currentJob.publicationPhase = "staged";
+        currentJob.stagedAt = storedArtifact.stagedAt;
+        currentJob.updatedAt = this.clock();
+      });
+    } catch (error) {
+      this.failRecoveredJob(job.jobId, errorCode(error));
+    }
+  }
+
+  private recoverPublicationJob(job: S6JobState, artifact: S6ViewArtifact): void {
+    try {
+      if (job.revisionId === null) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      const source = this.currentSource(job.projectId, job.sourceS5Fingerprint);
+      let active = job;
+      if (active.status === "queued") active = this.claimQueuedJob(active.jobId);
+      let state = this.repository.state();
+      const model = modelFor(state, job.projectId, job.revisionId);
+      const currentArtifact = state.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId);
+      if (!currentArtifact || model.status !== "accepted_current" || currentAccepted(state, job.projectId, source.sourceFingerprint)?.modelRevisionId !== model.modelRevisionId) throw new Error("S6_SOURCE_STALE");
+      if (currentArtifact.status === "committed") {
+        readS6CommittedExact(this.objects, currentArtifact);
+        this.repository.transact((nextState) => {
+          this.currentSource(job.projectId, job.sourceS5Fingerprint);
+          const currentJob = nextState.s6Jobs.find((item) => item.jobId === active.jobId);
+          if (!currentJob || (active.claimToken !== null && currentJob.claimToken !== active.claimToken)) throw new Error("S6_CLAIM_FENCED");
+          currentJob.status = "committed";
+          currentJob.publicationPhase = "committed";
+          currentJob.completedAt = this.clock();
+          currentJob.updatedAt = this.clock();
+          this.clearRecoveryClaim(currentJob);
+        });
+        return;
+      }
+      if (currentArtifact.outputSha256 === null || currentArtifact.outputByteSize === null || (currentArtifact.status !== "staged" && currentArtifact.status !== "promoted")) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      let bytes = currentArtifact.publicationPhase === "promoted" ? this.objects.read(currentArtifact.artifactKey) : this.objects.read(currentArtifact.stagingKey);
+      if (sha256(bytes) !== currentArtifact.outputSha256 || bytes.byteLength !== currentArtifact.outputByteSize) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      if (currentArtifact.publicationPhase === "staged") {
+        this.currentSource(job.projectId, job.sourceS5Fingerprint);
+        promoteS6Exact(this.objects, currentArtifact.stagingKey, currentArtifact.artifactKey, bytes);
+        this.repository.transact((nextState) => {
+          this.currentSource(job.projectId, job.sourceS5Fingerprint);
+          const storedArtifact = nextState.s6ViewArtifacts.find((item) => item.artifactId === currentArtifact.artifactId);
+          const currentJob = nextState.s6Jobs.find((item) => item.jobId === active.jobId);
+          if (!storedArtifact || !currentJob || (active.claimToken !== null && currentJob.claimToken !== active.claimToken)) throw new Error("S6_CLAIM_FENCED");
+          storedArtifact.status = "promoted";
+          storedArtifact.publicationPhase = "promoted";
+          storedArtifact.promotedAt = this.clock();
+          storedArtifact.updatedAt = this.clock();
+          currentJob.status = "promoted";
+          currentJob.publicationPhase = "promoted";
+          currentJob.promotedAt = storedArtifact.promotedAt;
+          currentJob.updatedAt = this.clock();
+        });
+      }
+      state = this.repository.state();
+      bytes = this.objects.read(currentArtifact.artifactKey);
+      if (sha256(bytes) !== currentArtifact.outputSha256 || bytes.byteLength !== currentArtifact.outputByteSize) throw new Error("S6_PUBLICATION_UNCERTAIN");
+      this.currentSource(job.projectId, job.sourceS5Fingerprint);
+      this.repository.transact((nextState) => {
+        this.currentSource(job.projectId, job.sourceS5Fingerprint);
+        const storedArtifact = nextState.s6ViewArtifacts.find((item) => item.artifactId === currentArtifact.artifactId);
+        const currentJob = nextState.s6Jobs.find((item) => item.jobId === active.jobId);
+        const renderJob = nextState.s6Jobs.find((item) => item.artifactId === currentArtifact.artifactId && item.kind === "render");
+        if (!storedArtifact || !currentJob || currentJob.claimToken !== active.claimToken || storedArtifact.publicationPhase !== "promoted") throw new Error("S6_CLAIM_FENCED");
+        storedArtifact.status = "committed";
+        storedArtifact.publicationPhase = "committed";
+        storedArtifact.completedAt = this.clock();
+        storedArtifact.updatedAt = this.clock();
         currentJob.status = "committed";
         currentJob.publicationPhase = "committed";
-        currentJob.promotedAt = currentArtifact.promotedAt;
-        currentJob.completedAt = currentArtifact.completedAt;
-        currentJob.updatedAt = currentArtifact.updatedAt;
-        currentJob.claimToken = null;
-        currentJob.workerId = null;
-        currentJob.processId = null;
-        currentJob.claimedAt = null;
-        if (renderJob) {
+        currentJob.completedAt = storedArtifact.completedAt;
+        currentJob.updatedAt = this.clock();
+        this.clearRecoveryClaim(currentJob);
+        if (renderJob && renderJob.status !== "committed") {
           renderJob.status = "committed";
           renderJob.publicationPhase = "committed";
-          renderJob.promotedAt = currentArtifact.promotedAt;
-          renderJob.completedAt = currentArtifact.completedAt;
-          renderJob.updatedAt = currentArtifact.updatedAt;
-          renderJob.claimToken = null;
-          renderJob.workerId = null;
-          renderJob.processId = null;
-          renderJob.claimedAt = null;
+          renderJob.completedAt = storedArtifact.completedAt;
+          renderJob.updatedAt = this.clock();
+          this.clearRecoveryClaim(renderJob);
         }
       });
-      this.objects.remove(artifact.stagingKey);
+      this.objects.remove(currentArtifact.stagingKey);
     } catch (error) {
-      const code = errorCode(error);
-      this.repository.transact((state) => {
-        const currentArtifact = state.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId);
-        const currentJob = state.s6Jobs.find((item) => item.jobId === job.jobId);
-        if (currentArtifact && currentArtifact.status !== "committed") {
-          currentArtifact.status = "failed_terminal";
-          currentArtifact.publicationPhase = "aborted";
-          currentArtifact.failureCode = code === "S6_SOURCE_STALE" ? "S6_SOURCE_STALE" : "S6_PUBLICATION_UNCERTAIN";
-          currentArtifact.terminalAt = this.clock();
-          currentArtifact.updatedAt = this.clock();
+      this.failRecoveredJob(job.jobId, errorCode(error));
+    }
+  }
+
+  private recoverPending(): void {
+    for (let pass = 0; pass < 8; pass += 1) {
+      let changed = false;
+      const before = this.repository.state();
+      for (const job of before.s6Jobs.filter((item) => item.status === "running")) {
+        if (this.ownerIsLive(job)) continue;
+        this.reclaimDeadJob(job.jobId);
+        changed = true;
+      }
+      const retryable = this.repository.state().s6Jobs.filter((item) => item.status === "failed_retryable" && item.attempt === 1 && !this.repository.state().s6Jobs.some((candidate) => candidate.retryOfJobId === item.jobId));
+      for (const job of retryable) {
+        this.reclaimDeadJob(job.jobId);
+        changed = true;
+      }
+      for (const job of this.repository.state().s6Jobs.filter((item) => item.status === "queued")) {
+        const beforeStatus = job.status;
+        if (job.kind === "generation") this.recoverGenerationJob(job);
+        else if (job.kind === "validation") this.recoverValidationJob(job);
+        else if (job.kind === "render") {
+          const artifact = job.artifactId === null ? null : this.repository.state().s6ViewArtifacts.find((item) => item.artifactId === job.artifactId) ?? null;
+          if (artifact) this.recoverRenderJob(job, artifact);
+          else this.failRecoveredJob(job.jobId, "S6_PUBLICATION_UNCERTAIN");
+        } else {
+          const artifact = job.artifactId === null ? null : this.repository.state().s6ViewArtifacts.find((item) => item.artifactId === job.artifactId) ?? null;
+          if (artifact) this.recoverPublicationJob(job, artifact);
+          else this.failRecoveredJob(job.jobId, "S6_PUBLICATION_UNCERTAIN");
         }
-        if (currentJob && currentJob.status !== "committed") {
-          currentJob.status = "failed_terminal";
-          currentJob.publicationPhase = "aborted";
-          currentJob.failureCode = code === "S6_SOURCE_STALE" ? "S6_SOURCE_STALE" : "S6_PUBLICATION_UNCERTAIN";
-          currentJob.terminalAt = this.clock();
-          currentJob.updatedAt = this.clock();
+        const after = this.repository.state().s6Jobs.find((item) => item.jobId === job.jobId);
+        if (after?.status !== beforeStatus) changed = true;
+      }
+      for (const job of this.repository.state().s6Jobs.filter((item) => item.status === "staged" || item.status === "promoted")) {
+        const beforeStatus = job.status;
+        if (job.kind === "generation") this.recoverGenerationJob(job);
+        else if (job.kind === "validation") this.recoverValidationJob(job);
+        else if (job.kind === "render") {
+          const artifact = job.artifactId === null ? null : this.repository.state().s6ViewArtifacts.find((item) => item.artifactId === job.artifactId) ?? null;
+          if (artifact) this.recoverRenderJob(job, artifact);
+          else this.failRecoveredJob(job.jobId, "S6_PUBLICATION_UNCERTAIN");
+        } else {
+          const artifact = job.artifactId === null ? null : this.repository.state().s6ViewArtifacts.find((item) => item.artifactId === job.artifactId) ?? null;
+          if (artifact) this.recoverPublicationJob(job, artifact);
+          else this.failRecoveredJob(job.jobId, "S6_PUBLICATION_UNCERTAIN");
         }
-      });
+        const after = this.repository.state().s6Jobs.find((item) => item.jobId === job.jobId);
+        if (after?.status !== beforeStatus) changed = true;
+      }
+      if (!changed) break;
     }
   }
 

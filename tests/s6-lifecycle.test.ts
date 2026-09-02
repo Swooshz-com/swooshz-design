@@ -166,6 +166,27 @@ test("generation persists one source-fenced draft with designFormReview", async 
   }
 });
 
+test("draft preview is inspectable before form completion but cannot be published", async () => {
+  const harness = makeHarness();
+  try {
+    const generated = await harness.service.generate(PROJECT_ID, uuid(801), uuid(802), "subject-s6");
+    const rendered = await harness.service.render(PROJECT_ID, generated.revisionId, generated.concurrency, uuid(803), uuid(804));
+    const top = rendered.views.find((item) => item.viewId === "top-orthographic");
+    assert.ok(top);
+    assert.equal(top.purpose, "draft_preview");
+    assert.equal(top.status, "staged");
+    const preview = harness.service.getViewDownload(PROJECT_ID, generated.revisionId, "top-orthographic");
+    assert.equal(preview.contentType, "image/svg+xml");
+    assert.match(preview.bytes.toString("utf8"), /<svg/u);
+    await assert.rejects(
+      harness.service.publish(PROJECT_ID, generated.revisionId, "top-orthographic", generated.concurrency, uuid(805), uuid(806)),
+      (error: unknown) => errorCode(error) === "S6_ACCEPTANCE_CONFLICT",
+    );
+  } finally {
+    harness.close();
+  }
+});
+
 test("same generation key replays without a second draft", async () => {
   const harness = makeHarness();
   try {
@@ -586,6 +607,7 @@ test("restart recovery handles queued running staged promoted and terminal state
       });
       const running = state.s6Jobs[0]!;
       state.s6Jobs.push({ ...running, jobId: uuid(84), inputHash: "c".repeat(64), idempotencyKey: uuid(85), requestReferenceId: uuid(86), status: "running", workerId: "dead-worker", processId: 999, claimToken: uuid(87), claimedAt: AT, startedAt: AT });
+      state.s6Jobs.push({ ...running, jobId: uuid(91), inputHash: "e".repeat(64), idempotencyKey: uuid(92), requestReferenceId: uuid(93), status: "running", workerId: null, processId: null, claimToken: null, claimedAt: null, startedAt: AT });
       state.s6Jobs.push({ ...running, jobId: uuid(88), inputHash: "d".repeat(64), idempotencyKey: uuid(89), requestReferenceId: uuid(90), status: "failed_terminal", failureCode: "S6_PUBLICATION_UNCERTAIN", terminalAt: AT });
     });
     const recovered = new S6WorkflowService({
@@ -609,10 +631,245 @@ test("restart recovery handles queued running staged promoted and terminal state
       isProcessAlive: (processId) => processId === 702,
     });
     await recovered.recover();
-    const statuses = recovered.repository.state().s6Jobs.map((item) => item.status);
-    assert.ok(statuses.includes("queued"));
+    const jobs = recovered.repository.state().s6Jobs;
+    const statuses = jobs.map((item) => item.status);
+    assert.equal(statuses.includes("queued"), false);
+    assert.equal(jobs.find((item) => item.jobId === uuid(91))?.status, "running");
     assert.ok(statuses.includes("failed_terminal"));
     assert.ok(statuses.includes("failed_retryable") || statuses.includes("committed"));
+  } finally {
+    harness.close();
+  }
+});
+
+test("restart recovery reconciles a queued render job with an already staged exact artifact", async () => {
+  const source = makeS6Source({ requirements: [{ name: "Welcome counter", expected: "present" }] });
+  const gate = mutableSourceReader(source);
+  const harness = makeHarness({ source, sourceReader: gate.reader });
+  try {
+    const generated = await harness.service.generate(PROJECT_ID, uuid(181), uuid(182), "subject-s6");
+    const corrected = await confirmDraft(harness, generated.revisionId, 183);
+    const validation = await harness.service.validate(PROJECT_ID, corrected.revisionId, corrected.token, uuid(185), uuid(186));
+    assert.equal(validation.errors.length, 0, JSON.stringify(validation.errors));
+    const accepted = await harness.service.accept(PROJECT_ID, corrected.revisionId, corrected.token, uuid(187), uuid(188), "subject-s6");
+    await harness.service.render(PROJECT_ID, accepted.revisionId, accepted.concurrency, uuid(189), uuid(190));
+    const renderJob = harness.repository.state().s6Jobs.find((item) => item.kind === "render" && item.viewId === "top-orthographic")!;
+    const artifact = harness.repository.state().s6ViewArtifacts.find((item) => item.artifactId === renderJob.artifactId)!;
+    const bytes = harness.objects.read(artifact.stagingKey);
+    harness.repository.transact((state) => {
+      const currentJob = state.s6Jobs.find((item) => item.jobId === renderJob.jobId)!;
+      currentJob.status = "queued";
+      currentJob.publicationPhase = "none";
+      currentJob.workerId = null;
+      currentJob.processId = null;
+      currentJob.claimToken = null;
+      currentJob.claimedAt = null;
+      currentJob.startedAt = null;
+      currentJob.updatedAt = AT;
+    });
+    const recovered = new S6WorkflowService({
+      repository: harness.repository,
+      objects: harness.objects,
+      sourceReader: gate.reader,
+      clock: deterministicClock(),
+      uuid: (() => { let next = 1900; return () => uuid(next++); })(),
+      workerId: "restarted-worker",
+      processId: 702,
+      isProcessAlive: () => false,
+    });
+    await recovered.recover();
+    const state = recovered.repository.state();
+    assert.equal(state.s6Jobs.find((item) => item.jobId === renderJob.jobId)?.status, "staged");
+    assert.equal(state.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId)?.status, "staged");
+    assert.equal(harness.objects.read(artifact.stagingKey).equals(bytes), true);
+    assert.equal(state.s6Jobs.some((item) => item.retryOfJobId === renderJob.jobId), false);
+  } finally {
+    harness.close();
+  }
+});
+
+test("restart recovery resumes exact staged model state and terminalizes corrupt staged render bytes", async () => {
+  {
+    const source = makeS6Source({ requirements: [{ name: "Welcome counter", expected: "present" }] });
+    const gate = mutableSourceReader(source);
+    const harness = makeHarness({ source, sourceReader: gate.reader });
+    try {
+      const generated = await harness.service.generate(PROJECT_ID, uuid(121), uuid(122), "subject-s6");
+      const model = harness.repository.state().s6SpatialModels.find((item) => item.modelRevisionId === generated.revisionId)!;
+      const job = harness.repository.state().s6Jobs.find((item) => item.kind === "generation" && item.revisionId === generated.revisionId)!;
+      const modelBytes = harness.objects.read(model.modelArtifact.artifactKey);
+      harness.objects.putExact(model.modelArtifact.stagingKey, modelBytes);
+      harness.repository.transact((state) => {
+        const storedModel = state.s6SpatialModels.find((item) => item.modelRevisionId === generated.revisionId)!;
+        const storedJob = state.s6Jobs.find((item) => item.jobId === job.jobId)!;
+        storedModel.modelArtifact.status = "staged";
+        storedJob.status = "staged";
+        storedJob.publicationPhase = "staged";
+        storedJob.stagedAt = AT;
+        storedJob.updatedAt = AT;
+      });
+      const recovered = new S6WorkflowService({
+        repository: harness.repository,
+        objects: harness.objects,
+        sourceReader: gate.reader,
+        clock: deterministicClock(),
+        uuid: (() => { let next = 1200; return () => uuid(next++); })(),
+        workerId: "restarted-worker",
+        processId: 702,
+        isProcessAlive: () => false,
+      });
+      await recovered.recover();
+      const state = recovered.repository.state();
+      assert.equal(state.s6SpatialModels.find((item) => item.modelRevisionId === generated.revisionId)?.modelArtifact.status, "committed");
+      assert.equal(state.s6Jobs.find((item) => item.jobId === job.jobId)?.status, "committed");
+      assert.equal(harness.objects.exists(model.modelArtifact.stagingKey), false);
+    } finally {
+      harness.close();
+    }
+  }
+
+  {
+    const source = makeS6Source({ requirements: [{ name: "Welcome counter", expected: "present" }] });
+    const gate = mutableSourceReader(source);
+    const harness = makeHarness({ source, sourceReader: gate.reader });
+    try {
+      const generated = await harness.service.generate(PROJECT_ID, uuid(123), uuid(124), "subject-s6");
+      const corrected = await confirmDraft(harness, generated.revisionId, 125);
+      const validation = await harness.service.validate(PROJECT_ID, corrected.revisionId, corrected.token, uuid(127), uuid(128));
+      assert.equal(validation.errors.length, 0, JSON.stringify(validation.errors));
+      const accepted = await harness.service.accept(PROJECT_ID, corrected.revisionId, corrected.token, uuid(129), uuid(130), "subject-s6");
+      await harness.service.render(PROJECT_ID, accepted.revisionId, accepted.concurrency, uuid(131), uuid(132));
+      const artifact = harness.repository.state().s6ViewArtifacts.find((item) => item.viewId === "perspective-northwest")!;
+      const job = harness.repository.state().s6Jobs.find((item) => item.kind === "render" && item.artifactId === artifact.artifactId)!;
+      harness.objects.remove(artifact.stagingKey);
+      harness.objects.put(artifact.stagingKey, Buffer.from("corrupt staged render"));
+      const recovered = new S6WorkflowService({
+        repository: harness.repository,
+        objects: harness.objects,
+        sourceReader: gate.reader,
+        clock: deterministicClock(),
+        uuid: (() => { let next = 1300; return () => uuid(next++); })(),
+        workerId: "restarted-worker",
+        processId: 702,
+        isProcessAlive: () => false,
+      });
+      await recovered.recover();
+      const state = recovered.repository.state();
+      assert.equal(state.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId)?.status, "failed_terminal");
+      assert.equal(state.s6Jobs.find((item) => item.jobId === job.jobId)?.status, "failed_terminal");
+      assert.equal(harness.objects.exists(artifact.stagingKey), false);
+    } finally {
+      harness.close();
+    }
+  }
+});
+
+test("restart recovery claims a queued publication and closes its render job", async () => {
+  const source = makeS6Source({ requirements: [{ name: "Welcome counter", expected: "present" }] });
+  const gate = mutableSourceReader(source);
+  const harness = makeHarness({ source, sourceReader: gate.reader });
+  try {
+    const generated = await harness.service.generate(PROJECT_ID, uuid(141), uuid(142), "subject-s6");
+    const corrected = await confirmDraft(harness, generated.revisionId, 143);
+    const validation = await harness.service.validate(PROJECT_ID, corrected.revisionId, corrected.token, uuid(145), uuid(146));
+    assert.equal(validation.errors.length, 0, JSON.stringify(validation.errors));
+    const accepted = await harness.service.accept(PROJECT_ID, corrected.revisionId, corrected.token, uuid(147), uuid(148), "subject-s6");
+    await harness.service.render(PROJECT_ID, accepted.revisionId, accepted.concurrency, uuid(149), uuid(150));
+    const renderJob = harness.repository.state().s6Jobs.find((item) => item.kind === "render" && item.viewId === "perspective-northwest")!;
+    const artifact = harness.repository.state().s6ViewArtifacts.find((item) => item.artifactId === renderJob.artifactId)!;
+    harness.repository.transact((state) => {
+      state.s6Jobs.push({
+        ...renderJob,
+        jobId: uuid(151),
+        kind: "publication",
+        inputHash: "f".repeat(64),
+        idempotencyKey: uuid(152),
+        requestReferenceId: uuid(153),
+        status: "queued",
+        publicationPhase: "none",
+        workerId: null,
+        processId: null,
+        claimToken: null,
+        claimedAt: null,
+        startedAt: null,
+        stagedAt: null,
+        promotedAt: null,
+        completedAt: null,
+        terminalAt: null,
+        failureCode: null,
+      });
+    });
+    const recovered = new S6WorkflowService({
+      repository: harness.repository,
+      objects: harness.objects,
+      sourceReader: gate.reader,
+      clock: deterministicClock(),
+      uuid: (() => { let next = 1500; return () => uuid(next++); })(),
+      workerId: "restarted-worker",
+      processId: 702,
+      isProcessAlive: () => false,
+    });
+    await recovered.recover();
+    const state = recovered.repository.state();
+    assert.equal(state.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId)?.status, "committed");
+    assert.equal(state.s6Jobs.find((item) => item.jobId === uuid(151))?.status, "committed");
+    assert.equal(state.s6Jobs.find((item) => item.jobId === renderJob.jobId)?.status, "committed");
+    assert.equal(harness.objects.exists(artifact.artifactKey), true);
+  } finally {
+    harness.close();
+  }
+});
+
+test("restart recovery terminalizes a dead second attempt without a third dispatch", async () => {
+  const source = makeS6Source({ requirements: [{ name: "Welcome counter", expected: "present" }] });
+  const gate = mutableSourceReader(source);
+  const harness = makeHarness({ source, sourceReader: gate.reader });
+  try {
+    const generated = await harness.service.generate(PROJECT_ID, uuid(161), uuid(162), "subject-s6");
+    const first = harness.repository.state().s6Jobs.find((item) => item.kind === "generation")!;
+    harness.repository.transact((state) => {
+      const current = state.s6Jobs.find((item) => item.jobId === first.jobId)!;
+      current.status = "failed_retryable";
+      current.publicationPhase = "aborted";
+      current.failureCode = "S6_PUBLICATION_UNCERTAIN";
+      current.terminalAt = null;
+      current.claimToken = null;
+      current.workerId = null;
+      current.processId = null;
+      current.claimedAt = null;
+      state.s6Jobs.push({
+        ...current,
+        jobId: uuid(163),
+        attempt: 2,
+        retryOfJobId: first.jobId,
+        status: "running",
+        publicationPhase: "none",
+        workerId: "dead-worker",
+        processId: 999,
+        claimToken: uuid(164),
+        claimedAt: AT,
+        startedAt: AT,
+        terminalAt: null,
+        failureCode: null,
+      });
+    });
+    const recovered = new S6WorkflowService({
+      repository: harness.repository,
+      objects: harness.objects,
+      sourceReader: gate.reader,
+      clock: deterministicClock(),
+      uuid: (() => { let next = 1700; return () => uuid(next++); })(),
+      workerId: "restarted-worker",
+      processId: 702,
+      isProcessAlive: () => false,
+    });
+    await recovered.recover();
+    const jobs = recovered.repository.state().s6Jobs;
+    assert.equal(jobs.length, 2);
+    assert.equal(jobs.find((item) => item.jobId === uuid(163))?.status, "failed_terminal");
+    assert.equal(jobs.some((item) => item.attempt > 2), false);
+    assert.equal(jobs.some((item) => item.status === "queued"), false);
+    void generated;
   } finally {
     harness.close();
   }
