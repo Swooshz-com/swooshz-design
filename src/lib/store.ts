@@ -22,6 +22,7 @@ import { validateS2Graph } from "./s2-persistence";
 import { validateS3Collections, validateS3Graph } from "./s3-persistence";
 import { validateS4Collections, validateS4Graph } from "./s4-persistence";
 import { validateS5Collections, validateS5Graph } from "./s5-persistence";
+import { validateS6Collections, validateS6Graph } from "./s6-persistence";
 
 const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
@@ -138,6 +139,15 @@ export function emptyStoreState(): StoreState {
     s4Transitions: [],
     s5ApprovalEvents: [],
     s5Artifacts: [],
+    s6SpatialModels: [],
+    s6ValidationReceipts: [],
+    s6CorrectionEvents: [],
+    s6AcceptanceEvents: [],
+    s6SupersessionEvents: [],
+    s6ViewArtifacts: [],
+    s6ViewPreservationReceipts: [],
+    s6Jobs: [],
+    s6Idempotency: [],
   };
 }
 
@@ -760,10 +770,12 @@ export class JsonRepository {
       validateS3Collections(parsedRecord, merged);
       validateS4Collections(parsedRecord, merged);
       validateS5Collections(parsedRecord, merged);
+      validateS6Collections(parsedRecord, merged);
       validateS2Graph(merged);
       validateS3Graph(merged);
       validateS4Graph(merged);
       validateS5Graph(merged);
+      validateS6Graph(merged);
       return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
@@ -1117,6 +1129,8 @@ export class JsonRepository {
         validateS3Graph(fresh);
         validateS4Graph(fresh);
         validateS5Graph(fresh);
+        validateS6Collections(fresh, fresh);
+        validateS6Graph(fresh);
       } catch {
         throw new AppError(500, "PERSISTENCE_FAILED");
       }

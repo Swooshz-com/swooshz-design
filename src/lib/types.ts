@@ -317,6 +317,15 @@ export type StoreState = {
   s4Transitions: S4StateTransition[];
   s5ApprovalEvents: S5ApprovalEvent[];
   s5Artifacts: S5Artifact[];
+  s6SpatialModels: S6SpatialModelRecord[];
+  s6ValidationReceipts: S6ValidationReceipt[];
+  s6CorrectionEvents: S6CorrectionEvent[];
+  s6AcceptanceEvents: S6AcceptanceEvent[];
+  s6SupersessionEvents: S6SupersessionEvent[];
+  s6ViewArtifacts: S6ViewArtifact[];
+  s6ViewPreservationReceipts: S6ViewPreservationReceipt[];
+  s6Jobs: S6JobState[];
+  s6Idempotency: S6IdempotencyState[];
 };
 
 export type S6RevisionStatus =
