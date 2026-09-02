@@ -639,7 +639,8 @@ function validateModelLineage(models: PersistedRecord[]): Map<string, PersistedR
     if (projectRevisionKeys.has(revisionKey)) return invalid("S6_DUPLICATE_REVISION");
     projectRevisionKeys.add(revisionKey);
     if (model.parentRevisionId === null) {
-      if (revisionNumber !== 1) return invalid("S6_LINEAGE_INVALID");
+      // A source-epoch root has no parent even when earlier source epochs
+      // already consumed lower project revision numbers.
     } else {
       const parent = modelById.get(String(model.parentRevisionId));
       if (parent === undefined || parent.projectId !== model.projectId || Number(parent.revisionNumber) !== revisionNumber - 1) return invalid("S6_LINEAGE_INVALID");
@@ -664,7 +665,7 @@ function validateAcceptanceGraph(models: PersistedRecord[], modelById: Map<strin
   }
   for (const event of events) {
     const model = modelById.get(String(event.revisionId));
-    if (model === undefined || model.projectId !== event.projectId || model.modelHash !== event.revisionHash || model.sourceS5Fingerprint !== event.sourceS5Fingerprint || (model.status !== "accepted_current" && model.status !== "superseded") || model.acceptanceEventId !== event.acceptanceEventId) return invalid("S6_ACCEPTANCE_LINK_INVALID");
+    if (model === undefined || model.projectId !== event.projectId || model.modelHash !== event.revisionHash || model.sourceS5Fingerprint !== event.sourceS5Fingerprint || (model.status !== "accepted_current" && model.status !== "superseded" && model.status !== "stale") || model.acceptanceEventId !== event.acceptanceEventId) return invalid("S6_ACCEPTANCE_LINK_INVALID");
     sameNullablePair(event, "priorAcceptedRevisionId", "priorAcceptedRevisionHash");
     sameNullablePair(event, "expectedCurrentAcceptedRevisionId", "expectedCurrentAcceptedHash");
     if (event.priorAcceptedRevisionId !== null) {

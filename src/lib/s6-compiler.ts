@@ -36,8 +36,13 @@ export type S6CompilerInput = {
   source: S5ToS6Projection;
   revisionId: UUID;
   parentRevisionId: UUID | null;
+  revisionNumber?: number;
   clock: () => Timestamp;
 };
+
+function compilerNamespace(source: S5ToS6Projection): string {
+  return source.activeRevisionId + ":" + source.sourceFingerprint;
+}
 
 const CATEGORY_ORDER: readonly S5ZoneCategory[] = [
   "reception_welcome",
@@ -419,7 +424,7 @@ function makeFloor(source: S5ToS6Projection, booth: S6BoothEnvelope, material: S
     localAnchor: "floor",
   });
   return {
-    objectId: compilerObjectId(source.projectId, source.activeRevisionId, "booth-floor"),
+    objectId: compilerObjectId(source.projectId, compilerNamespace(source), "booth-floor"),
     identityKey: "booth-floor",
     parentObjectId: null,
     objectType: "floor_footprint",
@@ -442,7 +447,7 @@ function makeWall(source: S5ToS6Projection, booth: S6BoothEnvelope, side: OpenSi
   const provenance = inferredProvenance(source, "s5:geometrySnapshot", "Closed-side wall run follows confirmed open-side facts; thickness is a bounded S6 draft value.");
   const unknownId = "design-form:booth-wall:" + side;
   return {
-    objectId: compilerObjectId(source.projectId, source.activeRevisionId, "booth-wall:" + side),
+    objectId: compilerObjectId(source.projectId, compilerNamespace(source), "booth-wall:" + side),
     identityKey: "booth-wall:" + side,
     parentObjectId: null,
     objectType: "wall",
@@ -470,7 +475,7 @@ function makeZoneRegion(
   const width = usableSize(Math.max(600, Math.trunc(booth.widthMm * 0.4)), booth.widthMm);
   const depth = usableSize(Math.max(600, Math.trunc(booth.depthMm * 0.4)), booth.depthMm);
   const provenance = inferredProvenance(source, "s5:layoutPlan.zones." + zone.zoneId, "Semantic zone relationship only; S5 normalized-Q16 coordinates are conceptual and were not copied.");
-  const regionObjectId = compilerObjectId(source.projectId, source.activeRevisionId, "zone:" + zone.zoneId);
+  const regionObjectId = compilerObjectId(source.projectId, compilerNamespace(source), "zone:" + zone.zoneId);
   const object: S6SpatialObject = {
     objectId: regionObjectId,
     identityKey: "zone:" + zone.zoneId,
@@ -528,7 +533,7 @@ function objectForRequirement(
   const primitive = geometryFor(semantic.objectType, shape, dimensions.width, dimensions.depth, height);
   const transform = placementFor(semantic.objectType, record.category, slot, footprintSize(primitive), booth, renderHeight, height);
   const stableKey = "requirement:" + record.requirement.requirementId + ":" + semantic.role + ":" + String(index + 1);
-  const objectId = compilerObjectId(source.projectId, source.activeRevisionId, stableKey);
+  const objectId = compilerObjectId(source.projectId, compilerNamespace(source), stableKey);
   const unknownId = "design-form:" + objectId;
   const provenance = inferredProvenance(source, "s5:layoutPlan.zones." + (record.zone?.zoneId ?? "unmapped"), "Bounded S6 shape, placement, dimensions, and finish inferred from structured requirement semantics; S5 placement remains conceptual.");
   const material = materialFor(materials, record.text, slot);
@@ -578,7 +583,7 @@ function seatingMarkersFor(
     const primitive = geometryFor("seating_marker", null, dimensions.width, dimensions.depth, height);
     const transform = placementFor("seating_marker", record.category, slot + index, footprintSize(primitive), booth, renderHeight, height);
     const stableKey = "requirement:" + record.requirement.requirementId + ":seating:" + String(index + 1);
-    const objectId = compilerObjectId(source.projectId, source.activeRevisionId, stableKey);
+    const objectId = compilerObjectId(source.projectId, compilerNamespace(source), stableKey);
     const unknownId = "design-form:" + objectId;
     const provenance = inferredProvenance(source, "s5:layoutPlan.zones." + (record.zone?.zoneId ?? "unmapped"), "Symbolic seating marker added for a confirmed consultation relationship; dimensions remain bounded design inference.");
     const material = materialFor(materials, record.text, slot + index);
@@ -733,7 +738,7 @@ export function compileS6Draft(input: S6CompilerInput): S6SpatialModelRecord {
     projectId: source.projectId,
     parentRevisionId: input.parentRevisionId,
     parentRevisionHash: null,
-    revisionNumber: 1,
+    revisionNumber: input.revisionNumber ?? 1,
     sourceS5Fingerprint: source.sourceFingerprint,
     sourceS5ApprovalEventId: source.approvalEventId,
     sourceS5ApprovalGeneration: source.approvalGeneration,

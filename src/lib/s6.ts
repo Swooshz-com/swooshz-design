@@ -153,6 +153,14 @@ function latestEditable(state: StoreState, projectId: UUID, sourceFingerprint: S
     .sort((left, right) => right.revisionNumber - left.revisionNumber)[0] ?? null;
 }
 
+function nextRevisionNumber(state: StoreState, projectId: UUID): number {
+  const maximum = state.s6SpatialModels
+    .filter((item) => item.projectId === projectId)
+    .reduce((value, item) => Math.max(value, item.revisionNumber), 0);
+  if (maximum >= S6_MAX_REVISIONS_PER_PROJECT) return fail(422, "S6_SPATIAL_SCHEMA_INVALID");
+  return maximum + 1;
+}
+
 function revisionSummary(model: S6SpatialModelRecord, receipts: readonly S6ValidationReceipt[]): S6RevisionSummary {
   const receipt = receipts
     .filter((item) => item.revisionId === model.modelRevisionId && item.revisionHash === model.modelHash)
@@ -423,12 +431,55 @@ export class S6WorkflowService {
     const state = this.repository.state();
     projectIn(state, projectId);
     const model = modelFor(state, projectId, revisionId);
-    this.currentSource(projectId, model.sourceS5Fingerprint);
+    const source = this.source(projectId);
+    if (model.sourceS5Fingerprint !== source.sourceFingerprint) {
+      const hasReplacementRoot = state.s6SpatialModels.some((item) =>
+        item.projectId === projectId &&
+        item.parentRevisionId === null &&
+        item.sourceS5Fingerprint === source.sourceFingerprint,
+      );
+      if (!hasReplacementRoot) this.currentSource(projectId, model.sourceS5Fingerprint);
+    }
     return this.revisionPublic(state, projectId, revisionId);
   }
 
   private writeModel(model: S6SpatialModelRecord): Buffer {
     return canonicalS6ModelBytes(model);
+  }
+
+  private abortGeneration(projectId: UUID, revisionId: UUID, jobId: UUID, failureCode: string): void {
+    try {
+      this.repository.transact((state) => {
+        const model = state.s6SpatialModels.find((item) => item.projectId === projectId && item.modelRevisionId === revisionId);
+        const job = state.s6Jobs.find((item) => item.projectId === projectId && item.jobId === jobId);
+        const at = this.clock();
+        if (model && (model.status === "generated_draft" || model.status === "corrected_draft")) {
+          if (failureCode === "S6_SOURCE_STALE") {
+            model.status = "stale";
+            model.staleAt = at;
+          } else {
+            model.status = "aborted";
+          }
+          model.modelArtifact.status = "failed_terminal";
+          model.modelArtifact.sha256 = null;
+          model.modelArtifact.byteSize = null;
+          model.updatedAt = at;
+        }
+        if (job && job.status !== "committed" && job.status !== "failed_terminal") {
+          job.status = "aborted";
+          job.publicationPhase = "aborted";
+          job.failureCode = failureCode;
+          job.terminalAt = at;
+          job.updatedAt = at;
+          job.claimToken = null;
+          job.workerId = null;
+          job.processId = null;
+          job.claimedAt = null;
+        }
+      });
+    } catch {
+      // The original source-fence or persistence error remains authoritative.
+    }
   }
 
   private async createChild(
@@ -452,6 +503,7 @@ export class S6WorkflowService {
     const eventId = this.uuid();
     const childJobId = this.uuid();
     const claimToken = this.uuid();
+    let cleanupKeys: ReturnType<typeof s6ModelStorageKeys> | null = null;
     try {
       const applied = applyS6Corrections(parent, operations, {
         childRevisionId,
@@ -467,6 +519,7 @@ export class S6WorkflowService {
       child = cloneWithHash(child);
       event.childRevisionHash = child.modelHash;
       const keys = s6ModelStorageKeys(parent.projectId, childRevisionId, childJobId, claimToken);
+      cleanupKeys = keys;
       child.modelArtifact = { artifactKey: keys.artifactKey, stagingKey: keys.stagingKey, sha256: null, byteSize: null, status: "not_written" };
       const bytes = this.writeModel(child);
       this.currentSource(parent.projectId, source.sourceFingerprint);
@@ -476,6 +529,7 @@ export class S6WorkflowService {
       child.modelArtifact.byteSize = bytes.byteLength;
       child.modelArtifact.status = "committed";
       const result = this.repository.transact((nextState) => {
+        this.currentSource(parent.projectId, source.sourceFingerprint);
         const currentParent = modelFor(nextState, parent.projectId, parent.modelRevisionId);
         this.assertToken(nextState, currentParent, this.tokenFor(state, parent, source.sourceFingerprint), source.sourceFingerprint);
         if (operation === "reopen") {
@@ -494,6 +548,10 @@ export class S6WorkflowService {
       this.objects.remove(keys.stagingKey);
       return result;
     } catch (error) {
+      if (cleanupKeys) {
+        this.objects.remove(cleanupKeys.stagingKey);
+        this.objects.remove(cleanupKeys.artifactKey);
+      }
       return mapError(error, "S6_GEOMETRY_INVALID");
     }
   }
@@ -509,14 +567,17 @@ export class S6WorkflowService {
     if (existing) return { ...(cloneJson(existing.result) as S6MutationResult), replayed: true };
     if (typeof actorSubjectId !== "string" || !actorSubjectId.trim()) return fail(400, "S6_INVALID_REQUEST", "actorSubjectId");
     if (currentAccepted(firstState, projectId, source.sourceFingerprint) || latestEditable(firstState, projectId, source.sourceFingerprint)) return fail(409, "S6_REVISION_CONFLICT");
+    const revisionNumber = nextRevisionNumber(firstState, projectId);
     const revisionId = this.uuid();
     const jobId = this.uuid();
     const claimToken = this.uuid();
+    let cleanupKeys: ReturnType<typeof s6ModelStorageKeys> | null = null;
     try {
-      let model = compileS6Draft({ source, revisionId, parentRevisionId: null, clock: this.clock });
+      let model = compileS6Draft({ source, revisionId, parentRevisionId: null, revisionNumber, clock: this.clock });
       model.cameras = buildS6Cameras(model);
       model = cloneWithHash(model);
       const keys = s6ModelStorageKeys(projectId, revisionId, jobId, claimToken);
+      cleanupKeys = keys;
       model.modelArtifact = { artifactKey: keys.artifactKey, stagingKey: keys.stagingKey, sha256: null, byteSize: null, status: "not_written" };
       const at = this.clock();
       const job = jobBase(projectId, jobId, "generation", revisionId, null, source.sourceFingerprint, inputHash, key, referenceId, at);
@@ -527,13 +588,24 @@ export class S6WorkflowService {
       job.startedAt = at;
       this.repository.transact((state) => {
         projectIn(state, projectId);
+        this.currentSource(projectId, source.sourceFingerprint);
+        if (nextRevisionNumber(state, projectId) !== revisionNumber) return fail(409, "S6_REVISION_CONFLICT");
         if (currentAccepted(state, projectId, source.sourceFingerprint) || latestEditable(state, projectId, source.sourceFingerprint)) return fail(409, "S6_REVISION_CONFLICT");
+        for (const prior of state.s6SpatialModels) {
+          if (prior.projectId === projectId && prior.status === "accepted_current" && prior.sourceS5Fingerprint !== source.sourceFingerprint) {
+            prior.status = "stale";
+            prior.staleAt = at;
+            prior.updatedAt = at;
+          }
+        }
         state.s6SpatialModels.push(model);
         state.s6Jobs.push(job);
       });
       const bytes = this.writeModel(model);
+      this.currentSource(projectId, source.sourceFingerprint);
       this.objects.putExact(keys.stagingKey, bytes);
       this.repository.transact((state) => {
+        this.currentSource(projectId, source.sourceFingerprint);
         const currentModel = modelFor(state, projectId, revisionId);
         const currentJob = state.s6Jobs.find((item) => item.jobId === jobId);
         if (!currentJob || currentJob.claimToken !== claimToken) return fail(409, "S6_CLAIM_FENCED");
@@ -548,6 +620,7 @@ export class S6WorkflowService {
       this.currentSource(projectId, source.sourceFingerprint);
       promoteS6Exact(this.objects, keys.stagingKey, keys.artifactKey, bytes);
       const result = this.repository.transact((state) => {
+        this.currentSource(projectId, source.sourceFingerprint);
         const currentModel = modelFor(state, projectId, revisionId);
         const currentJob = state.s6Jobs.find((item) => item.jobId === jobId);
         if (!currentJob || currentJob.claimToken !== claimToken) return fail(409, "S6_CLAIM_FENCED");
@@ -568,6 +641,13 @@ export class S6WorkflowService {
       this.objects.remove(keys.stagingKey);
       return result;
     } catch (error) {
+      if (cleanupKeys) {
+        this.objects.remove(cleanupKeys.stagingKey);
+        this.objects.remove(cleanupKeys.artifactKey);
+      }
+      if (this.repository.state().s6SpatialModels.some((item) => item.projectId === projectId && item.modelRevisionId === revisionId)) {
+        this.abortGeneration(projectId, revisionId, jobId, errorCode(error));
+      }
       return mapError(error, "S6_INTERNAL_ERROR", 500);
     }
   }
@@ -625,6 +705,7 @@ export class S6WorkflowService {
       job.status = "committed";
       job.completedAt = at;
       const result = this.repository.transact((state) => {
+        this.currentSource(projectId, source.sourceFingerprint);
         const current = modelFor(state, projectId, revisionId);
         this.assertToken(state, current, token, source.sourceFingerprint);
         current.validationReceiptId = receipt.receiptId;
@@ -668,6 +749,7 @@ export class S6WorkflowService {
       const supersessionEventId = this.uuid();
       const at = this.clock();
       const result = this.repository.transact((state) => {
+        this.currentSource(projectId, source.sourceFingerprint);
         const candidate = modelFor(state, projectId, revisionId);
         this.assertToken(state, candidate, token, source.sourceFingerprint, true);
         if (candidate.status !== "generated_draft" && candidate.status !== "corrected_draft") return fail(409, "S6_ACCEPTANCE_CONFLICT");
@@ -814,6 +896,7 @@ export class S6WorkflowService {
         return { artifact, job, bytes: Buffer.from(item.value.svgBytes), preservation: item.preservation };
       });
       this.repository.transact((state) => {
+        this.currentSource(projectId, source.sourceFingerprint);
         const current = modelFor(state, projectId, revisionId);
         this.assertToken(state, current, token, source.sourceFingerprint);
         if (purpose === "accepted_view" && (current.status !== "accepted_current" || !reviewReady(current))) return fail(422, "S6_DESIGN_FORM_UNREVIEWED");
@@ -823,9 +906,13 @@ export class S6WorkflowService {
           state.s6Jobs.push(record.job);
         }
       });
-      for (const record of records) this.objects.putExact(record.artifact.stagingKey, record.bytes);
+      for (const record of records) {
+        this.currentSource(projectId, source.sourceFingerprint);
+        this.objects.putExact(record.artifact.stagingKey, record.bytes);
+      }
       this.currentSource(projectId, source.sourceFingerprint);
       const result = this.repository.transact((state) => {
+        this.currentSource(projectId, source.sourceFingerprint);
         const current = modelFor(state, projectId, revisionId);
         this.assertToken(state, current, token, source.sourceFingerprint);
         const outputViews: S6ViewSummary[] = [];
@@ -886,7 +973,10 @@ export class S6WorkflowService {
         const bytes = readS6CommittedExact(this.objects, artifact);
         if (sha256(bytes) !== artifact.outputSha256) return fail(409, "S6_STALE_ARTIFACT");
         const value: import("./types").S6PublicationResult = { replayed: false, artifactId: artifact.artifactId, revisionId, revisionHash: artifact.revisionHash, sourceS5Fingerprint: source.sourceFingerprint, view: viewSummary(artifact, initial.s6ViewPreservationReceipts) };
-        this.repository.transact((state) => this.remember(state, key, "publication", projectId, source.sourceFingerprint, inputHash, value));
+        this.repository.transact((state) => {
+          this.currentSource(projectId, source.sourceFingerprint);
+          this.remember(state, key, "publication", projectId, source.sourceFingerprint, inputHash, value);
+        });
         return value;
       }
       if (artifact.status !== "staged" && artifact.status !== "promoted") return fail(409, "S6_PUBLICATION_BUSY");
@@ -925,6 +1015,7 @@ export class S6WorkflowService {
           created.retryOfJobId = prior.jobId;
         }
         publicationJob = this.repository.transact((state) => {
+          this.currentSource(projectId, source.sourceFingerprint);
           const currentArtifact = state.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId);
           const currentModel = modelFor(state, projectId, revisionId);
           this.assertToken(state, currentModel, token, source.sourceFingerprint, true);
@@ -938,6 +1029,7 @@ export class S6WorkflowService {
       if (publicationJob.status === "queued") {
         const claimToken = this.uuid();
         publicationJob = this.repository.transact((state) => {
+          this.currentSource(projectId, source.sourceFingerprint);
           const current = state.s6Jobs.find((item) => item.jobId === publicationJob!.jobId);
           if (!current) return fail(409, "S6_CLAIM_FENCED");
           if (current.status !== "queued") return current;
@@ -960,6 +1052,7 @@ export class S6WorkflowService {
       if (artifact.publicationPhase === "staged") {
         promoteS6Exact(this.objects, artifact.stagingKey, artifact.artifactKey, bytes);
         this.repository.transact((state) => {
+          this.currentSource(projectId, source.sourceFingerprint);
           const currentArtifact = state.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId);
           const currentJob = state.s6Jobs.find((item) => item.jobId === publicationJob!.jobId);
           const currentModel = modelFor(state, projectId, revisionId);
@@ -980,6 +1073,7 @@ export class S6WorkflowService {
       }
       this.currentSource(projectId, source.sourceFingerprint);
       const result = this.repository.transact((state) => {
+        this.currentSource(projectId, source.sourceFingerprint);
         const currentArtifact = state.s6ViewArtifacts.find((item) => item.artifactId === artifact.artifactId);
         const currentJob = state.s6Jobs.find((item) => item.jobId === publicationJob!.jobId);
         const renderJob = state.s6Jobs.find((item) => item.artifactId === artifact.artifactId && item.kind === "render");

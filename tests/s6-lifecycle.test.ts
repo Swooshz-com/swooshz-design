@@ -43,6 +43,7 @@ function makeHarness(options: {
   source?: ReturnType<typeof makeS6Source>;
   uuid?: () => UUID;
   isProcessAlive?: (processId: number) => boolean;
+  sourceReader?: S6SourceReader;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), "s6-lifecycle-"));
   const repository = new JsonRepository(root, { processId: 701, isProcessAlive: options.isProcessAlive });
@@ -51,7 +52,7 @@ function makeHarness(options: {
   repository.transact((state) => {
     state.projects.push(project());
   });
-  const sourceReader: S6SourceReader = {
+  const defaultSourceReader: S6SourceReader = {
     readReady: (projectId) => {
       if (projectId !== PROJECT_ID || source.readiness !== "ready") throw new AppError(409, "S6_SOURCE_NOT_READY");
       return structuredClone(source);
@@ -72,7 +73,7 @@ function makeHarness(options: {
   const service = new S6WorkflowService({
     repository,
     objects,
-    sourceReader,
+    sourceReader: options.sourceReader ?? defaultSourceReader,
     clock,
     uuid: nextUuid,
     workerId: "s6-test-worker",
@@ -89,6 +90,31 @@ function makeHarness(options: {
     },
     close() {
       rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function mutableSourceReader(source: ReturnType<typeof makeS6Source>): { reader: S6SourceReader; fence: () => void } {
+  let fenced = false;
+  return {
+    reader: {
+      readReady: (projectId) => {
+        if (projectId !== PROJECT_ID) throw new AppError(409, "S6_SOURCE_NOT_READY");
+        return structuredClone(source);
+      },
+      currentFingerprint: (projectId) => {
+        if (projectId !== PROJECT_ID) throw new AppError(409, "S6_SOURCE_NOT_READY");
+        return source.sourceFingerprint;
+      },
+      assertCurrent: (projectId, expectedFingerprint) => {
+        if (projectId !== PROJECT_ID || fenced || source.sourceFingerprint !== expectedFingerprint) {
+          throw new AppError(409, "S6_SOURCE_STALE");
+        }
+        return structuredClone(source);
+      },
+    },
+    fence() {
+      fenced = true;
     },
   };
 }
@@ -258,6 +284,177 @@ test("stale source blocks every mutation boundary", async () => {
     assert.throws(() => harness.service.getViewDownload(PROJECT_ID, generated.revisionId, "perspective-northwest"), (error: unknown) => errorCode(error) === "S6_SOURCE_STALE");
   } finally {
     harness.close();
+  }
+});
+
+test("a new valid S5 source epoch creates a distinct root and atomically stales the prior accepted epoch", async () => {
+  const harness = makeHarness({ source: makeS6Source({ widthMm: 6000, requirements: [{ name: "Welcome counter", expected: "present" }] }) });
+  try {
+    const generatedA = await harness.service.generate(PROJECT_ID, uuid(501), uuid(502), "subject-s6");
+    const correctedA = await confirmDraft(harness, generatedA.revisionId, 503);
+    const validationA = await harness.service.validate(PROJECT_ID, correctedA.revisionId, correctedA.token, uuid(505), uuid(506));
+    assert.equal(validationA.errors.length, 0, JSON.stringify(validationA.errors));
+    const acceptedA = await harness.service.accept(PROJECT_ID, correctedA.revisionId, correctedA.token, uuid(507), uuid(508), "subject-s6");
+
+    const sourceB = makeS6Source({ widthMm: 6100, requirements: [{ name: "Welcome counter", expected: "present" }] });
+    harness.setSource(sourceB);
+    const generatedB = await harness.service.generate(PROJECT_ID, uuid(509), uuid(510), "subject-s6");
+    assert.notEqual(generatedB.revisionId, acceptedA.revisionId);
+
+    const persisted = harness.repository.state();
+    const oldModel = persisted.s6SpatialModels.find((item) => item.modelRevisionId === acceptedA.revisionId);
+    const newModel = persisted.s6SpatialModels.find((item) => item.modelRevisionId === generatedB.revisionId);
+    assert.equal(oldModel?.status, "stale");
+    assert.notEqual(oldModel?.staleAt, null);
+    assert.equal(newModel?.parentRevisionId, null);
+    assert.notEqual(oldModel?.revisionNumber, newModel?.revisionNumber);
+    assert.equal(newModel?.sourceS5Fingerprint, sourceB.sourceFingerprint);
+    assert.equal(harness.service.getRevision(PROJECT_ID, acceptedA.revisionId).revision.modelRevisionId, acceptedA.revisionId);
+  } finally {
+    harness.close();
+  }
+});
+
+test("generation fences before its first durable model and job write", async () => {
+  const source = makeS6Source({ requirements: [{ name: "Welcome counter", expected: "present" }] });
+  const harness = makeHarness({
+    source,
+    sourceReader: {
+      readReady: () => structuredClone(source),
+      currentFingerprint: () => source.sourceFingerprint,
+      assertCurrent: () => { throw new AppError(409, "S6_SOURCE_STALE"); },
+    },
+  });
+  try {
+    await assert.rejects(harness.service.generate(PROJECT_ID, uuid(511), uuid(512), "subject-s6"), (error: unknown) => errorCode(error) === "S6_SOURCE_STALE");
+    assert.equal(harness.repository.state().s6SpatialModels.length, 0);
+    assert.equal(harness.repository.state().s6Jobs.length, 0);
+  } finally {
+    harness.close();
+  }
+});
+
+test("a late generation source fence cleans staged objects and closes the candidate", async () => {
+  const source = makeS6Source({ requirements: [{ name: "Welcome counter", expected: "present" }] });
+  let assertions = 0;
+  const sourceReader: S6SourceReader = {
+    readReady: () => structuredClone(source),
+    currentFingerprint: () => source.sourceFingerprint,
+    assertCurrent: () => {
+      assertions += 1;
+      if (assertions === 3) throw new AppError(409, "S6_SOURCE_STALE");
+      return structuredClone(source);
+    },
+  };
+  const harness = makeHarness({ source, sourceReader });
+  try {
+    await assert.rejects(
+      harness.service.generate(PROJECT_ID, uuid(551), uuid(552), "subject-s6"),
+      (error: unknown) => errorCode(error) === "S6_SOURCE_STALE",
+    );
+    const state = harness.repository.state();
+    const model = state.s6SpatialModels[0]!;
+    const job = state.s6Jobs.find((item) => item.kind === "generation")!;
+    assert.equal(model.status, "stale");
+    assert.equal(model.modelArtifact.status, "failed_terminal");
+    assert.equal(job.status, "aborted");
+    assert.equal(job.terminalAt !== null, true);
+    assert.equal(harness.objects.exists(model.modelArtifact.stagingKey), false);
+    assert.equal(harness.objects.exists(model.modelArtifact.artifactKey), false);
+  } finally {
+    harness.close();
+  }
+});
+
+test("downstream S6 durable writes fence a stale source before creating records", async () => {
+  const source = makeS6Source({ requirements: [{ name: "Welcome counter", expected: "present" }] });
+
+  {
+    const gate = mutableSourceReader(source);
+    const harness = makeHarness({ source, sourceReader: gate.reader });
+    try {
+      const generated = await harness.service.generate(PROJECT_ID, uuid(601), uuid(602), "subject-s6");
+      const corrected = await confirmDraft(harness, generated.revisionId, 603);
+      const before = harness.repository.state();
+      gate.fence();
+      await assert.rejects(
+        harness.service.validate(PROJECT_ID, corrected.revisionId, corrected.token, uuid(605), uuid(606)),
+        (error: unknown) => errorCode(error) === "S6_SOURCE_STALE",
+      );
+      const after = harness.repository.state();
+      assert.equal(after.s6ValidationReceipts.length, before.s6ValidationReceipts.length);
+      assert.equal(after.s6Jobs.length, before.s6Jobs.length);
+    } finally {
+      harness.close();
+    }
+  }
+
+  {
+    const gate = mutableSourceReader(source);
+    const harness = makeHarness({ source, sourceReader: gate.reader });
+    try {
+      const generated = await harness.service.generate(PROJECT_ID, uuid(607), uuid(608), "subject-s6");
+      const corrected = await confirmDraft(harness, generated.revisionId, 609);
+      const validation = await harness.service.validate(PROJECT_ID, corrected.revisionId, corrected.token, uuid(611), uuid(612));
+      assert.equal(validation.errors.length, 0, JSON.stringify(validation.errors));
+      const before = harness.repository.state();
+      gate.fence();
+      await assert.rejects(
+        harness.service.accept(PROJECT_ID, corrected.revisionId, corrected.token, uuid(613), uuid(614), "subject-s6"),
+        (error: unknown) => errorCode(error) === "S6_SOURCE_STALE",
+      );
+      const after = harness.repository.state();
+      assert.equal(after.s6AcceptanceEvents.length, before.s6AcceptanceEvents.length);
+      assert.equal(after.s6SpatialModels.find((item) => item.modelRevisionId === corrected.revisionId)?.status, "corrected_draft");
+    } finally {
+      harness.close();
+    }
+  }
+
+  {
+    const gate = mutableSourceReader(source);
+    const harness = makeHarness({ source, sourceReader: gate.reader });
+    try {
+      const generated = await harness.service.generate(PROJECT_ID, uuid(615), uuid(616), "subject-s6");
+      const corrected = await confirmDraft(harness, generated.revisionId, 617);
+      const validation = await harness.service.validate(PROJECT_ID, corrected.revisionId, corrected.token, uuid(619), uuid(620));
+      assert.equal(validation.errors.length, 0, JSON.stringify(validation.errors));
+      const accepted = await harness.service.accept(PROJECT_ID, corrected.revisionId, corrected.token, uuid(621), uuid(622), "subject-s6");
+      const before = harness.repository.state();
+      gate.fence();
+      await assert.rejects(
+        harness.service.render(PROJECT_ID, accepted.revisionId, accepted.concurrency, uuid(623), uuid(624)),
+        (error: unknown) => errorCode(error) === "S6_SOURCE_STALE",
+      );
+      const after = harness.repository.state();
+      assert.equal(after.s6ViewArtifacts.length, before.s6ViewArtifacts.length);
+      assert.equal(after.s6Jobs.length, before.s6Jobs.length);
+    } finally {
+      harness.close();
+    }
+  }
+
+  {
+    const gate = mutableSourceReader(source);
+    const harness = makeHarness({ source, sourceReader: gate.reader });
+    try {
+      const generated = await harness.service.generate(PROJECT_ID, uuid(625), uuid(626), "subject-s6");
+      const corrected = await confirmDraft(harness, generated.revisionId, 627);
+      const validation = await harness.service.validate(PROJECT_ID, corrected.revisionId, corrected.token, uuid(629), uuid(630));
+      assert.equal(validation.errors.length, 0, JSON.stringify(validation.errors));
+      const accepted = await harness.service.accept(PROJECT_ID, corrected.revisionId, corrected.token, uuid(631), uuid(632), "subject-s6");
+      const rendered = await harness.service.render(PROJECT_ID, accepted.revisionId, accepted.concurrency, uuid(633), uuid(634));
+      const before = harness.repository.state();
+      gate.fence();
+      await assert.rejects(
+        harness.service.publish(PROJECT_ID, accepted.revisionId, rendered.views[0]!.viewId, accepted.concurrency, uuid(635), uuid(636)),
+        (error: unknown) => errorCode(error) === "S6_SOURCE_STALE",
+      );
+      const after = harness.repository.state();
+      assert.equal(after.s6Jobs.filter((item) => item.kind === "publication").length, before.s6Jobs.filter((item) => item.kind === "publication").length);
+    } finally {
+      harness.close();
+    }
   }
 });
 
