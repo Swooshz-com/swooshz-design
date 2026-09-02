@@ -17,6 +17,7 @@ import {
   S6_VALIDATION_ORDER_VERSION,
   S6_VALIDATOR_VERSION,
 } from "./s6-canonical";
+import { buildS6Cameras, hashS6Camera } from "./s6-camera";
 import { sha256 } from "./utils";
 import type {
   OpenSide,
@@ -42,8 +43,6 @@ type IssueBag = {
   errors: S6ValidationIssue[];
   warnings: S6ValidationIssue[];
 };
-
-const VIEW_IDS = ["perspective-northwest", "perspective-southeast", "top-orthographic"] as const;
 
 function issue(
   bag: IssueBag,
@@ -387,27 +386,27 @@ function validateDesignForm(model: S6SpatialModelRecord, context: S6ValidationCo
   }
 }
 
-export function hashS6Camera(camera: { viewId: string; projection: string; positionMm: S6Vector3Mm; targetMm: S6Vector3Mm; up: string; fovMd: number | null; orthoScaleMm: number | null; paddingMm: number; nearMm: number; farMm: number; heightBasis: string; derivedRenderHeightMm: number; cameraHash: string }): Sha256 {
-  const copy = { ...camera, cameraHash: "" };
-  return sha256(canonicalS6Json(copy));
-}
-
 function validateCameras(model: S6SpatialModelRecord, bag: IssueBag): void {
-  if (model.cameras.length !== 3 || new Set(model.cameras.map((camera) => camera.viewId)).size !== 3 || VIEW_IDS.some((viewId) => !model.cameras.some((camera) => camera.viewId === viewId))) {
+  let canonicalCameras: S6SpatialModelRecord["cameras"];
+  try {
+    canonicalCameras = buildS6Cameras(model);
+  } catch {
     issue(bag, "CAMERA_INVALID", "cameras");
     return;
   }
-  for (const camera of model.cameras) {
-    if (!camera.positionMm || !camera.targetMm || !["world-y", "negative-world-z"].includes(camera.up) || camera.nearMm <= 0 || camera.farMm <= camera.nearMm || camera.paddingMm < 0 || !integer(camera.derivedRenderHeightMm, 1, S6_MAX_COORDINATE_MM)) {
-      issue(bag, "CAMERA_INVALID", "cameras[" + camera.viewId + "]", null);
-      continue;
-    }
-    if (camera.projection === "perspective" && (camera.fovMd === null || camera.orthoScaleMm !== null)) issue(bag, "CAMERA_INVALID", "cameras[" + camera.viewId + "]", null);
-    if (camera.projection === "orthographic" && (camera.fovMd !== null || camera.orthoScaleMm === null)) issue(bag, "CAMERA_INVALID", "cameras[" + camera.viewId + "]", null);
+  if (!Array.isArray(model.cameras) || model.cameras.length !== canonicalCameras.length) {
+    issue(bag, "CAMERA_INVALID", "cameras");
+    return;
+  }
+  for (let index = 0; index < canonicalCameras.length; index += 1) {
+    const camera = model.cameras[index];
+    const canonical = canonicalCameras[index];
     try {
-      if (hashS6Camera(camera) !== camera.cameraHash) issue(bag, "CAMERA_INVALID", "cameras[" + camera.viewId + "].cameraHash", null);
+      if (hashS6Camera(camera) !== camera.cameraHash || canonicalS6Json(camera) !== canonicalS6Json(canonical)) {
+        issue(bag, "CAMERA_INVALID", "cameras[" + String(index) + "]", null);
+      }
     } catch {
-      issue(bag, "CAMERA_INVALID", "cameras[" + camera.viewId + "]", null);
+      issue(bag, "CAMERA_INVALID", "cameras[" + String(index) + "]", null);
     }
   }
 }

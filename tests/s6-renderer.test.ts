@@ -16,6 +16,28 @@ function draft(source = makeS6Source(), revision = 1): S6SpatialModelRecord {
   return compileS6Draft({ source, revisionId: "20000000-0000-4000-8000-" + String(100 + revision).padStart(12, "0"), parentRevisionId: null, clock: deterministicClock() });
 }
 
+function polygonPoints(rendered: ReturnType<typeof renderS6View>, objectId: string): string[] {
+  const svg = new TextDecoder().decode(rendered.svgBytes);
+  return Array.from(svg.matchAll(new RegExp("<polygon\\b[^>]*data-s6-object-id=\"" + objectId + "\"[^>]*points=\"([^\"]+)\"", "gu")), (match) => match[1]!);
+}
+
+function geometryFingerprint(rendered: ReturnType<typeof renderS6View>, objectId: string): string {
+  return polygonPoints(rendered, objectId).join("|");
+}
+
+function projectedBounds(rendered: ReturnType<typeof renderS6View>, objectId: string): { width: number; height: number } {
+  const coordinates = polygonPoints(rendered, objectId).flatMap((polygon) => polygon.split(" ").map((point) => point.split(",").map(Number)));
+  const xs = coordinates.map(([x]) => x!);
+  const ys = coordinates.map(([, y]) => y!);
+  return { width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
+}
+
+function physicalObject(model: S6SpatialModelRecord): S6SpatialModelRecord["objects"][number] {
+  const object = model.objects.find((item) => item.role !== "booth_floor" && item.role !== "zone");
+  assert.ok(object);
+  return object;
+}
+
 test("camera formulas are stable for known and unknown height", () => {
   const known = draft(makeS6Source({ maxHeightMm: 3200 }));
   const knownCameras = buildS6Cameras(known);
@@ -37,6 +59,80 @@ test("same model and camera produce byte-identical s6-svg-geometry-v2 output", (
   assert.equal(new TextDecoder().decode(first.svgBytes), new TextDecoder().decode(second.svgBytes));
   assert.equal(first.outputSha256, second.outputSha256);
   assert.equal(first.sceneHash, second.sceneHash);
+});
+
+test("perspective geometry is bound to position, target, and FOV rather than metadata", () => {
+  const model = draft();
+  const camera = buildS6Cameras(model)[0]!;
+  const objectId = physicalObject(model).objectId;
+  const baseline = geometryFingerprint(renderS6View(model, camera), objectId);
+
+  const positionChanged = structuredClone(camera);
+  positionChanged.positionMm.xMm += 500;
+  assert.notEqual(geometryFingerprint(renderS6View(model, positionChanged), objectId), baseline);
+
+  const targetChanged = structuredClone(camera);
+  targetChanged.targetMm.xMm += 500;
+  assert.notEqual(geometryFingerprint(renderS6View(model, targetChanged), objectId), baseline);
+
+  const fovChanged = structuredClone(camera);
+  fovChanged.fovMd = (fovChanged.fovMd ?? 0) + 5_000;
+  assert.notEqual(geometryFingerprint(renderS6View(model, fovChanged), objectId), baseline);
+});
+
+test("northwest and southeast perspective views use camera fields, not view-ID projection aliases", () => {
+  const model = draft();
+  const cameras = buildS6Cameras(model);
+  const northwest = cameras[0]!;
+  const southeast = cameras[1]!;
+  const objectId = physicalObject(model).objectId;
+  const northwestGeometry = geometryFingerprint(renderS6View(model, northwest), objectId);
+  const southeastGeometry = geometryFingerprint(renderS6View(model, southeast), objectId);
+  assert.notEqual(northwestGeometry, southeastGeometry);
+
+  const southeastFieldsWithNorthwestId = structuredClone(southeast);
+  southeastFieldsWithNorthwestId.viewId = "perspective-northwest";
+  assert.equal(geometryFingerprint(renderS6View(model, southeastFieldsWithNorthwestId), objectId), southeastGeometry);
+});
+
+test("perspective scale changes with camera depth for equal-size geometry", () => {
+  const model = draft();
+  const tables = model.objects.filter((item) => item.objectType === "table");
+  assert.equal(tables.length, 2);
+  tables[0]!.transform.positionMm = { xMm: 1_000, yMm: 0, zMm: 1_000 };
+  tables[1]!.transform.positionMm = { xMm: 4_500, yMm: 0, zMm: 2_500 };
+  const camera = buildS6Cameras(model)[0]!;
+  const rendered = renderS6View(model, camera);
+  const near = projectedBounds(rendered, tables[0]!.objectId);
+  const far = projectedBounds(rendered, tables[1]!.objectId);
+  assert.notEqual(near.width, far.width);
+  assert.notEqual(near.height, far.height);
+});
+
+test("top orthographic geometry uses the canonical basis and orthographic scale", () => {
+  const model = draft();
+  const camera = buildS6Cameras(model)[2]!;
+  const objectId = physicalObject(model).objectId;
+  const baseline = geometryFingerprint(renderS6View(model, camera), objectId);
+
+  const targetChanged = structuredClone(camera);
+  targetChanged.targetMm.xMm += 500;
+  assert.notEqual(geometryFingerprint(renderS6View(model, targetChanged), objectId), baseline);
+
+  const scaleChanged = structuredClone(camera);
+  scaleChanged.orthoScaleMm = (scaleChanged.orthoScaleMm ?? 0) + 500;
+  assert.notEqual(geometryFingerprint(renderS6View(model, scaleChanged), objectId), baseline);
+});
+
+test("required geometry outside near or far clipping fails deterministically", () => {
+  const model = draft();
+  const camera = buildS6Cameras(model)[0]!;
+  const nearClipped = structuredClone(camera);
+  nearClipped.nearMm = 100_000;
+  assert.throws(() => renderS6View(model, nearClipped), /S6_VIEW_RENDER_FAILURE/);
+  const farClipped = structuredClone(camera);
+  farClipped.farMm = 200;
+  assert.throws(() => renderS6View(model, farClipped), /S6_VIEW_RENDER_FAILURE/);
 });
 
 test("rect, round, and profile geometry render as distinct filled silhouettes", () => {

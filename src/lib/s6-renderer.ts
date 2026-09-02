@@ -24,6 +24,9 @@ import type {
 type Point3 = { x: number; y: number; z: number };
 type Point2 = { x: number; y: number; depth: number };
 type Face = { object: S6SpatialObject; points: Point3[]; depth: number; index: number; materialId: string | null };
+type CameraBasis = { forward: Point3; right: Point3; up: Point3; focalDistance: number };
+
+const VIEWPORT_UNITS = 1_000;
 
 function escapeXml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
@@ -132,45 +135,104 @@ function shade(hex: string | null, amount: number): string {
   return "#" + [apply(red), apply(green), apply(blue)].map((value) => value.toString(16).padStart(2, "0")).join("");
 }
 
-function rawProject(point: Point3, camera: S6Camera): Point2 {
-  if (camera.viewId === "top-orthographic") return { x: point.x, y: point.z, depth: point.y };
-  if (camera.viewId === "perspective-southeast") return { x: point.z - point.x, y: point.y - (point.x + point.z) * 0.42, depth: -(point.x + point.z) + point.y * 0.15 };
-  return { x: point.x - point.z, y: point.y - (point.x + point.z) * 0.42, depth: point.x + point.z + point.y * 0.15 };
+function cross(left: Point3, right: Point3): Point3 {
+  return {
+    x: left.y * right.z - left.z * right.y,
+    y: left.z * right.x - left.x * right.z,
+    z: left.x * right.y - left.y * right.x,
+  };
+}
+
+function dot(left: Point3, right: Point3): number {
+  return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+function normalize(value: Point3): Point3 {
+  const length = Math.sqrt(dot(value, value));
+  if (!Number.isFinite(length) || length <= 0) throw new Error("S6_VIEW_RENDER_FAILURE");
+  return { x: value.x / length, y: value.y / length, z: value.z / length };
+}
+
+function cameraBasis(camera: S6Camera): CameraBasis {
+  const forward = normalize({
+    x: camera.targetMm.xMm - camera.positionMm.xMm,
+    y: camera.targetMm.yMm - camera.positionMm.yMm,
+    z: camera.targetMm.zMm - camera.positionMm.zMm,
+  });
+  const declaredUp = camera.up === "world-y" ? { x: 0, y: 1, z: 0 } : { x: 0, y: 0, z: -1 };
+  const right = normalize(cross(forward, declaredUp));
+  const up = normalize(cross(right, forward));
+  const focalDistance = Math.sqrt(
+    (camera.targetMm.xMm - camera.positionMm.xMm) ** 2 +
+    (camera.targetMm.yMm - camera.positionMm.yMm) ** 2 +
+    (camera.targetMm.zMm - camera.positionMm.zMm) ** 2,
+  );
+  if (!Number.isFinite(focalDistance) || focalDistance <= 0) throw new Error("S6_VIEW_RENDER_FAILURE");
+  return { forward, right, up, focalDistance };
+}
+
+function rawProject(point: Point3, camera: S6Camera, basis: CameraBasis): Point2 {
+  const relative = {
+    x: point.x - camera.positionMm.xMm,
+    y: point.y - camera.positionMm.yMm,
+    z: point.z - camera.positionMm.zMm,
+  };
+  const horizontal = dot(relative, basis.right);
+  const vertical = dot(relative, basis.up);
+  const depth = dot(relative, basis.forward);
+  if (!Number.isFinite(horizontal) || !Number.isFinite(vertical) || !Number.isFinite(depth) || depth <= 0) {
+    throw new Error("S6_VIEW_RENDER_FAILURE");
+  }
+  if (camera.projection === "orthographic") {
+    const scale = VIEWPORT_UNITS / (camera.orthoScaleMm ?? 0);
+    if (!Number.isFinite(scale) || scale <= 0) throw new Error("S6_VIEW_RENDER_FAILURE");
+    return { x: VIEWPORT_UNITS / 2 + horizontal * scale, y: VIEWPORT_UNITS / 2 - vertical * scale, depth };
+  }
+  const fovRadians = ((camera.fovMd ?? 0) / 1_000) * Math.PI / 180;
+  const tangent = Math.tan(fovRadians / 2);
+  const halfFrame = basis.focalDistance * tangent + camera.paddingMm;
+  if (!Number.isFinite(tangent) || tangent <= 0 || !Number.isFinite(halfFrame) || halfFrame <= 0) {
+    throw new Error("S6_VIEW_RENDER_FAILURE");
+  }
+  const scale = (basis.focalDistance / depth) * (VIEWPORT_UNITS / 2) / halfFrame;
+  return { x: VIEWPORT_UNITS / 2 + horizontal * scale, y: VIEWPORT_UNITS / 2 - vertical * scale, depth };
 }
 
 function q16(value: number): number {
-  return roundHalfAwayFromZero(value * S6_RENDER_Q16);
+  const result = roundHalfAwayFromZero(value * S6_RENDER_Q16);
+  if (!Number.isSafeInteger(result)) throw new Error("S6_VIEW_RENDER_FAILURE");
+  return result;
 }
 
-function makeFace(object: S6SpatialObject, points: Point3[], index: number, materialId: string | null): Face {
-  const projectedDepth = points.reduce((total, point) => total + point.y + point.x + point.z, 0) / Math.max(1, points.length);
-  return { object, points, depth: projectedDepth, index, materialId };
+function makeFace(object: S6SpatialObject, points: Point3[], index: number, materialId: string | null, mapped: (point: Point3) => Point2): Face {
+  const projectedDepth = points.reduce((total, point) => total + mapped(point).depth, 0) / Math.max(1, points.length);
+  return { object, points, depth: roundHalfAwayFromZero(projectedDepth), index, materialId };
 }
 
-function facesFor(object: S6SpatialObject, camera: S6Camera): Face[] {
+function facesFor(object: S6SpatialObject, camera: S6Camera, mapped: (point: Point3) => Point2): Face[] {
   const points = worldPoints(object);
   const materialId = object.materialIds[0] ?? null;
   if (object.primitive.kind === "rect_prism") {
-    const faces = camera.viewId === "top-orthographic"
+    const faces = camera.projection === "orthographic"
       ? [[4, 5, 6, 7]]
       : [[4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]];
-    return faces.map((indices, index) => makeFace(object, indices.map((item) => points[item]!), index, materialId));
+    return faces.map((indices, index) => makeFace(object, indices.map((item) => points[item]!), index, materialId, mapped));
   }
   const count = object.primitive.kind === "round_prism" ? 24 : object.primitive.profile.vertices.length;
   if (object.primitive.kind === "round_prism") {
-    if (camera.viewId === "top-orthographic") return [makeFace(object, points.slice(0, count), 0, materialId)];
-    const faces: Face[] = [makeFace(object, points.slice(count), 0, materialId), makeFace(object, points.slice(0, count), 1, materialId)];
+    if (camera.projection === "orthographic") return [makeFace(object, points.slice(0, count), 0, materialId, mapped)];
+    const faces: Face[] = [makeFace(object, points.slice(count), 0, materialId, mapped), makeFace(object, points.slice(0, count), 1, materialId, mapped)];
     for (let index = 0; index < count; index += 1) {
       const next = (index + 1) % count;
-      faces.push(makeFace(object, [points[index]!, points[next]!, points[count + next]!, points[count + index]!], index + 2, materialId));
+      faces.push(makeFace(object, [points[index]!, points[next]!, points[count + next]!, points[count + index]!], index + 2, materialId, mapped));
     }
     return faces;
   }
-  if (camera.viewId === "top-orthographic") return [makeFace(object, points.slice(0, count), 0, materialId)];
-  const faces: Face[] = [makeFace(object, points.slice(count), 0, materialId), makeFace(object, points.slice(0, count), 1, materialId)];
+  if (camera.projection === "orthographic") return [makeFace(object, points.slice(0, count), 0, materialId, mapped)];
+  const faces: Face[] = [makeFace(object, points.slice(count), 0, materialId, mapped), makeFace(object, points.slice(0, count), 1, materialId, mapped)];
   for (let index = 0; index < count; index += 1) {
     const next = (index + 1) % count;
-    faces.push(makeFace(object, [points[index]!, points[next]!, points[count + next]!, points[count + index]!], index + 2, materialId));
+    faces.push(makeFace(object, [points[index]!, points[next]!, points[count + next]!, points[count + index]!], index + 2, materialId, mapped));
   }
   return faces;
 }
@@ -222,22 +284,21 @@ function colorFor(material: S6MaterialFinishRef | null, faceIndex: number): stri
 }
 
 function pointMap(points: Point3[], camera: S6Camera): { map: (point: Point3) => { x: number; y: number; depth: number }; maxX: number; maxY: number } {
-  const projected = points.map((point) => rawProject(point, camera));
-  const minX = Math.min(...projected.map((point) => point.x));
-  const maxX = Math.max(...projected.map((point) => point.x));
-  const minY = Math.min(...projected.map((point) => point.y));
-  const maxY = Math.max(...projected.map((point) => point.y));
-  const padding = Math.max(100, camera.paddingMm);
-  const scale = 1000 / Math.max(1, maxX - minX, maxY - minY);
+  if (points.length === 0) throw new Error("S6_VIEW_RENDER_FAILURE");
+  const basis = cameraBasis(camera);
+  const projected = points.map((point) => rawProject(point, camera, basis));
+  if (projected.some((point) => point.depth < camera.nearMm || point.depth > camera.farMm)) {
+    throw new Error("S6_VIEW_RENDER_FAILURE");
+  }
   const map = (point: Point3): { x: number; y: number; depth: number } => {
-    const value = rawProject(point, camera);
+    const value = rawProject(point, camera, basis);
     return {
-      x: q16((value.x - minX + padding) * scale),
-      y: q16((value.y - minY + padding) * scale),
-      depth: value.depth,
+      x: q16(value.x),
+      y: q16(value.y),
+      depth: q16(value.depth),
     };
   };
-  return { map, maxX: q16((maxX - minX + 2 * padding) * scale), maxY: q16((maxY - minY + 2 * padding) * scale) };
+  return { map, maxX: q16(VIEWPORT_UNITS), maxY: q16(VIEWPORT_UNITS) };
 }
 
 function faceSvg(face: Face, mapped: ReturnType<typeof pointMap>["map"], materials: ReadonlyMap<string, S6MaterialFinishRef>): string {
@@ -261,7 +322,7 @@ function faceSvg(face: Face, mapped: ReturnType<typeof pointMap>["map"], materia
 }
 
 function labelSvg(object: S6SpatialObject, mapped: ReturnType<typeof pointMap>["map"], camera: S6Camera): string {
-  if (camera.viewId !== "top-orthographic") return "";
+  if (camera.projection !== "orthographic") return "";
   const first = worldPoints(object)[0];
   if (!first) return "";
   const projected = mapped(first);
@@ -275,8 +336,8 @@ export function renderS6View(model: S6SpatialModelRecord, camera: S6Camera): S6R
   const allPoints = model.objects.flatMap((object) => worldPoints(object));
   const frame = pointMap(allPoints, camera);
   const materials = new Map(model.materials.map((material) => [material.materialId, material]));
-  const faces = model.objects.flatMap((object) => facesFor(object, camera)).sort((left, right) => right.depth - left.depth || (left.object.objectId < right.object.objectId ? -1 : left.object.objectId > right.object.objectId ? 1 : left.index - right.index));
-  const marker = model.status === "accepted_current" ? "" : "<text data-draft-marker=\"true\" x=\"32768\" y=\"32768\" fill=\"#9a4d00\">DRAFT - DESIGN FORM REVIEW REQUIRED</text>";
+  const faces = model.objects.flatMap((object) => facesFor(object, camera, frame.map)).sort((left, right) => right.depth - left.depth || (left.object.objectId < right.object.objectId ? -1 : left.object.objectId > right.object.objectId ? 1 : left.index - right.index));
+  const marker = model.status === "accepted_current" ? "" : "<text data-draft-marker=\"true\" x=\"" + q16(5) + "\" y=\"" + q16(5) + "\" fill=\"#9a4d00\">DRAFT - DESIGN FORM REVIEW REQUIRED</text>";
   const body = faces.map((face) => faceSvg(face, frame.map, materials)).join("") +
     model.objects.map((object) => labelSvg(object, frame.map, camera)).join("") + marker;
   const svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" data-view-id=\"" + camera.viewId +

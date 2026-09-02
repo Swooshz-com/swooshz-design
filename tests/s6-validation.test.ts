@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
+import { buildS6Cameras, hashS6Camera } from "../src/lib/s6-camera";
 import { compileS6Draft } from "../src/lib/s6-compiler";
 import { hashS6Model } from "../src/lib/s6-canonical";
 import { validateS6Model } from "../src/lib/s6-validation";
@@ -21,6 +22,19 @@ function checked(model: S6SpatialModelRecord, source: S5ToS6Projection): ReturnT
 
 function clone(model: S6SpatialModelRecord): S6SpatialModelRecord {
   return structuredClone(model);
+}
+
+function refreshModelHash(model: S6SpatialModelRecord): void {
+  const hashed = hashS6Model(model);
+  model.modelHash = hashed.modelHash;
+  model.canonicalByteSize = hashed.canonicalByteSize;
+}
+
+function canonicalCameraModel(source: S5ToS6Projection): S6SpatialModelRecord {
+  const model = clone(draft(source));
+  model.cameras = buildS6Cameras(model);
+  refreshModelHash(model);
+  return model;
 }
 
 function codes(receipt: ReturnType<typeof validateS6Model>): string[] {
@@ -182,6 +196,33 @@ test("camera and canonical hash failures are reported", () => {
   const receipt = checked(hashBroken, source);
   assert.ok(codes(receipt).includes("CANONICAL_HASH_MISMATCH"));
   assert.equal(JSON.stringify(receipt).includes(source.canonicalRequirements[0]!.text), false);
+});
+
+test("canonical cameras pass exact validation and recomputed noncanonical cameras are rejected", () => {
+  const source = makeS6Source();
+  const model = canonicalCameraModel(source);
+  assert.deepEqual(model.cameras, buildS6Cameras(model));
+  assert.equal(codes(checked(model, source)).includes("CAMERA_INVALID"), false);
+
+  const mutations: Array<{ label: string; viewId: S6SpatialModelRecord["cameras"][number]["viewId"]; mutate: (camera: S6SpatialModelRecord["cameras"][number]) => void }> = [
+    { label: "position", viewId: "perspective-northwest", mutate: (camera) => { camera.positionMm.xMm += 1; } },
+    { label: "target", viewId: "perspective-northwest", mutate: (camera) => { camera.targetMm.xMm += 1; } },
+    { label: "up", viewId: "perspective-northwest", mutate: (camera) => { camera.up = "negative-world-z"; } },
+    { label: "perspective FOV", viewId: "perspective-northwest", mutate: (camera) => { camera.fovMd = (camera.fovMd ?? 0) + 1; } },
+    { label: "orthographic scale", viewId: "top-orthographic", mutate: (camera) => { camera.orthoScaleMm = (camera.orthoScaleMm ?? 0) + 1; } },
+    { label: "near plane", viewId: "perspective-northwest", mutate: (camera) => { camera.nearMm += 1; } },
+    { label: "far plane", viewId: "perspective-northwest", mutate: (camera) => { camera.farMm += 1; } },
+  ];
+
+  for (const mutation of mutations) {
+    const candidate = canonicalCameraModel(source);
+    const camera = candidate.cameras.find((item) => item.viewId === mutation.viewId);
+    assert.ok(camera, mutation.label);
+    mutation.mutate(camera);
+    camera.cameraHash = hashS6Camera(camera);
+    refreshModelHash(candidate);
+    assert.ok(codes(checked(candidate, source)).includes("CAMERA_INVALID"), mutation.label);
+  }
 });
 
 test("warnings do not become fabricated zero values", () => {

@@ -1,11 +1,12 @@
-import { hashS6Camera } from "./s6-validation";
 import {
+  canonicalS6Json,
   normalizeS6Rotation,
   roundHalfAwayFromZero,
   S6_MAX_COORDINATE_MM,
   S6_OPEN_SIDE_ORDER,
 } from "./s6-canonical";
-import type { S6Camera, S6SpatialModelRecord, S6Vector3Mm } from "./types";
+import { sha256 } from "./utils";
+import type { S6Camera, S6SpatialModelRecord, S6Vector3Mm, Sha256 } from "./types";
 
 function shapeHeight(model: S6SpatialModelRecord): number {
   let maximum = 0;
@@ -19,6 +20,11 @@ function shapeHeight(model: S6SpatialModelRecord): number {
 function renderHeight(model: S6SpatialModelRecord): { value: number; basis: S6Camera["heightBasis"] } {
   if (model.booth.maxHeightMm !== null) return { value: model.booth.maxHeightMm, basis: "confirmed_max_height" };
   return { value: Math.min(S6_MAX_COORDINATE_MM, Math.max(3000, shapeHeight(model))), basis: "derived_render_height" };
+}
+
+export function hashS6Camera(camera: S6Camera): Sha256 {
+  const copy = { ...camera, cameraHash: "" };
+  return sha256(canonicalS6Json(copy));
 }
 
 function cameraHash(camera: S6Camera): string {
