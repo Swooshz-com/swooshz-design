@@ -165,11 +165,21 @@ export function createS6Client(options: { projectId: string; operationKeys?: Ide
   };
 }
 
-function geometryCorrection(object: ClientObject, kind: string, radiusMm: number, heightMm: number, profileVertices: Array<{ xMm: number; zMm: number }>): Record<string, unknown> {
+function geometryCorrection(object: ClientObject, kind: string, widthMm: number, depthMm: number, radiusMm: number, heightMm: number, profileVertices: Array<{ xMm: number; zMm: number }>): Record<string, unknown> {
   if (kind === "round_prism") return { kind, radiusMm, heightMm, localAnchor: object.primitive.localAnchor };
   if (kind === "profile_extrusion") return { kind, profile: { winding: "ccw-from-positive-y-v1", vertices: profileVertices }, heightMm, localAnchor: object.primitive.localAnchor };
-  const current = object.primitive.kind === "rect_prism" ? object.primitive.dimensionsMm : { widthMm: 900, depthMm: 900, heightMm };
-  return { kind: "rect_prism", dimensionsMm: { widthMm: current.widthMm, depthMm: current.depthMm, heightMm }, localAnchor: object.primitive.localAnchor };
+  return { kind: "rect_prism", dimensionsMm: { widthMm, depthMm, heightMm }, localAnchor: object.primitive.localAnchor };
+}
+
+const MATERIAL_FINISH_KINDS = ["solid_color", "wood_like", "metal_like", "fabric_like", "glass_like", "brand_reference", "unknown"] as const;
+type ClientMaterialFinishKind = typeof MATERIAL_FINISH_KINDS[number];
+
+function materialFinishKind(value: string): ClientMaterialFinishKind {
+  return (MATERIAL_FINISH_KINDS as readonly string[]).includes(value) ? value as ClientMaterialFinishKind : "unknown";
+}
+
+function commaSeparatedValues(value: string): string[] {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
 const fieldStyle: CSSProperties = { display: "grid", gap: 6 };
@@ -180,10 +190,18 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [geometryKind, setGeometryKind] = useState("rect_prism");
   const [radiusMm, setRadiusMm] = useState(450);
+  const [widthMm, setWidthMm] = useState(900);
+  const [depthMm, setDepthMm] = useState(900);
   const [heightMm, setHeightMm] = useState(1100);
   const [profileVertices, setProfileVertices] = useState<Array<{ xMm: number; zMm: number }>>([{ xMm: 0, zMm: 0 }, { xMm: 1200, zMm: 0 }, { xMm: 1200, zMm: 400 }, { xMm: 0, zMm: 400 }]);
   const [move, setMove] = useState({ xMm: 0, yMm: 0, zMm: 0 });
   const [rotation, setRotation] = useState({ xMd: 0, yMd: 0, zMd: 0 });
+  const [materialLabel, setMaterialLabel] = useState("");
+  const [finishKind, setFinishKind] = useState<ClientMaterialFinishKind>("unknown");
+  const [colorHex, setColorHex] = useState("#888888");
+  const [zoneIdsText, setZoneIdsText] = useState("");
+  const [requirementIdsText, setRequirementIdsText] = useState("");
+  const [reviewNote, setReviewNote] = useState("User confirmed the bounded typed form after reference review.");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -195,10 +213,14 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
   const selected = objects.find((item) => item.objectId === selectedId) ?? objects[0] ?? null;
   const unresolved = model?.unknowns.filter((item) => item.status === "unresolved") ?? [];
   const currentToken = data?.state.concurrency ?? null;
-  const topView = data?.state.views.find((item) => item.viewId === "top-orthographic" && item.status === "committed") ?? null;
+  const draftPreview = data?.state.views.find((item) => item.viewId === "top-orthographic" && item.purpose === "draft_preview" && (item.status === "staged" || item.status === "promoted" || item.status === "committed") && item.preservationOutcome === "pass") ?? null;
+  const topView = data?.state.views.find((item) => item.viewId === "top-orthographic" && item.purpose === "accepted_view" && item.status === "committed") ?? null;
+  const draftPreviewUrl = draftPreview ? apiPath(projectId, "/revisions/" + draftPreview.revisionId + "/views/top-orthographic/download") : null;
   const topViewUrl = topView ? apiPath(projectId, "/revisions/" + topView.revisionId + "/views/top-orthographic/download") : null;
+  const approvedReferenceUrl = "/api/projects/" + projectId + "/s5/hero/download";
   const reviewed = model?.designFormReview.status === "complete" && model.designFormReview.acceptedByUser === true && unresolved.length === 0;
   const allowedShapes = selected ? GEOMETRY_ALLOWLIST[selected.objectType] ?? ["rect_prism"] : ["rect_prism"];
+  const selectedIsEditable = Boolean(selected && selected.editable !== false && selected.role !== "booth_floor" && selected.role !== "booth_wall" && selected.role !== "zone");
 
   useEffect(() => {
     if (initialData) return;
@@ -211,9 +233,21 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
     if (!selected) return;
     setSelectedId(selected.objectId);
     setGeometryKind(selected.primitive.kind);
+    if (selected.primitive.kind === "rect_prism") {
+      setWidthMm(selected.primitive.dimensionsMm.widthMm);
+      setDepthMm(selected.primitive.dimensionsMm.depthMm);
+    }
     setHeightMm(selected.primitive.kind === "round_prism" || selected.primitive.kind === "profile_extrusion" ? selected.primitive.heightMm : selected.primitive.dimensionsMm.heightMm);
     if (selected.primitive.kind === "round_prism") setRadiusMm(selected.primitive.radiusMm);
     if (selected.primitive.kind === "profile_extrusion") setProfileVertices(selected.primitive.profile.vertices);
+    const selectedMaterial = model?.materials.find((item) => selected.materialIds.includes(item.materialId)) ?? model?.materials[0];
+    if (selectedMaterial) {
+      setMaterialLabel(selectedMaterial.label);
+      setFinishKind(materialFinishKind(selectedMaterial.finishKind));
+      setColorHex(/^#[0-9a-f]{6}$/iu.test(selectedMaterial.colorHex ?? "") ? selectedMaterial.colorHex! : "#888888");
+    }
+    setZoneIdsText(selected.zoneIds.join(", "));
+    setRequirementIdsText(selected.requirementIds.join(", "));
     setMove({ xMm: 0, yMm: 0, zMm: 0 });
     setRotation(selected.transform.rotationMd);
   }, [selected?.objectId]);
@@ -221,6 +255,22 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
   async function refresh(): Promise<void> {
     try { setData(await client.refresh()); setError(""); }
     catch (caught) { setError(caught instanceof Error ? caught.message : "The request could not be completed."); }
+  }
+
+  async function generateDraft(): Promise<void> {
+    setBusy(true); setError(""); setNotice("");
+    try {
+      await client.generate();
+      const generated = await client.refresh();
+      setData(generated);
+      const token = generated.state.concurrency;
+      if (!token) throw new Error("The draft was created but could not be reloaded. Reference: unavailable");
+      await client.render(token);
+      setData(await client.refresh());
+      setNotice("Fresh spatial draft generated. The diagnostic top preview is non-final and unpublishable.");
+    } catch (caught) {
+      setError(caught instanceof UnknownNetworkOutcome ? "Unknown network outcome. Retry the same action to reuse its key." : caught instanceof Error ? caught.message : "The request could not be completed.");
+    } finally { setBusy(false); }
   }
 
   async function mutate(input: unknown, action: () => Promise<unknown>, message: string): Promise<void> {
@@ -237,7 +287,8 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
   }
 
   const material = selected && model ? model.materials.find((item) => selected.materialIds.includes(item.materialId)) ?? model.materials[0] : null;
-  const selectedGeometry = selected ? geometryCorrection(selected, geometryKind, radiusMm, heightMm, profileVertices) : null;
+  const selectedGeometry = selected ? geometryCorrection(selected, geometryKind, widthMm, depthMm, radiusMm, heightMm, profileVertices) : null;
+  const selectedMaterial = material ? { ...material, label: materialLabel.trim() || material.label, finishKind, colorHex } : null;
   const selectedPosition = selected?.transform.positionMm ?? { xMm: 0, yMm: 0, zMm: 0 };
   const selectedRotation = selected?.transform.rotationMd ?? { xMd: 0, yMd: 0, zMd: 0 };
   const reviewObjectIds = unresolved
@@ -258,23 +309,35 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
         <p>Revision status: <strong>{model?.status ?? "not generated"}</strong></p>
         <p>Design-form review: <strong>{model?.designFormReview.status ?? "not available"}</strong>{reviewed ? " / complete" : " / acceptance blocked until explicit coverage"}</p>
         {model ? <p className="muted">Approved reference: <span aria-label="evidenceAssetId">{model.designFormReview.evidenceAssetId}</span> / {model.designFormReview.evidenceAssetSha256}</p> : null}
-        <p className="muted">The approved reference is metadata for comparison only; pixels are never metric input.</p>
+        <p className="muted">The approved reference is a private comparison visual; its pixels are never metric input.</p>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+          <button type="button" disabled={busy || data.state.source.readiness !== "ready" || data.state.editableRevision !== null || data.state.currentAcceptedRevisionId !== null} onClick={() => void generateDraft()}>Generate spatial draft</button>
           <button type="button" disabled={busy || !currentToken} onClick={() => currentToken && void mutate(currentToken, () => client.validate(currentToken), "Validation receipt reloaded.")}>Validate draft</button>
           <button type="button" disabled={busy || !currentToken || !reviewed} onClick={() => currentToken && void mutate(currentToken, () => client.accept(currentToken), "Accepted revision reloaded.")}>Accept reviewed model</button>
           <button type="button" disabled={busy || !currentToken || !reviewed} onClick={() => currentToken && void mutate(currentToken, () => client.render(currentToken), "Three coherent views staged for publication.")}>Render three views</button>
         </div>
       </section>
       <section className="panel">
-        <h2>Top view / object selection</h2>
-        {topViewUrl ? <img src={topViewUrl} alt="Persisted top orthographic spatial view" style={{ width: "100%", maxHeight: 480, objectFit: "contain", background: "#f5f3ef", border: "1px solid #ddd7ce" }} /> : <p className="muted">The committed top orthographic view appears after a reviewed model is rendered and one view is published.</p>}
+        <h2>Top view / reference comparison</h2>
+        <div className="candidate-grid">
+          <figure className="candidate">
+            <figcaption><strong>Approved private reference visual</strong></figcaption>
+            <img src={approvedReferenceUrl} alt="Approved private S5 reference visual" style={{ width: "100%", maxHeight: 360, objectFit: "contain", background: "#f5f3ef", border: "1px solid #ddd7ce" }} />
+          </figure>
+          <figure className="candidate">
+            <figcaption><strong>Spatial draft comparison</strong></figcaption>
+            {draftPreviewUrl ? <img src={draftPreviewUrl} alt="Diagnostic draft preview top orthographic spatial view" style={{ width: "100%", maxHeight: 360, objectFit: "contain", background: "#f5f3ef", border: "1px solid #ddd7ce" }} /> : topViewUrl ? <img src={topViewUrl} alt="Persisted accepted top orthographic spatial view" style={{ width: "100%", maxHeight: 360, objectFit: "contain", background: "#f5f3ef", border: "1px solid #ddd7ce" }} /> : <p className="muted">Generate a spatial draft to create the diagnostic comparison preview.</p>}
+          </figure>
+        </div>
+        {draftPreview ? <p className="muted">Diagnostic draft_preview: this top view is visibly non-final and unpublishable until the model is reviewed, accepted, and rendered as an accepted_view.</p> : null}
+        <h3>Object selection</h3>
         <div className="candidate-grid">
           {objects.map((object) => <button key={object.objectId} type="button" data-object-id={object.objectId} aria-pressed={selected?.objectId === object.objectId} disabled={busy} onClick={() => setSelectedId(object.objectId)}>{object.label} / {object.primitive.kind}</button>)}
         </div>
       </section>
       <section className="panel">
         <h2>Typed correction</h2>
-        {!selected ? <p className="muted">No editable object is selected.</p> : <>
+        {!selected ? <p className="muted">No editable object is selected.</p> : !selectedIsEditable ? <p className="muted">This server-owned booth or zone object is not editable. Hard facts remain outside the correction controls.</p> : <>
           <p>Selected object: <strong data-selected-object-id={selected.objectId}>{selected.label}</strong></p>
           <div style={compactGrid}>
             <label style={fieldStyle}>Shape family
@@ -282,11 +345,17 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
                 {allowedShapes.map((kind) => <option key={kind} value={kind}>{kind}</option>)}
               </select>
             </label>
+            <label style={fieldStyle}>Width (mm)
+              <input aria-label="Width" type="number" step={1} value={widthMm} onChange={(event) => setWidthMm(Number(event.target.value))} disabled={busy || geometryKind !== "rect_prism"} />
+            </label>
+            <label style={fieldStyle}>Depth (mm)
+              <input aria-label="Depth" type="number" step={1} value={depthMm} onChange={(event) => setDepthMm(Number(event.target.value))} disabled={busy || geometryKind !== "rect_prism"} />
+            </label>
             <label style={fieldStyle}>Radius (mm)
               <input aria-label="Radius" type="number" step={1} value={radiusMm} onChange={(event) => setRadiusMm(Number(event.target.value))} disabled={busy || geometryKind !== "round_prism"} />
             </label>
             <label style={fieldStyle}>Height (mm)
-              <input aria-label="Height" type="number" step={1} value={heightMm} onChange={(event) => setHeightMm(Number(event.target.value))} disabled={busy || geometryKind === "rect_prism" && selected.primitive.kind !== "rect_prism"} />
+              <input aria-label="Height" type="number" step={1} value={heightMm} onChange={(event) => setHeightMm(Number(event.target.value))} disabled={busy} />
             </label>
           </div>
           {geometryKind === "profile_extrusion" ? <div>
@@ -298,6 +367,27 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
             </div>)}
             <button type="button" disabled={busy || profileVertices.length >= 24} onClick={() => setProfileVertices((current) => [...current, { xMm: 0, zMm: 0 }])}>Add profile vertex</button>
           </div> : <p className="muted">Profile vertices (integer X/Z, maximum 24) are available when profile_extrusion is selected.</p>}
+          {material ? <div style={compactGrid}>
+            <label style={fieldStyle}>Material label
+              <input aria-label="Material label" type="text" value={materialLabel} onChange={(event) => setMaterialLabel(event.target.value)} disabled={busy} />
+            </label>
+            <label style={fieldStyle}>Finish
+              <select aria-label="Finish" value={finishKind} onChange={(event) => setFinishKind(materialFinishKind(event.target.value))} disabled={busy}>
+                {MATERIAL_FINISH_KINDS.map((kind) => <option key={kind} value={kind}>{kind}</option>)}
+              </select>
+            </label>
+            <label style={fieldStyle}>Color
+              <input aria-label="Material color" type="color" value={colorHex} onChange={(event) => setColorHex(event.target.value)} disabled={busy} />
+            </label>
+          </div> : null}
+          <div style={compactGrid}>
+            <label style={fieldStyle}>Zone IDs (comma separated)
+              <input aria-label="Zone IDs" type="text" value={zoneIdsText} onChange={(event) => setZoneIdsText(event.target.value)} disabled={busy} />
+            </label>
+            <label style={fieldStyle}>Requirement IDs (comma separated)
+              <input aria-label="Requirement IDs" type="text" value={requirementIdsText} onChange={(event) => setRequirementIdsText(event.target.value)} disabled={busy} />
+            </label>
+          </div>
           <div style={compactGrid}>
             {(["xMm", "yMm", "zMm"] as const).map((axis) => <label key={axis} style={fieldStyle}>Move {axis}<input type="number" value={move[axis]} onChange={(event) => setMove((current) => ({ ...current, [axis]: Number(event.target.value) }))} /></label>)}
             {(["xMd", "yMd", "zMd"] as const).map((axis) => <label key={axis} style={fieldStyle}>Rotate {axis}<input type="number" value={rotation[axis]} onChange={(event) => setRotation((current) => ({ ...current, [axis]: Number(event.target.value) }))} /></label>)}
@@ -306,9 +396,11 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
             <button type="button" disabled={busy || !currentToken} onClick={() => void correct({ kind: "replace_geometry", objectId: selected.objectId, geometry: selectedGeometry as never }, "Typed geometry correction saved as a child revision.")}>Save typed geometry</button>
             <button type="button" disabled={busy || !currentToken} onClick={() => void correct({ kind: "move", objectId: selected.objectId, deltaMm: move }, "Position correction saved as a child revision.")}>Move selected object</button>
             <button type="button" disabled={busy || !currentToken} onClick={() => void correct({ kind: "rotate", objectId: selected.objectId, rotationMd: rotation }, "Rotation correction saved as a child revision.")}>Rotate selected object</button>
-            {material ? <button type="button" disabled={busy || !currentToken} onClick={() => void correct({ kind: "material", objectId: selected.objectId, material: material as never }, "Material correction saved without changing geometry.")}>Save material and finish</button> : null}
+            <button type="button" disabled={busy || !currentToken || selected.primitive.kind !== "rect_prism"} onClick={() => void correct({ kind: "resize", objectId: selected.objectId, dimensionsMm: { widthMm, depthMm, heightMm } }, "Rectangular dimensions saved as a child revision.")}>Resize selected object</button>
+            {selectedMaterial ? <button type="button" disabled={busy || !currentToken} onClick={() => void correct({ kind: "material", objectId: selected.objectId, material: selectedMaterial as never }, "Material and finish correction saved without changing geometry.")}>Save material and finish</button> : null}
+            <button type="button" disabled={busy || !currentToken} onClick={() => void correct({ kind: "zone_requirement_map", objectId: selected.objectId, zoneIds: commaSeparatedValues(zoneIdsText), requirementIds: commaSeparatedValues(requirementIdsText) }, "Zone and requirement mapping saved as a bounded correction.")}>Map zones and requirements</button>
             <button type="button" disabled={busy || !currentToken || selected.removable === false} onClick={() => void correct({ kind: "remove", objectId: selected.objectId }, "Removal saved as a visible draft correction.")}>Remove selected object</button>
-            <button type="button" disabled={busy || !currentToken || !material} onClick={() => material && void correct({ kind: "add", objectType: "counter", role: "furniture", label: "Typed counter", geometry: { kind: "rect_prism", dimensionsMm: { widthMm: 900, depthMm: 600, heightMm: 900 }, localAnchor: "floor" } as never, positionMm: selectedPosition, rotationMd: selectedRotation, material: material as never, parentObjectId: null, zoneIds: selected.zoneIds, requirementIds: selected.requirementIds }, "A server-identified typed object was added to the draft.")}>Add typed counter</button>
+            <button type="button" disabled={busy || !currentToken || !selectedMaterial} onClick={() => selectedMaterial && void correct({ kind: "add", objectType: "counter", role: "furniture", label: "Typed counter", geometry: { kind: "rect_prism", dimensionsMm: { widthMm: 900, depthMm: 600, heightMm: 900 }, localAnchor: "floor" } as never, positionMm: selectedPosition, rotationMd: selectedRotation, material: selectedMaterial as never, parentObjectId: null, zoneIds: selected.zoneIds, requirementIds: selected.requirementIds }, "A server-identified typed object was added to the draft.")}>Add typed counter</button>
           </div>
         </>}
       </section>
@@ -316,24 +408,29 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
         <h2>Design-form decision</h2>
         {unresolved.length === 0 ? <p className="success">No unresolved blocking form unknowns remain in the loaded revision.</p> : <>
           <p className="error">Unresolved or unsupported form blocks acceptance and final view publication.</p>
-          <button type="button" disabled={busy || !currentToken || reviewObjectIds.length === 0} onClick={() => currentToken && void correct({ kind: "confirm_design_inference", objectIds: reviewObjectIds, note: "User confirmed the bounded typed form after reference review." }, "Bounded design inference confirmation saved.")}>Confirm design inference</button>
-          {selected && material && unresolved[0] ? <button type="button" disabled={busy || !currentToken} onClick={() => currentToken && void correct({
+          <p>Review object IDs: <strong>{reviewObjectIds.length > 0 ? reviewObjectIds.join(", ") : "none linked in this response"}</strong></p>
+          <label style={fieldStyle}>Review note
+            <textarea aria-label="Review note" rows={3} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} disabled={busy} style={{ minHeight: 80 }} />
+          </label>
+          <button type="button" disabled={busy || !currentToken || reviewObjectIds.length === 0 || !reviewNote.trim()} onClick={() => currentToken && void correct({ kind: "confirm_design_inference", objectIds: reviewObjectIds, note: reviewNote }, "Bounded design inference confirmation saved.")}>Confirm design inference</button>
+          {selected && selectedMaterial && unresolved[0] ? <button type="button" disabled={busy || !currentToken} onClick={() => currentToken && void correct({
             kind: "resolve_unknown",
             unknownId: unresolved[0]!.unknownId,
             resolutionKind: "explicit_simplification",
             resolutionNote: "User explicitly accepted this bounded typed simplification after review.",
-            replacement: { objectType: selected.objectType as never, role: selected.role as never, label: selected.label, geometry: selectedGeometry as never, positionMm: selectedPosition, rotationMd: selectedRotation, material: material as never },
+            replacement: { objectType: selected.objectType as never, role: selected.role as never, label: selected.label, geometry: selectedGeometry as never, positionMm: selectedPosition, rotationMd: selectedRotation, material: selectedMaterial as never },
           }, "Explicit simplification decision saved with the original unknown preserved.")}>Record Explicit simplification</button> : null}
         </>}
       </section>
       <section className="panel">
-        <h2>Published views</h2>
+        <h2>View artifacts</h2>
+        <p className="muted">Only accepted_view artifacts can be published. draft_preview artifacts remain diagnostic and unpublishable.</p>
         {VIEW_IDS.map((viewId) => {
           const view = data.state.views.find((item) => item.viewId === viewId);
           return <article className="candidate" key={viewId}>
             <strong>{viewId}</strong>
             <p>{view ? view.status + " / preservation " + String(view.preservationOutcome ?? "pending") : "not rendered"}</p>
-            <button type="button" disabled={busy || !currentToken || !reviewed || view?.status !== "staged"} onClick={() => currentToken && void mutate({ viewId, token: currentToken }, () => client.publish(currentToken, viewId), "View published with exact private promotion.")}>Publish view</button>
+            <button type="button" disabled={busy || !currentToken || !reviewed || view?.purpose !== "accepted_view" || view.status !== "staged"} onClick={() => currentToken && void mutate({ viewId, token: currentToken }, () => client.publish(currentToken, viewId), "View published with exact private promotion.")}>Publish view</button>
           </article>;
         })}
       </section>

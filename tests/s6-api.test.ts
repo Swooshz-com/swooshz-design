@@ -90,6 +90,21 @@ function request(method: string, body?: unknown, headers: Record<string, string>
   });
 }
 
+function streamedJsonRequest(method: string, body: string, headers: Record<string, string> = {}): Request {
+  const bytes = Buffer.from(body, "utf8");
+  return new Request("http://localhost", {
+    method,
+    headers: { "content-type": "application/json", ...headers },
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let offset = 0; offset < bytes.byteLength; offset += 997) controller.enqueue(bytes.subarray(offset, Math.min(offset + 997, bytes.byteLength)));
+        controller.close();
+      },
+    }),
+    duplex: "half",
+  } as RequestInit);
+}
+
 function path(...segments: string[]): string[] {
   return ["projects", PROJECT_ID, "s6", ...segments];
 }
@@ -134,6 +149,52 @@ test("S6 exact routes reject wrong methods and unknown fields", async () => {
   const body = await json(unknownField);
   assert.equal(body.error.code, "S6_INVALID_REQUEST");
   assert.deepEqual(body.error.fieldErrors, [{ field: "body", code: "UNKNOWN_FIELD" }]);
+});
+
+test("S6 JSON bodies stream up to exactly 64000 bytes and reject malformed or oversized input before mutation", async () => {
+  let generateCalls = 0;
+  const fixture = stubService({
+    generate: () => {
+      generateCalls += 1;
+      return {
+        replayed: false,
+        revisionId: REVISION_ID,
+        revisionHash: SHA,
+        status: "generated_draft",
+        sourceS5Fingerprint: SHA,
+        currentAcceptedRevisionId: null,
+        currentAcceptedRevisionHash: null,
+        concurrency: TOKEN,
+      };
+    },
+  });
+  const auth = dependencies(fixture.service);
+  const exactBody = "{}" + " ".repeat(64000 - 2);
+  const exact = await handleApiRequest(
+    streamedJsonRequest("POST", exactBody, { "Idempotency-Key": IDENTITY_KEY }),
+    path("generation"),
+    auth,
+  );
+  assert.equal(exact.status, 202);
+  assert.equal(generateCalls, 1);
+
+  const tooLarge = await handleApiRequest(
+    streamedJsonRequest("POST", "{}" + " ".repeat(64000 - 1), { "Idempotency-Key": "40000000-0000-4000-8000-000000000005" }),
+    path("generation"),
+    auth,
+  );
+  assert.equal(tooLarge.status, 400);
+  assert.deepEqual((await json(tooLarge)).error.fieldErrors, [{ field: "body", code: "BODY_TOO_LARGE" }]);
+  assert.equal(generateCalls, 1);
+
+  const malformedLength = await handleApiRequest(
+    request("POST", {}, { "content-length": "not-a-number", "Idempotency-Key": "40000000-0000-4000-8000-000000000006" }),
+    path("generation"),
+    auth,
+  );
+  assert.equal(malformedLength.status, 400);
+  assert.deepEqual((await json(malformedLength)).error.fieldErrors, [{ field: "body", code: "BODY_LENGTH_INVALID" }]);
+  assert.equal(generateCalls, 1);
 });
 
 test("S6 generation correction acceptance render and publish DTOs are exact", async () => {
@@ -267,7 +328,7 @@ test("S6 editor exposes stable object selection, typed semantic controls, and ex
         currentAcceptedRevisionHash: null,
         editableRevision: { revisionId: REVISION_ID, revisionHash: SHA, parentRevisionId: null, status: "corrected_draft", sourceS5Fingerprint: SHA, objectCount: 1, zoneCount: 0, unknownCount: 1, validationOutcome: null, createdAt: "2026-09-02T00:00:00.000Z", updatedAt: "2026-09-02T00:00:00.000Z" },
         revisions: [],
-        views: [],
+        views: [{ viewId: "top-orthographic", revisionId: REVISION_ID, status: "staged", purpose: "draft_preview", preservationOutcome: "pass" }],
         concurrency: TOKEN,
       },
       revision: {
@@ -304,5 +365,12 @@ test("S6 editor exposes stable object selection, typed semantic controls, and ex
   assert.match(markup, /Explicit simplification/u);
   assert.match(markup, /Approved reference/u);
   assert.match(markup, /evidenceAssetId/u);
+  assert.match(markup, /Generate spatial draft/u);
+  assert.match(markup, /Diagnostic draft preview/u);
+  assert.ok(markup.includes('src="/api/projects/' + PROJECT_ID + '/s5/hero/download"'));
+  assert.match(markup, /Resize selected object/u);
+  assert.match(markup, /Map zones and requirements/u);
+  assert.match(markup, /Review object IDs/u);
+  assert.match(markup, /Review note/u);
   assert.doesNotMatch(markup, /Edit booth width|Edit booth depth|Edit open sides|Edit maximum height|Edit S5 counts|Approve S5/u);
 });

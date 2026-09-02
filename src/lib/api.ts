@@ -7,6 +7,7 @@ import { createWorkflowService, type WorkflowService } from "./workflow";
 
 const MAX_MULTIPART_BODY_BYTES = MAX_BRIEF_BYTES + 1024 * 1024;
 const MAX_S4_BODY_BYTES = 131072;
+const MAX_S6_BODY_BYTES = 64000;
 const PUBLIC_S3_ERROR_CODES = new Set<string>([
   "INVALID_REQUEST",
   "IDEMPOTENCY_KEY_REQUIRED",
@@ -160,18 +161,19 @@ async function jsonBody(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
+async function boundedJsonBody(request: Request, maxBytes: number): Promise<Record<string, unknown>> {
   const contentType = request.headers.get("content-type") ?? "";
   if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
     throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "JSON_REQUIRED" }]);
   }
   const suppliedLength = request.headers.get("content-length");
   if (suppliedLength !== null) {
-    const parsedLength = Number(suppliedLength);
-    if (!Number.isSafeInteger(parsedLength) || parsedLength < 0) {
+    if (!/^\d+$/u.test(suppliedLength)) {
       throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_LENGTH_INVALID" }]);
     }
-    if (parsedLength > MAX_S4_BODY_BYTES) {
+    const parsedLength = Number(suppliedLength);
+    if (!Number.isSafeInteger(parsedLength) || parsedLength > maxBytes) {
+      if (!Number.isSafeInteger(parsedLength)) throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_LENGTH_INVALID" }]);
       throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
     }
   }
@@ -184,7 +186,7 @@ async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
       const next = await reader.read();
       if (next.done) break;
       total += next.value.byteLength;
-      if (total > MAX_S4_BODY_BYTES) {
+      if (total > maxBytes) {
         await reader.cancel().catch(() => undefined);
         throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "BODY_TOO_LARGE" }]);
       }
@@ -200,6 +202,10 @@ async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
   } catch {
     throw new AppError(400, "INVALID_REQUEST", [{ field: "body", code: "JSON_OBJECT_REQUIRED" }]);
   }
+}
+
+async function s4JsonBody(request: Request): Promise<Record<string, unknown>> {
+  return boundedJsonBody(request, MAX_S4_BODY_BYTES);
 }
 
 function keyFromHeader(request: Request, header: string): UUID {
@@ -1099,7 +1105,7 @@ function s6Token(body: Record<string, unknown>, withOperations = false): S6Concu
 }
 
 async function s6JsonBody(request: Request): Promise<Record<string, unknown>> {
-  return s4JsonBody(request);
+  return boundedJsonBody(request, MAX_S6_BODY_BYTES);
 }
 
 function s6ViewId(value: string): S6ViewId {

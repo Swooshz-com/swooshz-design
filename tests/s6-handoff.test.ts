@@ -112,7 +112,10 @@ test("telemetry reports exact zero and unavailable cost semantics", () => {
   assert.equal(telemetry.projectId, PROJECT_ID);
   for (const [key, metric] of Object.entries(telemetry)) {
     if (key.endsWith("Count")) {
-      assert.deepEqual(metric, { availability: "available", value: 0, reason: null }, key);
+      const unsupported = key === "correctionFailureCount" || key === "revisionConflictCount" || key === "staleFenceCount";
+      assert.deepEqual(metric, unsupported
+        ? { availability: "unavailable", value: null, reason: "not_durably_recorded" }
+        : { availability: "available", value: 0, reason: null }, key);
     }
   }
   assert.deepEqual(telemetry.sourceReadiness, { availability: "available", value: "ready", reason: null });
