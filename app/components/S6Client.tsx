@@ -182,6 +182,15 @@ function commaSeparatedValues(value: string): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+function linkedDesignFormUnknown(object: ClientObject | null, unresolved: readonly ClientUnknown[]): ClientUnknown | null {
+  if (!object) return null;
+  return unresolved.find((item) =>
+    item.kind === "design_form" &&
+    object.unknownIds.includes(item.unknownId) &&
+    item.fieldPath === "objects[" + object.objectId + "].primitive",
+  ) ?? null;
+}
+
 const fieldStyle: CSSProperties = { display: "grid", gap: 6 };
 const compactGrid: CSSProperties = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10 };
 
@@ -201,7 +210,7 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
   const [colorHex, setColorHex] = useState("#888888");
   const [zoneIdsText, setZoneIdsText] = useState("");
   const [requirementIdsText, setRequirementIdsText] = useState("");
-  const [reviewNote, setReviewNote] = useState("User confirmed the bounded typed form after reference review.");
+  const [reviewNote, setReviewNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -212,6 +221,8 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
   const objects = model?.objects ?? [];
   const selected = objects.find((item) => item.objectId === selectedId) ?? objects[0] ?? null;
   const unresolved = model?.unknowns.filter((item) => item.status === "unresolved") ?? [];
+  const explicitlySelected = selectedId !== null && selected?.objectId === selectedId;
+  const selectedReviewUnknown = linkedDesignFormUnknown(selected, unresolved);
   const currentToken = data?.state.concurrency ?? null;
   const draftPreview = data?.state.views.find((item) => item.viewId === "top-orthographic" && item.purpose === "draft_preview" && (item.status === "staged" || item.status === "promoted" || item.status === "committed") && item.preservationOutcome === "pass") ?? null;
   const topView = data?.state.views.find((item) => item.viewId === "top-orthographic" && item.purpose === "accepted_view" && item.status === "committed") ?? null;
@@ -231,7 +242,6 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
 
   useEffect(() => {
     if (!selected) return;
-    setSelectedId(selected.objectId);
     setGeometryKind(selected.primitive.kind);
     if (selected.primitive.kind === "rect_prism") {
       setWidthMm(selected.primitive.dimensionsMm.widthMm);
@@ -291,9 +301,8 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
   const selectedMaterial = material ? { ...material, label: materialLabel.trim() || material.label, finishKind, colorHex } : null;
   const selectedPosition = selected?.transform.positionMm ?? { xMm: 0, yMm: 0, zMm: 0 };
   const selectedRotation = selected?.transform.rotationMd ?? { xMd: 0, yMd: 0, zMd: 0 };
-  const reviewObjectIds = unresolved
-    .map((item) => /^objects\[(.+)\]\.primitive$/u.exec(item.fieldPath ?? "")?.[1])
-    .filter((item): item is string => item !== undefined);
+  const deliberateReviewNote = reviewNote.trim();
+  const reviewObjectIds = explicitlySelected && selectedReviewUnknown && selected ? [selected.objectId] : [];
 
   return <main>
     <p className="muted">Swooshz Design / S6 spatial review</p>
@@ -412,12 +421,12 @@ export function S6Screen({ projectId, initialData, fetcher }: { projectId: strin
           <label style={fieldStyle}>Review note
             <textarea aria-label="Review note" rows={3} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} disabled={busy} style={{ minHeight: 80 }} />
           </label>
-          <button type="button" disabled={busy || !currentToken || reviewObjectIds.length === 0 || !reviewNote.trim()} onClick={() => currentToken && void correct({ kind: "confirm_design_inference", objectIds: reviewObjectIds, note: reviewNote }, "Bounded design inference confirmation saved.")}>Confirm design inference</button>
-          {selected && selectedMaterial && unresolved[0] ? <button type="button" disabled={busy || !currentToken} onClick={() => currentToken && void correct({
+          <button type="button" disabled={busy || !currentToken || reviewObjectIds.length === 0 || !deliberateReviewNote} onClick={() => currentToken && void correct({ kind: "confirm_design_inference", objectIds: reviewObjectIds, note: deliberateReviewNote }, "Bounded design inference confirmation saved.")}>Confirm design inference</button>
+          {selected && selectedMaterial && selectedReviewUnknown ? <button type="button" disabled={busy || !currentToken || !explicitlySelected || !deliberateReviewNote} onClick={() => currentToken && void correct({
             kind: "resolve_unknown",
-            unknownId: unresolved[0]!.unknownId,
+            unknownId: selectedReviewUnknown.unknownId,
             resolutionKind: "explicit_simplification",
-            resolutionNote: "User explicitly accepted this bounded typed simplification after review.",
+            resolutionNote: deliberateReviewNote,
             replacement: { objectType: selected.objectType as never, role: selected.role as never, label: selected.label, geometry: selectedGeometry as never, positionMm: selectedPosition, rotationMd: selectedRotation, material: selectedMaterial as never },
           }, "Explicit simplification decision saved with the original unknown preserved.")}>Record Explicit simplification</button> : null}
         </>}

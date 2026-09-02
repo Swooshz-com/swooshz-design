@@ -3,10 +3,11 @@ import { Buffer } from "node:buffer";
 import { test } from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { act, create } from "react-test-renderer";
 import { AppError, type UUID } from "../src/lib/types";
 import { handleApiRequest, type ApiRequestDependencies } from "../src/lib/api";
 import type { WorkflowService } from "../src/lib/workflow";
-import { createS6Client, S6Screen } from "../app/components/S6Client";
+import { createS6Client, S6Screen, type S6ClientData } from "../app/components/S6Client";
 
 const PROJECT_ID = "40000000-0000-4000-8000-000000000001" as UUID;
 const REVISION_ID = "40000000-0000-4000-8000-000000000002" as UUID;
@@ -350,7 +351,7 @@ test("S6 editor exposes stable object selection, typed semantic controls, and ex
             unknownIds: ["unknown-form"],
           }],
           materials: [{ materialId: "material-metal", label: "Metal", finishKind: "metal_like", colorHex: "#888888" }],
-          unknowns: [{ unknownId: "unknown-form", kind: "design_form", status: "unresolved" }],
+          unknowns: [{ unknownId: "unknown-form", kind: "design_form", status: "unresolved", fieldPath: "objects[object-counter].primitive" }],
         },
         validation: null,
         views: [],
@@ -373,4 +374,142 @@ test("S6 editor exposes stable object selection, typed semantic controls, and ex
   assert.match(markup, /Review object IDs/u);
   assert.match(markup, /Review note/u);
   assert.doesNotMatch(markup, /Edit booth width|Edit booth depth|Edit open sides|Edit maximum height|Edit S5 counts|Approve S5/u);
+});
+
+test("S6 editor requires a deliberate single-object review decision", async () => {
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const makeData = (): S6ClientData => ({
+    state: {
+      projectId: PROJECT_ID,
+      source: { readiness: "ready", sourceS5Fingerprint: SHA, approvalEventId: REVISION_ID, approvalGeneration: 1 },
+      currentAcceptedRevisionId: null,
+      currentAcceptedRevisionHash: null,
+      editableRevision: { revisionId: REVISION_ID, revisionHash: SHA, parentRevisionId: null, status: "corrected_draft", sourceS5Fingerprint: SHA, objectCount: 2, zoneCount: 0, unknownCount: 2, validationOutcome: null, createdAt: "2026-09-02T00:00:00.000Z", updatedAt: "2026-09-02T00:00:00.000Z" },
+      revisions: [],
+      views: [],
+      concurrency: TOKEN,
+    },
+    revision: {
+      revision: {
+        modelRevisionId: REVISION_ID,
+        status: "corrected_draft",
+        designFormReview: { status: "in_progress", evidenceAssetId: REVISION_ID, evidenceAssetSha256: SHA, unresolvedUnknownIds: ["unknown-a", "unknown-b"], reviewedObjectIds: [], explicitSimplificationUnknownIds: [], acceptedByUser: false },
+        booth: { widthMm: 6000, depthMm: 3000, openSides: ["north"], maxHeightMm: 3000 },
+        objects: [
+          {
+            objectId: "object-a",
+            objectType: "counter",
+            role: "furniture",
+            label: "Object A",
+            primitive: { kind: "rect_prism", dimensionsMm: { widthMm: 900, depthMm: 600, heightMm: 900 }, localAnchor: "floor" },
+            transform: { positionMm: { xMm: 100, yMm: 0, zMm: 100 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } },
+            materialIds: ["material-a"],
+            zoneIds: [],
+            requirementIds: [],
+            unknownIds: ["unknown-a"],
+          },
+          {
+            objectId: "object-b",
+            objectType: "counter",
+            role: "furniture",
+            label: "Object B",
+            primitive: { kind: "rect_prism", dimensionsMm: { widthMm: 900, depthMm: 600, heightMm: 900 }, localAnchor: "floor" },
+            transform: { positionMm: { xMm: 1200, yMm: 0, zMm: 100 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } },
+            materialIds: ["material-a"],
+            zoneIds: [],
+            requirementIds: [],
+            unknownIds: ["unknown-b"],
+          },
+        ],
+        materials: [{ materialId: "material-a", label: "Material A", finishKind: "solid_color", colorHex: "#888888" }],
+        unknowns: [
+          { unknownId: "unknown-a", kind: "design_form", status: "unresolved", fieldPath: "objects[object-a].primitive", question: "Confirm object A." },
+          { unknownId: "unknown-b", kind: "design_form", status: "unresolved", fieldPath: "objects[object-b].primitive", question: "Confirm object B." },
+        ],
+      },
+      validation: null,
+      views: [],
+    },
+  } as unknown as S6ClientData);
+
+  let currentData = makeData();
+  const corrections: Array<Record<string, any>> = [];
+  const fetcher = async (input: string, init?: RequestInit): Promise<Response> => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body ?? "{}")) as { operations?: Array<Record<string, any>> };
+      const operation = body.operations?.[0];
+      if (operation) {
+        corrections.push(operation);
+        const model = currentData.revision!.revision as any;
+        if (operation.kind === "confirm_design_inference") {
+          const objectId = operation.objectIds?.[0];
+          const object = model.objects.find((item: any) => item.objectId === objectId);
+          const unknownId = object?.unknownIds?.[0];
+          const unknown = model.unknowns.find((item: any) => item.unknownId === unknownId);
+          if (unknown) unknown.status = "resolved";
+        }
+        if (operation.kind === "resolve_unknown") {
+          const unknown = model.unknowns.find((item: any) => item.unknownId === operation.unknownId);
+          if (unknown) unknown.status = "resolved";
+        }
+        const unresolvedIds = model.unknowns.filter((item: any) => item.status === "unresolved").map((item: any) => item.unknownId);
+        model.designFormReview.unresolvedUnknownIds = unresolvedIds;
+        if (unresolvedIds.length === 0) {
+          model.designFormReview.status = "complete";
+          model.designFormReview.acceptedByUser = true;
+        }
+        currentData.state.editableRevision!.unknownCount = unresolvedIds.length;
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    const payload = input.endsWith("/s6") ? currentData.state : currentData.revision;
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  let renderer: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(createElement(S6Screen, { projectId: PROJECT_ID, initialData: makeData(), fetcher }));
+  });
+  const failures: string[] = [];
+  const require = (condition: boolean, message: string): void => { if (!condition) failures.push(message); };
+  const button = (label: string) => renderer!.root.findAllByType("button").find((item) => item.props.children === label)!;
+  const objectButton = (objectId: string) => {
+    const found = renderer!.root.findAllByType("button").find((item) => item.props["data-object-id"] === objectId);
+    assert.ok(found, JSON.stringify(renderer!.root.findAllByType("button").map((item) => item.props)));
+    return found;
+  };
+  const note = () => {
+    const found = renderer!.root.findAllByType("textarea").find((item) => item.props["aria-label"] === "Review note");
+    assert.ok(found, JSON.stringify({ statuses: (currentData.revision!.revision as any).unknowns, corrections, textareas: renderer!.root.findAllByType("textarea").map((item) => item.props), buttons: renderer!.root.findAllByType("button").map((item) => item.props.children) }));
+    return found;
+  };
+  const flush = async (): Promise<void> => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); };
+
+  require(note().props.value === "", "review note starts blank");
+  await act(async () => { note().props.onChange({ target: { value: "" } }); });
+  const initialConfirm = button("Confirm design inference");
+  require(initialConfirm.props.disabled === true, "blank note cannot confirm");
+  if (!initialConfirm.props.disabled) {
+    await act(async () => { initialConfirm.props.onClick(); await flush(); });
+  }
+  require(corrections.length === 0, "blank confirmation does not post");
+
+  await act(async () => { objectButton("object-a").props.onClick(); });
+  await act(async () => { note().props.onChange({ target: { value: "Deliberate A decision." } }); });
+  await act(async () => { button("Confirm design inference").props.onClick(); await flush(); });
+  require(corrections[0]?.kind === "confirm_design_inference", "object A uses design confirmation");
+  require(JSON.stringify(corrections[0]?.objectIds) === JSON.stringify(["object-a"]), "object A confirmation sends only A");
+  require((currentData.revision!.revision as any).unknowns.find((item: any) => item.unknownId === "unknown-b")?.status === "unresolved", "object B remains unresolved after A");
+  require(button("Accept reviewed model").props.disabled === true, "acceptance remains blocked while B is unresolved");
+
+  await act(async () => { objectButton("object-b").props.onClick(); });
+  await act(async () => { note().props.onChange({ target: { value: "Deliberate B simplification." } }); });
+  await act(async () => { button("Record Explicit simplification").props.onClick(); await flush(); });
+  const simplification = corrections[1];
+  require(simplification?.kind === "resolve_unknown", "object B uses a separate simplification decision");
+  require(simplification?.unknownId === "unknown-b", "simplification binds to selected B unknown");
+  require(simplification?.resolutionNote === "Deliberate B simplification.", "simplification uses the deliberate B note");
+  require((currentData.revision!.revision as any).unknowns.every((item: any) => item.status === "resolved"), "B is resolved only after its own decision");
+  assert.deepEqual(failures, []);
+  await act(async () => { renderer!.unmount(); });
 });
