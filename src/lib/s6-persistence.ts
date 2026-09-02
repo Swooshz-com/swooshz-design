@@ -1,6 +1,7 @@
 import { codePointLength, uuidV4Pattern } from "./utils";
 import {
   hashS6Model,
+  hashS6ValidationReceipt,
   normalizeS6Geometry,
   S6_MAX_ASSUMPTIONS,
   S6_MAX_CAMERAS,
@@ -17,7 +18,7 @@ import {
   S6_MAX_ZONES,
   S6_MIN_PHYSICAL_MM,
 } from "./s6-canonical";
-import type { StoreState } from "./types";
+import type { S6ValidationReceipt, StoreState } from "./types";
 
 type PersistedRecord = Record<string, unknown>;
 
@@ -702,6 +703,24 @@ function validateRetryChains(values: PersistedRecord[], idKey: string, groupKey:
   }
 }
 
+function validateValidationReceiptGraph(models: PersistedRecord[], modelById: Map<string, PersistedRecord>, receipts: PersistedRecord[]): void {
+  const receiptById = uniqueRecordIds(receipts, "receiptId");
+  for (const receipt of receipts) {
+    try {
+      if (hashS6ValidationReceipt(receipt as unknown as S6ValidationReceipt) !== receipt.validationHash) return invalid("S6_RECEIPT_HASH_MISMATCH");
+    } catch {
+      return invalid("S6_RECEIPT_HASH_MISMATCH");
+    }
+    const model = modelById.get(String(receipt.revisionId));
+    if (model === undefined || model.projectId !== receipt.projectId || model.modelRevisionId !== receipt.revisionId || model.modelHash !== receipt.revisionHash || model.sourceS5Fingerprint !== receipt.sourceS5Fingerprint) return invalid("S6_RECEIPT_REFERENCE_INVALID");
+  }
+  for (const model of models) {
+    if (model.validationReceiptId === null) continue;
+    const receipt = receiptById.get(String(model.validationReceiptId));
+    if (receipt === undefined || receipt.projectId !== model.projectId || receipt.revisionId !== model.modelRevisionId || receipt.revisionHash !== model.modelHash || receipt.sourceS5Fingerprint !== model.sourceS5Fingerprint) return invalid("S6_RECEIPT_REFERENCE_INVALID");
+  }
+}
+
 function validateArtifactGraph(models: PersistedRecord[], modelById: Map<string, PersistedRecord>, artifacts: PersistedRecord[], receipts: PersistedRecord[], jobs: PersistedRecord[]): void {
   const artifactById = uniqueRecordIds(artifacts, "artifactId");
   const receiptById = uniqueRecordIds(receipts, "receiptId");
@@ -779,6 +798,7 @@ export function validateS6Graph(state: StoreState): void {
   const idempotency = persistedRecords(state.s6Idempotency);
   const modelById = validateModelLineage(models);
   validateEventGraph(models, modelById, corrections, acceptances, supersessions);
+  validateValidationReceiptGraph(models, modelById, receipts);
   validateArtifactGraph(models, modelById, artifacts, preservationReceipts, jobs);
   validateIdempotencyGraph(idempotency);
 }

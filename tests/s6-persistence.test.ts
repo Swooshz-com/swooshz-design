@@ -8,12 +8,15 @@ import {
   type S6AcceptanceEvent,
   type S6SpatialModelRecord,
   type S6SupersessionEvent,
+  type S6ValidationReceipt,
   type S6ViewArtifact,
   type StoreState,
   type UUID,
 } from "../src/lib/types";
 import { emptyStoreState, JsonRepository } from "../src/lib/store";
-import { hashS6Model } from "../src/lib/s6-canonical";
+import { hashS6Model, hashS6ValidationReceipt } from "../src/lib/s6-canonical";
+import { validateS6Graph } from "../src/lib/s6-persistence";
+import { buildS6Telemetry } from "../src/lib/s6-telemetry";
 
 const HASH = "a".repeat(64);
 const PROJECT_ID = "10000000-0000-4000-8000-000000000001" as UUID;
@@ -155,6 +158,38 @@ function stateWith(overrides: Record<string, unknown> = {}): Record<string, unkn
     s6Idempotency: [],
     ...overrides,
   };
+}
+
+function makeValidationReceipt(model: S6SpatialModelRecord, receiptId = id(40)): S6ValidationReceipt {
+  const receipt: S6ValidationReceipt = {
+    schemaVersion: "s6-validation-receipt-v1",
+    receiptId,
+    projectId: model.projectId,
+    revisionId: model.modelRevisionId,
+    revisionHash: model.modelHash,
+    sourceS5Fingerprint: model.sourceS5Fingerprint,
+    validatorVersion: "s6-validator-v1",
+    orderVersion: "s6-validation-order-v1",
+    outcome: "pass",
+    errors: [],
+    warnings: [],
+    checkedAt: "2026-09-02T00:00:00.000Z",
+    validationHash: "" as S6ValidationReceipt["validationHash"],
+  };
+  receipt.validationHash = hashS6ValidationReceipt(receipt);
+  return receipt;
+}
+
+function attachValidationReceipt(model: S6SpatialModelRecord, receiptId = id(40)): S6ValidationReceipt {
+  model.validationReceiptId = receiptId;
+  const digest = hashS6Model(model);
+  model.modelHash = digest.modelHash;
+  model.canonicalByteSize = digest.canonicalByteSize;
+  return makeValidationReceipt(model, receiptId);
+}
+
+function graphState(models: S6SpatialModelRecord[], receipts: S6ValidationReceipt[]): StoreState {
+  return stateWith({ s6SpatialModels: models, s6ValidationReceipts: receipts }) as unknown as StoreState;
 }
 
 function withRepository(state: unknown, action: (repository: JsonRepository) => void): void {
@@ -331,4 +366,88 @@ test("artifact attempts/retries/idempotency keys form a valid graph", () => {
 test("S6 persistence remains compatible with the typed StoreState boundary", () => {
   const state = stateWith() as unknown as StoreState;
   assert.equal(Array.isArray((state as unknown as Record<string, unknown>).s6SpatialModels), true);
+});
+
+test("validation receipt graph rejects dangling, mismatched, non-reciprocal, and duplicate receipt state", () => {
+  const cases: Array<{ label: string; state: StoreState }> = [];
+
+  const danglingModel = makeModel();
+  const danglingReceipt = attachValidationReceipt(danglingModel);
+  danglingReceipt.revisionId = id(99);
+  danglingReceipt.validationHash = hashS6ValidationReceipt(danglingReceipt);
+  cases.push({ label: "nonexistent revision", state: graphState([danglingModel], [danglingReceipt]) });
+
+  const hashModel = makeModel();
+  const hashReceipt = attachValidationReceipt(hashModel);
+  hashReceipt.revisionHash = "b".repeat(64);
+  hashReceipt.validationHash = hashS6ValidationReceipt(hashReceipt);
+  cases.push({ label: "revision hash mismatch", state: graphState([hashModel], [hashReceipt]) });
+
+  const sourceModel = makeModel();
+  const sourceReceipt = attachValidationReceipt(sourceModel);
+  sourceReceipt.sourceS5Fingerprint = "b".repeat(64);
+  sourceReceipt.validationHash = hashS6ValidationReceipt(sourceReceipt);
+  cases.push({ label: "source fingerprint mismatch", state: graphState([sourceModel], [sourceReceipt]) });
+
+  const noBackReferenceModel = makeModel();
+  const noBackReferenceReceipt = makeValidationReceipt(noBackReferenceModel);
+  noBackReferenceModel.validationReceiptId = id(98);
+  cases.push({ label: "model points to no receipt", state: graphState([noBackReferenceModel], [noBackReferenceReceipt]) });
+
+  const wrongBackReferenceParent = makeModel();
+  const wrongBackReferenceChild = makeModel({ revision: 2 });
+  wrongBackReferenceChild.objects[0]!.objectId = "s6_floor_child";
+  const wrongBackReferenceChildDigest = hashS6Model(wrongBackReferenceChild);
+  wrongBackReferenceChild.modelHash = wrongBackReferenceChildDigest.modelHash;
+  wrongBackReferenceChild.canonicalByteSize = wrongBackReferenceChildDigest.canonicalByteSize;
+  const wrongBackReferenceReceipt = attachValidationReceipt(wrongBackReferenceChild, id(41));
+  wrongBackReferenceParent.validationReceiptId = wrongBackReferenceReceipt.receiptId;
+  const wrongBackReferenceParentDigest = hashS6Model(wrongBackReferenceParent);
+  wrongBackReferenceParent.modelHash = wrongBackReferenceParentDigest.modelHash;
+  wrongBackReferenceParent.canonicalByteSize = wrongBackReferenceParentDigest.canonicalByteSize;
+  wrongBackReferenceChild.validationReceiptId = wrongBackReferenceReceipt.receiptId;
+  cases.push({ label: "model points to the wrong receipt", state: graphState([wrongBackReferenceParent, wrongBackReferenceChild], [wrongBackReferenceReceipt]) });
+
+  const crossProjectModel = makeModel();
+  const crossProjectReceipt = makeValidationReceipt(crossProjectModel);
+  crossProjectReceipt.projectId = id(99);
+  crossProjectReceipt.validationHash = hashS6ValidationReceipt(crossProjectReceipt);
+  cases.push({ label: "cross-project receipt linkage", state: graphState([crossProjectModel], [crossProjectReceipt]) });
+
+  const duplicateModel = makeModel();
+  const duplicateReceipt = attachValidationReceipt(duplicateModel);
+  cases.push({ label: "duplicate receipt identity", state: graphState([duplicateModel], [duplicateReceipt, clone(duplicateReceipt)]) });
+
+  const failures: string[] = [];
+  for (const item of cases) {
+    try {
+      validateS6Graph(item.state);
+    } catch {
+      continue;
+    }
+    failures.push(item.label);
+  }
+  assert.deepEqual(failures, []);
+});
+
+test("invalid validation receipt graph makes graph-dependent telemetry unavailable", () => {
+  const model = makeModel();
+  const receipt = makeValidationReceipt(model);
+  model.validationReceiptId = receipt.receiptId;
+  receipt.revisionId = id(99);
+  receipt.validationHash = hashS6ValidationReceipt(receipt);
+  const state = graphState([model], [receipt]);
+  assert.throws(() => validateS6Graph(state), /S6_RECEIPT_REFERENCE_INVALID/u);
+  const telemetry = buildS6Telemetry(state, PROJECT_ID, {
+    readiness: "ready",
+    sourceS5Fingerprint: HASH,
+    approvalEventId: APPROVAL_EVENT_ID,
+    approvalGeneration: 1,
+  });
+  assert.deepEqual(telemetry.generationCount, { availability: "unavailable", value: null, reason: "s6_state_invalid" });
+  assert.deepEqual(telemetry.correctionCount, { availability: "unavailable", value: null, reason: "s6_state_invalid" });
+  assert.deepEqual(telemetry.acceptanceCount, { availability: "unavailable", value: null, reason: "s6_state_invalid" });
+  assert.deepEqual(telemetry.correctionFailureCount, { availability: "unavailable", value: null, reason: "not_durably_recorded" });
+  assert.deepEqual(telemetry.revisionConflictCount, { availability: "unavailable", value: null, reason: "not_durably_recorded" });
+  assert.deepEqual(telemetry.staleFenceCount, { availability: "unavailable", value: null, reason: "not_durably_recorded" });
 });
