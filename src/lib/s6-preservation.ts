@@ -17,7 +17,6 @@ function deterministicUuid(seed: string): UUID {
   const hash = sha256(seed);
   return hash.slice(0, 8) + "-" + hash.slice(8, 12) + "-4" + hash.slice(13, 16) + "-8" + hash.slice(17, 20) + "-" + hash.slice(20, 32);
 }
-
 function fail(checks: S6ValidationIssue[], fieldPath: string): void {
   checks.push({ code: "VIEW_PRESERVATION_FAILED", severity: "error", fieldPath, objectId: null, requirementId: null, detail: "Structured view evidence does not preserve the accepted S6 scene." });
 }
@@ -81,4 +80,3 @@ export function checkS6ViewPreservation(model: S6SpatialModelRecord, camera: S6C
   receipt.receiptHash = sha256(canonicalS6Json(receipt));
   return receipt;
 }
-

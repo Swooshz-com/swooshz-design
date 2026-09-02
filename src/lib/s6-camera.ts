@@ -16,7 +16,6 @@ function shapeHeight(model: S6SpatialModelRecord): number {
   }
   return maximum;
 }
-
 function renderHeight(model: S6SpatialModelRecord): { value: number; basis: S6Camera["heightBasis"] } {
   if (model.booth.maxHeightMm !== null) return { value: model.booth.maxHeightMm, basis: "confirmed_max_height" };
   return { value: Math.min(S6_MAX_COORDINATE_MM, Math.max(3000, shapeHeight(model))), basis: "derived_render_height" };
@@ -98,4 +97,3 @@ export function buildS6Cameras(model: S6SpatialModelRecord): S6Camera[] {
   top.cameraHash = cameraHash(top);
   return [northwest, southeast, top];
 }
-
