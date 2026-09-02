@@ -319,6 +319,748 @@ export type StoreState = {
   s5Artifacts: S5Artifact[];
 };
 
+export type S6RevisionStatus =
+  | "generated_draft"
+  | "corrected_draft"
+  | "accepted_current"
+  | "superseded"
+  | "stale"
+  | "rejected"
+  | "aborted";
+
+export type S6ProvenanceKind =
+  | "confirmed_project_input"
+  | "user_confirmed_design_decision"
+  | "bounded_design_inference"
+  | "unknown_unresolved";
+
+export type S6Provenance = {
+  kind: S6ProvenanceKind;
+  sourceRef: string;
+  sourceFingerprint: Sha256 | null;
+  acceptedByUser: boolean;
+  note: string | null;
+};
+
+export type S6CoordinateConvention = {
+  version: "booth-local-right-handed-v1";
+  units: "millimetres";
+  handedness: "right-handed";
+  origin: "north-west-floor-corner";
+  xAxis: "east";
+  yAxis: "up";
+  zAxis: "south";
+};
+
+export type S6Mm = number;
+export type S6Millidegree = number;
+
+export type S6Vector3Mm = {
+  xMm: S6Mm;
+  yMm: S6Mm;
+  zMm: S6Mm;
+};
+
+export type S6Dimensions = {
+  widthMm: S6Mm;
+  depthMm: S6Mm;
+  heightMm: S6Mm;
+};
+
+export type S6RotationMd = {
+  xMd: S6Millidegree;
+  yMd: S6Millidegree;
+  zMd: S6Millidegree;
+};
+
+export type S6Transform = {
+  positionMm: S6Vector3Mm;
+  rotationMd: S6RotationMd;
+};
+
+export type S6PrimitiveKind =
+  | "floor_footprint"
+  | "wall"
+  | "partition"
+  | "box"
+  | "counter"
+  | "display_plinth"
+  | "screen"
+  | "storage_volume"
+  | "table"
+  | "seating_marker"
+  | "equipment_placeholder"
+  | "overhead_volume"
+  | "zone_region";
+
+export type S6ObjectRole =
+  | "booth_floor"
+  | "booth_wall"
+  | "booth_partition"
+  | "furniture"
+  | "display"
+  | "screen"
+  | "storage"
+  | "seating"
+  | "equipment"
+  | "overhead"
+  | "zone";
+
+export type S6GeometryKind = "rect_prism" | "round_prism" | "profile_extrusion";
+
+export type S6ProfileVertex = {
+  xMm: S6Mm;
+  zMm: S6Mm;
+};
+
+export type S6Profile = {
+  winding: "ccw-from-positive-y-v1";
+  vertices: S6ProfileVertex[];
+};
+
+export type S6GeometryState = "exact" | "bounded_inference";
+
+export type S6RectPrismGeometry = {
+  kind: "rect_prism";
+  dimensionsMm: S6Dimensions;
+  geometryState: S6GeometryState;
+  localAnchor: "floor" | "center";
+};
+
+export type S6RoundPrismGeometry = {
+  kind: "round_prism";
+  radiusMm: S6Mm;
+  heightMm: S6Mm;
+  geometryState: S6GeometryState;
+  localAnchor: "floor" | "center";
+};
+
+export type S6ProfileExtrusionGeometry = {
+  kind: "profile_extrusion";
+  profile: S6Profile;
+  heightMm: S6Mm;
+  geometryState: S6GeometryState;
+  localAnchor: "floor" | "center";
+};
+
+export type S6GeometryPrimitive =
+  | S6RectPrismGeometry
+  | S6RoundPrismGeometry
+  | S6ProfileExtrusionGeometry;
+
+export type S6Footprint2D =
+  | { kind: "rectangle"; widthMm: S6Mm; depthMm: S6Mm }
+  | { kind: "circle"; radiusMm: S6Mm }
+  | { kind: "polygon"; vertices: S6ProfileVertex[] };
+
+export type S6DesignFormReview = {
+  status: "required" | "in_progress" | "complete" | "unsupported";
+  evidenceAssetId: UUID;
+  evidenceAssetSha256: Sha256;
+  sourceS5Fingerprint: Sha256;
+  reviewedObjectIds: string[];
+  unresolvedUnknownIds: string[];
+  explicitSimplificationUnknownIds: string[];
+  acceptedByUser: boolean;
+};
+
+export type S6MaterialFinishKind =
+  | "solid_color"
+  | "wood_like"
+  | "metal_like"
+  | "fabric_like"
+  | "glass_like"
+  | "brand_reference"
+  | "unknown";
+
+export type S6MaterialFinishRef = {
+  materialId: string;
+  label: string;
+  finishKind: S6MaterialFinishKind;
+  colorHex: string | null;
+  source: "confirmed_project_input" | "user_confirmed_design_decision" | "s5_visual_intent" | "bounded_design_inference" | "unknown";
+  sourceAssetId: UUID | null;
+  sourceAssetSha256: Sha256 | null;
+  notes: string | null;
+  provenance: S6Provenance;
+};
+
+export type S6SpatialObject = {
+  objectId: string;
+  identityKey: string;
+  parentObjectId: string | null;
+  objectType: S6PrimitiveKind;
+  role: S6ObjectRole;
+  label: string;
+  primitive: S6GeometryPrimitive;
+  transform: S6Transform;
+  zoneIds: string[];
+  requirementIds: string[];
+  materialIds: string[];
+  unknownIds: string[];
+  provenance: S6Provenance;
+  hardConstraint: "booth_envelope" | "requirement" | "design_inference" | "user_editable";
+  editable: boolean;
+  removable: boolean;
+};
+
+export type S6Zone = {
+  zoneId: string;
+  label: string;
+  category: S5ZoneCategory;
+  regionObjectId: string;
+  requirementIds: string[];
+  unknownIds: string[];
+  provenance: S6Provenance;
+};
+
+export type S6Unknown = {
+  unknownId: string;
+  kind: "geometry" | "material" | "requirement_mapping" | "design_form" | "camera";
+  fieldPath: string;
+  requirementId: string | null;
+  question: string;
+  blocking: boolean;
+  status: "unresolved" | "resolved";
+  resolutionKind: "represented" | "explicit_simplification" | null;
+  resolutionNote: string | null;
+  resolvedBy: "user" | "system" | null;
+  resolvedAt: Timestamp | null;
+  provenance: S6Provenance;
+};
+
+export type S6Assumption = {
+  assumptionId: string;
+  fieldPath: string;
+  value: string;
+  provenance: S6Provenance;
+  acceptedByUser: boolean;
+  requiresConfirmation: boolean;
+  createdAt: Timestamp;
+};
+
+export type S6BoothEnvelope = {
+  widthMm: S6Mm;
+  depthMm: S6Mm;
+  openSides: OpenSide[];
+  maxHeightMm: S6Mm | null;
+  coordinateConvention: S6CoordinateConvention;
+  heightState: "known" | "unknown";
+};
+
+export type S6ViewId = "perspective-northwest" | "perspective-southeast" | "top-orthographic";
+
+export type S6Camera = {
+  viewId: S6ViewId;
+  projection: "perspective" | "orthographic";
+  positionMm: S6Vector3Mm;
+  targetMm: S6Vector3Mm;
+  up: "world-y" | "negative-world-z";
+  fovMd: S6Millidegree | null;
+  orthoScaleMm: S6Mm | null;
+  paddingMm: S6Mm;
+  nearMm: S6Mm;
+  farMm: S6Mm;
+  heightBasis: "confirmed_max_height" | "derived_render_height";
+  derivedRenderHeightMm: S6Mm;
+  cameraHash: Sha256;
+};
+
+export type S6ArtifactPointer = {
+  artifactKey: string;
+  stagingKey: string;
+  sha256: Sha256 | null;
+  byteSize: number | null;
+  status: "not_written" | "staged" | "promoted" | "committed" | "failed_terminal";
+};
+
+export type S6SpatialModelRecord = {
+  schemaVersion: "s6-spatial-model-v1";
+  modelRevisionId: UUID;
+  projectId: UUID;
+  parentRevisionId: UUID | null;
+  parentRevisionHash: Sha256 | null;
+  revisionNumber: number;
+  sourceS5Fingerprint: Sha256;
+  sourceS5ApprovalEventId: UUID;
+  sourceS5ApprovalGeneration: number;
+  status: S6RevisionStatus;
+  booth: S6BoothEnvelope;
+  objects: S6SpatialObject[];
+  zones: S6Zone[];
+  materials: S6MaterialFinishRef[];
+  cameras: S6Camera[];
+  provenance: S6Provenance[];
+  assumptions: S6Assumption[];
+  unknowns: S6Unknown[];
+  designFormReview: S6DesignFormReview;
+  modelHash: Sha256;
+  canonicalByteSize: number;
+  modelArtifact: S6ArtifactPointer;
+  validationReceiptId: UUID | null;
+  acceptanceEventId: UUID | null;
+  createdBy: "compiler" | "user_correction";
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  acceptedAt: Timestamp | null;
+  supersededAt: Timestamp | null;
+  staleAt: Timestamp | null;
+};
+
+export type S6ValidationSeverity = "error" | "warning";
+export type S6ValidationIssue = {
+  code: string;
+  severity: S6ValidationSeverity;
+  fieldPath: string;
+  objectId: string | null;
+  requirementId: string | null;
+  detail: string;
+};
+
+export type S6ValidationReceipt = {
+  schemaVersion: "s6-validation-receipt-v1";
+  receiptId: UUID;
+  projectId: UUID;
+  revisionId: UUID;
+  revisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  validatorVersion: "s6-validator-v1";
+  orderVersion: "s6-validation-order-v1";
+  outcome: "pass" | "pass_with_warnings" | "acceptance_blocked" | "render_blocked" | "failed";
+  errors: S6ValidationIssue[];
+  warnings: S6ValidationIssue[];
+  checkedAt: Timestamp;
+  validationHash: Sha256;
+};
+
+export type S6CorrectionGeometry =
+  | { kind: "rect_prism"; dimensionsMm: S6Dimensions; localAnchor: "floor" | "center" }
+  | { kind: "round_prism"; radiusMm: S6Mm; heightMm: S6Mm; localAnchor: "floor" | "center" }
+  | { kind: "profile_extrusion"; profile: S6Profile; heightMm: S6Mm; localAnchor: "floor" | "center" };
+
+export type S6CorrectionOperation =
+  | { kind: "move"; objectId: string; deltaMm: S6Vector3Mm }
+  | { kind: "rotate"; objectId: string; rotationMd: S6RotationMd }
+  | { kind: "resize"; objectId: string; dimensionsMm: S6Dimensions }
+  | { kind: "replace_geometry"; objectId: string; geometry: S6CorrectionGeometry }
+  | { kind: "material"; objectId: string; material: S6MaterialFinishRef }
+  | { kind: "zone_requirement_map"; objectId: string; zoneIds: string[]; requirementIds: string[] }
+  | { kind: "confirm_design_inference"; objectIds: string[]; note: string }
+  | { kind: "resolve_unknown"; unknownId: string; resolutionKind: "represented" | "explicit_simplification"; resolutionNote: string; replacement: { objectType: S6PrimitiveKind; role: S6ObjectRole; label: string; geometry: S6CorrectionGeometry; positionMm: S6Vector3Mm; rotationMd: S6RotationMd; material: S6MaterialFinishRef } | null }
+  | { kind: "add"; objectType: "counter" | "display_plinth" | "screen" | "storage_volume" | "table" | "seating_marker" | "equipment_placeholder" | "box" | "overhead_volume" | "partition"; role: "furniture" | "display" | "screen" | "storage" | "seating" | "equipment" | "overhead" | "booth_partition"; label: string; geometry: S6CorrectionGeometry; positionMm: S6Vector3Mm; rotationMd: S6RotationMd; material: S6MaterialFinishRef; parentObjectId: string | null; zoneIds: string[]; requirementIds: string[] }
+  | { kind: "remove"; objectId: string };
+
+export type S6ConcurrencyToken = {
+  expectedRevisionId: UUID;
+  expectedRevisionHash: Sha256;
+  expectedParentRevisionId: UUID | null;
+  expectedParentHash: Sha256 | null;
+  expectedCurrentAcceptedRevisionId: UUID | null;
+  expectedCurrentAcceptedHash: Sha256 | null;
+  expectedSourceFingerprint: Sha256;
+};
+
+export type S6CorrectionEvent = {
+  schemaVersion: "s6-correction-event-v1";
+  correctionEventId: UUID;
+  projectId: UUID;
+  parentRevisionId: UUID;
+  parentRevisionHash: Sha256;
+  childRevisionId: UUID;
+  childRevisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  actorSubjectId: string;
+  operations: S6CorrectionOperation[];
+  requestHash: Sha256;
+  idempotencyKey: UUID;
+  requestReferenceId: UUID;
+  occurredAt: Timestamp;
+};
+
+export type S6AcceptanceEvent = {
+  schemaVersion: "s6-acceptance-event-v1";
+  acceptanceEventId: UUID;
+  projectId: UUID;
+  revisionId: UUID;
+  revisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  priorAcceptedRevisionId: UUID | null;
+  priorAcceptedRevisionHash: Sha256 | null;
+  actorSubjectId: string;
+  expectedCurrentAcceptedRevisionId: UUID | null;
+  expectedCurrentAcceptedHash: Sha256 | null;
+  idempotencyKey: UUID;
+  requestReferenceId: UUID;
+  occurredAt: Timestamp;
+};
+
+export type S6SupersessionEvent = {
+  schemaVersion: "s6-supersession-event-v1";
+  supersessionEventId: UUID;
+  projectId: UUID;
+  supersededRevisionId: UUID;
+  supersededRevisionHash: Sha256;
+  replacementRevisionId: UUID;
+  replacementRevisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  acceptanceEventId: UUID;
+  actorSubjectId: string;
+  requestReferenceId: UUID;
+  occurredAt: Timestamp;
+};
+
+export type S6ViewArtifactStatus = "queued" | "running" | "staged" | "promoted" | "committed" | "failed_retryable" | "failed_terminal" | "aborted";
+export type S6PublicationPhase = "none" | "staged" | "promoted" | "committed" | "aborted";
+
+export type S6ViewArtifact = {
+  schemaVersion: "s6-view-artifact-v1";
+  artifactId: UUID;
+  artifactGroupId: UUID;
+  projectId: UUID;
+  revisionId: UUID;
+  revisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  viewId: S6ViewId;
+  purpose: "draft_preview" | "accepted_view";
+  rendererVersion: "s6-svg-geometry-v2";
+  format: "svg";
+  mimeType: "image/svg+xml";
+  fileExtension: ".svg";
+  fileName: "swooshz-spatial-perspective-northwest.svg" | "swooshz-spatial-perspective-southeast.svg" | "swooshz-spatial-top-orthographic.svg";
+  artifactKey: string;
+  stagingKey: string;
+  outputSha256: Sha256 | null;
+  outputByteSize: number | null;
+  cameraHash: Sha256;
+  sceneHash: Sha256 | null;
+  preservationReceiptId: UUID | null;
+  attempt: 1 | 2;
+  retryOfArtifactId: UUID | null;
+  status: S6ViewArtifactStatus;
+  publicationPhase: S6PublicationPhase;
+  workerId: string | null;
+  processId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  stagedAt: Timestamp | null;
+  promotedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  terminalAt: Timestamp | null;
+  failureCode: string | null;
+  idempotencyKey: UUID;
+  requestReferenceId: UUID;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type S6ViewPreservationReceipt = {
+  schemaVersion: "s6-view-preservation-v1";
+  receiptId: UUID;
+  projectId: UUID;
+  revisionId: UUID;
+  revisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  viewId: S6ViewId;
+  rendererVersion: "s6-svg-geometry-v2";
+  cameraHash: Sha256;
+  sceneHash: Sha256;
+  outcome: "pass" | "fail";
+  hardInvariantHash: Sha256;
+  objectIds: string[];
+  overheadObjectIds: string[];
+  materialIds: string[];
+  checks: S6ValidationIssue[];
+  checkedAt: Timestamp;
+  receiptHash: Sha256;
+};
+
+export type S6JobKind = "generation" | "validation" | "render" | "publication";
+export type S6JobStatus = "queued" | "running" | "staged" | "promoted" | "committed" | "failed_retryable" | "failed_terminal" | "aborted";
+
+export type S6JobState = {
+  schemaVersion: "s6-job-state-v1";
+  jobId: UUID;
+  projectId: UUID;
+  kind: S6JobKind;
+  revisionId: UUID | null;
+  viewId: S6ViewId | null;
+  sourceS5Fingerprint: Sha256;
+  inputHash: Sha256;
+  attempt: 1 | 2;
+  retryOfJobId: UUID | null;
+  status: S6JobStatus;
+  publicationPhase: S6PublicationPhase;
+  artifactId: UUID | null;
+  workerId: string | null;
+  processId: number | null;
+  claimToken: UUID | null;
+  claimedAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  stagedAt: Timestamp | null;
+  promotedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  terminalAt: Timestamp | null;
+  failureCode: string | null;
+  idempotencyKey: UUID;
+  requestReferenceId: UUID;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type S6IdempotencyOperation = "generation" | "correction" | "reopen" | "validation" | "acceptance" | "render" | "publication";
+export type S6IdempotencyState = {
+  schemaVersion: "s6-idempotency-v1";
+  key: UUID;
+  operation: S6IdempotencyOperation;
+  projectId: UUID;
+  inputHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  result: S6MutationResult | S6ValidationReceipt | S6AcceptanceResult | S6RenderResult | S6PublicationResult;
+  createdAt: Timestamp;
+};
+
+export type S5ToS6Projection = {
+  schemaVersion: "s5-to-s6-projection-v1";
+  readOnly: true;
+  readiness: "ready";
+  projectId: UUID;
+  generationSetId: UUID;
+  selectionStateId: UUID;
+  selectionVersion: number;
+  approvalEventId: UUID;
+  approvalGeneration: number;
+  eventSequence: number;
+  generationContextHash: Sha256;
+  activeRevisionId: UUID;
+  activeRevisionKind: S5ActiveRevisionKind;
+  sourceSnapshotId: UUID;
+  lineageRootRevisionId: UUID;
+  sourceBindingHash: Sha256;
+  quality: "PASS" | "WARNING";
+  activeAsset: {
+    assetId: UUID;
+    storageKey: string;
+    sha256: Sha256;
+    byteSize: number;
+    width: 1536;
+    height: 1024;
+    pixelCount: 1572864;
+  };
+  confirmedBriefVersionId: UUID;
+  briefContentHash: Sha256;
+  geometrySnapshot: BoothGeometry;
+  geometryHash: Sha256;
+  canonicalRequirements: S2Requirement[];
+  requirementHash: Sha256;
+  layoutRequirements: S5LayoutRequirement[];
+  layoutRequirementsHash: Sha256;
+  designRulesVersion: "s2-design-rules-v1";
+  designRuleSnapshot: S2DesignRuleSnapshot[];
+  designRuleSnapshotHash: Sha256;
+  presentationFacts: S5FrozenGenerationContext["presentationFacts"];
+  visualIntent: {
+    brandName: string | null;
+    visualDirection: string | null;
+    preferredColors: string[];
+    materials: string[];
+    logoInstructions: string | null;
+    source: "confirmed_brief";
+    sourceHash: Sha256;
+  };
+  layoutPlan: S5LayoutPlan;
+  layoutArtifacts: {
+    planJson: { artifactId: UUID; sha256: Sha256; byteSize: number; rendererVersion: string; status: "committed" };
+    planSvg: { artifactId: UUID; sha256: Sha256; byteSize: number; rendererVersion: string; status: "committed" };
+  };
+  presentationArtifact: {
+    artifactId: UUID;
+    sha256: Sha256;
+    byteSize: number;
+    pageCount: number;
+    rendererVersion: string;
+    status: "committed";
+  };
+  sourceFingerprint: Sha256;
+};
+
+export type S6RevisionSummary = {
+  revisionId: UUID;
+  revisionHash: Sha256;
+  parentRevisionId: UUID | null;
+  status: S6RevisionStatus;
+  sourceS5Fingerprint: Sha256;
+  objectCount: number;
+  zoneCount: number;
+  unknownCount: number;
+  validationOutcome: S6ValidationReceipt["outcome"] | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type S6ViewSummary = {
+  viewId: S6ViewId;
+  revisionId: UUID;
+  revisionHash: Sha256;
+  purpose: "draft_preview" | "accepted_view";
+  status: S6ViewArtifactStatus;
+  rendererVersion: "s6-svg-geometry-v2";
+  preservationOutcome: "pass" | "fail" | null;
+  outputSha256: Sha256 | null;
+  outputByteSize: number | null;
+};
+
+export type S6PublicState = {
+  projectId: UUID;
+  source: {
+    readiness: "ready" | "not_ready";
+    sourceS5Fingerprint: Sha256 | null;
+    approvalEventId: UUID | null;
+    approvalGeneration: number | null;
+  };
+  currentAcceptedRevisionId: UUID | null;
+  currentAcceptedRevisionHash: Sha256 | null;
+  editableRevision: S6RevisionSummary | null;
+  revisions: S6RevisionSummary[];
+  views: S6ViewSummary[];
+  concurrency: S6ConcurrencyToken | null;
+};
+
+export type S6PublicSpatialModel = Omit<S6SpatialModelRecord, "modelArtifact"> & {
+  modelArtifact: {
+    sha256: Sha256 | null;
+    byteSize: number | null;
+    status: S6ArtifactPointer["status"];
+  };
+};
+
+export type S6PublicRevision = {
+  revision: S6PublicSpatialModel;
+  validation: S6ValidationReceipt | null;
+  views: S6ViewSummary[];
+};
+
+export type S6MutationResult = {
+  replayed: boolean;
+  revisionId: UUID;
+  revisionHash: Sha256;
+  status: S6RevisionStatus;
+  sourceS5Fingerprint: Sha256;
+  currentAcceptedRevisionId: UUID | null;
+  currentAcceptedRevisionHash: Sha256 | null;
+  concurrency: S6ConcurrencyToken;
+};
+
+export type S6AcceptanceResult = S6MutationResult & {
+  acceptanceEventId: UUID;
+};
+
+export type S6RenderResult = {
+  replayed: boolean;
+  revisionId: UUID;
+  revisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  artifactGroupId: UUID;
+  views: S6ViewSummary[];
+};
+
+export type S6PublicationResult = {
+  replayed: boolean;
+  artifactId: UUID;
+  revisionId: UUID;
+  revisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  view: S6ViewSummary;
+};
+
+export type S6PublicViewArtifact = S6ViewSummary & {
+  artifactId: UUID;
+  artifactGroupId: UUID;
+  cameraHash: Sha256;
+  sceneHash: Sha256;
+  preservationReceiptId: UUID;
+  downloadPath: string;
+};
+
+export type S6Metric<T> = {
+  availability: "available" | "unavailable";
+  value: T | null;
+  reason: string | null;
+};
+
+export type S6Telemetry = {
+  schemaVersion: "s6-telemetry-v1";
+  projectId: UUID;
+  sourceReadiness: S6Metric<"ready" | "not_ready">;
+  generationCount: S6Metric<number>;
+  correctionCount: S6Metric<number>;
+  correctionFailureCount: S6Metric<number>;
+  reopenCount: S6Metric<number>;
+  acceptanceCount: S6Metric<number>;
+  revisionConflictCount: S6Metric<number>;
+  staleFenceCount: S6Metric<number>;
+  renderRequestCount: S6Metric<number>;
+  renderSuccessCount: S6Metric<number>;
+  renderFailureCount: S6Metric<number>;
+  viewPreservationFailureCount: S6Metric<number>;
+  publicationFailureCount: S6Metric<number>;
+  acceptedViewCount: S6Metric<number>;
+  fullModelByteSize: S6Metric<number>;
+  providerCost: S6Metric<number>;
+  toolCost: S6Metric<number>;
+  generatedAt: Timestamp;
+};
+
+export type S6ToS7Handoff = {
+  schemaVersion: "s6-to-s7-handoff-v1";
+  projectId: UUID;
+  acceptedRevisionId: UUID;
+  acceptedRevisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  spatialSchemaVersion: "s6-spatial-model-v1";
+  units: "millimetres";
+  coordinateConvention: S6CoordinateConvention;
+  booth: {
+    widthMm: S6Mm;
+    depthMm: S6Mm;
+    openSides: OpenSide[];
+    maxHeightMm: S6Mm | null;
+    heightState: "known" | "unknown";
+  };
+  objects: Array<{
+    objectId: string;
+    identityKey: string;
+    parentObjectId: string | null;
+    objectType: S6PrimitiveKind;
+    role: S6ObjectRole;
+    geometry: S6GeometryPrimitive;
+    footprint: S6Footprint2D;
+    transform: S6Transform;
+    boundsMm: S6Dimensions;
+    zoneIds: string[];
+    requirementIds: string[];
+    materialIds: string[];
+    provenance: S6Provenance;
+    unknownIds: string[];
+  }>;
+  hierarchy: Array<{ objectId: string; parentObjectId: string | null }>;
+  zones: S6Zone[];
+  requirements: S2Requirement[];
+  materials: S6MaterialFinishRef[];
+  assumptions: S6Assumption[];
+  unknowns: S6Unknown[];
+  validationReceipt: { receiptId: UUID; validationHash: Sha256; outcome: "pass" | "pass_with_warnings" };
+  eligibility: { currentAccepted: true; sourceCurrent: true; stale: false };
+};
+
+export type S6EmptyRequest = Record<string, never>;
+export type S6GenerationRequest = S6EmptyRequest;
+export type S6RevisionMutationRequest = S6ConcurrencyToken;
+export type S6CorrectionRequest = S6ConcurrencyToken & { operations: S6CorrectionOperation[] };
+export type S6ValidationRequest = S6ConcurrencyToken;
+export type S6RenderRequest = S6ConcurrencyToken;
+export type S6PublicationRequest = S6ConcurrencyToken;
+
 export type FieldError = {
   field: string;
   code: string;
