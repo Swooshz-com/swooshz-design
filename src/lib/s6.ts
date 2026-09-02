@@ -40,7 +40,7 @@ import {
   S6_RENDERER_VERSION,
 } from "./s6-canonical";
 import { compileS6Draft } from "./s6-compiler";
-import { applyS6Corrections } from "./s6-correction";
+import { applyS6Corrections, canonicalS6CorrectionOperations } from "./s6-correction";
 import { buildS6Cameras } from "./s6-camera";
 import { renderS6View } from "./s6-renderer";
 import { checkS6ViewPreservation } from "./s6-preservation";
@@ -261,12 +261,17 @@ function cloneWithHash(model: S6SpatialModelRecord): S6SpatialModelRecord {
   return { ...model, modelHash: hashed.modelHash, canonicalByteSize: hashed.canonicalByteSize };
 }
 
+function hasUnsupportedFormBlock(model: S6SpatialModelRecord): boolean {
+  return model.designFormReview.status === "unsupported" ||
+    model.unknowns.some((item) => item.kind === "design_form" && item.status === "unresolved" && item.question.includes("S6_UNSUPPORTED_FORM"));
+}
+
 function reviewReady(model: S6SpatialModelRecord): boolean {
   return model.designFormReview.status === "complete" &&
     model.designFormReview.acceptedByUser &&
     model.designFormReview.unresolvedUnknownIds.length === 0 &&
     !model.unknowns.some((item) => item.kind === "design_form" && item.status === "unresolved") &&
-    !model.unknowns.some((item) => item.question.includes("S6_UNSUPPORTED_FORM"));
+    !hasUnsupportedFormBlock(model);
 }
 
 function fixedViewId(value: S6ViewId): S6ViewId {
@@ -436,9 +441,10 @@ export class S6WorkflowService {
     operation: "correction" | "reopen",
   ): Promise<S6MutationResult> {
     const state = this.repository.state();
+    const normalizedOperations = canonicalS6CorrectionOperations(operations);
     const inputHash = operationHash(operation, parent.projectId, source.sourceFingerprint, {
       token: this.tokenFor(state, parent, source.sourceFingerprint),
-      operations,
+      operations: normalizedOperations,
     });
     const existing = this.idempotencyIn(state, key, operation, parent.projectId, inputHash);
     if (existing) return { ...(cloneJson(existing.result) as S6MutationResult), replayed: true };
@@ -588,7 +594,7 @@ export class S6WorkflowService {
     const state = this.repository.state();
     projectIn(state, projectId);
     const parent = modelFor(state, projectId, revisionId);
-    const inputHash = operationHash("correction", projectId, source.sourceFingerprint, { token, operations });
+    const inputHash = operationHash("correction", projectId, source.sourceFingerprint, { token, operations: canonicalS6CorrectionOperations(operations) });
     const existing = this.idempotencyIn(state, key, "correction", projectId, inputHash);
     if (existing) return { ...(cloneJson(existing.result) as S6MutationResult), replayed: true };
     this.assertToken(state, parent, token, source.sourceFingerprint);
@@ -637,7 +643,7 @@ export class S6WorkflowService {
   private acceptanceGate(model: S6SpatialModelRecord, receipt: S6ValidationReceipt | null): void {
     if (!receipt || receipt.revisionHash !== model.modelHash || (receipt.outcome !== "pass" && receipt.outcome !== "pass_with_warnings") || receipt.errors.length > 0) return fail(422, "S6_GEOMETRY_INVALID");
     if (!reviewReady(model)) {
-      if (model.unknowns.some((item) => item.question.includes("S6_UNSUPPORTED_FORM")) || model.designFormReview.status === "unsupported") return fail(422, "S6_UNSUPPORTED_FORM");
+      if (hasUnsupportedFormBlock(model)) return fail(422, "S6_UNSUPPORTED_FORM");
       return fail(422, "S6_DESIGN_FORM_UNREVIEWED");
     }
   }
@@ -731,7 +737,7 @@ export class S6WorkflowService {
     if (model.status !== "accepted_current" && model.status !== "generated_draft" && model.status !== "corrected_draft") return fail(409, "S6_REVISION_CONFLICT");
     const purpose: S6ViewArtifact["purpose"] = model.status === "accepted_current" ? "accepted_view" : "draft_preview";
     if (purpose === "accepted_view" && !reviewReady(model)) {
-      if (model.designFormReview.status === "unsupported" || model.unknowns.some((item) => item.question.includes("S6_UNSUPPORTED_FORM"))) return fail(422, "S6_UNSUPPORTED_FORM");
+      if (hasUnsupportedFormBlock(model)) return fail(422, "S6_UNSUPPORTED_FORM");
       return fail(422, "S6_DESIGN_FORM_UNREVIEWED");
     }
     const inputHash = operationHash("render", projectId, source.sourceFingerprint, { token, purpose });

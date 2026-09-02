@@ -150,6 +150,10 @@ function canonicalOperationInput(operations: readonly S6CorrectionOperation[]): 
   });
 }
 
+export function canonicalS6CorrectionOperations(operations: readonly S6CorrectionOperation[]): unknown[] {
+  return canonicalOperationInput(operations);
+}
+
 type Replacement = Extract<S6CorrectionOperation, { kind: "resolve_unknown" }>["replacement"];
 
 function applyGeometry(object: S6SpatialObject, geometry: S6CorrectionGeometry): void {

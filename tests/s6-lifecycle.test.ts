@@ -275,6 +275,65 @@ test("unreviewed or unsupported form blocks accepted_view and publication while 
   }
 });
 
+test("explicit simplification keeps unsupported provenance and permits only the typed accepted form", async () => {
+  const harness = makeHarness({ source: makeS6Source({ visualDirection: "curved double-bent wall with a hole; unsupported free-form shape", requirements: [{ name: "Curved double-bent wall with a hole", expected: "present" }] }) });
+  try {
+    const generated = await harness.service.generate(PROJECT_ID, uuid(101), uuid(102), "subject-s6");
+    const draft = harness.service.getRevision(PROJECT_ID, generated.revisionId).revision;
+    const unknown = draft.unknowns.find((item) => item.kind === "design_form" && item.question.includes("S6_UNSUPPORTED_FORM"));
+    assert.ok(unknown);
+    const material = draft.materials[0];
+    assert.ok(material);
+    const inferredObjectIds = draft.unknowns
+      .filter((item) => item.kind === "design_form" && item.status === "unresolved")
+      .map((item) => /^objects\[(.+)\]\.primitive$/u.exec(item.fieldPath)?.[1])
+      .filter((item): item is string => item !== undefined);
+    const corrected = await harness.service.correct(
+      PROJECT_ID,
+      generated.revisionId,
+      harness.service.getState(PROJECT_ID).concurrency!,
+      [
+        { kind: "confirm_design_inference", objectIds: inferredObjectIds, note: "User confirms the remaining bounded typed forms." },
+        {
+          kind: "resolve_unknown",
+          unknownId: unknown.unknownId,
+          resolutionKind: "explicit_simplification",
+          resolutionNote: "User accepts this bounded typed simplification for the unsupported form.",
+          replacement: {
+            objectType: "partition",
+            role: "booth_partition",
+            label: "Simplified typed partition",
+            geometry: { kind: "rect_prism", dimensionsMm: { widthMm: 1200, depthMm: 100, heightMm: 2200 }, localAnchor: "floor" },
+            positionMm: { xMm: 1200, yMm: 0, zMm: 600 },
+            rotationMd: { xMd: 0, yMd: 30000, zMd: 0 },
+            material,
+          },
+        },
+      ],
+      uuid(103),
+      uuid(104),
+      "subject-s6",
+    );
+    const correctedRevision = harness.service.getRevision(PROJECT_ID, corrected.revisionId).revision;
+    const resolved = correctedRevision.unknowns.find((item) => item.unknownId === unknown.unknownId);
+    assert.ok(resolved);
+    assert.equal(resolved.status, "resolved");
+    assert.equal(resolved.resolutionKind, "explicit_simplification");
+    assert.match(resolved.question, /S6_UNSUPPORTED_FORM/);
+    assert.equal(correctedRevision.designFormReview.explicitSimplificationUnknownIds.includes(unknown.unknownId), true);
+    const validation = await harness.service.validate(PROJECT_ID, corrected.revisionId, corrected.concurrency, uuid(105), uuid(106));
+    assert.equal(validation.errors.length, 0, JSON.stringify(validation.errors));
+    assert.equal(validation.warnings.some((item) => item.code === "S6_DESIGN_FORM_SIMPLIFIED"), true);
+    const accepted = await harness.service.accept(PROJECT_ID, corrected.revisionId, corrected.concurrency, uuid(107), uuid(108), "subject-s6");
+    const rendered = await harness.service.render(PROJECT_ID, accepted.revisionId, accepted.concurrency, uuid(109), uuid(110));
+    assert.equal(rendered.views.every((view) => view.purpose === "accepted_view"), true);
+    const published = await harness.service.publish(PROJECT_ID, accepted.revisionId, "perspective-northwest", accepted.concurrency, uuid(111), uuid(112));
+    assert.equal(published.view.viewId, "perspective-northwest");
+  } finally {
+    harness.close();
+  }
+});
+
 test("render and publish use exact no-overwrite promotion", async () => {
   const harness = makeHarness();
   try {

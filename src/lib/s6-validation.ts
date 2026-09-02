@@ -373,7 +373,8 @@ function validateDesignForm(model: S6SpatialModelRecord, context: S6ValidationCo
   const unresolvedDesign = model.unknowns.filter((item) => item.kind === "design_form" && item.status === "unresolved").map((item) => item.unknownId).sort();
   const listed = review.unresolvedUnknownIds.slice().sort();
   if (JSON.stringify(unresolvedDesign) !== JSON.stringify(listed) || review.status !== "complete" || !review.acceptedByUser || listed.length > 0) issue(bag, "S6_DESIGN_FORM_UNREVIEWED", "designFormReview");
-  if (review.status === "unsupported" || model.unknowns.some((item) => item.question.includes("S6_UNSUPPORTED_FORM"))) issue(bag, "S6_UNSUPPORTED_FORM", "unknowns");
+  const unsupportedUnresolved = model.unknowns.some((item) => item.kind === "design_form" && item.status === "unresolved" && item.question.includes("S6_UNSUPPORTED_FORM"));
+  if (review.status === "unsupported" || unsupportedUnresolved) issue(bag, "S6_UNSUPPORTED_FORM", "unknowns");
   for (const unknown of model.unknowns) {
     if (unknown.status === "unresolved" && (unknown.kind === "geometry" || unknown.kind === "design_form")) issue(bag, "GEOMETRY_UNRESOLVED", "unknowns[" + unknown.unknownId + "]", null, unknown.requirementId);
     if (unknown.status === "resolved" && unknown.resolutionKind === "explicit_simplification") {
