@@ -28,6 +28,9 @@ function assertEligible(model: S6SpatialModelRecord, receipt: S6ValidationReceip
     model.sourceS5ApprovalEventId !== source.approvalEventId ||
     model.sourceS5ApprovalGeneration !== source.approvalGeneration
   ) reject("S6_SOURCE_STALE");
+  if (model.booth.widthMm !== source.geometrySnapshot.widthMm || model.booth.depthMm !== source.geometrySnapshot.depthMm) {
+    reject("S6_ACCEPTANCE_CONFLICT");
+  }
   if (model.status !== "accepted_current") reject("S6_ACCEPTANCE_CONFLICT");
   if (
     receipt.projectId !== model.projectId ||

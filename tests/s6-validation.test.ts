@@ -96,6 +96,21 @@ test("open-side, envelope, and maximum-height failures are exact", () => {
   assert.ok(codes(checked(tall, source)).includes("MAX_HEIGHT_EXCEEDED"));
 });
 
+test("booth envelope and floor dimensions stay bound to the confirmed S5 geometry", () => {
+  const source = makeS6Source({ widthMm: 6400, depthMm: 3200 });
+  const mismatchedEnvelope = clone(draft(source));
+  mismatchedEnvelope.booth.widthMm -= 1;
+  mismatchedEnvelope.booth.depthMm += 1;
+  const envelopeCodes = codes(checked(mismatchedEnvelope, source));
+  assert.ok(envelopeCodes.includes("BOOTH_ENVELOPE_INVALID"));
+
+  const mismatchedFloor = clone(draft(source));
+  const floor = mismatchedFloor.objects.find((item) => item.role === "booth_floor");
+  assert.ok(floor && floor.primitive.kind === "rect_prism");
+  if (floor?.primitive.kind === "rect_prism") floor.primitive.dimensionsMm.widthMm -= 1;
+  assert.ok(codes(checked(mismatchedFloor, source)).includes("BOOTH_ENVELOPE_INVALID"));
+});
+
 test("semantic geometry allowlists and bounded profile rules are enforced", () => {
   const source = makeS6Source();
   const wrong = clone(draft(source));

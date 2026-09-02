@@ -234,12 +234,21 @@ function validateNumeric(model: S6SpatialModelRecord, bag: IssueBag): void {
 
 function validateBooth(model: S6SpatialModelRecord, context: S6ValidationContext, bag: IssueBag): void {
   if (!integer(model.booth.widthMm, 1, S6_MAX_COORDINATE_MM) || !integer(model.booth.depthMm, 1, S6_MAX_COORDINATE_MM)) issue(bag, "BOOTH_ENVELOPE_INVALID", "booth");
+  if (model.booth.widthMm !== context.source.geometrySnapshot.widthMm || model.booth.depthMm !== context.source.geometrySnapshot.depthMm) {
+    issue(bag, "BOOTH_ENVELOPE_INVALID", "booth");
+  }
   const openSides = model.booth.openSides;
   if (!Array.isArray(openSides) || new Set(openSides).size !== openSides.length || openSides.some((side) => !S6_OPEN_SIDE_ORDER.includes(side as OpenSide))) issue(bag, "BOOTH_ENVELOPE_INVALID", "booth.openSides");
   const expected = S6_OPEN_SIDE_ORDER.filter((side) => context.source.geometrySnapshot.openSides.includes(side));
   if (JSON.stringify(openSides) !== JSON.stringify(expected)) issue(bag, "OPEN_SIDE_INTEGRITY", "booth.openSides");
   if (model.booth.maxHeightMm !== context.source.geometrySnapshot.maxHeightMm || (model.booth.maxHeightMm === null ? model.booth.heightState !== "unknown" : model.booth.heightState !== "known")) {
     issue(bag, "BOOTH_ENVELOPE_INVALID", "booth.heightState");
+  }
+  const floor = model.objects.find((item) => item.role === "booth_floor");
+  if (floor?.primitive.kind !== "rect_prism" ||
+      floor.primitive.dimensionsMm.widthMm !== model.booth.widthMm ||
+      floor.primitive.dimensionsMm.depthMm !== model.booth.depthMm) {
+    issue(bag, "BOOTH_ENVELOPE_INVALID", "objects.booth-floor.primitive.dimensionsMm");
   }
   const convention = model.booth.coordinateConvention;
   if (convention.version !== "booth-local-right-handed-v1" || convention.units !== "millimetres" || convention.handedness !== "right-handed" || convention.origin !== "north-west-floor-corner" || convention.xAxis !== "east" || convention.yAxis !== "up" || convention.zAxis !== "south") {

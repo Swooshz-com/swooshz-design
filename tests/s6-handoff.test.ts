@@ -193,3 +193,11 @@ test("handoff rejects draft, stale, unsupported, and unresolved form state", () 
   rehash(unsupported);
   assert.throws(() => buildS6ToS7Handoff(unsupported, receipt(unsupported), unsupportedSource), /S6_(?:UNSUPPORTED_FORM|ACCEPTANCE_CONFLICT|HANDOFF)/u);
 });
+
+test("handoff refuses an accepted-looking model whose booth envelope contradicts S5", () => {
+  const source = makeS6Source();
+  const model = acceptedModel(source);
+  model.booth.widthMm -= 1;
+  rehash(model);
+  assert.throws(() => buildS6ToS7Handoff(model, receipt(model), source), /S6_(?:ACCEPTANCE_CONFLICT|HANDOFF)/u);
+});
