@@ -575,6 +575,48 @@ export type S6Camera = {
   cameraHash: Sha256;
 };
 
+export type S6SceneEvidence = {
+  schemaVersion: "s6-view-preservation-v1";
+  booth: {
+    widthMm: S6Mm;
+    depthMm: S6Mm;
+    openSides: OpenSide[];
+    coordinateConvention: S6CoordinateConvention;
+  };
+  objects: Array<{
+    objectId: string;
+    objectType: S6PrimitiveKind;
+    geometryKind: S6GeometryKind;
+    geometry: S6GeometryPrimitive;
+    footprint: S6Footprint2D;
+    boundsMm: S6Dimensions;
+    transformedBoundsMm: { min: S6Vector3Mm; max: S6Vector3Mm };
+    materialIds: string[];
+    visible: boolean;
+  }>;
+  overheadObjectIds: string[];
+  materialIds: string[];
+  cameraHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  modelHash: Sha256;
+  rendererVersion: "s6-svg-geometry-v2";
+  externalResourceCount: 0;
+  unsafeElementCount: 0;
+};
+
+export type S6RenderedView = {
+  viewId: S6ViewId;
+  cameraHash: Sha256;
+  sceneHash: Sha256;
+  svgBytes: Uint8Array;
+  outputSha256: Sha256;
+  outputByteSize: number;
+  projectedBoundsQ16: { minX: number; minY: number; maxX: number; maxY: number };
+  visibleObjectIds: string[];
+  materialIds: string[];
+  sceneEvidence: S6SceneEvidence;
+};
+
 export type S6ArtifactPointer = {
   artifactKey: string;
   stagingKey: string;
