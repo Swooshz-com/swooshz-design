@@ -1,9 +1,12 @@
 import { strict as assert } from "node:assert";
 import { Buffer } from "node:buffer";
 import { test } from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { AppError, type UUID } from "../src/lib/types";
 import { handleApiRequest, type ApiRequestDependencies } from "../src/lib/api";
 import type { WorkflowService } from "../src/lib/workflow";
+import { createS6Client, S6Screen } from "../app/components/S6Client";
 
 const PROJECT_ID = "40000000-0000-4000-8000-000000000001" as UUID;
 const REVISION_ID = "40000000-0000-4000-8000-000000000002" as UUID;
@@ -221,4 +224,73 @@ test("S6 handoff requires the current accepted revision", async () => {
   const body = await json(response);
   assert.equal(body.error.code, "S6_ACCEPTANCE_CONFLICT");
   assert.deepEqual(fixture.calls.map((call) => call[0]), ["getS7Handoff"]);
+});
+
+test("S6 client retains keys through uncertain mutation", async () => {
+  const keys: string[] = [];
+  let calls = 0;
+  const client = createS6Client({
+    projectId: PROJECT_ID,
+    fetcher: async (_input, init) => {
+      calls += 1;
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      if (calls === 1) throw new Error("network interrupted");
+      return new Response(JSON.stringify({ replayed: true }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  await client.generate();
+  assert.equal(calls, 2);
+  assert.equal(keys[0], keys[1]);
+  assert.ok(keys[0]);
+});
+
+test("S6 editor exposes stable object selection, typed semantic controls, and explicit review", () => {
+  const markup = renderToStaticMarkup(createElement(S6Screen, {
+    projectId: PROJECT_ID,
+    initialData: {
+      state: {
+        projectId: PROJECT_ID,
+        source: { readiness: "ready", sourceS5Fingerprint: SHA, approvalEventId: REVISION_ID, approvalGeneration: 1 },
+        currentAcceptedRevisionId: null,
+        currentAcceptedRevisionHash: null,
+        editableRevision: { revisionId: REVISION_ID, revisionHash: SHA, parentRevisionId: null, status: "corrected_draft", sourceS5Fingerprint: SHA, objectCount: 1, zoneCount: 0, unknownCount: 1, validationOutcome: null, createdAt: "2026-09-02T00:00:00.000Z", updatedAt: "2026-09-02T00:00:00.000Z" },
+        revisions: [],
+        views: [],
+        concurrency: TOKEN,
+      },
+      revision: {
+        revision: {
+          modelRevisionId: REVISION_ID,
+          status: "corrected_draft",
+          designFormReview: { status: "in_progress", evidenceAssetId: REVISION_ID, evidenceAssetSha256: SHA },
+          booth: { widthMm: 6000, depthMm: 3000, openSides: ["north"], maxHeightMm: 3000 },
+          objects: [{
+            objectId: "object-counter",
+            objectType: "counter",
+            role: "furniture",
+            label: "Round counter",
+            primitive: { kind: "round_prism", radiusMm: 450, heightMm: 1100, localAnchor: "floor" },
+            transform: { positionMm: { xMm: 1000, yMm: 0, zMm: 1000 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } },
+            materialIds: ["material-metal"],
+            zoneIds: [],
+            requirementIds: [],
+            unknownIds: ["unknown-form"],
+          }],
+          materials: [{ materialId: "material-metal", label: "Metal", finishKind: "metal_like", colorHex: "#888888" }],
+          unknowns: [{ unknownId: "unknown-form", kind: "design_form", status: "unresolved" }],
+        },
+        validation: null,
+        views: [],
+      },
+    },
+  }));
+  assert.match(markup, /data-object-id="object-counter"/u);
+  assert.match(markup, /round_prism/u);
+  assert.match(markup, /Radius/u);
+  assert.match(markup, /Profile vertices/u);
+  assert.match(markup, /Confirm design inference/u);
+  assert.match(markup, /Explicit simplification/u);
+  assert.match(markup, /Approved reference/u);
+  assert.match(markup, /evidenceAssetId/u);
+  assert.doesNotMatch(markup, /Edit booth width|Edit booth depth|Edit open sides|Edit maximum height|Edit S5 counts|Approve S5/u);
 });
