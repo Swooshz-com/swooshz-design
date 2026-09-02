@@ -664,7 +664,7 @@ function validateAcceptanceGraph(models: PersistedRecord[], modelById: Map<strin
   }
   for (const event of events) {
     const model = modelById.get(String(event.revisionId));
-    if (model === undefined || model.projectId !== event.projectId || model.modelHash !== event.revisionHash || model.sourceS5Fingerprint !== event.sourceS5Fingerprint || model.status !== "accepted_current" || model.acceptanceEventId !== event.acceptanceEventId) return invalid("S6_ACCEPTANCE_LINK_INVALID");
+    if (model === undefined || model.projectId !== event.projectId || model.modelHash !== event.revisionHash || model.sourceS5Fingerprint !== event.sourceS5Fingerprint || (model.status !== "accepted_current" && model.status !== "superseded") || model.acceptanceEventId !== event.acceptanceEventId) return invalid("S6_ACCEPTANCE_LINK_INVALID");
     sameNullablePair(event, "priorAcceptedRevisionId", "priorAcceptedRevisionHash");
     sameNullablePair(event, "expectedCurrentAcceptedRevisionId", "expectedCurrentAcceptedHash");
     if (event.priorAcceptedRevisionId !== null) {
