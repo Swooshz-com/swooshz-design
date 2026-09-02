@@ -4,6 +4,7 @@ import {
   S6_RENDERER_VERSION,
 } from "./s6-canonical";
 import { sha256 } from "./utils";
+import { renderS6View } from "./s6-renderer";
 import type {
   S6Camera,
   S6RenderedView,
@@ -29,9 +30,36 @@ function sameJson(left: unknown, right: unknown): boolean {
   }
 }
 
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
 export function checkS6ViewPreservation(model: S6SpatialModelRecord, camera: S6Camera, rendered: S6RenderedView): S6ViewPreservationReceipt {
   const checks: S6ValidationIssue[] = [];
   const modelHash = hashS6Model(model).modelHash;
+  let fresh: S6RenderedView | null = null;
+  try {
+    fresh = renderS6View(model, camera);
+  } catch {
+    fail(checks, "freshRender");
+  }
+  if (fresh && (
+    !sameBytes(fresh.svgBytes, rendered.svgBytes) ||
+    fresh.outputSha256 !== rendered.outputSha256 ||
+    fresh.outputByteSize !== rendered.outputByteSize ||
+    fresh.sceneHash !== rendered.sceneHash ||
+    !sameJson(fresh.sceneEvidence, rendered.sceneEvidence) ||
+    !sameJson(fresh.projectedBoundsQ16, rendered.projectedBoundsQ16) ||
+    !sameJson(fresh.visibleObjectIds, rendered.visibleObjectIds) ||
+    !sameJson(fresh.materialIds, rendered.materialIds)
+  )) fail(checks, "freshRender.binding");
+  if (rendered.outputSha256 !== sha256(rendered.svgBytes) || rendered.outputByteSize !== rendered.svgBytes.byteLength) fail(checks, "svgBytes.hashOrSize");
+  const svg = new TextDecoder().decode(rendered.svgBytes);
+  if (!svg.startsWith("<svg ") || /(?:<script|foreignObject|href=|xlink:|url\(|javascript:|data:image|on[a-z]+=|<image)/iu.test(svg)) fail(checks, "svgBytes.security");
   const expectedObjectIds = model.objects.map((object) => object.objectId).sort();
   const actualObjectIds = rendered.sceneEvidence.objects.map((object) => object.objectId).sort();
   if (rendered.viewId !== camera.viewId || rendered.cameraHash !== camera.cameraHash || rendered.sceneEvidence.cameraHash !== camera.cameraHash) fail(checks, "cameraHash");

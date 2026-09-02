@@ -3,7 +3,8 @@ import { test } from "node:test";
 import { buildS6Cameras } from "../src/lib/s6-camera";
 import { checkS6ViewPreservation } from "../src/lib/s6-preservation";
 import { renderS6View } from "../src/lib/s6-renderer";
-import { hashS6Model } from "../src/lib/s6-canonical";
+import { canonicalS6Json, hashS6Model } from "../src/lib/s6-canonical";
+import { sha256 } from "../src/lib/utils";
 import {
   deterministicClock,
   makeS6Source,
@@ -279,4 +280,23 @@ test("scene evidence is structured and hash-bound to the model", () => {
   assert.equal(rendered.sceneEvidence.sourceS5Fingerprint, model.sourceS5Fingerprint);
   assert.equal(rendered.sceneEvidence.rendererVersion, "s6-svg-geometry-v2");
   assert.deepEqual(rendered.visibleObjectIds.sort(), model.objects.map((item) => item.objectId).sort());
+});
+
+test("preservation rejects rehashed scene evidence that changes the footprint", () => {
+  const model = draft();
+  const camera = buildS6Cameras(model)[0]!;
+  const corrupted = renderS6View(model, camera);
+  corrupted.sceneEvidence.objects[0]!.footprint = { kind: "rectangle", widthMm: 1, depthMm: 1 };
+  corrupted.sceneHash = sha256(canonicalS6Json(corrupted.sceneEvidence));
+  assert.equal(checkS6ViewPreservation(model, camera, corrupted).outcome, "fail");
+});
+
+test("preservation rejects unrelated SVG bytes even when their hash and size are re-bound", () => {
+  const model = draft();
+  const camera = buildS6Cameras(model)[0]!;
+  const corrupted = renderS6View(model, camera);
+  corrupted.svgBytes = new TextEncoder().encode("<svg/>");
+  corrupted.outputSha256 = sha256(corrupted.svgBytes);
+  corrupted.outputByteSize = corrupted.svgBytes.byteLength;
+  assert.equal(checkS6ViewPreservation(model, camera, corrupted).outcome, "fail");
 });
