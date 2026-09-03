@@ -400,12 +400,13 @@ Each phase must preserve the specification's geometry and security rules:
    opaque claim ownership, heartbeat, and bounded recovery.
 2. Implement `s7-geometry.ts` with the S6 X -> Y -> Z Euler order, full
    hierarchy composition, independent matrix oracle, exact rect hulls,
-   profile union boundaries, round-prism analytic silhouettes, deterministic
-   degeneracies, and fail-closed ambiguity handling.
+   profile union boundaries, and the specification's exact round-prism
+   analytic/rank-degenerate projection contract, with fail-closed ambiguity
+   handling.
 3. Implement `s7-dxf-writer.ts` for the AC1015 ASCII profile, exact numeric
    bytes, complete model-space scaffold, deterministic handle allocation,
-   extents, locked layers, entity order, dimensions, labels, XDATA, and private
-   manifest bytes. Do not add a runtime dependency.
+   extents, the specification's locked layer order, entity order, dimensions,
+   labels, XDATA, and private manifest bytes. Do not add a runtime dependency.
 4. Implement `s7-dxf-readback.ts` as an independent strict parser for
    `s7-cad-readback-v1`. Validate sections, headers, tables, owners, handles,
    layers, entity geometry, ASCII/text limits, XDATA limits, resource bounds,
@@ -525,5 +526,7 @@ G3 may implement the map after exact docs acceptance and canonical merge. G3
 must return any materially necessary helper outside this map to Web rather
 than silently expanding it. G4/finality additionally requires representative,
 version-pinned local CAD open/import/edit/save/reopen evidence for this exact
-writer/profile and fixtures. No cloud CAD, S8/S9 implementation, Ready
-transition, merge, or tooling-HOLD clearance is included in this plan.
+writer/profile and fixtures, under the specification's gate/release rule that
+saved CAD scratch bytes need not reproduce canonical writer bytes. No cloud CAD,
+S8/S9 implementation, Ready transition, merge, or tooling-HOLD clearance is
+included in this plan.

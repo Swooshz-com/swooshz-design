@@ -113,6 +113,40 @@ DXF Z = 0
 The convention version is `s7-world-to-plan-v1`. The plan frame is the S6 world
 floor projection, not a local footprint copied from an individual source node.
 
+### Locked layer order
+
+Canonical source-geometry sorting uses this exact ordered allowlist as the
+locked layer order:
+
+```
+S7-BOOTH-BOUNDARY
+S7-BOOTH-OPENINGS
+S7-WALLS-PARTITIONS
+S7-ZONES
+S7-FURNITURE
+S7-EQUIPMENT
+S7-DISPLAYS
+S7-OVERHEAD
+S7-DIMENSIONS
+S7-LABELS
+S7-UNKNOWN
+```
+
+No alternate layer order is valid. The role-to-layer mapping below remains the
+semantic mapping for source roles.
+
+### Booth envelope and open sides
+
+The booth envelope is one closed plan boundary even when one or more sides are
+open. Open sides are separate semantic/opening-marker entities on
+`S7-BOOTH-OPENINGS`; an open side does not delete the booth-envelope boundary.
+No wall is synthesized merely because a booth side exists. The absence of a
+modeled wall on an open side remains meaningful.
+
+Opening-marker groups are emitted in deterministic `north`, `east`, `south`,
+`west` order. Where open-side labels are emitted, they are deterministic derived
+labels and never fabricated geometry.
+
 ### Primitive projection
 
 - `rect_prism`: transform all eight solid corners, project world X/Z, and
@@ -124,12 +158,20 @@ floor projection, not a local footprint copied from an individual source node.
   triangulation seams never become authoritative output boundaries. Multiple
   exact exterior loops are valid where required. Invalid or ambiguous topology
   fails closed.
-- `round_prism`: a floor-normal axis is an exact `CIRCLE`. A generally tilted
-  finite cylinder is an exact analytic swept silhouette using `ELLIPSE` arcs
-  and tangent `LINE` caps. An exact rank-degenerate representation is allowed
-  only when mathematically proven. Coarse polygon, facet, box, clipping, and
-  silent approximation fallbacks are not allowed. Ambiguous classification
-  fails closed.
+- `round_prism`:
+  - a proven plan-normal case is an exact `CIRCLE`;
+  - a full-rank (rank-two) tilted radial projection is analytic `ELLIPSE` arcs
+    plus tangent `LINE` caps;
+  - a rank-one radial projection with nonzero projected cylinder axis is the
+    exact closed straight-edge projected hull as an `LWPOLYLINE`;
+  - a rank-one radial projection with zero projected cylinder axis is the exact
+    segment as a `LINE`;
+  - a mathematically proven rank-zero case is the exact axis segment or point,
+    using `LINE` or `POINT` as applicable;
+  - an ambiguous or unproved analytic classification fails closed.
+
+  No sampled polygon, facet or faceted fallback, bounding box, silent clipping,
+  or fabricated area is allowed.
 
 No booth clipping is applied to make an invalid source appear valid. Unknown
 or unresolved geometry remains explicit and never receives invented geometry.
@@ -267,10 +309,11 @@ If the source geometry is bounded inference or has relevant unresolved
 unknowns, primary emitted geometry uses `S7-UNKNOWN`; the private manifest
 retains the intended semantic layer.
 
-After booth boundary and opening markers, canonical entity order is locked
-layer order, then `identityKey` UTF-8 byte order, then `partIndex`, then entity
-type rank. Dimensions follow, then source labels, then unknown diagnostics.
-Source array order and mutable presentation order are not entity identity.
+After the closed booth boundary and opening markers, canonical entity order is
+the exact locked layer order defined above, then `identityKey` UTF-8 byte order,
+then `partIndex`, then entity type rank. Dimensions follow, then source labels,
+then unknown diagnostics. Source array order and mutable presentation order are
+not entity identity.
 
 ## 8. Lifecycle, integrity, and security
 
@@ -322,13 +365,21 @@ and final-object integrity. Runtime export, download, and handoff require
 authorization, a live-current S6 source, a committed immutable artifact,
 passing internal readback, exact hashes and sizes, and exact final objects.
 
-Representative local CAD open/import/edit/save/reopen evidence validates the
-writer and profile at G3/G4/release level for pinned representative fixtures.
-It is not a manual per-export runtime dependency and does not become a runtime
-project field, runtime authority, or download prerequisite. No cloud CAD
-substitution is allowed. `TOOLING_HOLD: YES` remains governance/release state
-only, nonblocking for G2 and G3, and blocking for G4/finality until the
-required version-pinned local evidence exists.
+Representative local CAD evidence still requires open/import/edit/save/reopen of
+a representative local CAD scratch copy. The CAD application's edited/saved
+scratch copy does not need to remain canonical-byte-identical to the original
+S7 writer bytes. Canonical product writer bytes remain governed by deterministic
+internal readback/hash/size rules. External CAD evidence proves
+interoperability/editability, not reproduction of canonical writer bytes after
+the CAD application saves them.
+
+This evidence validates the writer and profile at G3/G4/release level for
+pinned representative fixtures. It is not a manual per-export runtime
+dependency and does not become a runtime project field, runtime authority, or
+download prerequisite. No cloud CAD substitution is allowed.
+`TOOLING_HOLD: YES` remains governance/release state only, nonblocking for G2
+and G3, and blocking for G4/finality until the required version-pinned local
+evidence exists.
 
 ## 10. S7-to-S8 boundary
 
