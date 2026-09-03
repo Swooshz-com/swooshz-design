@@ -45,6 +45,7 @@ import { S5WorkflowService, type S5WorkflowServiceOptions } from "./s5";
 import { S6WorkflowService, type S6WorkflowServiceOptions } from "./s6";
 import { createS6SourceReader, type S6SourceReader } from "./s6-source";
 import { assertS5MutationAllowed } from "./s5-lock";
+import { S7CadService, type S7PublicationPhaseHook } from "./s7-cad";
 
 
 export type WorkflowServiceOptions = {
@@ -68,6 +69,7 @@ export type WorkflowServiceOptions = {
   onS5PublicationPhase?: S5WorkflowServiceOptions["onPublicationPhase"];
   s6SourceReader?: S6SourceReader;
   onS6PublicationPhase?: S6WorkflowServiceOptions["onPublicationPhase"];
+  onS7PublicationPhase?: S7PublicationPhaseHook;
 };
 
 export type PublicGeneration = {
@@ -176,6 +178,7 @@ export class WorkflowService {
   readonly s4: S4WorkflowService;
   readonly s5: S5WorkflowService;
   readonly s6: S6WorkflowService;
+  readonly s7: S7CadService;
   private readonly clock: () => string;
   private readonly uuid: () => UUID;
   private readonly workerId: string;
@@ -264,6 +267,16 @@ export class WorkflowService {
       isProcessAlive: this.isProcessAlive,
       onPublicationPhase: options.onS6PublicationPhase,
     });
+    this.s7 = new S7CadService({
+      repository: this.repository,
+      objects: this.objects,
+      s6: this.s6,
+      clock: this.clock,
+      uuid: this.uuid,
+      ownerProcessId: this.workerId,
+      onPublicationPhase: options.onS7PublicationPhase,
+    });
+    this.s7.recoverPending();
   }
 
   private state(): StoreState {
