@@ -79,6 +79,38 @@ function mutateFirstEntity(bytes: Uint8Array, entityType: string, mutate: (pairs
   return Buffer.from(lines.slice(0, startLine).concat(record.split("\n"), lines.slice(endLine)).join("\n"), "ascii");
 }
 
+function blockRecordHandle(text: string, blockName: string): string {
+  const escapedName = blockName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const match = text.match(new RegExp(`0\\nBLOCK_RECORD\\n5\\n([0-9A-F]+)\\n330\\n[0-9A-F]+\\n100\\nAcDbSymbolTableRecord\\n100\\nAcDbBlockTableRecord\\n2\\n${escapedName}\\n`, "u"));
+  assert.ok(match?.[1]);
+  return match![1]!;
+}
+
+function mutateBlockOwners(bytes: Uint8Array, blockName: string, blockOwner: string, endBlockOwner: string): Buffer {
+  const text = Buffer.from(bytes).toString("ascii");
+  const blocksMarker = "0\nSECTION\n2\nBLOCKS\n";
+  const blocksStart = text.indexOf(blocksMarker);
+  assert.ok(blocksStart >= 0);
+  const section = text.slice(blocksStart);
+  const nameIndex = section.indexOf(`2\n${blockName}\n`);
+  assert.ok(nameIndex >= 0);
+  const blockStart = section.lastIndexOf("0\nBLOCK\n", nameIndex);
+  assert.ok(blockStart >= 0);
+  const endBlockMarker = "\n0\nENDBLK\n";
+  const endBlock = section.indexOf(endBlockMarker, nameIndex);
+  assert.ok(endBlock >= 0);
+  const blockEnd = section.indexOf("\n0\n", endBlock + endBlockMarker.length);
+  assert.ok(blockEnd >= 0);
+  const block = section.slice(blockStart, blockEnd);
+  let ownerIndex = 0;
+  const replaced = block.replace(/\n330\n[^\n]+\n/gu, () => {
+    ownerIndex += 1;
+    return `\n330\n${ownerIndex === 1 ? blockOwner : endBlockOwner}\n`;
+  });
+  assert.equal(ownerIndex, 2);
+  return Buffer.from(text.slice(0, blocksStart + blockStart) + replaced + text.slice(blocksStart + blockEnd), "ascii");
+}
+
 function roundPrismHandoff(rotationMd: { xMd: number; yMd: number; zMd: number }): S6ToS7Handoff {
   const value = handoff();
   const object = value.objects[0]!;
@@ -138,6 +170,29 @@ test("strict readback rejects non-canonical symbol-table header owner and order"
   const wrongOrder = text.replace(header, "\n0\nTABLE\n5\n1\n2\nLTYPE\n330\n0\n100\nAcDbSymbolTable\n70\n1\n");
   assert.notEqual(wrongOrder, text);
   assert.throws(() => parseS7Dxf(Buffer.from(wrongOrder, "ascii")), (error) => errorCode(error) === "S7_DXF_TABLE_INVALID");
+});
+
+test("strict readback binds each BLOCK and ENDBLK owner to its matching BLOCK_RECORD", () => {
+  const generated = writeS7Dxf(handoff(), { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source });
+  const text = generated.bytes.toString("ascii");
+  const modelRecord = blockRecordHandle(text, "*MODEL_SPACE");
+  const paperRecord = blockRecordHandle(text, "*PAPER_SPACE");
+  const cases = [
+    { name: "swapped complete pairs", model: [paperRecord, paperRecord], paper: [modelRecord, modelRecord] },
+    { name: "model BLOCK cross-link", model: [paperRecord, modelRecord], paper: [paperRecord, paperRecord] },
+    { name: "model ENDBLK cross-link", model: [modelRecord, paperRecord], paper: [paperRecord, paperRecord] },
+    { name: "paper BLOCK cross-link", model: [modelRecord, modelRecord], paper: [modelRecord, paperRecord] },
+    { name: "paper ENDBLK cross-link", model: [modelRecord, modelRecord], paper: [paperRecord, modelRecord] },
+  ] as const;
+  for (const testCase of cases) {
+    const malformed = mutateBlockOwners(
+      mutateBlockOwners(generated.bytes, "*MODEL_SPACE", testCase.model[0], testCase.model[1]),
+      "*PAPER_SPACE",
+      testCase.paper[0],
+      testCase.paper[1],
+    );
+    assert.throws(() => parseS7Dxf(malformed), (error) => errorCode(error) === "S7_DXF_BLOCK_INVALID", testCase.name);
+  }
 });
 
 test("readback rejects malformed, non-canonical, oversized, and injected DXF content", () => {

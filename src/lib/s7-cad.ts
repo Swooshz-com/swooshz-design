@@ -331,6 +331,7 @@ export class S7CadService {
       const linked = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === existing.artifactId);
       const linkedJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === existing.jobId);
       if (!linked || !linkedJob) fail(500, "S7_PERSISTENCE_INVALID");
+      if (linked.status === "failed_retryable" && linkedJob.status === "failed_retryable") return this.retryExport(linked.artifactId);
       if (linkedJob.status === "queued") this.process(linkedJob.jobId);
       const current = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === existing.artifactId)!;
       const currentJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === existing.jobId)!;
@@ -360,6 +361,7 @@ export class S7CadService {
       const linkedJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === admission.jobId);
       const linkedArtifact = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === admission.artifactId);
       if (!linkedJob || !linkedArtifact) fail(500, "S7_PERSISTENCE_INVALID");
+      if (linkedArtifact.status === "failed_retryable" && linkedJob.status === "failed_retryable") return this.retryExport(linkedArtifact.artifactId);
       if (linkedJob.status === "queued") this.process(linkedJob.jobId);
       const current = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === admission.artifactId)!;
       const latestJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === admission.jobId)!;

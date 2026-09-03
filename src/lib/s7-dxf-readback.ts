@@ -395,13 +395,14 @@ function parseBlocks(body: readonly Pair[], registry: Set<string>, modelRecord: 
     expect(end.map((pair) => pair.code).join("|") === "0|5|330|100|8|100", "S7_DXF_BLOCK_INVALID", "endblk.order");
     assertUniqueHandle(registry, beginHandle);
     assertUniqueHandle(registry, endHandle);
+    const name = exactOne(begin, 2, "block.name");
+    const expectedOwner = name === "*MODEL_SPACE" ? modelRecord : paperRecord;
     const owner = exactOne(begin, 330, "block.owner");
-    expect(owner === modelRecord || owner === paperRecord, "S7_DXF_BLOCK_INVALID", "block.owner");
-    expect(exactOne(end, 330, "endblk.owner") === owner, "S7_DXF_BLOCK_INVALID", "endblk.owner");
+    expect(owner === expectedOwner, "S7_DXF_BLOCK_INVALID", "block.owner");
+    expect(exactOne(end, 330, "endblk.owner") === expectedOwner, "S7_DXF_BLOCK_INVALID", "endblk.owner");
     expect(all(begin, 100).join("|") === "AcDbEntity|AcDbBlockBegin", "S7_DXF_BLOCK_INVALID", "block.subclass");
     expect(all(end, 100).join("|") === "AcDbEntity|AcDbBlockEnd", "S7_DXF_BLOCK_INVALID", "endblk.subclass");
     expect(exactOne(begin, 8, "block.layer") === "0" && exactOne(end, 8, "endblk.layer") === "0", "S7_DXF_BLOCK_INVALID", "block.layer");
-    const name = exactOne(begin, 2, "block.name");
     expect(name === (index === 0 ? "*MODEL_SPACE" : "*PAPER_SPACE"), "S7_DXF_BLOCK_INVALID", "block.name");
     expect(exactOne(begin, 3, "block.name2") === name && exactOne(begin, 1, "block.xref") === "", "S7_DXF_BLOCK_INVALID", "block.name");
     expect(integer(exactOne(begin, 70, "block.flags")) === 0, "S7_DXF_BLOCK_INVALID", "block.flags");
