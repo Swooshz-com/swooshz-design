@@ -28,6 +28,11 @@ function errorCode(error: unknown): string {
   return error instanceof AppError ? error.code : String(error);
 }
 
+function assertTableSubclass(text: string, tableName: string, typeSpecific: string): void {
+  const pattern = new RegExp(`\\n0\\n${tableName}\\n5\\n[0-9A-F]+\\n330\\n[0-9A-F]+\\n100\\nAcDbSymbolTableRecord\\n100\\n${typeSpecific}\\n`, "u");
+  assert.match(text, pattern);
+}
+
 test("transport numeric format is half-away-from-zero, bounded, locale-independent, and non-exponential", () => {
   assert.equal(formatS7Mm(1.005), "1.01");
   assert.equal(formatS7Mm(-1.005), "-1.01");
@@ -54,6 +59,10 @@ test("writer emits deterministic AC1015 scaffold, locked layers, handles, extent
   assert.equal(/(?:^|\n)-0(?:\n|$)/u.test(text), false);
   assert.equal(text.includes("$EXTMIN"), true);
   assert.equal(text.includes("$EXTMAX"), true);
+  assertTableSubclass(text, "LTYPE", "AcDbLinetypeTableRecord");
+  assert.equal((text.match(/\n0\nLAYER\n5\n[0-9A-F]+\n330\n[0-9A-F]+\n100\nAcDbSymbolTableRecord\n100\nAcDbLayerTableRecord\n/gu) ?? []).length, 11);
+  assertTableSubclass(text, "APPID", "AcDbRegAppTableRecord");
+  assertTableSubclass(text, "BLOCK_RECORD", "AcDbBlockTableRecord");
   const parsed = parseS7Dxf(first.bytes, { expectedManifest: first.manifest, expectedSource: source });
   assert.equal(parsed.outcome, "pass");
   assert.equal(parsed.correspondenceResult, "pass");
@@ -70,11 +79,38 @@ test("readback rejects malformed, non-canonical, oversized, and injected DXF con
   assert.throws(() => writeS7Dxf(handoff("bad\\injection"), { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source }), (error) => errorCode(error) === "S7_DXF_TEXT_INVALID");
 });
 
+test("strict readback rejects both old shortened symbol-table-entry profiles", () => {
+  const generated = writeS7Dxf(handoff(), { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source });
+  const text = generated.bytes.toString("ascii");
+  const missingCommon = text.replace("\n100\nAcDbSymbolTableRecord\n100\nAcDbLinetypeTableRecord\n", "\n100\nAcDbLinetypeTableRecord\n");
+  assert.notEqual(missingCommon, text);
+  assert.throws(() => parseS7Dxf(Buffer.from(missingCommon, "ascii")), /S7_/u);
+  const missingTypeSpecific = text.replace("\n100\nAcDbSymbolTableRecord\n100\nAcDbBlockTableRecord\n2\n*MODEL_SPACE\n", "\n100\nAcDbSymbolTableRecord\n2\n*MODEL_SPACE\n");
+  assert.notEqual(missingTypeSpecific, text);
+  assert.throws(() => parseS7Dxf(Buffer.from(missingTypeSpecific, "ascii")), /S7_/u);
+});
+
+test("analytic round-prism geometry survives writer to independent readback with ELLIPSE arcs and tangent LINEs", () => {
+  const analyticHandoff = handoff();
+  const analyticObject = analyticHandoff.objects[0]!;
+  analyticObject.geometry = { kind: "round_prism", radiusMm: 450, heightMm: 1100, geometryState: "exact", localAnchor: "floor" };
+  analyticObject.transform = { positionMm: { xMm: 100, yMm: 200, zMm: 300 }, rotationMd: { xMd: 30_000, yMd: 0, zMd: 0 } };
+  const generated = writeS7Dxf(analyticHandoff, { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source });
+  assert.equal(generated.plan.entities.filter((entity) => entity.entityType === "ELLIPSE").length, 2);
+  assert.equal(generated.plan.entities.filter((entity) => entity.entityType === "LINE" && entity.sourceObjectId === "object-1").length, 2);
+  const parsed = parseS7Dxf(generated.bytes, { expectedManifest: generated.manifest, expectedSource: source });
+  assert.equal(parsed.entities.filter((entity) => entity.entityType === "ELLIPSE").length, 2);
+  assert.equal(parsed.entities.filter((entity) => entity.entityType === "LINE" && entity.sourceObjectIdToken === "object-1").length, 2);
+});
+
 test("golden and independent hand-authored AC1015 fixtures are accepted", () => {
-  const golden = parseS7Dxf(readFileSync("tests/fixtures/s7/golden-plan-minimal.dxf"));
+  const generated = writeS7Dxf(handoff(), { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source });
+  const goldenBytes = readFileSync("tests/fixtures/s7/golden-plan-minimal.dxf");
+  assert.deepEqual(goldenBytes, generated.bytes);
+  const golden = parseS7Dxf(goldenBytes, { expectedManifest: generated.manifest, expectedSource: source });
   assert.equal(golden.readbackVersion, "s7-cad-readback-v1");
-  assert.equal(golden.entityCount, 1);
-  assert.equal(golden.entities[0]?.entityType, "LWPOLYLINE");
+  assert.equal(golden.entityCount, generated.entityCount);
+  assert.equal(golden.entities.some((entity) => entity.entityType === "LWPOLYLINE"), true);
 
   const handAuthored = parseS7Dxf(readFileSync("tests/fixtures/s7/hand-authored-valid-ac1015.dxf"));
   assert.equal(handAuthored.readbackVersion, "s7-cad-readback-v1");

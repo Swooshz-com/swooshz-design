@@ -61,6 +61,8 @@ LTYPE
 330
 1
 100
+AcDbSymbolTableRecord
+100
 AcDbLinetypeTableRecord
 2
 CONTINUOUS
@@ -93,6 +95,8 @@ LAYER
 330
 3
 100
+AcDbSymbolTableRecord
+100
 AcDbLayerTableRecord
 2
 S7-BOOTH-BOUNDARY
@@ -110,6 +114,8 @@ LAYER
 5
 330
 3
+100
+AcDbSymbolTableRecord
 100
 AcDbLayerTableRecord
 2
@@ -129,6 +135,8 @@ LAYER
 330
 3
 100
+AcDbSymbolTableRecord
+100
 AcDbLayerTableRecord
 2
 S7-WALLS-PARTITIONS
@@ -146,6 +154,8 @@ LAYER
 7
 330
 3
+100
+AcDbSymbolTableRecord
 100
 AcDbLayerTableRecord
 2
@@ -165,6 +175,8 @@ LAYER
 330
 3
 100
+AcDbSymbolTableRecord
+100
 AcDbLayerTableRecord
 2
 S7-FURNITURE
@@ -182,6 +194,8 @@ LAYER
 9
 330
 3
+100
+AcDbSymbolTableRecord
 100
 AcDbLayerTableRecord
 2
@@ -201,6 +215,8 @@ LAYER
 330
 3
 100
+AcDbSymbolTableRecord
+100
 AcDbLayerTableRecord
 2
 S7-DISPLAYS
@@ -218,6 +234,8 @@ LAYER
 11
 330
 3
+100
+AcDbSymbolTableRecord
 100
 AcDbLayerTableRecord
 2
@@ -237,6 +255,8 @@ LAYER
 330
 3
 100
+AcDbSymbolTableRecord
+100
 AcDbLayerTableRecord
 2
 S7-DIMENSIONS
@@ -255,6 +275,8 @@ LAYER
 330
 3
 100
+AcDbSymbolTableRecord
+100
 AcDbLayerTableRecord
 2
 S7-LABELS
@@ -272,6 +294,8 @@ LAYER
 14
 330
 3
+100
+AcDbSymbolTableRecord
 100
 AcDbLayerTableRecord
 2
@@ -303,6 +327,8 @@ APPID
 330
 15
 100
+AcDbSymbolTableRecord
+100
 AcDbRegAppTableRecord
 2
 SWOOSHZ_S7
@@ -328,6 +354,8 @@ BLOCK_RECORD
 17
 100
 AcDbSymbolTableRecord
+100
+AcDbBlockTableRecord
 2
 *MODEL_SPACE
 0
@@ -338,6 +366,8 @@ BLOCK_RECORD
 17
 100
 AcDbSymbolTableRecord
+100
+AcDbBlockTableRecord
 2
 *PAPER_SPACE
 0

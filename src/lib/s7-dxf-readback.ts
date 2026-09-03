@@ -346,31 +346,31 @@ function parseTables(body: readonly Pair[], registry: Set<string>): { layers: re
     for (const record of recordsForTable) {
       const expectedRecord = expected[tableIndex]!;
       expect(record[0]!.value === expectedRecord, "S7_DXF_TABLE_INVALID", "record.type");
-      const expectedRecordCodes: Record<string, string> = { LTYPE: "0|5|330|100|2|70|3|72|73|40", LAYER: "0|5|330|100|2|70|62|6|370", APPID: "0|5|330|100|2|70", BLOCK_RECORD: "0|5|330|100|2" };
+      const expectedRecordCodes: Record<string, string> = { LTYPE: "0|5|330|100|100|2|70|3|72|73|40", LAYER: "0|5|330|100|100|2|70|62|6|370", APPID: "0|5|330|100|100|2|70", BLOCK_RECORD: "0|5|330|100|100|2" };
       expect(record.map((pair) => pair.code).join("|") === expectedRecordCodes[expectedRecord], "S7_DXF_TABLE_INVALID", "record.order");
       const recordHandle = requireHandle(record, 5, "record.handle");
       assertUniqueHandle(registry, recordHandle);
       expect(exactOne(record, 330, "record.owner") === tableHandle, "S7_DXF_TABLE_INVALID", "record.owner");
       if (expectedRecord === "LTYPE") {
         expect(exactOne(record, 2, "linetype.name") === "CONTINUOUS", "S7_DXF_TABLE_INVALID", "linetype");
-        expect(exactOne(record, 100, "linetype.subclass") === "AcDbLinetypeTableRecord", "S7_DXF_TABLE_INVALID", "linetype");
+        expect(all(record, 100).join("|") === "AcDbSymbolTableRecord|AcDbLinetypeTableRecord", "S7_DXF_TABLE_INVALID", "linetype.subclass");
         canonicalMm(exactOne(record, 40, "linetype.length"));
       } else if (expectedRecord === "LAYER") {
         const name = exactOne(record, 2, "layer.name");
         expect((LAYER_ORDER as readonly string[]).includes(name), "S7_DXF_TABLE_INVALID", "layer.name");
         layerNames.push(name);
-        expect(exactOne(record, 100, "layer.subclass") === "AcDbLayerTableRecord", "S7_DXF_TABLE_INVALID", "layer");
+        expect(all(record, 100).join("|") === "AcDbSymbolTableRecord|AcDbLayerTableRecord", "S7_DXF_TABLE_INVALID", "layer.subclass");
         expect(integer(exactOne(record, 70, "layer.flags")) === 0, "S7_DXF_TABLE_INVALID", "layer.flags");
         expect(integer(exactOne(record, 62, "layer.color")) === 7, "S7_DXF_TABLE_INVALID", "layer.color");
         expect(exactOne(record, 6, "layer.linetype") === "CONTINUOUS", "S7_DXF_TABLE_INVALID", "layer.linetype");
         expect(integer(exactOne(record, 370, "layer.lineweight")) === -1, "S7_DXF_TABLE_INVALID", "layer.lineweight");
       } else if (expectedRecord === "APPID") {
         expect(exactOne(record, 2, "appid.name") === APPID, "S7_DXF_TABLE_INVALID", "appid.name");
-        expect(exactOne(record, 100, "appid.subclass") === "AcDbRegAppTableRecord", "S7_DXF_TABLE_INVALID", "appid");
+        expect(all(record, 100).join("|") === "AcDbSymbolTableRecord|AcDbRegAppTableRecord", "S7_DXF_TABLE_INVALID", "appid.subclass");
       } else {
         const name = exactOne(record, 2, "block-record.name");
         expect(name === "*MODEL_SPACE" || name === "*PAPER_SPACE", "S7_DXF_TABLE_INVALID", "block-record.name");
-        expect(exactOne(record, 100, "block-record.subclass") === "AcDbSymbolTableRecord", "S7_DXF_TABLE_INVALID", "block-record");
+        expect(all(record, 100).join("|") === "AcDbSymbolTableRecord|AcDbBlockTableRecord", "S7_DXF_TABLE_INVALID", "block-record.subclass");
         if (name === "*MODEL_SPACE") modelRecord = recordHandle;
         else paperRecord = recordHandle;
       }

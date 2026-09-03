@@ -149,8 +149,32 @@ export class S7CadService {
       throw sourceError(error);
     }
     const stamp = stampFromHandoff(current);
-    if (!sameS7Source(stamp, expected)) throw new AppError(409, "S7_SOURCE_STALE", [{ field: "source", code: "S7_SOURCE_STALE" }]);
+    if (current.eligibility.currentAccepted !== true || current.eligibility.sourceCurrent !== true || current.eligibility.stale !== false) throw new AppError(409, "S7_SOURCE_NOT_READY", [{ field: "source", code: "S7_SOURCE_NOT_READY" }]);
+    if (!sameS7Source(stamp, expected)) {
+      this.reconcileCommittedSupersession(projectId, stamp);
+      throw new AppError(409, "S7_SOURCE_STALE", [{ field: "source", code: "S7_SOURCE_STALE" }]);
+    }
     return current;
+  }
+
+  private supersedeCommittedInState(state: import("./types").StoreState, projectId: UUID, current: S7SourceStamp, at: Timestamp): void {
+    for (const artifact of state.s7CadExports ?? []) {
+      if (artifact.projectId !== projectId || artifact.status !== "committed" || sameS7Source(artifact.source, current)) continue;
+      artifact.status = "superseded";
+      artifact.supersededAt = at;
+      artifact.updatedAt = at;
+      const job = state.s7CadJobs?.find((item) => item.jobId === artifact.jobId);
+      if (job) {
+        job.status = "superseded";
+        job.terminalAt = at;
+        job.updatedAt = at;
+      }
+    }
+  }
+
+  private reconcileCommittedSupersession(projectId: UUID, current: S7SourceStamp): void {
+    const at = this.clock();
+    this.repository.transact((state) => this.supersedeCommittedInState(state, projectId, current, at));
   }
 
   private projectExists(projectId: UUID): void {
@@ -299,6 +323,7 @@ export class S7CadService {
   createExport(projectId: UUID, idempotencyKey: string, requestReferenceId?: UUID): S7ExportResult {
     assertOpaqueKey(idempotencyKey); assertRequestReference(requestReferenceId); this.projectExists(projectId);
     const admitted = this.source(projectId);
+    this.reconcileCommittedSupersession(projectId, admitted.stamp);
     const inputHash = sha256(jcs({ operation: "export", projectId, input: INPUT }));
     const existing = getS7Collections(this.repository.state()).idempotency.find((item) => item.projectId === projectId && item.operation === "export" && item.idempotencyKey === idempotencyKey);
     if (existing) {
@@ -316,17 +341,21 @@ export class S7CadService {
     const job: S7CadJob = { schemaVersion: "s7-cad-job-v1", jobId, projectId, artifactId, source: cloneStamp(admitted.stamp), inputHash, idempotencyKey, status: "queued", attempt: 1, retryOfJobId: null, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, createdAt: at, updatedAt: at, terminalAt: null };
     this.phase("admission", projectId, job, artifact);
     const admission = this.repository.transact((state) => {
+      let live: { stamp: S7SourceStamp };
+      try { live = this.source(projectId); } catch (error) { throw sourceError(error); }
+      if (!sameS7Source(admitted.stamp, live.stamp)) {
+        this.supersedeCommittedInState(state, projectId, live.stamp, this.clock());
+        return { stale: true as const };
+      }
       const collision = state.s7CadIdempotency?.find((item) => item.projectId === projectId && item.operation === "export" && item.idempotencyKey === idempotencyKey);
       if (collision) {
         if (collision.inputHash !== inputHash || !sameS7Source(collision.source, admitted.stamp)) fail(409, "S7_IDEMPOTENCY_CONFLICT", "Idempotency-Key");
         return { replayed: true as const, jobId: collision.jobId, artifactId: collision.artifactId };
       }
-      let live: { stamp: S7SourceStamp };
-      try { live = this.source(projectId); } catch (error) { throw sourceError(error); }
-      if (!sameS7Source(admitted.stamp, live.stamp)) fail(409, "S7_SOURCE_STALE");
       state.s7CadExports?.push(artifact); state.s7CadJobs?.push(job); state.s7CadIdempotency?.push({ schemaVersion: "s7-cad-idempotency-v1", projectId, operation: "export", idempotencyKey, inputHash, source: cloneStamp(admitted.stamp), jobId, artifactId, createdAt: at });
       return { replayed: false as const, jobId, artifactId };
     });
+    if ("stale" in admission && admission.stale) fail(409, "S7_SOURCE_STALE");
     if (admission.replayed) {
       const linkedJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === admission.jobId);
       const linkedArtifact = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === admission.artifactId);
@@ -358,6 +387,7 @@ export class S7CadService {
     if (!priorArtifact || !priorJob) fail(404, "NOT_FOUND", "artifact");
     if (priorArtifact.attempt !== 1 || priorArtifact.status !== "failed_retryable" || priorJob.status !== "failed_retryable") fail(409, "S7_RETRY_NOT_AVAILABLE");
     const source = this.source(priorArtifact.projectId);
+    this.reconcileCommittedSupersession(priorArtifact.projectId, source.stamp);
     if (!sameS7Source(source.stamp, priorArtifact.source)) {
       this.markStale(priorJob.jobId, null);
       fail(409, "S7_SOURCE_STALE");
@@ -401,18 +431,10 @@ export class S7CadService {
 
   getState(projectId: UUID): S7PublicState {
     this.projectExists(projectId);
-    const collections = getS7Collections(this.repository.state());
     let source: { stamp: S7SourceStamp } | null = null;
     try { source = this.source(projectId); } catch { source = null; }
     if (source) {
-      const at = this.clock();
-      this.repository.transact((state) => {
-        for (const artifact of state.s7CadExports ?? []) if (artifact.projectId === projectId && artifact.status === "committed" && !sameS7Source(artifact.source, source!.stamp)) {
-          artifact.status = "superseded"; artifact.supersededAt = at; artifact.updatedAt = at;
-          const job = state.s7CadJobs?.find((item) => item.jobId === artifact.jobId);
-          if (job) { job.status = "superseded"; job.terminalAt = at; job.updatedAt = at; }
-        }
-      });
+      this.reconcileCommittedSupersession(projectId, source.stamp);
       this.currentSource(projectId, source.stamp);
     }
     const exports = getS7Collections(this.repository.state()).exports.filter((item) => item.projectId === projectId).map(publicExport);
@@ -421,6 +443,7 @@ export class S7CadService {
 
   getExport(projectId: UUID, artifactId: UUID): S7CadPublicExport {
     const source = this.source(projectId);
+    this.reconcileCommittedSupersession(projectId, source.stamp);
     const artifact = getS7Collections(this.repository.state()).exports.find((item) => item.projectId === projectId && item.artifactId === artifactId);
     if (!artifact) fail(404, "NOT_FOUND", "artifact");
     this.currentSource(projectId, artifact.source);
@@ -433,6 +456,7 @@ export class S7CadService {
     const artifact = getS7Collections(this.repository.state()).exports.find((item) => item.projectId === projectId && item.artifactId === artifactId);
     if (!artifact) fail(404, "NOT_FOUND", "artifact");
     const source = this.source(projectId);
+    this.reconcileCommittedSupersession(projectId, source.stamp);
     if (!sameS7Source(source.stamp, artifact.source)) fail(409, "S7_SOURCE_STALE");
     if (artifact.status !== "committed" || artifact.sha256 === null || artifact.byteSize === null || artifact.readbackReceiptId === null || artifact.readbackHash === null || artifact.manifestHash === null) fail(409, "S7_EXPORT_NOT_READY");
     const bytes = this.objects.read(artifact.privateFinalStorageKey);
@@ -451,12 +475,17 @@ export class S7CadService {
   getTelemetry(projectId: UUID): S7Telemetry {
     this.projectExists(projectId);
     let readiness: "ready" | "not_ready" = "not_ready";
-    try { this.source(projectId); readiness = "ready"; } catch { /* telemetry remains privacy-safe and unavailable */ }
+    try {
+      const source = this.source(projectId);
+      this.reconcileCommittedSupersession(projectId, source.stamp);
+      readiness = "ready";
+    } catch { /* telemetry remains privacy-safe and unavailable */ }
     return buildS7Telemetry(this.repository.state(), projectId, { readiness });
   }
 
   getHandoff(projectId: UUID): S7ToS8Handoff {
     const source = this.source(projectId);
+    this.reconcileCommittedSupersession(projectId, source.stamp);
     const committed = getS7Collections(this.repository.state()).exports.filter((item) => item.projectId === projectId && item.status === "committed" && sameS7Source(item.source, source.stamp)).sort((left, right) => {
       const leftAt = left.committedAt ?? "";
       const rightAt = right.committedAt ?? "";

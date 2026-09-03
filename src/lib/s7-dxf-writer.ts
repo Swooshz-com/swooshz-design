@@ -349,6 +349,7 @@ function blockRecordBody(allocator: HandleAllocator, name: string, tableHandle: 
   pushHandle(lines, 5, recordHandle);
   pushHandle(lines, 330, tableHandle);
   pushPair(lines, 100, "AcDbSymbolTableRecord");
+  pushPair(lines, 100, "AcDbBlockTableRecord");
   pushPair(lines, 2, name);
   return { recordHandle, lines };
 }
@@ -436,6 +437,7 @@ export function writeS7Dxf(handoff: S6ToS7Handoff, options: S7DxfWriteOptions): 
   const ltypeTable: string[] = [];
   const ltypeOwner = addTableHeader(ltypeTable, allocator, "LTYPE", 1);
   addTableRecord(ltypeTable, allocator, "LTYPE", ltypeOwner, [
+    ...pair(100, "AcDbSymbolTableRecord"),
     ...pair(100, "AcDbLinetypeTableRecord"),
     ...pair(2, "CONTINUOUS"),
     ...pair(70, "0"),
@@ -451,6 +453,7 @@ export function writeS7Dxf(handoff: S6ToS7Handoff, options: S7DxfWriteOptions): 
   const layerOwner = addTableHeader(layerTable, allocator, "LAYER", S7_LAYER_ORDER.length);
   for (const layer of S7_LAYER_ORDER) {
     addTableRecord(layerTable, allocator, "LAYER", layerOwner, [
+      ...pair(100, "AcDbSymbolTableRecord"),
       ...pair(100, "AcDbLayerTableRecord"),
       ...pair(2, layer),
       ...pair(70, "0"),
@@ -465,6 +468,7 @@ export function writeS7Dxf(handoff: S6ToS7Handoff, options: S7DxfWriteOptions): 
   const appidTable: string[] = [];
   const appidOwner = addTableHeader(appidTable, allocator, "APPID", 1);
   addTableRecord(appidTable, allocator, "APPID", appidOwner, [
+    ...pair(100, "AcDbSymbolTableRecord"),
     ...pair(100, "AcDbRegAppTableRecord"),
     ...pair(2, S7_XDATA_APPID),
     ...pair(70, "0"),

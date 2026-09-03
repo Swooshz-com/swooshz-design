@@ -47,16 +47,64 @@ function errorCode(error: unknown): string {
   return error instanceof AppError ? error.code : String(error);
 }
 
-test("independent matrix oracle preserves mixed Euler order and nested parent composition", () => {
+type Matrix3 = number[][];
+
+function multiplyExpected(left: Matrix3, right: Matrix3): Matrix3 {
+  return left.map((row, rowIndex) => row.map((_, columnIndex) =>
+    row.reduce((sum, value, innerIndex) => sum + value * right[innerIndex]![columnIndex]!, 0),
+  ));
+}
+
+function expectedEuler(rotation: { xMd: number; yMd: number; zMd: number }): Matrix3 {
+  const x = rotation.xMd * Math.PI / 180_000;
+  const y = rotation.yMd * Math.PI / 180_000;
+  const z = rotation.zMd * Math.PI / 180_000;
+  const cx = Math.cos(x); const sx = Math.sin(x);
+  const cy = Math.cos(y); const sy = Math.sin(y);
+  const cz = Math.cos(z); const sz = Math.sin(z);
+  return [
+    [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+    [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+    [-sy, cy * sx, cy * cx],
+  ];
+}
+
+function assertMatrixClose(actual: readonly (readonly number[])[], expected: Matrix3, label = "matrix"): void {
+  for (let row = 0; row < 3; row += 1) for (let column = 0; column < 3; column += 1) {
+    assert.ok(Math.abs(actual[row]![column]! - expected[row]![column]!) < 1e-9, `${label}[${row}][${column}]`);
+  }
+}
+
+test("independent matrix oracle covers X-only, Y-only, Z-only, and true mixed Euler rotations", () => {
+  const cases: Array<[string, { xMd: number; yMd: number; zMd: number }, Matrix3]> = [
+    ["X-only", { xMd: 90_000, yMd: 0, zMd: 0 }, [[1, 0, 0], [0, 0, -1], [0, 1, 0]]],
+    ["Y-only", { xMd: 0, yMd: 90_000, zMd: 0 }, [[0, 0, 1], [0, 1, 0], [-1, 0, 0]]],
+    ["Z-only", { xMd: 0, yMd: 0, zMd: 90_000 }, [[0, -1, 0], [1, 0, 0], [0, 0, 1]]],
+    ["mixed X/Y/Z", { xMd: 30_000, yMd: 45_000, zMd: 60_000 }, [
+      [0.3535533905932738, -0.5732233047033631, 0.7391989197401166],
+      [0.6123724356957946, 0.7391989197401166, 0.2803300858899106],
+      [-0.7071067811865475, 0.35355339059327373, 0.6123724356957946],
+    ]],
+  ];
+  for (const [label, rotation, expected] of cases) {
+    const actual = buildS7MatrixOracle(minimalHandoff({ objects: [object({ transform: { positionMm: { xMm: 0, yMm: 0, zMm: 0 }, rotationMd: rotation } })] })).get("object-1")!;
+    assertMatrixClose(actual.rotation, expected, label);
+  }
+});
+
+test("independent matrix oracle preserves nested parent/child hierarchy composition", () => {
   const parent = object({ objectId: "parent", identityKey: "parent", transform: { positionMm: { xMm: 100, yMm: 20, zMm: 50 }, rotationMd: { xMd: 0, yMd: 0, zMd: 90000 } } });
   const child = object({ objectId: "child", identityKey: "child", parentObjectId: "parent", transform: { positionMm: { xMm: 10, yMm: 0, zMm: 0 }, rotationMd: { xMd: 90000, yMd: 0, zMd: 0 } } });
   const matrices = buildS7MatrixOracle(minimalHandoff({ objects: [parent, child] }));
   const childMatrix = matrices.get("child")!;
-  assert.ok(Math.abs(childMatrix.translation.xMm - 100) < 1e-8);
-  assert.ok(Math.abs(childMatrix.translation.zMm - 50) < 1e-8);
-  assert.ok(Math.abs(childMatrix.translation.yMm - 30) < 1e-8);
-  assert.ok(Math.abs(childMatrix.rotation[0][0]) < 1e-8);
-  assert.ok(Math.abs(childMatrix.rotation[0][2] - 1) < 1e-8);
+  const parentRotation = expectedEuler({ xMd: 0, yMd: 0, zMd: 90_000 });
+  const childRotation = expectedEuler({ xMd: 90_000, yMd: 0, zMd: 0 });
+  const rotatedChildTranslation = [10 * parentRotation[0]![0]!, 10 * parentRotation[1]![0]!, 10 * parentRotation[2]![0]!];
+  assert.deepEqual(childMatrix.translation, { xMm: 100, yMm: 30, zMm: 50 });
+  assert.ok(Math.abs(childMatrix.translation.xMm - (100 + rotatedChildTranslation[0]!)) < 1e-9);
+  assert.ok(Math.abs(childMatrix.translation.yMm - (20 + rotatedChildTranslation[1]!)) < 1e-9);
+  assert.ok(Math.abs(childMatrix.translation.zMm - (50 + rotatedChildTranslation[2]!)) < 1e-9);
+  assertMatrixClose(childMatrix.rotation, multiplyExpected(parentRotation, childRotation));
 });
 
 test("hierarchy rejects dangling and cyclic parents", () => {
