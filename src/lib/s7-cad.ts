@@ -130,6 +130,7 @@ export class S7CadService {
   private source(projectId: UUID): { handoff: S6ToS7Handoff; stamp: S7SourceStamp } {
     try {
       const handoff = this.s6.getS7Handoff(projectId);
+      if (handoff.projectId !== projectId) throw new Error("source project mismatch");
       const stamp = stampFromHandoff(handoff);
       if (handoff.eligibility.currentAccepted !== true || handoff.eligibility.sourceCurrent !== true || handoff.eligibility.stale !== false) throw new Error("source eligibility");
       return { handoff, stamp };
@@ -143,6 +144,7 @@ export class S7CadService {
     let current: S6ToS7Handoff;
     try {
       current = this.s6.getS7Handoff(projectId);
+      if (current.projectId !== projectId) throw new Error("source project mismatch");
     } catch (error) {
       throw sourceError(error);
     }
@@ -313,15 +315,28 @@ export class S7CadService {
     const artifact: S7CadExport = { schemaVersion: "s7-cad-export-v1", artifactId, projectId, jobId, source: cloneStamp(admitted.stamp), inputHash, dxfVersion: S7_DXF_VERSION, worldToPlanVersion: S7_WORLD_TO_PLAN_VERSION, format: "dxf", mimeType: "application/dxf", downloadFileName: S7_FIXED_DOWNLOAD_NAME, status: "queued", publicationPhase: "none", attempt: 1, retryOfArtifactId: null, manifestId, manifestHash: null, readbackReceiptId: null, readbackHash: null, sha256: null, byteSize: null, privateFinalStorageKey: s7FinalDxfStorageKey(projectId, artifactId), privateStagingStorageKey: s7StagingDxfStorageKey(projectId, jobId, "unclaimed"), failureCode: null, createdAt: at, updatedAt: at, committedAt: null, staleAt: null, supersededAt: null };
     const job: S7CadJob = { schemaVersion: "s7-cad-job-v1", jobId, projectId, artifactId, source: cloneStamp(admitted.stamp), inputHash, idempotencyKey, status: "queued", attempt: 1, retryOfJobId: null, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, createdAt: at, updatedAt: at, terminalAt: null };
     this.phase("admission", projectId, job, artifact);
-    this.repository.transact((state) => {
+    const admission = this.repository.transact((state) => {
       const collision = state.s7CadIdempotency?.find((item) => item.projectId === projectId && item.operation === "export" && item.idempotencyKey === idempotencyKey);
-      if (collision) fail(409, "S7_IDEMPOTENCY_CONFLICT", "Idempotency-Key");
+      if (collision) {
+        if (collision.inputHash !== inputHash || !sameS7Source(collision.source, admitted.stamp)) fail(409, "S7_IDEMPOTENCY_CONFLICT", "Idempotency-Key");
+        return { replayed: true as const, jobId: collision.jobId, artifactId: collision.artifactId };
+      }
       let live: { stamp: S7SourceStamp };
       try { live = this.source(projectId); } catch (error) { throw sourceError(error); }
       if (!sameS7Source(admitted.stamp, live.stamp)) fail(409, "S7_SOURCE_STALE");
       state.s7CadExports?.push(artifact); state.s7CadJobs?.push(job); state.s7CadIdempotency?.push({ schemaVersion: "s7-cad-idempotency-v1", projectId, operation: "export", idempotencyKey, inputHash, source: cloneStamp(admitted.stamp), jobId, artifactId, createdAt: at });
+      return { replayed: false as const, jobId, artifactId };
     });
-    const current = this.process(jobId);
+    if (admission.replayed) {
+      const linkedJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === admission.jobId);
+      const linkedArtifact = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === admission.artifactId);
+      if (!linkedJob || !linkedArtifact) fail(500, "S7_PERSISTENCE_INVALID");
+      if (linkedJob.status === "queued") this.process(linkedJob.jobId);
+      const current = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === admission.artifactId)!;
+      const latestJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === admission.jobId)!;
+      return { replayed: true, export: publicExport(current), job: { jobId: latestJob.jobId, status: latestJob.status, attempt: latestJob.attempt } };
+    }
+    const current = this.process(admission.jobId);
     const latestJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === current.jobId)!;
     return { replayed: false, export: publicExport(current), job: { jobId: latestJob.jobId, status: latestJob.status, attempt: latestJob.attempt } };
   }
@@ -350,12 +365,20 @@ export class S7CadService {
     const at = this.clock(); const newArtifactId = this.uuid(); const newJobId = this.uuid(); const newManifestId = this.uuid();
     const artifact: S7CadExport = { ...priorArtifact, artifactId: newArtifactId, jobId: newJobId, status: "queued", publicationPhase: "none", attempt: 2, retryOfArtifactId: priorArtifact.artifactId, manifestId: newManifestId, manifestHash: null, readbackReceiptId: null, readbackHash: null, sha256: null, byteSize: null, privateFinalStorageKey: s7FinalDxfStorageKey(priorArtifact.projectId, newArtifactId), privateStagingStorageKey: s7StagingDxfStorageKey(priorArtifact.projectId, newJobId, "unclaimed"), failureCode: null, createdAt: at, updatedAt: at, committedAt: null, staleAt: null, supersededAt: null, source: cloneStamp(source.stamp) };
     const job: S7CadJob = { ...priorJob, jobId: newJobId, artifactId: newArtifactId, source: cloneStamp(source.stamp), status: "queued", attempt: 2, retryOfJobId: priorJob.jobId, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, createdAt: at, updatedAt: at, terminalAt: null };
-    this.repository.transact((state) => {
-      state.s7CadExports?.push(artifact); state.s7CadJobs?.push(job);
-      const idempotency = state.s7CadIdempotency?.find((item) => item.projectId === job.projectId && item.idempotencyKey === job.idempotencyKey);
-      if (!idempotency) fail(500, "S7_PERSISTENCE_INVALID");
-      idempotency.source = cloneStamp(source.stamp); idempotency.jobId = newJobId; idempotency.artifactId = newArtifactId;
-    });
+    try {
+      this.repository.transact((state) => {
+        let live: { stamp: S7SourceStamp };
+        try { live = this.source(priorArtifact!.projectId); } catch (error) { throw sourceError(error); }
+        if (!sameS7Source(source.stamp, live.stamp)) fail(409, "S7_SOURCE_STALE");
+        state.s7CadExports?.push(artifact); state.s7CadJobs?.push(job);
+        const idempotency = state.s7CadIdempotency?.find((item) => item.projectId === job.projectId && item.idempotencyKey === job.idempotencyKey);
+        if (!idempotency) fail(500, "S7_PERSISTENCE_INVALID");
+        idempotency.source = cloneStamp(source.stamp); idempotency.jobId = newJobId; idempotency.artifactId = newArtifactId;
+      });
+    } catch (error) {
+      if (error instanceof AppError && (error.code === "S7_SOURCE_STALE" || error.code === "S7_SOURCE_NOT_READY")) this.markStale(priorJob.jobId, null);
+      throw error;
+    }
     let result: S7CadExport;
     try { result = this.process(newJobId); } catch { result = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === newArtifactId)!; }
     const currentJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === result.jobId)!;
@@ -390,6 +413,7 @@ export class S7CadService {
           if (job) { job.status = "superseded"; job.terminalAt = at; job.updatedAt = at; }
         }
       });
+      this.currentSource(projectId, source.stamp);
     }
     const exports = getS7Collections(this.repository.state()).exports.filter((item) => item.projectId === projectId).map(publicExport);
     return { projectId, source: source ? { readiness: "ready", sourceRevisionId: source.stamp.sourceRevisionId, sourceRevisionHash: source.stamp.sourceRevisionHash, sourceS5Fingerprint: source.stamp.sourceS5Fingerprint } : { readiness: "not_ready", sourceRevisionId: null, sourceRevisionHash: null, sourceS5Fingerprint: null }, exports };
@@ -400,6 +424,7 @@ export class S7CadService {
     const artifact = getS7Collections(this.repository.state()).exports.find((item) => item.projectId === projectId && item.artifactId === artifactId);
     if (!artifact) fail(404, "NOT_FOUND", "artifact");
     this.currentSource(projectId, artifact.source);
+    if (artifact.status === "committed") this.download(projectId, artifactId);
     void source;
     return publicExport(artifact);
   }
@@ -415,9 +440,11 @@ export class S7CadService {
     if (bytes.length !== artifact.byteSize || sha256(bytes) !== artifact.sha256) fail(409, "S7_PUBLICATION_OBJECT_MISMATCH");
     if (sha256(manifestBytes) !== artifact.manifestHash) fail(409, "S7_PUBLICATION_OBJECT_MISMATCH");
     const manifest = decodeS7Manifest(manifestBytes);
+    if (manifest.manifestId !== artifact.manifestId || manifest.projectId !== projectId || manifest.artifactId !== artifact.artifactId) fail(409, "S7_PUBLICATION_OBJECT_MISMATCH");
     const readback = parseS7Dxf(bytes, { expectedManifest: manifest, expectedSource: source.stamp });
     const receipt = getS7Collections(this.repository.state()).receipts.find((item) => item.receiptId === artifact.readbackReceiptId);
     if (!receipt || receipt.receiptHash !== artifact.readbackHash || receipt.sha256 !== artifact.sha256 || receipt.byteSize !== artifact.byteSize || receipt.readbackVersion !== S7_READBACK_VERSION || receipt.worldToPlanVersion !== S7_WORLD_TO_PLAN_VERSION || receipt.dxfVersion !== S7_DXF_VERSION || receipt.manifestId !== artifact.manifestId || receipt.manifestHash !== artifact.manifestHash || !sameS7Source(receipt.source, source.stamp) || receipt.correspondenceResult !== "pass" || receipt.outcome !== "pass" || readback.outcome !== "pass") fail(409, "S7_READBACK_FAILED");
+    this.currentSource(projectId, source.stamp);
     return { bytes, contentType: "application/dxf", fileName: S7_FIXED_DOWNLOAD_NAME };
   }
 
@@ -430,9 +457,14 @@ export class S7CadService {
 
   getHandoff(projectId: UUID): S7ToS8Handoff {
     const source = this.source(projectId);
-    const committed = getS7Collections(this.repository.state()).exports.filter((item) => item.projectId === projectId && item.status === "committed" && sameS7Source(item.source, source.stamp)).sort((left, right) => (right.committedAt ?? "").localeCompare(left.committedAt ?? ""))[0];
+    const committed = getS7Collections(this.repository.state()).exports.filter((item) => item.projectId === projectId && item.status === "committed" && sameS7Source(item.source, source.stamp)).sort((left, right) => {
+      const leftAt = left.committedAt ?? "";
+      const rightAt = right.committedAt ?? "";
+      return leftAt < rightAt ? 1 : leftAt > rightAt ? -1 : 0;
+    })[0];
     if (!committed || committed.sha256 === null || committed.byteSize === null || committed.manifestHash === null || committed.readbackReceiptId === null || committed.readbackHash === null) fail(409, "S7_HANDOFF_NOT_READY");
     this.download(projectId, committed.artifactId);
+    this.currentSource(projectId, source.stamp);
     return { schemaVersion: "s7-to-s8-handoff-v1", projectId, sourceRevisionId: source.stamp.sourceRevisionId, sourceRevisionHash: source.stamp.sourceRevisionHash, sourceS5Fingerprint: source.stamp.sourceS5Fingerprint, s7ArtifactId: committed.artifactId, s7ArtifactHash: committed.sha256, s7ArtifactByteSize: committed.byteSize, manifestId: committed.manifestId, manifestHash: committed.manifestHash, readbackReceiptId: committed.readbackReceiptId, readbackHash: committed.readbackHash, dxfVersion: S7_DXF_VERSION, worldToPlanVersion: S7_WORLD_TO_PLAN_VERSION, coordinateConvention: "booth-local-right-handed-v1", dxfIsNot3DAuthority: true, s8MustReadAcceptedS6Model: true };
   }
 }

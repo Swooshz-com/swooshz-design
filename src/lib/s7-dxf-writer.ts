@@ -91,6 +91,7 @@ export function formatS7Fixed12(value: number): string {
   const magnitude = Math.abs(normalized);
   const integer = Math.floor(magnitude);
   const fraction = Math.round((magnitude - integer) * 1e12);
+  if (integer === 0 && fraction === 0) return "0.000000000000";
   if (fraction >= 1e12) return `${sign}${integer + 1}.000000000000`;
   return `${sign}${integer}.${fraction.toString().padStart(12, "0")}`;
 }

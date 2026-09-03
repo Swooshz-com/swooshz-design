@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import type {
   S7CadExport,
   S7CadIdempotency,
@@ -185,7 +186,8 @@ function validateExport(value: unknown): S7CadExport {
   uuid(item.artifactId); uuid(item.projectId); uuid(item.jobId); sourceStamp(item.source); sha(item.inputHash);
   enumValue(item.dxfVersion, [S7_DXF_VERSION]); enumValue(item.worldToPlanVersion, [S7_WORLD_TO_PLAN_VERSION]);
   enumValue(item.format, ["dxf"]); enumValue(item.mimeType, ["application/dxf"]); enumValue(item.downloadFileName, [S7_FIXED_DOWNLOAD_NAME]);
-  enumValue(item.status, EXPORT_STATUSES); enumValue(item.publicationPhase, PHASES);
+  const status = enumValue(item.status, EXPORT_STATUSES);
+  const publicationPhase = enumValue(item.publicationPhase, PHASES);
   const attempt = integer(item.attempt, 1, S7_MAX_ATTEMPTS); if (attempt !== 1 && attempt !== 2) invalid();
   nullableUuid(item.retryOfArtifactId); uuid(item.manifestId); nullableSha(item.manifestHash); nullableUuid(item.readbackReceiptId); nullableSha(item.readbackHash); nullableSha(item.sha256);
   if (item.byteSize !== null) integer(item.byteSize, 1, S7_MAX_DXF_BYTES);
@@ -195,12 +197,21 @@ function validateExport(value: unknown): S7CadExport {
   if (!expectedStagingPath(result.projectId, result.jobId, stagingPath)) invalid("S7_STAGING_PATH_INVALID");
   nullableText(item.failureCode, 200);
   timestamp(item.createdAt); timestamp(item.updatedAt); nullableTimestamp(item.committedAt); nullableTimestamp(item.staleAt); nullableTimestamp(item.supersededAt);
-  if (item.status === "committed") {
+  const allowedPhases: Readonly<Record<string, readonly string[]>> = {
+    queued: ["none"], running: ["none"], staged: ["staged"], promoted: ["promoted"],
+    committed: ["committed"], superseded: ["committed"], stale: ["none", "staged", "promoted"],
+    failed_retryable: ["none", "staged", "promoted"], failed_terminal: ["aborted"], aborted: ["aborted"],
+  };
+  if (!allowedPhases[status]?.includes(publicationPhase)) invalid("S7_PUBLICATION_STATE_INVALID");
+  if (status === "committed" || status === "superseded") {
     if (item.publicationPhase !== "committed" || item.manifestHash === null || item.readbackReceiptId === null || item.readbackHash === null || item.sha256 === null || item.byteSize === null || item.committedAt === null) invalid("S7_COMMIT_STATE_INVALID");
-  }
-  if (item.status === "superseded" && item.supersededAt === null) invalid("S7_SUPERSESSION_STATE_INVALID");
-  if (item.status === "stale" && item.staleAt === null) invalid("S7_STALE_STATE_INVALID");
-  if (item.status === "aborted" && item.publicationPhase !== "aborted") invalid("S7_ABORT_STATE_INVALID");
+  } else if (item.committedAt !== null) invalid("S7_COMMIT_STATE_INVALID");
+  if (status !== "stale" && item.staleAt !== null) invalid("S7_STALE_STATE_INVALID");
+  if (status !== "superseded" && item.supersededAt !== null) invalid("S7_SUPERSESSION_STATE_INVALID");
+  if (status === "failed_retryable" && item.attempt !== 1) invalid("S7_RETRY_CHAIN_INVALID");
+  if (status === "failed_terminal" && item.attempt !== 2) invalid("S7_RETRY_CHAIN_INVALID");
+  if (status === "superseded" && item.supersededAt === null) invalid("S7_SUPERSESSION_STATE_INVALID");
+  if (status === "stale" && item.staleAt === null) invalid("S7_STALE_STATE_INVALID");
   return result;
 }
 
@@ -208,11 +219,16 @@ function validateJob(value: unknown): S7CadJob {
   const item = record(value, JOB_KEYS);
   const result = item as unknown as S7CadJob;
   enumValue(item.schemaVersion, [S7_JOB_VERSION]); uuid(item.jobId); uuid(item.projectId); uuid(item.artifactId); sourceStamp(item.source); sha(item.inputHash); opaque(item.idempotencyKey);
-  enumValue(item.status, EXPORT_STATUSES); const attempt = integer(item.attempt, 1, S7_MAX_ATTEMPTS); if (attempt !== 1 && attempt !== 2) invalid();
+  const status = enumValue(item.status, EXPORT_STATUSES); const attempt = integer(item.attempt, 1, S7_MAX_ATTEMPTS); if (attempt !== 1 && attempt !== 2) invalid();
   nullableUuid(item.retryOfJobId); nullableUuid(item.claimToken); nullableText(item.ownerProcessId, 240); nullableTimestamp(item.claimedAt); nullableTimestamp(item.heartbeatAt); timestamp(item.createdAt); timestamp(item.updatedAt); nullableTimestamp(item.terminalAt);
   const claimFields = [item.claimToken, item.ownerProcessId, item.claimedAt, item.heartbeatAt];
   if (claimFields.some((field) => field === null) && claimFields.some((field) => field !== null)) invalid("S7_CLAIM_STATE_INVALID");
-  if (["stale", "superseded", "failed_terminal", "aborted"].includes(item.status as string) && item.terminalAt === null) invalid("S7_TERMINAL_STATE_INVALID");
+  const active = ["running", "staged", "promoted"].includes(status);
+  if (active !== claimFields.every((field) => field !== null)) invalid("S7_CLAIM_STATE_INVALID");
+  const terminal = ["committed", "stale", "superseded", "failed_terminal", "aborted"].includes(status);
+  if (terminal !== (item.terminalAt !== null)) invalid("S7_TERMINAL_STATE_INVALID");
+  if (status === "failed_retryable" && attempt !== 1) invalid("S7_RETRY_CHAIN_INVALID");
+  if (status === "failed_terminal" && attempt !== 2) invalid("S7_RETRY_CHAIN_INVALID");
   return result;
 }
 
@@ -240,6 +256,7 @@ function validateReceipt(value: unknown): S7CadReadbackReceipt {
   const result = item as unknown as S7CadReadbackReceipt;
   enumValue(item.schemaVersion, [S7_RECEIPT_VERSION]); uuid(item.receiptId); uuid(item.projectId); uuid(item.artifactId); sourceStamp(item.source); uuid(item.manifestId); sha(item.manifestHash); enumValue(item.worldToPlanVersion, [S7_WORLD_TO_PLAN_VERSION]); enumValue(item.dxfVersion, [S7_DXF_VERSION]); sha(item.sha256); integer(item.byteSize, 1, S7_MAX_DXF_BYTES); integer(item.entityCount, 0, S7_MAX_ENTITIES); enumValue(item.correspondenceResult, ["pass", "fail"]); enumValue(item.outcome, ["pass", "fail"]); const issues = array(item.issues); if (issues.length > 128) invalid(); issues.forEach((issue) => text(issue, 400, true)); timestamp(item.checkedAt); sha(item.receiptHash); enumValue(item.readbackVersion, [S7_READBACK_VERSION]);
   if (hashS7ReadbackReceipt(result) !== result.receiptHash) invalid("S7_RECEIPT_HASH_MISMATCH");
+  if (Buffer.byteLength(jcs(result), "utf8") > S7_MAX_RECEIPT_BYTES) invalid("S7_RESOURCE_LIMIT");
   if (result.outcome === "pass" && (result.correspondenceResult !== "pass" || result.issues.length > 0)) invalid("S7_RECEIPT_OUTCOME_INVALID");
   return result;
 }
@@ -321,6 +338,7 @@ export function validateS7Graph(state: StoreState): void {
   const jobById = unique(jobs, (item) => item.jobId);
   const manifestById = unique(manifests, (item) => item.manifestId);
   const receiptById = unique(receipts, (item) => item.receiptId);
+  const claimTokens = new Set<string>();
   const idempotencyByKey = new Map<string, S7CadIdempotency>();
   for (const item of idempotency) {
     const key = `${item.projectId}:${item.operation}:${item.idempotencyKey}`;
@@ -331,7 +349,10 @@ export function validateS7Graph(state: StoreState): void {
   }
   for (const artifact of exports) {
     const job = jobById.get(artifact.jobId);
-    if (!job || job.projectId !== artifact.projectId || job.artifactId !== artifact.artifactId || job.status !== artifact.status || !sameS7Source(job.source, artifact.source)) invalid("S7_ARTIFACT_REFERENCE_INVALID");
+    if (!job || job.projectId !== artifact.projectId || job.artifactId !== artifact.artifactId || job.status !== artifact.status || job.attempt !== artifact.attempt || !sameS7Source(job.source, artifact.source)) invalid("S7_ARTIFACT_REFERENCE_INVALID");
+    if ((artifact.readbackReceiptId === null) !== (artifact.readbackHash === null)) invalid("S7_RECEIPT_REFERENCE_INVALID");
+    if ((artifact.sha256 === null) !== (artifact.byteSize === null)) invalid("S7_ARTIFACT_REFERENCE_INVALID");
+    if (artifact.readbackReceiptId !== null && artifact.status !== "committed" && artifact.status !== "superseded") invalid("S7_RECEIPT_REFERENCE_INVALID");
     if (!idempotencyByKey.has(`${artifact.projectId}:export:${job.idempotencyKey}`)) invalid("S7_IDEMPOTENCY_LINK_INVALID");
     if (artifact.manifestHash !== null) {
       const manifest = manifestById.get(artifact.manifestId);
@@ -344,6 +365,8 @@ export function validateS7Graph(state: StoreState): void {
     if (artifact.status === "committed" && (artifact.readbackReceiptId === null || artifact.manifestHash === null || artifact.sha256 === null || artifact.byteSize === null)) invalid("S7_COMMIT_REFERENCE_INVALID");
   }
   for (const job of jobs) {
+    if (job.claimToken !== null && claimTokens.has(job.claimToken)) invalid("S7_CLAIM_STATE_INVALID");
+    if (job.claimToken !== null) claimTokens.add(job.claimToken);
     const artifact = exportById.get(job.artifactId);
     if (!artifact || artifact.jobId !== job.jobId || artifact.projectId !== job.projectId || !sameS7Source(artifact.source, job.source)) invalid("S7_JOB_REFERENCE_INVALID");
   }

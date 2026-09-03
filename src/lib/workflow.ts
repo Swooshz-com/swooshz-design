@@ -199,6 +199,12 @@ export class WorkflowService {
     this.processId = options.processId ?? process.pid;
     this.isProcessAlive = options.isProcessAlive ?? processIsAlive;
     this.workerId = options.workerId ?? `process-${this.processId}-${newUuid()}`;
+    const isS7OwnerProcessAlive = (ownerProcessId: string): boolean => {
+      const embeddedProcess = /^process-(\d+)-/u.exec(ownerProcessId);
+      if (embeddedProcess) return this.isProcessAlive(Number(embeddedProcess[1]));
+      if (ownerProcessId === this.workerId) return this.isProcessAlive(this.processId);
+      return true;
+    };
     this.recoverPendingOperations();
     this.s2 = new S2WorkflowService({
       repository: this.repository,
@@ -274,6 +280,7 @@ export class WorkflowService {
       clock: this.clock,
       uuid: this.uuid,
       ownerProcessId: this.workerId,
+      isOwnerProcessAlive: isS7OwnerProcessAlive,
       onPublicationPhase: options.onS7PublicationPhase,
     });
     this.s7.recoverPending();

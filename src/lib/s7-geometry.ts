@@ -299,8 +299,12 @@ function assertPrimitive(primitive: S6GeometryPrimitive): void {
   }
   const vertices = primitive.profile.vertices;
   if (vertices.length < 3 || vertices.length > 24) fail("S7_PROFILE_INVALID", "profile.vertices");
+  const seenVertices = new Set<string>();
   for (const vertex of vertices) {
     if (!Number.isSafeInteger(vertex.xMm) || !Number.isSafeInteger(vertex.zMm) || Math.abs(vertex.xMm) > MAX_COORDINATE_MM || Math.abs(vertex.zMm) > MAX_COORDINATE_MM) fail("S7_PROFILE_INVALID", "profile.vertices");
+    const key = `${vertex.xMm}:${vertex.zMm}`;
+    if (seenVertices.has(key)) fail("S7_PROFILE_INVALID", "profile.vertices");
+    seenVertices.add(key);
   }
   const normalized = vertices.map((vertex) => ({ xMm: vertex.xMm, yMm: vertex.zMm }));
   if (Math.abs(signedArea(normalized)) <= EPSILON) fail("S7_PROFILE_INVALID", "profile.vertices");
@@ -452,7 +456,7 @@ function unionPolygons(polygons: readonly S7PlanPoint[][]): S7PlanPoint[][] {
     while (!samePoint(current, loop[0]!) && loop.length <= directed.size + 2) {
       const candidates = Array.from(remaining).map((key) => ({ key, segment: directed.get(key)! })).filter((item) => samePoint(item.segment.start, current));
       if (candidates.length === 0) break;
-      candidates.sort((left, right) => left.key.localeCompare(right.key));
+      candidates.sort((left, right) => compareUtf8(left.key, right.key));
       const selected = candidates[0]!;
       remaining.delete(selected.key);
       loop.push(selected.segment.end);

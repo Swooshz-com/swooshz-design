@@ -115,8 +115,11 @@ test("dead ownership is reconciled only when explicitly proven dead; live/uncert
     const artifact = state.s7CadExports?.find((item) => item.artifactId === result.export.artifactId)!;
     const job = state.s7CadJobs?.find((item) => item.jobId === artifact.jobId)!;
     const claimToken = "40000000-0000-4000-8000-000000000001" as UUID;
+    state.s7CadManifests = state.s7CadManifests?.filter((item) => item.manifestId !== artifact.manifestId);
+    state.s7CadReadbackReceipts = state.s7CadReadbackReceipts?.filter((item) => item.artifactId !== artifact.artifactId);
+    artifact.manifestHash = null; artifact.readbackReceiptId = null; artifact.readbackHash = null; artifact.sha256 = null; artifact.byteSize = null; artifact.committedAt = null; artifact.staleAt = null; artifact.supersededAt = null; artifact.failureCode = null;
     artifact.status = "running"; artifact.privateStagingStorageKey = s7StagingDxfStorageKey(PROJECT_ID, job.jobId, claimToken); artifact.publicationPhase = "none";
-    job.status = "running"; job.claimToken = claimToken; job.ownerProcessId = "dead-owner"; job.claimedAt = job.updatedAt; job.heartbeatAt = job.updatedAt;
+    job.status = "running"; job.claimToken = claimToken; job.ownerProcessId = "dead-owner"; job.claimedAt = job.updatedAt; job.heartbeatAt = job.updatedAt; job.terminalAt = null;
   });
   const dead = new S7CadService({ repository: value.repository, objects: value.objects, s6: value.service.s6, ownerProcessId: "new-owner", isOwnerProcessAlive: (owner) => owner !== "dead-owner" });
   assert.equal(dead.recoverPending(), 1);
@@ -128,7 +131,10 @@ test("dead ownership is reconciled only when explicitly proven dead; live/uncert
     const artifact = state.s7CadExports?.find((item) => item.artifactId === liveResult.export.artifactId)!;
     const job = state.s7CadJobs?.find((item) => item.jobId === artifact.jobId)!;
     const claimToken = "40000000-0000-4000-8000-000000000002" as UUID;
-    artifact.status = "running"; artifact.privateStagingStorageKey = s7StagingDxfStorageKey(PROJECT_ID, job.jobId, claimToken); job.status = "running"; job.claimToken = claimToken; job.ownerProcessId = "live-owner"; job.claimedAt = job.updatedAt; job.heartbeatAt = job.updatedAt;
+    state.s7CadManifests = state.s7CadManifests?.filter((item) => item.manifestId !== artifact.manifestId);
+    state.s7CadReadbackReceipts = state.s7CadReadbackReceipts?.filter((item) => item.artifactId !== artifact.artifactId);
+    artifact.manifestHash = null; artifact.readbackReceiptId = null; artifact.readbackHash = null; artifact.sha256 = null; artifact.byteSize = null; artifact.committedAt = null; artifact.staleAt = null; artifact.supersededAt = null; artifact.failureCode = null;
+    artifact.status = "running"; artifact.privateStagingStorageKey = s7StagingDxfStorageKey(PROJECT_ID, job.jobId, claimToken); artifact.publicationPhase = "none"; job.status = "running"; job.claimToken = claimToken; job.ownerProcessId = "live-owner"; job.claimedAt = job.updatedAt; job.heartbeatAt = job.updatedAt; job.terminalAt = null;
   });
   const liveService = new S7CadService({ repository: live.repository, objects: live.objects, s6: live.service.s6, ownerProcessId: "new-owner", isOwnerProcessAlive: () => true });
   assert.equal(liveService.recoverPending(), 0);
