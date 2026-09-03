@@ -334,8 +334,9 @@ function parseTables(body: readonly Pair[], registry: Set<string>): { layers: re
     if (headerEnd < 0) fail("S7_DXF_TABLE_INVALID", expected[tableIndex]!);
     const header = table.slice(0, headerEnd);
     expect(header[0]!.value === "TABLE" && exactOne(header, 2, "table.name") === expected[tableIndex], "S7_DXF_TABLE_INVALID", "table.order");
-    expect(header.map((pair) => pair.code).join("|") === "0|5|100|2|70", "S7_DXF_TABLE_INVALID", "table.order");
+    expect(header.map((pair) => pair.code).join("|") === "0|2|5|330|100|70", "S7_DXF_TABLE_INVALID", "table.order");
     const tableHandle = requireHandle(header, 5, "table.handle");
+    expect(exactOne(header, 330, "table.owner") === "0", "S7_DXF_TABLE_INVALID", "table.owner");
     assertUniqueHandle(registry, tableHandle);
     expect(exactOne(header, 100, "table.subclass") === "AcDbSymbolTable", "S7_DXF_TABLE_INVALID", "table.subclass");
     const count = integer(exactOne(header, 70, "table.count"));
@@ -492,6 +493,25 @@ function parseEntity(record: readonly Pair[], registry: Set<string>, modelRecord
     const xs = values(10).map((value) => canonicalMm(value));
     const ys = values(20).map((value) => canonicalMm(value));
     expect(xs.length === count && ys.length === count, "S7_DXF_ENTITY_INVALID", "polyline.vertices");
+    const effective: Array<{ x: number; y: number }> = [];
+    for (let index = 0; index < count; index += 1) {
+      const point = { x: xs[index]!, y: ys[index]! };
+      const previous = effective[effective.length - 1];
+      if (!previous || previous.x !== point.x || previous.y !== point.y) effective.push(point);
+    }
+    const first = effective[0];
+    const last = effective[effective.length - 1];
+    if (first && last && first.x === last.x && first.y === last.y) effective.pop();
+    const unique = new Set(effective.map((point) => `${point.x},${point.y}`));
+    expect(effective.length >= 3 && unique.size >= 3, "S7_DXF_ENTITY_INVALID", "polyline.vertices");
+    let areaTwice = 0;
+    const origin = effective[0]!;
+    for (let index = 1; index < effective.length - 1; index += 1) {
+      const current = effective[index]!;
+      const next = effective[index + 1]!;
+      areaTwice += (current.x - origin.x) * (next.y - origin.y) - (next.x - origin.x) * (current.y - origin.y);
+    }
+    expect(areaTwice !== 0, "S7_DXF_ENTITY_INVALID", "polyline.area");
     vertexCount = count;
     bounds = { minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) };
   } else if (type === "LINE") {
@@ -501,6 +521,7 @@ function parseEntity(record: readonly Pair[], registry: Set<string>, modelRecord
     const x2 = one(11, "line.x2");
     const y2 = one(21, "line.y2");
     expect(one(31, "line.z2") === 0, "S7_DXF_ENTITY_INVALID", "line.z2");
+    expect(x1 !== x2 || y1 !== y2, "S7_DXF_ENTITY_INVALID", "line.endpoints");
     bounds = { minX: Math.min(x1, x2), minY: Math.min(y1, y2), maxX: Math.max(x1, x2), maxY: Math.max(y1, y2) };
     vertexCount = 2;
   } else if (type === "POINT") {
@@ -513,7 +534,7 @@ function parseEntity(record: readonly Pair[], registry: Set<string>, modelRecord
     const y = one(20, "circle.y");
     expect(one(30, "circle.z") === 0, "S7_DXF_ENTITY_INVALID", "circle.z");
     const radius = one(40, "circle.radius");
-    expect(radius >= 0, "S7_DXF_ENTITY_INVALID", "circle.radius");
+    expect(radius > 0, "S7_DXF_ENTITY_INVALID", "circle.radius");
     bounds = { minX: x - radius, minY: y - radius, maxX: x + radius, maxY: y + radius };
   } else if (type === "ELLIPSE") {
     const x = one(10, "ellipse.x");
@@ -525,6 +546,7 @@ function parseEntity(record: readonly Pair[], registry: Set<string>, modelRecord
     const ratio = canonicalFixed12(exactOne(geometry, 40, "ellipse.ratio"));
     const start = canonicalFixed12(exactOne(geometry, 41, "ellipse.start"));
     const end = canonicalFixed12(exactOne(geometry, 42, "ellipse.end"));
+    expect(majorX !== 0 || majorY !== 0, "S7_DXF_ENTITY_INVALID", "ellipse.majorAxis");
     expect(ratio > 0 && ratio <= 1 && start >= 0 && end > start && end <= 13, "S7_DXF_ENTITY_INVALID", "ellipse.parameters");
     const minorX = -majorY * ratio;
     const minorY = majorX * ratio;

@@ -10,11 +10,15 @@ export type S7SourceReadiness = { readiness: "ready" | "not_ready"; checkedAt?: 
 
 export function buildS7Telemetry(state: StoreState, projectId: string, source: S7SourceReadiness): S7Telemetry {
   validateS7Graph(state);
-  const { exports } = getS7Collections(state);
+  const { exports, receipts } = getS7Collections(state);
   const projectExports = exports.filter((item) => item.projectId === projectId);
   const committed = projectExports.filter((item) => item.status === "committed");
   const retryCount = projectExports.filter((item) => item.attempt === 2).length;
-  const readbackPassCount = committed.filter((item) => item.readbackReceiptId !== null && item.readbackHash !== null).length;
+  const readbackPassCount = committed.filter((item) => {
+    if (item.readbackReceiptId === null || item.readbackHash === null) return false;
+    const receipt = receipts.find((candidate) => candidate.artifactId === item.artifactId && candidate.receiptId === item.readbackReceiptId);
+    return receipt?.receiptHash === item.readbackHash && receipt.outcome === "pass" && receipt.correspondenceResult === "pass" && receipt.issues.length === 0;
+  }).length;
   const byteSize = committed.reduce((total, item) => total + (item.byteSize ?? 0), 0);
   return {
     schemaVersion: "s7-telemetry-v1",

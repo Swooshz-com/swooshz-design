@@ -326,9 +326,10 @@ function addGraphicalEntity(target: string[], allocator: HandleAllocator, entity
 function addTableHeader(target: string[], allocator: HandleAllocator, name: string, count: number): string {
   const handle = allocator.allocate();
   pushPair(target, 0, "TABLE");
-  pushHandle(target, 5, handle);
-  pushPair(target, 100, "AcDbSymbolTable");
   pushPair(target, 2, name);
+  pushHandle(target, 5, handle);
+  pushPair(target, 330, "0");
+  pushPair(target, 100, "AcDbSymbolTable");
   pushPair(target, 70, String(count));
   return handle;
 }

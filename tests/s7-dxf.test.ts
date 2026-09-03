@@ -13,6 +13,8 @@ const HASH = "a".repeat(64);
 
 const source: S7SourceStamp = { sourceRevisionId: REVISION_ID, sourceRevisionHash: HASH, sourceS5Fingerprint: HASH, validationReceiptId: "30000000-0000-4000-8000-000000000002", validationHash: HASH, s6HandoffSchemaVersion: "s6-to-s7-handoff-v1", handoffDigest: HASH };
 
+type DxfPair = { code: number; value: string };
+
 function handoff(identityKey = "object-1"): S6ToS7Handoff {
   const object = {
     objectId: "object-1", identityKey, parentObjectId: null, objectType: "box", role: "furniture",
@@ -28,9 +30,61 @@ function errorCode(error: unknown): string {
   return error instanceof AppError ? error.code : String(error);
 }
 
+function assertTableHeader(text: string, tableName: string, count: number): void {
+  const pattern = new RegExp(`\\n0\\nTABLE\\n2\\n${tableName}\\n5\\n[1-9A-F][0-9A-F]*\\n330\\n0\\n100\\nAcDbSymbolTable\\n70\\n${count}\\n`, "u");
+  assert.match(text, pattern);
+}
+
 function assertTableSubclass(text: string, tableName: string, typeSpecific: string): void {
   const pattern = new RegExp(`\\n0\\n${tableName}\\n5\\n[0-9A-F]+\\n330\\n[0-9A-F]+\\n100\\nAcDbSymbolTableRecord\\n100\\n${typeSpecific}\\n`, "u");
   assert.match(text, pattern);
+}
+
+function setPair(pairs: DxfPair[], code: number, value: string): void {
+  const pair = pairs.find((item) => item.code === code);
+  assert.ok(pair, `missing group code ${code}`);
+  pair!.value = value;
+}
+
+function setPolylineVertices(pairs: DxfPair[], vertices: readonly (readonly [number, number])[]): void {
+  const xdataIndex = pairs.findIndex((pair) => pair.code === 1001);
+  assert.ok(xdataIndex > 0);
+  const geometry = pairs.slice(0, xdataIndex).filter((pair) => pair.code !== 10 && pair.code !== 20);
+  const closedIndex = geometry.findIndex((pair) => pair.code === 70);
+  assert.ok(closedIndex >= 0);
+  const coordinates = vertices.flatMap(([x, y]) => [{ code: 10, value: String(x) }, { code: 20, value: String(y) }]);
+  geometry.splice(closedIndex + 1, 0, ...coordinates);
+  pairs.splice(0, pairs.length, ...geometry, ...pairs.slice(xdataIndex));
+  setPair(pairs, 90, String(vertices.length));
+}
+
+function mutateFirstEntity(bytes: Uint8Array, entityType: string, mutate: (pairs: DxfPair[]) => void): Buffer {
+  const text = Buffer.from(bytes).toString("ascii");
+  const entitiesMarker = "0\nSECTION\n2\nENTITIES\n";
+  const entitiesStart = text.indexOf(entitiesMarker);
+  assert.ok(entitiesStart >= 0);
+  const start = text.indexOf("0\n" + entityType + "\n", entitiesStart + entitiesMarker.length);
+  assert.ok(start >= 0);
+  const lines = text.split("\n");
+  const startLine = text.slice(0, start).split("\n").length - 1;
+  let endLine = startLine + 2;
+  while (endLine < lines.length && lines[endLine] !== "0") endLine += 2;
+  assert.ok(endLine < lines.length);
+  const recordLines = lines.slice(startLine, endLine);
+  assert.equal(recordLines.length % 2, 0);
+  const pairs: DxfPair[] = [];
+  for (let index = 0; index < recordLines.length; index += 2) pairs.push({ code: Number(recordLines[index]), value: recordLines[index + 1]! });
+  mutate(pairs);
+  const record = pairs.flatMap((pair) => [String(pair.code), pair.value]).join("\n");
+  return Buffer.from(lines.slice(0, startLine).concat(record.split("\n"), lines.slice(endLine)).join("\n"), "ascii");
+}
+
+function roundPrismHandoff(rotationMd: { xMd: number; yMd: number; zMd: number }): S6ToS7Handoff {
+  const value = handoff();
+  const object = value.objects[0]!;
+  object.geometry = { kind: "round_prism", radiusMm: 450, heightMm: 1100, geometryState: "exact", localAnchor: "floor" };
+  object.transform = { positionMm: { xMm: 100, yMm: 200, zMm: 300 }, rotationMd };
+  return value;
 }
 
 test("transport numeric format is half-away-from-zero, bounded, locale-independent, and non-exponential", () => {
@@ -59,6 +113,10 @@ test("writer emits deterministic AC1015 scaffold, locked layers, handles, extent
   assert.equal(/(?:^|\n)-0(?:\n|$)/u.test(text), false);
   assert.equal(text.includes("$EXTMIN"), true);
   assert.equal(text.includes("$EXTMAX"), true);
+  assertTableHeader(text, "LTYPE", 1);
+  assertTableHeader(text, "LAYER", 11);
+  assertTableHeader(text, "APPID", 1);
+  assertTableHeader(text, "BLOCK_RECORD", 2);
   assertTableSubclass(text, "LTYPE", "AcDbLinetypeTableRecord");
   assert.equal((text.match(/\n0\nLAYER\n5\n[0-9A-F]+\n330\n[0-9A-F]+\n100\nAcDbSymbolTableRecord\n100\nAcDbLayerTableRecord\n/gu) ?? []).length, 11);
   assertTableSubclass(text, "APPID", "AcDbRegAppTableRecord");
@@ -68,6 +126,18 @@ test("writer emits deterministic AC1015 scaffold, locked layers, handles, extent
   assert.equal(parsed.correspondenceResult, "pass");
   assert.equal(parsed.entityCount, first.entityCount);
   assert.match(parsed.handseed, /^[0-9A-F]+$/u);
+});
+
+test("strict readback rejects non-canonical symbol-table header owner and order", () => {
+  const generated = writeS7Dxf(handoff(), { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source });
+  const text = generated.bytes.toString("ascii");
+  const header = "\n0\nTABLE\n2\nLTYPE\n5\n1\n330\n0\n100\nAcDbSymbolTable\n70\n1\n";
+  const wrongOwner = text.replace(header, header.replace("330\n0", "330\n1"));
+  assert.notEqual(wrongOwner, text);
+  assert.throws(() => parseS7Dxf(Buffer.from(wrongOwner, "ascii")), (error) => errorCode(error) === "S7_DXF_TABLE_INVALID");
+  const wrongOrder = text.replace(header, "\n0\nTABLE\n5\n1\n2\nLTYPE\n330\n0\n100\nAcDbSymbolTable\n70\n1\n");
+  assert.notEqual(wrongOrder, text);
+  assert.throws(() => parseS7Dxf(Buffer.from(wrongOrder, "ascii")), (error) => errorCode(error) === "S7_DXF_TABLE_INVALID");
 });
 
 test("readback rejects malformed, non-canonical, oversized, and injected DXF content", () => {
@@ -91,16 +161,39 @@ test("strict readback rejects both old shortened symbol-table-entry profiles", (
 });
 
 test("analytic round-prism geometry survives writer to independent readback with ELLIPSE arcs and tangent LINEs", () => {
-  const analyticHandoff = handoff();
-  const analyticObject = analyticHandoff.objects[0]!;
-  analyticObject.geometry = { kind: "round_prism", radiusMm: 450, heightMm: 1100, geometryState: "exact", localAnchor: "floor" };
-  analyticObject.transform = { positionMm: { xMm: 100, yMm: 200, zMm: 300 }, rotationMd: { xMd: 30_000, yMd: 0, zMd: 0 } };
+  const analyticHandoff = roundPrismHandoff({ xMd: 30_000, yMd: 0, zMd: 0 });
   const generated = writeS7Dxf(analyticHandoff, { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source });
   assert.equal(generated.plan.entities.filter((entity) => entity.entityType === "ELLIPSE").length, 2);
   assert.equal(generated.plan.entities.filter((entity) => entity.entityType === "LINE" && entity.sourceObjectId === "object-1").length, 2);
   const parsed = parseS7Dxf(generated.bytes, { expectedManifest: generated.manifest, expectedSource: source });
   assert.equal(parsed.entities.filter((entity) => entity.entityType === "ELLIPSE").length, 2);
   assert.equal(parsed.entities.filter((entity) => entity.entityType === "LINE" && entity.sourceObjectIdToken === "object-1").length, 2);
+});
+
+test("strict readback rejects adversarial degenerate LINE, LWPOLYLINE, CIRCLE, and ELLIPSE entities", () => {
+  const polygonSource = writeS7Dxf(handoff(), { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source });
+  for (const vertices of [[[0, 0]], [[0, 0], [100, 0]], [[0, 0], [100, 0], [200, 0]]] as const) {
+    const malformed = mutateFirstEntity(polygonSource.bytes, "LWPOLYLINE", (pairs) => setPolylineVertices(pairs, vertices));
+    assert.throws(() => parseS7Dxf(malformed), (error) => errorCode(error) === "S7_DXF_ENTITY_INVALID");
+  }
+
+  const analytic = writeS7Dxf(roundPrismHandoff({ xMd: 30_000, yMd: 0, zMd: 0 }), { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source });
+  const coincidentLine = mutateFirstEntity(analytic.bytes, "LINE", (pairs) => {
+    setPair(pairs, 11, pairs.find((pair) => pair.code === 10)!.value);
+    setPair(pairs, 21, pairs.find((pair) => pair.code === 20)!.value);
+  });
+  assert.throws(() => parseS7Dxf(coincidentLine), (error) => errorCode(error) === "S7_DXF_ENTITY_INVALID");
+
+  const circle = writeS7Dxf(roundPrismHandoff({ xMd: 0, yMd: 0, zMd: 0 }), { artifactId: ARTIFACT_ID, manifestId: MANIFEST_ID, source });
+  assert.equal(circle.plan.entities.some((entity) => entity.entityType === "CIRCLE"), true);
+  const zeroRadius = mutateFirstEntity(circle.bytes, "CIRCLE", (pairs) => setPair(pairs, 40, "0"));
+  assert.throws(() => parseS7Dxf(zeroRadius), (error) => errorCode(error) === "S7_DXF_ENTITY_INVALID");
+
+  const zeroMajorAxis = mutateFirstEntity(analytic.bytes, "ELLIPSE", (pairs) => {
+    setPair(pairs, 11, "0");
+    setPair(pairs, 21, "0");
+  });
+  assert.throws(() => parseS7Dxf(zeroMajorAxis), (error) => errorCode(error) === "S7_DXF_ENTITY_INVALID");
 });
 
 test("golden and independent hand-authored AC1015 fixtures are accepted", () => {

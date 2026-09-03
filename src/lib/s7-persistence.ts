@@ -338,6 +338,7 @@ export function validateS7Graph(state: StoreState): void {
   const jobById = unique(jobs, (item) => item.jobId);
   const manifestById = unique(manifests, (item) => item.manifestId);
   const receiptById = unique(receipts, (item) => item.receiptId);
+  unique(receipts, (item) => item.artifactId);
   const claimTokens = new Set<string>();
   const idempotencyByKey = new Map<string, S7CadIdempotency>();
   for (const item of idempotency) {
@@ -360,7 +361,7 @@ export function validateS7Graph(state: StoreState): void {
     }
     if (artifact.readbackReceiptId !== null) {
       const receipt = receiptById.get(artifact.readbackReceiptId);
-      if (!receipt || receipt.projectId !== artifact.projectId || receipt.artifactId !== artifact.artifactId || receipt.manifestId !== artifact.manifestId || receipt.manifestHash !== artifact.manifestHash || receipt.sha256 !== artifact.sha256 || receipt.byteSize !== artifact.byteSize || receipt.readbackVersion !== S7_READBACK_VERSION || !sameS7Source(receipt.source, artifact.source)) invalid("S7_RECEIPT_REFERENCE_INVALID");
+      if (!receipt || receipt.receiptId !== artifact.readbackReceiptId || receipt.receiptHash !== artifact.readbackHash || receipt.projectId !== artifact.projectId || receipt.artifactId !== artifact.artifactId || receipt.manifestId !== artifact.manifestId || receipt.manifestHash !== artifact.manifestHash || receipt.sha256 !== artifact.sha256 || receipt.byteSize !== artifact.byteSize || receipt.readbackVersion !== S7_READBACK_VERSION || !sameS7Source(receipt.source, artifact.source) || receipt.outcome !== "pass" || receipt.correspondenceResult !== "pass" || receipt.issues.length !== 0) invalid("S7_RECEIPT_REFERENCE_INVALID");
     }
     if (artifact.status === "committed" && (artifact.readbackReceiptId === null || artifact.manifestHash === null || artifact.sha256 === null || artifact.byteSize === null)) invalid("S7_COMMIT_REFERENCE_INVALID");
   }

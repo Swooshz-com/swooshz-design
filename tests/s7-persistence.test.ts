@@ -3,10 +3,11 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { AppError, type S6ToS7Handoff, type Project, type S7Telemetry, type UUID } from "../src/lib/types";
+import { AppError, type S6ToS7Handoff, type Project, type S7CadExport, type S7CadReadbackReceipt, type S7Telemetry, type StoreState, type UUID } from "../src/lib/types";
 import { JsonRepository, PrivateObjectStore } from "../src/lib/store";
 import { S7CadService, type S7PublicationPhaseHook, type S7CadServiceOptions } from "../src/lib/s7-cad";
-import { s7FinalManifestStorageKey, s7StagingDxfStorageKey } from "../src/lib/s7-persistence";
+import { hashS7ReadbackReceipt, s7FinalManifestStorageKey, s7StagingDxfStorageKey } from "../src/lib/s7-persistence";
+import { buildS7Telemetry } from "../src/lib/s7-telemetry";
 import { parseS7Dxf } from "../src/lib/s7-dxf-readback";
 
 const PROJECT_ID = "20000000-0000-4000-8000-000000000001" as UUID;
@@ -86,6 +87,48 @@ test("opaque idempotency keys replay only for the exact accepted source/input an
   const moved = handoff("30000000-0000-4000-8000-000000000099" as UUID, "b".repeat(64));
   value.move(moved);
   assert.throws(() => value.service.createExport(PROJECT_ID, "not-a-uuid-key"), (error) => code(error) === "S7_IDEMPOTENCY_CONFLICT");
+});
+
+test("validated receipt linkage fences corrupted graph state before telemetry can count a readback pass", () => {
+  type Corruption = (state: StoreState, artifact: S7CadExport, receipt: S7CadReadbackReceipt) => void;
+  const corruptions: Array<{ name: string; mutate: Corruption; addSecondArtifact?: boolean }> = [
+    { name: "artifact readback hash mismatch", mutate: (_state, artifact) => { artifact.readbackHash = "b".repeat(64); } },
+    { name: "receipt outcome fail", mutate: (_state, _artifact, receipt) => { receipt.outcome = "fail"; receipt.receiptHash = hashS7ReadbackReceipt(receipt); } },
+    { name: "receipt correspondence fail", mutate: (_state, _artifact, receipt) => { receipt.correspondenceResult = "fail"; receipt.receiptHash = hashS7ReadbackReceipt(receipt); } },
+    { name: "receipt issues non-empty", mutate: (_state, _artifact, receipt) => { receipt.issues = ["corrupted receipt"]; receipt.receiptHash = hashS7ReadbackReceipt(receipt); } },
+    {
+      name: "incorrect receipt artifact linkage",
+      addSecondArtifact: true,
+      mutate: (state, artifact) => {
+        const otherArtifact = state.s7CadExports!.find((item) => item.artifactId !== artifact.artifactId)!;
+        const otherReceipt = state.s7CadReadbackReceipts!.find((item) => item.artifactId === otherArtifact.artifactId)!;
+        artifact.readbackReceiptId = otherReceipt.receiptId;
+        artifact.readbackHash = otherReceipt.receiptHash;
+      },
+    },
+    {
+      name: "duplicate receipt for artifact",
+      mutate: (state, _artifact, receipt) => {
+        const duplicate = structuredClone(receipt);
+        duplicate.receiptId = MOVED_REVISION_ID;
+        duplicate.receiptHash = hashS7ReadbackReceipt(duplicate);
+        state.s7CadReadbackReceipts!.push(duplicate);
+      },
+    },
+  ];
+
+  for (const corruption of corruptions) {
+    const value = context();
+    const created = value.service.createExport(PROJECT_ID, "receipt-corruption-" + corruption.name);
+    if (corruption.addSecondArtifact) value.service.createExport(PROJECT_ID, "receipt-corruption-secondary-" + corruption.name);
+    const validTelemetry = buildS7Telemetry(value.repository.state(), PROJECT_ID, { readiness: "ready" });
+    assert.equal(validTelemetry.readbackPassCount.value, corruption.addSecondArtifact ? 2 : 1);
+    const state = structuredClone(value.repository.state());
+    const artifact = state.s7CadExports!.find((item) => item.artifactId === created.export.artifactId)!;
+    const receipt = state.s7CadReadbackReceipts!.find((item) => item.receiptId === artifact.readbackReceiptId)!;
+    corruption.mutate(state, artifact, receipt);
+    assert.throws(() => buildS7Telemetry(state, PROJECT_ID, { readiness: "ready" }), (error) => error instanceof Error && /S7_/u.test(error.message));
+  }
 });
 
 test("source movement at a live fence fails closed and records stale, while committed history becomes superseded", () => {
