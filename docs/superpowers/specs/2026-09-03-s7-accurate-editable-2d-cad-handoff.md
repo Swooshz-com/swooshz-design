@@ -84,13 +84,13 @@ s6-to-s7-handoff-v1
 
 The S6 handoff is read-only input. S7 has no S6 mutation capability and never edits an S6 model, approval, asset, event, revision, or history.
 
-Each S7 export captures one immutable source binding containing all of the following values copied from the current handoff:
+Each S7 export captures one immutable `S7SourceStamp` containing all of the following values copied from the current handoff:
 
 ~~~text
 handoffSchemaVersion = s6-to-s7-handoff-v1
 projectId
-acceptedRevisionId
-acceptedRevisionHash
+sourceRevisionId
+sourceRevisionHash
 sourceS5Fingerprint
 validationReceiptId
 validationHash
@@ -98,9 +98,9 @@ validationOutcome
 handoffDigest
 ~~~
 
-The handoff digest is the SHA-256 of the canonical, independently normalized handoff payload with no artifact keys, private storage paths, timestamps, eligibility booleans, or generated CAD bytes. It is computed by S7 from the exact handoff bytes/values returned by S6 and is persisted with the source binding. A digest mismatch is a source failure, not a reason to choose another revision.
+The handoff digest is the SHA-256 of the canonical, independently normalized handoff payload with no artifact keys, private storage paths, timestamps, eligibility booleans, or generated CAD bytes. It is computed by S7 from the exact handoff bytes/values returned by S6 and is persisted with the source stamp. A digest mismatch is a source failure, not a reason to choose another revision.
 
-The accepted revision ID/hash, S5 fingerprint, validation receipt ID/hash, and handoff digest are runtime values. Documentation does not invent a placeholder revision or hash. Every export persists the exact values obtained from its admission read.
+The source revision ID/hash, S5 fingerprint, validation receipt ID/hash, and handoff digest are runtime values. Documentation does not invent a placeholder revision or hash. Every export persists the exact values obtained from its admission read.
 
 The S6 handoff eligibility object is snapshot evidence only:
 
@@ -126,7 +126,7 @@ The live source must be re-read and compared with the captured binding at:
 10. download;
 11. S7-to-S8 handoff disclosure.
 
-The fence compares project ID, handoff schema version, handoff digest, accepted revision ID/hash, S5 source fingerprint, validation receipt ID/hash/outcome, and the canonical handoff shape. A mismatch aborts or marks the work stale and is never silently replaced with a new source.
+The fence compares project ID, handoff schema version, handoff digest, source revision ID/hash, S5 source fingerprint, validation receipt ID/hash/outcome, and the canonical handoff shape. A mismatch aborts or marks the work stale and is never silently replaced with a new source.
 
 Approved S6 hero/reference imagery is not geometry authority. S7 does not inspect pixels, reconstruct geometry from imagery, or reuse a renderer's tessellation. S6 local footprints are not world-plan geometry.
 
@@ -180,6 +180,8 @@ For a local transform, the S7 affine has the translated origin and the three rot
 
 The parity oracle must compare independently calculated world points and projected boundaries against hand-authored reference calculations for roots, nested parents, X/Y/Z rotations, mixed rotations, center/floor anchors, and all three primitive families. Calling an S6 helper and asserting equality with itself is not independent validation.
 
+The proof/test oracle multiplies explicit homogeneous matrices for the X -> Y -> Z rotation order and full parent hierarchy, then compares independently hand-calculated world points and projected boundaries. It covers root and nested transforms, every rotation axis, mixed Euler rotations, both anchors, all eight rect-prism corners, cycle rejection, and dangling-parent rejection; it never validates the same implementation against itself.
+
 ## Exact projected solids
 
 S7 emits the orthographic X/Z projection of the actual hierarchy-composed S6 solid. The contract is analytic/solid-based and deterministic. A renderer facet count is never an authoritative CAD boundary.
@@ -196,7 +198,7 @@ baseY = 0 for floor anchor
 baseY = -heightMm / 2 for center anchor
 ~~~
 
-Apply the complete parent-composed affine to every corner, discard world Y only after transformation, and compute the exact convex hull of all eight X/Z points. Deduplicate equal points and remove collinear interior points deterministically. Emit one closed LWPOLYLINE with the hull vertices in canonical winding. The hull is allowed to have fewer than eight projected points; it is never replaced with the untransformed local rectangle.
+Apply the complete parent-composed affine to every corner, discard world Y only after transformation, and compute the exact convex hull of all eight X/Z points. Deduplicate equal points and remove collinear interior points deterministically. Emit a closed LWPOLYLINE with the hull vertices in canonical winding when the hull has area; emit a LINE for an exact two-point degeneracy or a POINT for an exact one-point degeneracy. The hull is never replaced with the untransformed local rectangle.
 
 ### Profile extrusion
 
@@ -220,7 +222,7 @@ Triangulation is an internal finite-union technique only. Triangulate the valida
 7. remove duplicate and collinear points only after union;
 8. emit the exact exterior cycles as closed LWPOLYLINE entities.
 
-The union boundary, not the triangulation, is authoritative. Internal triangulation seams must not be emitted. Holes are not permitted by the accepted S6 profile contract; if a malformed or ambiguous union would require a hole, self-intersection, or non-deterministic arrangement decision, fail closed. Do not substitute a coarse polygon, renderer facets, a bounding box, or silent clipping.
+The union boundary, not the triangulation, is authoritative. Internal triangulation seams must not be emitted. The exact union may emit multiple exact exterior closed loops where the solid requires them; there is no blanket single-loop or hole rejection. Malformed, ambiguous, self-intersecting, unclosed, or non-deterministic arrangements still fail closed. Do not substitute a coarse polygon, renderer facets, a bounding box, or silent clipping.
 
 ### Round prism
 
@@ -275,14 +277,16 @@ q(v) = floor(v * 100 + 0.5) when v >= 0
 q(v) = ceil(v * 100 - 0.5) when v < 0
 ~~~
 
-This is half-away-from-zero. A result of negative zero is normalized to zero. No length is serialized with exponent notation. Fixed formatting is locale-independent:
+This is half-away-from-zero. A result of negative zero is normalized to zero. No length is serialized with exponent notation. Fixed formatting is locale-independent. Whole-centimetre values may serialize without a fractional part; every other fractional-millimetre value has exactly two fractional digits:
 
 ~~~text
-formatLength(q) = sign + abs(q) div 100 + "." + two decimal digits(abs(q) mod 100)
-zero = 0.00
+formatLength(q) = sign + canonical integer/fractional representation of abs(q / 100)
+whole centimetre = integer millimetres with no decimal point
+fractional millimetre = exactly two fractional digits
+zero = 0
 ~~~
 
-Unitless ellipse ratios and radians use a separate deterministic fixed-decimal formatter with a finite decimal scale, no exponent notation, and normalized zero. Their scale is part of the writer version and is tested in golden fixtures. They are never confused with millimetre precision.
+Unitless ellipse ratio, start parameter, and end parameter values use exactly twelve fractional places, with no exponent notation and normalized zero. They are never confused with millimetre precision.
 
 Transport precision is not fabrication accuracy. S7 must expose the distinction in metadata, UI copy, and documentation. It must not claim that 0.01 mm transport quantisation is a fabrication tolerance or engineering guarantee.
 
@@ -309,6 +313,7 @@ The accepted resource and security bounds are fixed:
 | table records | 64 |
 | label length | 120 code points |
 | XDATA per entity | 2,048 bytes |
+| XDATA strings per entity | 16 |
 | manifest bytes | 4,000,000 |
 | readback receipt bytes | 256,000 |
 | CAD release evidence bytes | 32,768 |
@@ -429,7 +434,7 @@ Every graphical entity begins with these exact common fields before its entity-s
 
 370 = -1 means ByLayer. The owner handle, layer, subclass marker, and all entity data are read back and checked. No entity omits the common metadata because it is visually understandable.
 
-Each graphical entity also carries bounded source/part/revision identity XDATA under APPID SWOOSHZ_S7. XDATA is not a second manifest and is not a place for arbitrary user text; its total size is at most 2,048 bytes per entity.
+Each graphical entity also carries bounded source/part/revision identity XDATA under APPID SWOOSHZ_S7. XDATA is not a second manifest and is not a place for arbitrary user text; it has at most 16 strings and a total size of at most 2,048 bytes per entity.
 
 ### Deterministic handle allocation
 
@@ -470,10 +475,10 @@ The v1 writer supports only these graphical entity types:
 | CIRCLE | AcDbCircle; center 10/20/30; radius 40; 30 = 0 |
 | ELLIPSE | AcDbEllipse; center 10/20/30; relative major axis endpoint 11/21/31; ratio 40; start parameter 41; end parameter 42; 30/31 = 0 |
 | LINE | AcDbLine; start 10/20/30 and end 11/21/31; all Z values 0 |
-| TEXT | AcDbText; insertion 10/20/30; height 40; bounded sanitized ASCII text 1; Standard text style 7; deterministic rotation 50; Z values 0 |
+| TEXT | AcDbText; insertion 10/20/30; height 40; bounded printable ASCII text 1; Standard text style 7; deterministic rotation 50; Z values 0 |
 | POINT | AcDbPoint; position 10/20/30; Z = 0 |
 
-All planar entity coordinates use DXF X = world X, DXF Y = world Z, and DXF Z = 0. LWPOLYLINE vertices are written in canonical cycle order. ELLIPSE arc parameters are normalized to a deterministic range and use the exact analytic arc endpoints. TEXT never contains control characters, CR/LF, executable syntax, URLs, or unbounded source labels.
+All planar entity coordinates use DXF X = world X, DXF Y = world Z, and DXF Z = 0. LWPOLYLINE vertices are written in canonical cycle order. ELLIPSE arc parameters are normalized to a deterministic range and use the exact analytic arc endpoints with twelve fractional places. TEXT accepts only printable ASCII; C0/C1 controls, CR, LF, NUL, Unicode DXF escapes, backslash injection, and unsanitized user/customer text are rejected. Derived labels use deterministic ASCII conversion with `_uXXXX_` escapes or a stable identity hash.
 
 The writer does not emit 3D solids, meshes, faces, SPLINE entities, DIMENSION entities, HATCH entities, raster references, PDFs, DWG bytes, or arbitrary user-supplied DXF.
 
@@ -496,19 +501,38 @@ The layer mapping is:
 | S7-BOOTH-OPENINGS | open-side marker lines/points |
 | S7-WALLS-PARTITIONS | S6 wall and partition projections |
 | S7-ZONES | named functional-zone boundaries/markers |
-| S7-FURNITURE | furniture and counters |
-| S7-EQUIPMENT | equipment and storage |
-| S7-DISPLAYS | displays, plinths, and screens |
+| S7-FURNITURE | furniture, storage, seating, and counters |
+| S7-EQUIPMENT | equipment |
+| S7-DISPLAYS | display geometry, plinths, and screen geometry |
 | S7-OVERHEAD | overhead geometry shown in plan and marked by role |
 | S7-DIMENSIONS | deterministic width/depth and useful object dimensions |
 | S7-LABELS | bounded human-readable role/zone/opening labels |
 | S7-UNKNOWN | bounded source geometry with `geometryState = bounded_inference` or relevant `unknownIds`, plus explicit unresolved markers; never invented geometry |
 
-Source objects are sorted by stable objectId/identityKey, not source array order. A profile union may create several cycles, arcs may create several entities, and each emitted part has a zero-based partIndex. A stable entity is never matched by display order alone.
+The role-to-layer mapping is locked as follows:
+
+~~~text
+booth_floor -> S7-BOOTH-BOUNDARY
+booth_wall -> S7-WALLS-PARTITIONS
+booth_partition -> S7-WALLS-PARTITIONS
+zone -> S7-ZONES
+furniture | storage | seating -> S7-FURNITURE
+equipment -> S7-EQUIPMENT
+display | screen -> S7-DISPLAYS
+overhead -> S7-OVERHEAD
+~~~
+
+After booth boundary/opening markers, source geometry is sorted by locked layer order, identityKey UTF-8 byte order, partIndex, and entity type rank. Dimensions, source labels, and unknown diagnostics follow. Source array order, objectId, or zoneId does not determine output order. A profile union may create several cycles, arcs may create several entities, and each emitted part has a zero-based partIndex. A stable entity is never matched by display order alone.
 
 Out-of-envelope geometry that is valid in the accepted source remains represented. S7 records an out-of-envelope diagnostic in the private manifest/readback result and telemetry; it does not clip, shrink, move, or hide the geometry. Only malformed source, unsupported/ambiguous analytic classification, invalid numeric data, or failed independent validation causes a closed failure.
 
 Unknowns remain explicit. When `geometryState = bounded_inference`, or when source `unknownIds` remain relevant to emitted geometry, the primary emitted geometry layer is `S7-UNKNOWN`. The geometry remains bounded, source-derived, and visibly unresolved; S7 does not invent a rectangle, circle, wall, label, or requirement fulfillment. The intended semantic layer is retained in the private manifest. `S7-UNKNOWN` is not a diagnostics-only POINT/TEXT layer.
+
+### Dimensions and labels
+
+Width/depth dimensions are exploded editable LINE/TEXT groups on `S7-DIMENSIONS`; the writer does not emit native DIMENSION entities. Maximum height is an informational TEXT value, not plan geometry. Every dimension, label, and other derived value is explicitly marked `derived` in the private manifest and is placed by a fixed deterministic rule from the entity key, quantized bounds, and locked offsets.
+
+There is no collision solver, reflow, or layout-dependent repositioning. Overlap is retained and reported as an informational diagnostic. Text is limited to 120 code points, printable deterministic ASCII, and allowlisted derived/source labels; C0/C1 controls, CR, LF, NUL, Unicode DXF escapes, unsanitized user/customer text, and fabrication, engineering, venue-certification, or approval wording are rejected.
 
 ## Identity and private manifest
 
@@ -527,7 +551,7 @@ manifestId = UUID
 manifestHash = SHA-256(canonical manifest bytes with manifestHash empty)
 ~~~
 
-The `manifestId` is the identity of the immutable manifest bytes; `manifestHash` is the exact hash of those bytes. The export record, durable readback receipt, and `s7-to-s8-handoff-v1` carry both values. The `s7CadManifests` collection contains one immutable linkage record for each final export, including `schemaVersion = s7-cad-manifest-v1`, `manifestId`, `projectId`, `exportId`, the exact S6 source revision/hash, `worldToPlanVersion`, the DXF profile version, `manifestHash`, manifest byte size, the private manifest key, and creation time. The record is metadata/linkage only; manifest bytes remain private and immutable, and the collection is not product CAD evidence.
+The `manifestId` is the identity of the immutable manifest bytes; `manifestHash` is the exact hash of those bytes. The artifact record, durable readback receipt, and `s7-to-s8-handoff-v1` carry both values. The `s7CadManifests` collection contains one immutable linkage record for each final artifact, including `schemaVersion = s7-cad-manifest-v1`, `manifestId`, `projectId`, `artifactId`, the exact S6 source revision/hash, `worldToPlanVersion`, the DXF profile version, `manifestHash`, manifest byte size, the private manifest key, and creation time. The record is metadata/linkage only; manifest bytes remain private and immutable, and the collection is not product CAD evidence.
 
 Each manifest entity contains at minimum:
 
@@ -546,25 +570,22 @@ It also contains entityHandle, entityType, layer, intendedSemanticLayer, xdataEn
 
 The manifest includes the source binding, DXF writer/profile version, `worldToPlanVersion`, layer list, deterministic entity order, exact quantized entity parameters, source object counts, open-side set, intended semantic layer, and diagnostics. It does not contain image bytes, prompts, secrets, credentials, private storage values, or arbitrary raw customer text.
 
-Every emitted entity carries bounded stable source/part/revision identity under the fixed `SWOOSHZ_S7` APPID. The XDATA is:
+Every emitted entity carries bounded stable source/part/revision identity under the fixed `SWOOSHZ_S7` APPID. The accepted compact XDATA grammar is:
 
 ~~~text
 1001 SWOOSHZ_S7
-1000 s7-identity-v1
-1000 sourceObjectId=<UUID-or-null>
-1000 identityKey=<stable-identity-token-or-hash>
-1000 parentObjectId=<UUID-or-null>
-1000 role=<allowlisted-role>
-1070 partIndex=<nonnegative-integer>
-1000 geometryState=<exact|bounded_inference|derived>
-1000 sourceRevisionId=<UUID>
-1000 sourceRevisionHash=<SHA-256>
-1000 manifestId=<UUID>
-1000 manifestHash=<SHA-256>
-1000 entityKey=<stable-entity-key>
+1000 S7V1
+1000 O=<sourceObjectId>
+1000 K=<identityKeyToken-or-hash>
+1000 P=<parentObjectId-or->
+1000 R=<role>
+1000 I=<partIndex>
+1000 G=<geometryState>
+1000 V=<sourceRevisionId>
+1000 H=<sourceRevisionHash>
 ~~~
 
-The values are safe bounded ASCII and the complete XDATA/entity record is at most 2,048 bytes. Derived records use null source IDs only where they have no source object; they still carry deterministic identity, role, part, geometry state, and exact source revision binding. The private manifest remains the complete authority; XDATA is not trusted without manifest/readback verification.
+The values are bounded printable ASCII, there are at most 16 XDATA strings per entity, and the complete XDATA/entity record is at most 2,048 bytes. `sourceObjectId` and `parentObjectId` are stable opaque S6 IDs and are not required to be UUIDs; derived records use the accepted `-` parent/source representation where no source object exists. A compact manifest locator may coexist within these bounds but may not replace this identity block. The private manifest remains the complete authority; XDATA is not trusted without manifest/readback verification.
 
 ## Validation separation
 
@@ -573,7 +594,7 @@ S7 has two distinct validation layers.
 The raw readback/parser contract and durable validation receipt are separate records:
 
 - `S7CadRawReadbackResult` uses `schemaVersion = s7-cad-readback-v1`. It is the strict parser/readback result for the raw `s7-dxf-r2000-ascii-v1` bytes, including parsed sections, handles, extents, entities, XDATA, and bounded diagnostics.
-- `S7CadReadbackReceipt` is the durable record in `s7CadReadbackReceipts`. It uses `schemaVersion = s7-cad-validation-receipt-v1`, carries `readbackVersion = s7-cad-readback-v1`, and is linked to the export and manifest by receipt ID/hash and manifest ID/hash. It is the immutable validation receipt used for publication and handoff.
+- `S7CadReadbackReceipt` is the durable record in `s7CadReadbackReceipts`. It uses `schemaVersion = s7-cad-validation-receipt-v1`, carries `readbackVersion = s7-cad-readback-v1`, and is linked to the artifact and manifest by receipt ID/hash and manifest ID/hash. It is the immutable validation receipt used for publication and handoff.
 
 The two literals must not be renamed or collapsed: `s7-cad-readback-v1` identifies the raw parser contract, while `s7-cad-validation-receipt-v1` identifies the durable receipt.
 
@@ -675,17 +696,28 @@ The typed boundary is locked as:
 s7-to-s8-handoff-v1
 ~~~
 
-S8 receives `s7-to-s8-handoff-v1` only after authorization and committed/readback-gated validation. It contains the exact accepted S6 source binding (`sourceRevisionId` and `sourceRevisionHash`), the S7 artifact identity (`exportId`), DXF hash and byte size, `manifestId` and `manifestHash`, durable readback receipt identity/hash, `s7-dxf-r2000-ascii-v1`, `s7-world-to-plan-v1`, the locked coordinate convention, stable correspondence, and intended semantic layer. The DTO explicitly marks:
+S8 receives `s7-to-s8-handoff-v1` only after authorization and committed/readback-gated validation. Its top-level runtime DTO preserves the exact accepted S6 source binding, S7 artifact identity/hash/size, durable manifest identity/hash, durable readback receipt identity/hash, both readback/version contracts, `s7-dxf-r2000-ascii-v1`, `s7-world-to-plan-v1`, the locked coordinate convention, stable correspondence, and intended semantic layer. It has no external-CAD evidence ID or status.
 
 ~~~text
-threeDGeometryAuthority = s6-to-s7-handoff-v1
-planEvidence = s7-dxf-r2000-ascii-v1
+schemaVersion = s7-to-s8-handoff-v1
+sourceRevisionId
+sourceRevisionHash
+sourceS5Fingerprint
+s7ArtifactId
+s7ArtifactHash
+s7ArtifactByteSize
+manifestId
+manifestHash
+readbackReceiptId
+readbackHash
+dxfVersion = s7-dxf-r2000-ascii-v1
 worldToPlanVersion = s7-world-to-plan-v1
 coordinateConvention = booth-local-right-handed-v1
+stableCorrespondence
 readbackParserVersion = s7-cad-readback-v1
 readbackReceiptVersion = s7-cad-validation-receipt-v1
 dxfIsNot3DAuthority = true
-s8UsesSameAcceptedS6Model = true
+s8MustReadAcceptedS6Model = true
 ~~~
 
 No external-CAD evidence ID or status is required in this runtime handoff. S8 must continue to consume the same accepted S6 model for 3D authority. The S7 DXF is plan/correspondence evidence only; it is not a replacement spatial model and must not become the 3D source by reverse parsing.

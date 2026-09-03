@@ -97,27 +97,18 @@ Do not add src/lib/s7-publication.ts. Publication is a bounded phase in S7CadSer
 
 | Path | Required coverage |
 |---|---|
-| tests/s7-fixture.ts | Fresh ready S6 handoffs, deterministic UUID/clock/worker state, private repository/object roots, and synthetic fixtures without private asset bytes |
 | tests/s7-geometry.test.ts | Transform parity, rect/profile/round exact projections, rank cases, quantization, open sides, unknowns, and out-of-envelope preservation |
-| tests/s7-dxf-writer.test.ts | Byte determinism, exact sections/tables/blocks/entities, handles, HANDSEED, layers, XDATA, and golden hashes |
-| tests/s7-dxf-readback.test.ts | Positive hand-authored profiles, strict grammar, missing/wrong metadata, malformed numbers, bounds, and manifest mismatch |
+| tests/s7-dxf.test.ts | Byte determinism, exact sections/tables/blocks/entities, handles, HANDSEED, layers, XDATA, independent raw readback, hand-authored profile, and golden fixture |
 | tests/s7-persistence.test.ts | Legacy defaults, exact keys/literals, cross-record lineage, no overwrite, no evidence collection, malformed-state rejection |
-| tests/s7-cad-lifecycle.test.ts | Admission, idempotency, concurrency, every source fence, staging/promotion/commit, retry/recovery, stale exports, and private download |
 | tests/s7-api.test.ts | Auth-first construction, exact routes/DTOs, statuses, safe errors, headers, metadata, download, telemetry, and handoff |
 | tests/s7-security.test.ts | Cross-project isolation, path traversal, XDATA/text injection, resource bounds, no secrets, and no external-CAD runtime coupling |
-| tests/s7-telemetry.test.ts | Exact zero/unavailable semantics and no evidence coupling |
+| tests/s7-handoff.test.ts | Source/artifact/manifest/readback identity, flat S7-to-S8 DTO, currentness, correspondence, and authority booleans |
 
-Recommended later fixture paths:
+The only later implementation fixtures are:
 
 ~~~text
-tests/fixtures/s7/golden-minimal-booth.dxf
-tests/fixtures/s7/golden-rect-parent-rotation.dxf
-tests/fixtures/s7/golden-profile-union.dxf
-tests/fixtures/s7/golden-round-plan-normal.dxf
-tests/fixtures/s7/golden-round-tilted-ellipse.dxf
-tests/fixtures/s7/golden-round-rank-one.dxf
-tests/fixtures/s7/hand-authored-ac1015-minimal.dxf
-tests/fixtures/s7/hand-authored-ac1015-entity-metadata.dxf
+tests/fixtures/s7/golden-plan-minimal.dxf
+tests/fixtures/s7/hand-authored-valid-ac1015.dxf
 ~~~
 
 These are later implementation fixtures, not generated artifacts in this G2 branch.
@@ -138,8 +129,6 @@ export const S7_DXF_PROFILE_VERSION = "s7-dxf-r2000-ascii-v1" as const;
 export const S7_WORLD_TO_PLAN_VERSION = "s7-world-to-plan-v1" as const;
 export const S7_TO_S8_HANDOFF_SCHEMA_VERSION = "s7-to-s8-handoff-v1" as const;
 export const S7_TELEMETRY_SCHEMA_VERSION = "s7-telemetry-v1" as const;
-// Release/G3/G4 evidence only; never a product StoreState or runtime export contract.
-export const S7_CAD_EVIDENCE_SCHEMA_VERSION = "s7-cad-evidence-v1" as const;
 export const S7_XDATA_APPID = "SWOOSHZ_S7" as const;
 
 export const S7_QUANTIZATION_MM = 0.01;
@@ -152,6 +141,7 @@ export const S7_MAX_VERTICES = 16_384;
 export const S7_MAX_LAYERS = 32;
 export const S7_MAX_TABLE_RECORDS = 64;
 export const S7_MAX_XDATA_BYTES_PER_ENTITY = 2_048;
+export const S7_MAX_XDATA_STRINGS_PER_ENTITY = 16;
 export const S7_MAX_LABEL_CODE_POINTS = 120;
 export const S7_MAX_MANIFEST_BYTES = 4_000_000;
 export const S7_MAX_READBACK_RECEIPT_BYTES = 256_000;
@@ -173,11 +163,11 @@ The limits bound writer and parser work. The 1_000_000_000 mm plan-coordinate ce
 StoreState gains exactly:
 
 ~~~ts
-s7CadManifests: S7CadManifestRecord[];
 s7CadExports: S7CadExport[];
+s7CadJobs: S7CadJob[];
+s7CadIdempotency: S7CadIdempotency[];
+s7CadManifests: S7CadManifestRecord[];
 s7CadReadbackReceipts: S7CadReadbackReceipt[];
-s7CadJobs: S7CadJobState[];
-s7CadIdempotency: S7CadIdempotencyState[];
 ~~~
 
 `s7CadManifests` stores durable private manifest identity/linkage metadata, not manifest bytes. The complete manifest bytes are immutable private objects. There is deliberately no product s7CadEvidence collection. A release evidence receipt, if retained, belongs outside product StoreState and is never loaded into a customer project. Old snapshots missing S7 fields load all five S7 arrays empty without rewrite; malformed present fields fail as S7_PERSISTENCE_FAILED. No migration fabricates records.
@@ -205,13 +195,13 @@ export const S7_LAYER_NAMES = [
 
 export type S7Layer = typeof S7_LAYER_NAMES[number];
 
-export type S7SourceBinding = {
+export type S7SourceStamp = {
   schemaVersion: "s7-source-fence-v1";
   projectId: UUID;
   handoffSchemaVersion: "s6-to-s7-handoff-v1";
   handoffDigest: Sha256;
-  acceptedRevisionId: UUID;
-  acceptedRevisionHash: Sha256;
+  sourceRevisionId: UUID;
+  sourceRevisionHash: Sha256;
   sourceS5Fingerprint: Sha256;
   validationReceiptId: UUID;
   validationHash: Sha256;
@@ -219,7 +209,7 @@ export type S7SourceBinding = {
 };
 ~~~
 
-The binding is built only from one fresh S6ToS7Handoff. Its accepted revision ID/hash, S5 fingerprint, validation receipt ID/hash, validation outcome, handoff digest, and handoff version are persisted exactly. Eligibility booleans are snapshot evidence only.
+The source stamp is built only from one fresh S6ToS7Handoff. Its source revision ID/hash, S5 fingerprint, validation receipt ID/hash, validation outcome, handoff digest, and handoff version are persisted exactly. Eligibility booleans are snapshot evidence only.
 
 ### Private manifest
 
@@ -279,8 +269,8 @@ export type S7CadManifest = {
   schemaVersion: "s7-cad-manifest-v1";
   manifestId: UUID;
   projectId: UUID;
-  exportId: UUID;
-  source: S7SourceBinding;
+  artifactId: UUID;
+  source: S7SourceStamp;
   worldToPlanVersion: "s7-world-to-plan-v1";
   dxfProfileVersion: "s7-dxf-r2000-ascii-v1";
   units: "millimetres";
@@ -304,8 +294,8 @@ export type S7CadManifestRecord = {
   schemaVersion: "s7-cad-manifest-v1";
   manifestId: UUID;
   projectId: UUID;
-  exportId: UUID;
-  source: S7SourceBinding;
+  artifactId: UUID;
+  source: S7SourceStamp;
   worldToPlanVersion: "s7-world-to-plan-v1";
   dxfProfileVersion: "s7-dxf-r2000-ascii-v1";
   manifestHash: Sha256;
@@ -315,7 +305,7 @@ export type S7CadManifestRecord = {
 };
 ~~~
 
-One manifest record links exactly one export to exactly one immutable private manifest object by `manifestId`, `manifestHash`, byte size, project, export, source binding, and world-to-plan version. The record and private bytes are created once and never overwritten; no manifest bytes or private key are returned by public DTOs.
+One manifest record links exactly one artifact to exactly one immutable private manifest object by `manifestId`, `manifestHash`, byte size, project, artifactId, source stamp, and world-to-plan version. The record and private bytes are created once and never overwritten; no manifest bytes or private key are returned by public DTOs.
 
 ### Export, readback, job, and idempotency records
 
@@ -341,15 +331,17 @@ export type S7PublicationPhase =
 
 export type S7CadExport = {
   schemaVersion: "s7-cad-export-v1";
-  exportId: UUID;
+  artifactId: UUID;
   projectId: UUID;
-  source: S7SourceBinding;
+  jobId: UUID;
+  source: S7SourceStamp;
+  inputHash: Sha256;
   format: "dxf";
   worldToPlanVersion: "s7-world-to-plan-v1";
   dxfProfileVersion: "s7-dxf-r2000-ascii-v1";
   mimeType: "application/dxf";
   fileExtension: ".dxf";
-  fileName: string;
+  fileName: "swooshz-s7-plan.dxf";
   artifactKey: string;
   stagingKey: string;
   manifestKey: string;
@@ -364,9 +356,7 @@ export type S7CadExport = {
   status: S7CadExportStatus;
   publicationPhase: S7PublicationPhase;
   attempt: 1 | 2;
-  retryOfExportId: UUID | null;
-  workerId: string | null;
-  processId: number | null;
+  retryOfArtifactId: UUID | null;
   claimToken: UUID | null;
   claimedAt: Timestamp | null;
   startedAt: Timestamp | null;
@@ -377,7 +367,7 @@ export type S7CadExport = {
   staleAt: Timestamp | null;
   supersededAt: Timestamp | null;
   failureCode: string | null;
-  idempotencyKey: UUID;
+  idempotencyKey: string;
   requestReferenceId: UUID;
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -392,6 +382,7 @@ export type S7CadIssue = {
 
 export type S7CadRawReadbackResult = {
   schemaVersion: "s7-cad-readback-v1";
+  artifactId: UUID;
   dxfProfileVersion: "s7-dxf-r2000-ascii-v1";
   writerVersion: "s7-dxf-r2000-ascii-v1";
   parserVersion: "s7-cad-readback-v1";
@@ -412,8 +403,8 @@ export type S7CadReadbackReceipt = {
   readbackVersion: "s7-cad-readback-v1";
   receiptId: UUID;
   projectId: UUID;
-  exportId: UUID;
-  source: S7SourceBinding;
+  artifactId: UUID;
+  source: S7SourceStamp;
   manifestId: UUID;
   manifestHash: Sha256;
   worldToPlanVersion: "s7-world-to-plan-v1";
@@ -431,19 +422,19 @@ export type S7CadReadbackReceipt = {
   receiptHash: Sha256;
 };
 
-export type S7CadJobState = {
+export type S7CadJob = {
   schemaVersion: "s7-cad-job-v1";
   jobId: UUID;
-  exportId: UUID;
+  artifactId: UUID;
   projectId: UUID;
-  source: S7SourceBinding;
+  source: S7SourceStamp;
   inputHash: Sha256;
   attempt: 1 | 2;
   retryOfJobId: UUID | null;
   status: S7CadExportStatus;
   publicationPhase: S7PublicationPhase;
-  workerId: string | null;
-  processId: number | null;
+  ownerProcessId: number | null;
+  heartbeatAt: Timestamp | null;
   claimToken: UUID | null;
   claimedAt: Timestamp | null;
   startedAt: Timestamp | null;
@@ -453,20 +444,22 @@ export type S7CadJobState = {
   terminalAt: Timestamp | null;
   failureCode: string | null;
   supersededAt: Timestamp | null;
-  idempotencyKey: UUID;
+  idempotencyKey: string;
   requestReferenceId: UUID;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 };
 
-export type S7CadIdempotencyState = {
+export type S7CadIdempotency = {
   schemaVersion: "s7-cad-idempotency-v1";
-  key: UUID;
+  key: string;
   operation: "export";
   projectId: UUID;
+  requestHash: Sha256;
   inputHash: Sha256;
-  source: S7SourceBinding;
-  result: S7CadExportResult;
+  source: S7SourceStamp;
+  artifactId: UUID;
+  jobId: UUID;
   createdAt: Timestamp;
 };
 ~~~
@@ -477,9 +470,10 @@ S7CadExport intentionally contains no external-CAD evidence ID/status. The inter
 
 ~~~ts
 export type S7CadExportSummary = {
-  exportId: UUID;
+  artifactId: UUID;
   projectId: UUID;
-  source: S7SourceBinding;
+  jobId: UUID;
+  source: S7SourceStamp;
   worldToPlanVersion: "s7-world-to-plan-v1";
   dxfProfileVersion: "s7-dxf-r2000-ascii-v1";
   status: S7CadExportStatus;
@@ -499,8 +493,8 @@ export type S7PublicState = {
   source: {
     readiness: "ready" | "not_ready";
     sourceS5Fingerprint: Sha256 | null;
-    acceptedRevisionId: UUID | null;
-    acceptedRevisionHash: Sha256 | null;
+    sourceRevisionId: UUID | null;
+    sourceRevisionHash: Sha256 | null;
     handoffDigest: Sha256 | null;
     validationReceiptId: UUID | null;
     validationHash: Sha256 | null;
@@ -511,9 +505,10 @@ export type S7PublicState = {
 
 export type S7CadExportResult = {
   replayed: boolean;
-  exportId: UUID;
+  artifactId: UUID;
   projectId: UUID;
-  source: S7SourceBinding;
+  jobId: UUID;
+  source: S7SourceStamp;
   status: S7CadExportStatus;
   worldToPlanVersion: "s7-world-to-plan-v1";
   dxfProfileVersion: "s7-dxf-r2000-ascii-v1";
@@ -528,45 +523,31 @@ export type S7CadExportResult = {
 export type S7ToS8Handoff = {
   schemaVersion: "s7-to-s8-handoff-v1";
   projectId: UUID;
+  sourceRevisionId: UUID;
+  sourceRevisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  s7ArtifactId: UUID;
+  s7ArtifactHash: Sha256;
+  s7ArtifactByteSize: number;
+  manifestId: UUID;
+  manifestHash: Sha256;
+  readbackReceiptId: UUID;
+  readbackHash: Sha256;
+  dxfVersion: "s7-dxf-r2000-ascii-v1";
   worldToPlanVersion: "s7-world-to-plan-v1";
-  coordinateConvention: {
-    version: "booth-local-right-handed-v1";
-    units: "millimetres";
-    handedness: "right-handed";
-    origin: "north-west-floor-corner";
-    xAxis: "east";
-    yAxis: "up";
-    zAxis: "south";
-    planMapping: "DXF X = S6 world X; DXF Y = S6 world Z; DXF Z = 0";
-  };
-  threeDGeometryAuthority: "s6-to-s7-handoff-v1";
-  planEvidence: "s7-dxf-r2000-ascii-v1";
+  coordinateConvention: "booth-local-right-handed-v1";
+  readbackParserVersion: "s7-cad-readback-v1";
+  readbackReceiptVersion: "s7-cad-validation-receipt-v1";
   dxfIsNot3DAuthority: true;
-  s8UsesSameAcceptedS6Model: true;
-  source: S7SourceBinding;
-  export: {
-    exportId: UUID;
-    worldToPlanVersion: "s7-world-to-plan-v1";
-    dxfProfileVersion: "s7-dxf-r2000-ascii-v1";
-    dxfSha256: Sha256;
-    dxfByteSize: number;
-    manifestId: UUID;
-    manifestHash: Sha256;
-    readbackReceiptId: UUID;
-    readbackReceiptHash: Sha256;
-    readbackReceiptVersion: "s7-cad-validation-receipt-v1";
-    readbackParserVersion: "s7-cad-readback-v1";
-    status: "committed";
-  };
-  units: "millimetres";
+  s8MustReadAcceptedS6Model: true;
   openSides: OpenSide[];
   correspondence: Array<{
-    sourceObjectId: string;
+    sourceObjectId: string | null;
     identityKey: string;
     parentObjectId: string | null;
     role: S7ManifestRole;
     partIndex: number;
-    geometryState: "exact" | "bounded_inference";
+    geometryState: "exact" | "bounded_inference" | "derived";
     sourceRevisionId: UUID;
     sourceRevisionHash: Sha256;
     entityType: S7EntityType;
@@ -586,31 +567,31 @@ Implement the source reader in src/lib/s7-cad.ts or a private section of src/lib
 ~~~ts
 export type S7CurrentSource = {
   handoff: S6ToS7Handoff;
-  binding: S7SourceBinding;
+  binding: S7SourceStamp;
   canonicalHandoffBytes: Uint8Array;
 };
 
 export type S7SourceReader = {
   readCurrent(projectId: UUID): S7CurrentSource;
-  assertCurrent(projectId: UUID, expected: S7SourceBinding): S7CurrentSource;
+  assertCurrent(projectId: UUID, expected: S7SourceStamp): S7CurrentSource;
 };
 
 function readCurrentS7Source(projectId: UUID): S7CurrentSource;
-function assertCurrentS7Source(projectId: UUID, expected: S7SourceBinding): S7CurrentSource;
+function assertCurrentS7Source(projectId: UUID, expected: S7SourceStamp): S7CurrentSource;
 ~~~
 
 readCurrentS7Source:
 
 1. Read one fresh S6ToS7Handoff.
 2. Require exact handoff schema s6-to-s7-handoff-v1, project ID, spatial schema s6-spatial-model-v1, millimetre units, and the exact S6 coordinate convention.
-3. Validate accepted revision ID/hash, S5 fingerprint, validation receipt ID/hash/outcome, and all required handoff fields.
+3. Validate source revision ID/hash, S5 fingerprint, validation receipt ID/hash/outcome, and all required handoff fields.
 4. Require validation outcome pass or pass_with_warnings and a structurally valid handoff.
 5. Canonicalize a clone with deterministic object key order and set-like arrays ordered by open side north/east/south/west, objectId, hierarchy objectId, zoneId, requirementId, materialId, assumptionId, and unknownId. Preserve profile vertex order and source geometry values. Exclude eligibility, timestamps, private paths, and S7 artifact data.
 6. UTF-8 encode the canonical handoff and compute handoffDigest = SHA-256(bytes).
-7. Build S7SourceBinding from the exact fields. Eligibility.currentAccepted/sourceCurrent/stale are snapshot evidence only.
-8. Return cloned handoff, binding, and canonical bytes.
+7. Build S7SourceStamp from the exact fields. Eligibility.currentAccepted/sourceCurrent/stale are snapshot evidence only.
+8. Return cloned handoff, source stamp, and canonical bytes.
 
-assertCurrentS7Source reads a fresh source and compares every binding field and the canonical handoff shape. Any mismatch is S7_SOURCE_STALE; it never chooses the newer source or rebases an export.
+assertCurrentS7Source reads a fresh source and compares every source-stamp field and the canonical handoff shape. Any mismatch is S7_SOURCE_STALE; it never chooses the newer source or rebases an artifact.
 
 Required fence points:
 
@@ -632,6 +613,8 @@ If a fence changes after writing, objects remain private immutable history but c
 ## Independent S6 transform parity
 
 The S7 transform oracle may import S6 types but must not call deriveS6WorldGeometry or compare a function to itself.
+
+The proof/test oracle multiplies explicit homogeneous matrices for the X -> Y -> Z rotation order and full parent hierarchy, then compares independently hand-calculated world points and projected boundaries. It covers root and nested transforms, every rotation axis, mixed Euler rotations, both anchors, all eight rect-prism corners, cycle rejection, and dangling-parent rejection; it never validates the same implementation against itself.
 
 Exact full-Euler formula:
 
@@ -697,7 +680,7 @@ planPoints = (world.xMm, world.zMm)
 boundary = exact convex hull(planPoints)
 ~~~
 
-Use lexicographic X/Z monotonic-chain hull, duplicate removal, and collinear interior-point removal. Emit one closed LWPOLYLINE. Never project only a local footprint or use a world axis-aligned bounding box.
+Use lexicographic X/Z monotonic-chain hull, duplicate removal, and collinear interior-point removal. Emit a closed LWPOLYLINE for an area hull, a LINE for an exact two-point degeneracy, or a POINT for an exact one-point degeneracy. Never project only a local footprint or use a world axis-aligned bounding box.
 
 ### Profile extrusion
 
@@ -709,8 +692,8 @@ For each validated profile_extrusion:
 4. Build a planar arrangement from every convex-piece boundary segment, splitting at every proper and endpoint intersection.
 5. For each split segment, test a midpoint on both sides against the union; keep only a segment with union on exactly one side. Coincident internal seams cancel.
 6. Stitch retained segments into closed cycles using canonical turn/order and minimum vertex.
-7. Remove duplicates and collinear points after union. Reject non-closed cycles, holes, self-intersections, or ambiguous ownership.
-8. Emit one closed LWPOLYLINE per exterior cycle, sorted by minimum vertex and canonical vertex sequence.
+7. Remove duplicates and collinear points after union. Reject non-closed cycles, self-intersections, ambiguous ownership, or invalid arrangements; do not apply a blanket single-loop or hole rejection.
+8. Emit each exact exterior cycle as a closed LWPOLYLINE, sorted by minimum vertex and canonical vertex sequence; multiple exact exterior loops are allowed where required by the solid.
 
 The result is the exact deterministic projected-solid union, not triangulation boundaries. No coarse polygon, bounding box, renderer facet, or silent booth clipping.
 
@@ -758,15 +741,17 @@ q(v) = floor(v*100 + 0.5) for v >= 0
 q(v) = ceil(v*100 - 0.5) for v < 0
 ~~~
 
-This is half-away-from-zero. Normalize q = 0 before formatting. Every length uses exactly two decimal places, period separator, no grouping, no exponent, and no negative zero:
+This is half-away-from-zero. Normalize q = 0 before formatting. Whole-centimetre values may serialize as integers; every other fractional-millimetre value uses exactly two fractional digits, with a period separator, no grouping, no exponent, and no negative zero:
 
 ~~~text
 formatLength(q) =
-  sign + decimal(abs(q) div 100) + "." + two digits(abs(q) mod 100)
-zero = 0.00
+  sign + canonical integer/fractional representation of abs(q / 100)
+whole centimetre = integer millimetres with no decimal point
+fractional millimetre = exactly two fractional digits
+zero = 0
 ~~~
 
-Angles/radians and unitless ellipse ratios use writer-version fixed decimal formatting with no exponent, fixed locale-independent precision, and normalized zero. They are not millimetre precision. Quantize after analytic/union construction; shared endpoints come from one pre-quantization point.
+Angles/radians use writer-version fixed decimal formatting with no exponent and normalized zero. Unitless ellipse ratio, start parameter, and end parameter values use exactly twelve fractional places. They are not millimetre precision. Quantize after analytic/union construction; shared endpoints come from one pre-quantization point.
 
 Transport precision is not fabrication accuracy. UI/API/metadata must say so, and no engineering/fabrication tolerance claim is inferred.
 
@@ -943,7 +928,7 @@ TEXT:
 20 insertion Y
 30 0
 40 bounded height
-1 safe ASCII text
+1 bounded printable ASCII text
 7 Standard
 50 deterministic rotation
 ~~~
@@ -957,27 +942,24 @@ POINT:
 30 0
 ~~~
 
-All planar coordinates use DXF X = S6 world X, DXF Y = S6 world Z, DXF Z = 0. TEXT is sanitized bounded ASCII and never copies unsanitized raw user text. Every emitted entity uses the s7-world-to-plan-v1 mapping.
+All planar coordinates use DXF X = S6 world X, DXF Y = S6 world Z, DXF Z = 0. TEXT accepts only printable ASCII; reject C0/C1 controls, CR, LF, NUL, Unicode DXF escapes, backslash injection, and unsanitized user/customer text. Derived labels use deterministic `_uXXXX_` ASCII conversion or a stable identity hash. Every emitted entity uses the s7-world-to-plan-v1 mapping.
 
-Every entity appends:
+Every entity appends this exact bounded identity grammar:
 
 ~~~text
 1001 SWOOSHZ_S7
-1000 s7-identity-v1
-1000 sourceObjectId=<UUID-or-null>
-1000 identityKey=<stable-identity-token-or-hash>
-1000 parentObjectId=<UUID-or-null>
-1000 role=<allowlisted-role>
-1070 partIndex=<nonnegative-integer>
-1000 geometryState=<exact|bounded_inference|derived>
-1000 sourceRevisionId=<UUID>
-1000 sourceRevisionHash=<SHA-256>
-1000 manifestId=<UUID>
-1000 manifestHash=<SHA-256>
-1000 entityKey=<stable-entity-key>
+1000 S7V1
+1000 O=<sourceObjectId>
+1000 K=<identityKeyToken-or-hash>
+1000 P=<parentObjectId-or->
+1000 R=<role>
+1000 I=<partIndex>
+1000 G=<geometryState>
+1000 V=<sourceRevisionId>
+1000 H=<sourceRevisionHash>
 ~~~
 
-These bounded safe-ASCII fields preserve source object, stable identity token/hash, parent, role, part index, geometry state, and source revision ID/hash in-file. manifestId, manifestHash, and entityKey provide the compact private-manifest linkage. For derived records, sourceObjectId and parentObjectId are null while the deterministic identityKey and role remain present. The total XDATA for one entity is at most 2,048 bytes; it is never arbitrary user text and never replaces the complete private manifest.
+These bounded printable-ASCII fields preserve sourceObjectId, identityKey token/hash, parentObjectId, role, partIndex, geometryState, sourceRevisionId, and sourceRevisionHash in-file. Source and parent IDs are stable opaque S6 IDs, not UUID-only values. For derived records, the accepted `-` representation is used where no source/parent exists. At most 16 XDATA strings and 2,048 XDATA bytes are permitted per entity. A compact manifest locator may coexist within those bounds but may not replace this block; the private manifest remains complete authority.
 
 ### Canonical entity order
 
@@ -985,14 +967,25 @@ Plan every entity before assigning handles:
 
 1. closed booth boundary;
 2. open-side marker entities in north, east, south, west order;
-3. source walls and partitions by source objectId then partIndex;
-4. source geometry objects by objectId then partIndex;
-5. zones by zoneId;
-6. dimensions;
-7. labels by stable identityKey/label token;
-8. unknown markers by unknownId.
+3. source geometry by locked layer order, identityKey UTF-8 byte order, partIndex, and entity type rank;
+4. dimensions;
+5. source labels;
+6. unknown diagnostics.
 
 Within each group use canonical string comparison and entity type as final tie-break. Source array order never determines identity or handle.
+
+The locked role-to-layer mapping is:
+
+~~~text
+booth_floor -> S7-BOOTH-BOUNDARY
+booth_wall -> S7-WALLS-PARTITIONS
+booth_partition -> S7-WALLS-PARTITIONS
+zone -> S7-ZONES
+furniture | storage | seating -> S7-FURNITURE
+equipment -> S7-EQUIPMENT
+display | screen -> S7-DISPLAYS
+overhead -> S7-OVERHEAD
+~~~
 
 ## Layers and plan semantics
 
@@ -1006,6 +999,12 @@ Open-side rules:
 - No wall is synthesized on an open side; absence of a wall is meaningful.
 
 Zones use deterministic boundary/marker geometry and labels. Furniture, equipment, displays, overhead, dimensions, and labels use the locked layers above. Source geometry with geometryState = bounded_inference, or any source object with relevant unknownIds, is emitted on S7-UNKNOWN as its primary exported geometry layer. The private manifest preserves its intended semantic layer in intendedSemanticLayer. S7-UNKNOWN is therefore not a POINT/TEXT diagnostics-only layer: it may contain the bounded source geometry that is actually available, plus POINT/TEXT markers when no geometry can be emitted. S7 never invents geometry.
+
+### Dimensions and labels
+
+Width/depth dimensions are exploded editable LINE/TEXT groups on `S7-DIMENSIONS`; the writer does not emit native DIMENSION entities. Maximum height is an informational TEXT value, not plan geometry. Every dimension, label, and other derived value is explicitly marked `derived` in the private manifest and is placed by a fixed deterministic rule from the entity key, quantized bounds, and locked offsets.
+
+There is no collision solver, reflow, or layout-dependent repositioning. Overlap is retained and reported as an informational diagnostic. Text is limited to 120 code points, printable deterministic ASCII, and allowlisted derived/source labels; C0/C1 controls, CR, LF, NUL, Unicode DXF escapes, unsanitized user/customer text, and fabrication, engineering, venue-certification, or approval wording are rejected.
 
 Valid source geometry outside the booth envelope is emitted unchanged, with outOfEnvelope warning/diagnostic in the private manifest and telemetry. S7 never clips, moves, shrinks, or hides it.
 
@@ -1026,19 +1025,7 @@ sourceRevisionHash
 
 It also includes entity handle/type/layer, XDATA entity key, quantized bounds, derived marker, and out-of-envelope marker. Source fields are copied from S6. Derived booth/opening/dimension/label/unknown records use sourceObjectId = null and a fixed identityKey such as booth-envelope or opening-north, while retaining the accepted source revision fields.
 
-XDATA is a bounded in-file source/part/revision identity block with a compact manifest locator. entityKey is:
-
-~~~text
-SHA-256(canonical {
-  sourceObjectId,
-  partIndex,
-  role,
-  sourceRevisionId,
-  sourceRevisionHash
-}).slice(0, 16)
-~~~
-
-XDATA is an in-file bounded identity block, not only a manifest pointer. It carries the stable source/part/revision fields above and the manifest locator while remaining within 2,048 bytes per entity. The manifest excludes XDATA bytes so manifest hash and locator do not form a cycle. XDATA contains no full geometry, labels, prompts, image values, storage paths, secrets, or customer payload.
+The XDATA grammar above is the required in-file source/part/revision identity, not a reduction to `manifestHash` plus `entityKey`. A compact manifest locator may coexist only within the 16-string and 2,048-byte per-entity bounds. The manifest excludes XDATA bytes so manifest hash and any locator do not form a cycle. XDATA contains no full geometry, labels, prompts, image values, storage paths, secrets, or customer payload.
 
 ## Strict independent raw-DXF readback
 
@@ -1063,6 +1050,7 @@ During parsing:
 - exactly two block records and two block definitions;
 - at most 4,096 entities and 16,384 total polyline vertices;
 - at most 2,048 XDATA bytes per entity;
+- at most 16 XDATA strings per entity;
 - at most S7_MAX_DIAGNOSTICS issues;
 - all lengths finite and within S7_PLAN_COORDINATE_CEILING_MM;
 - fixed decimal numeric strings only, no exponent or negative zero;
@@ -1093,17 +1081,17 @@ The raw parser result uses s7-cad-readback-v1 and is not a StoreState record. Pe
 validateS7Collections and validateS7Graph enforce:
 
 - exact keys, schema literals, UUID/SHA/timestamp rules, attempts 1/2, status/phase combinations, bounded sizes, and allowlisted names/layers/types;
-- source binding equality across export/job/readback;
-- export/job/readback project and ID relationships;
-- one s7CadManifests record per export with exact manifestId/manifestHash/private-byte-size/worldToPlanVersion linkage;
+- source stamp equality across artifact/job/readback;
+- artifact/job/readback project and ID relationships;
+- one s7CadManifests record per artifact with exact manifestId/manifestHash/private-byte-size/worldToPlanVersion linkage;
 - committed/promoted objects have exact final metadata;
 - staged objects have exact staging metadata and no disclosure path;
-- readbackReceiptId/readbackReceiptHash point to a passing durable validation receipt for the exact export/source/manifest/hash/size;
+- readbackReceiptId/readbackReceiptHash point to a passing durable validation receipt for the exact artifact/source/manifest/hash/size;
 - stale and superseded exports cannot be current/downloadable; only a committed export whose source still matches may be current/downloadable;
 - retryOf chains have maximum length one and no attempt three;
 - idempotency keys are unique by project/operation and replay only for the same input hash;
 - final artifact keys are not shared by different exports;
-- private manifest/DXF are paired by export ID, manifestId, manifestHash, and hashes;
+- private manifest/DXF are paired by artifactId, manifestId, manifestHash, and hashes;
 - no record contains cadEvidenceId, cadEvidenceStatus, or another external-CAD runtime field;
 - no StoreState.s7CadEvidence exists.
 
@@ -1124,9 +1112,9 @@ attempt 2 failure -> failed_terminal
 
 stale, superseded, failed, and aborted are terminal statuses. No staged/promoted artifact is returned as committed. A committed export remains immutable history; when a newer accepted S6 revision becomes current, the old export is marked superseded, not stale, and is not current/downloadable.
 
-Claims are under the repository lock with workerId, processId, claimToken, and claimedAt. Live/unknown owners are never stolen. A dead owner receives one attempt-2 job/export with a new identity and retryOf reference. A stale claim token cannot mutate state.
+Claims are under the repository lock with ownerProcessId, heartbeatAt, claimToken, and claimedAt. Live/unknown owners are never stolen. A dead owner receives one attempt-2 job and artifact with a new identity and retryOfJobId/retryOfArtifactId references. A stale claim token cannot mutate state.
 
-POST /projects/:projectId/s7/exports requires a UUID Idempotency-Key. inputHash is SHA-256 over:
+POST /projects/{projectId}/s7/exports accepts a bounded opaque Idempotency-Key string; UUID-only keys are not required. requestHash/inputHash are SHA-256 values over the exact request and captured source/input.
 
 ~~~text
 {
@@ -1138,29 +1126,28 @@ POST /projects/:projectId/s7/exports requires a UUID Idempotency-Key. inputHash 
 }
 ~~~
 
-Same key/inputHash replays the stored result without another job/export. Same key/different hash returns S7_IDEMPOTENCY_KEY_REUSE. The client retains the key through UnknownNetworkOutcome. At most one nonterminal job per project/source binding is active; a different key receives S7_PUBLICATION_BUSY.
+The same idempotency key with the exact same request hash, source stamp, and input hash replays the stored artifact/job result without another job or artifact. Reusing the same key with any different request, source, or input returns S7_IDEMPOTENCY_CONFLICT. The key is an opaque bounded string, not UUID-only, and the client retains it through UnknownNetworkOutcome. At most one nonterminal job per project/source stamp is active; a different key receives S7_PUBLICATION_BUSY.
 
 ## Exact private staging/final key formulas
 
 Use existing privateStorageKey after validating UUIDs and fixed literals. No label, filename, material, URL, customer name, or raw user string enters a key.
 
 ~~~text
-finalDxfKey(projectId, exportId) =
+finalDxfKey(projectId, artifactId) =
   privateStorageKey(
-    "projects", projectId, "s7", "exports", exportId,
-    "s7-dxf-r2000-ascii-v1.dxf"
+    "projects", projectId, "s7", "exports", artifactId,
+    "swooshz-s7-plan.dxf"
   )
 
-finalManifestKey(projectId, exportId) =
+finalManifestKey(projectId, manifestId) =
   privateStorageKey(
-    "projects", projectId, "s7", "exports", exportId,
-    "manifest.json"
+    "projects", projectId, "s7", "manifests", manifestId + ".json"
   )
 
 stagingDxfKey(projectId, jobId, claimToken) =
   privateStorageKey(
     "projects", projectId, "s7", "staging", jobId, claimToken,
-    "export.dxf"
+    "swooshz-s7-plan.dxf"
   )
 
 stagingManifestKey(projectId, jobId, claimToken) =
@@ -1170,10 +1157,10 @@ stagingManifestKey(projectId, jobId, claimToken) =
   )
 ~~~
 
-Fixed safe ASCII filename:
+Fixed public and stored DXF filename:
 
 ~~~text
-swooshz-s7-plan-<projectId>.dxf
+swooshz-s7-plan.dxf
 ~~~
 
 projectId is validated canonical UUID and is never replaced by a project name.
@@ -1213,11 +1200,11 @@ Recovery leaves queued work queued, keeps live/unknown running owners busy, retr
 ~~~ts
 export type S7CadService = {
   getState(projectId: UUID): S7PublicState;
-  getExport(projectId: UUID, exportId: UUID): S7CadExportSummary;
-  createExport(projectId: UUID, key: UUID, referenceId: UUID, actorSubjectId: string): Promise<S7CadExportResult>;
-  getDownload(projectId: UUID, exportId: UUID): { bytes: Buffer; contentType: "application/dxf"; fileName: string };
+  getExport(projectId: UUID, artifactId: UUID): S7CadExportSummary;
+  createExport(projectId: UUID, key: string, referenceId: UUID, actorSubjectId: string): Promise<S7CadExportResult>;
+  getDownload(projectId: UUID, artifactId: UUID): { bytes: Buffer; contentType: "application/dxf"; fileName: "swooshz-s7-plan.dxf" };
   getTelemetry(projectId: UUID): S7Telemetry;
-  getS8Handoff(projectId: UUID, exportId: UUID): S7ToS8Handoff;
+  getS8Handoff(projectId: UUID): S7ToS8Handoff;
   recover(): void;
 };
 ~~~
@@ -1228,12 +1215,12 @@ This is the accepted G2 API surface. This repair restores DTO and persistence fi
 
 | Method/path | Exact behavior |
 |---|---|
-| GET /projects/:projectId/s7 | Authorized S7PublicState |
-| POST /projects/:projectId/s7/exports | Empty JSON object; UUID Idempotency-Key; 202 new/200 replay |
-| GET /projects/:projectId/s7/exports/:exportId | Authorized summary |
-| GET /projects/:projectId/s7/exports/:exportId/download | Current committed DXF only |
-| GET /projects/:projectId/s7/telemetry | S7Telemetry |
-| GET /projects/:projectId/s7/handoff/:exportId | Current-source, committed/readback-gated S7ToS8Handoff |
+| GET /projects/{projectId}/s7 | Authorized S7PublicState |
+| POST /projects/{projectId}/s7/exports | Empty JSON object; opaque Idempotency-Key; 202 new/200 replay |
+| GET /projects/{projectId}/s7/exports/{artifactId} | Authorized summary |
+| GET /projects/{projectId}/s7/exports/{artifactId}/download | Current eligible committed DXF only |
+| GET /projects/{projectId}/s7/telemetry | S7Telemetry |
+| GET /projects/{projectId}/s7/handoff | Current eligible committed/readback-gated S7ToS8Handoff |
 
 Only these paths are recognized. Auth and project authorization run before service construction or disclosure. Wrong methods, unknown fields, nonempty export body, malformed UUID, missing key, and oversized body fail closed.
 
@@ -1241,7 +1228,7 @@ Download headers:
 
 ~~~text
 content-type: application/dxf
-content-disposition: attachment; filename="swooshz-s7-plan-<projectId>.dxf"
+content-disposition: attachment; filename="swooshz-s7-plan.dxf"
 cache-control: private, no-store
 x-content-type-options: nosniff
 content-length: exact byte length
@@ -1268,7 +1255,7 @@ S7_STALE_ARTIFACT
 S7_PUBLICATION_BUSY
 S7_CLAIM_FENCED
 S7_RETRY_EXHAUSTED
-S7_IDEMPOTENCY_KEY_REUSE
+S7_IDEMPOTENCY_CONFLICT
 S7_PERSISTENCE_FAILED
 S7_UNAUTHORIZED_OR_NOT_FOUND
 S7_INVALID_REQUEST
@@ -1334,17 +1321,28 @@ Durable counts may be exactly zero. providerCost is unavailable with reason no_p
 
 ## S7-to-S8 boundary
 
-getS8Handoff requires authorization, a current source binding, committed current export, passing internal readback, exact final hash/size, and a final source fence. It returns s7-to-s8-handoff-v1 with the exact accepted S6 revision/source binding, S7 artifact identity/hash/size, manifestId/manifestHash, readbackReceiptId/readbackReceiptHash, the raw readback and durable validation-receipt versions, s7-dxf-r2000-ascii-v1, s7-world-to-plan-v1, and the coordinate convention:
+getS8Handoff(projectId) requires authorization, a current source stamp, the current eligible committed artifact, passing internal readback, exact final hash/size, and a final source fence. It returns the flat s7-to-s8-handoff-v1 DTO with the exact accepted S6 revision/source binding, sourceS5Fingerprint, S7 artifact identity/hash/size, manifestId/manifestHash, readbackReceiptId/readbackHash, the raw readback and durable validation-receipt versions, s7-dxf-r2000-ascii-v1, s7-world-to-plan-v1, stable correspondence, and the coordinate convention:
 
 ~~~text
-threeDGeometryAuthority = s6-to-s7-handoff-v1
-planEvidence = s7-dxf-r2000-ascii-v1
+schemaVersion = s7-to-s8-handoff-v1
+sourceRevisionId
+sourceRevisionHash
+sourceS5Fingerprint
+s7ArtifactId
+s7ArtifactHash
+s7ArtifactByteSize
+manifestId
+manifestHash
+readbackReceiptId
+readbackHash
+dxfVersion = s7-dxf-r2000-ascii-v1
 worldToPlanVersion = s7-world-to-plan-v1
-coordinateConvention = booth-local-right-handed-v1; millimetres; origin north-west-floor-corner; X east; Y up; Z south; DXF X = S6 world X; DXF Y = S6 world Z; DXF Z = 0
+coordinateConvention = booth-local-right-handed-v1
+stableCorrespondence
 readbackParserVersion = s7-cad-readback-v1
 readbackReceiptVersion = s7-cad-validation-receipt-v1
 dxfIsNot3DAuthority = true
-s8UsesSameAcceptedS6Model = true
+s8MustReadAcceptedS6Model = true
 ~~~
 
 S8 must consume the same exact accepted S6 model/revision represented by source; it must not derive 3D from the DXF or choose a newer S6 revision. DXF is plan/correspondence evidence only and is not 3D authority. The runtime handoff has no external-CAD evidence ID or per-export CAD evidence status. No FBX, .max, editable 3D, 3D production, APS, or S8 implementation belongs in S7.
@@ -1423,7 +1421,7 @@ Every task below starts only after the docs-only merge and Web G3 activation.
 
 ### Task 1 - Add exact types, constants, and numeric helpers
 
-Files: src/lib/types.ts; src/lib/s7-geometry.ts; tests/s7-fixture.ts; tests/s7-geometry.test.ts.
+Files: src/lib/types.ts; src/lib/s7-geometry.ts; tests/s7-geometry.test.ts.
 
 - RED: test every version/layer/record key, transform parity, half-away rounding, negative zero, exponent/finite/ceiling rejection, and absence of evidence fields/collection; run the focused test and expect new exports absent.
 - GREEN: add the exact types/constants, independent affine math, centi-mm quantization, fixed decimal helpers, safe ASCII helpers, and no dependency.
@@ -1439,7 +1437,7 @@ Files: src/lib/store.ts; src/lib/s7-persistence.ts; tests/s7-persistence.test.ts
 
 ### Task 3 - Implement source binding and all fences
 
-Files: src/lib/s7-cad.ts; tests/s7-fixture.ts; tests/s7-cad-lifecycle.test.ts.
+Files: src/lib/s7-cad.ts; tests/s7-handoff.test.ts.
 
 - RED: test exact handoff/digest/binding, eligibility snapshot-only behavior, every fence row, no S6 mutation, and no image read.
 - GREEN: implement readCurrentS7Source/assertCurrentS7Source using the existing S6 read-only handoff and persist exact bindings.
@@ -1455,7 +1453,7 @@ Files: src/lib/s7-geometry.ts; tests/s7-geometry.test.ts.
 
 ### Task 5 - Implement deterministic AC1015 writer and manifest
 
-Files: src/lib/s7-dxf-writer.ts; tests/s7-dxf-writer.test.ts; tests/fixtures/s7/golden-*.dxf.
+Files: src/lib/s7-dxf-writer.ts; tests/s7-dxf.test.ts; tests/fixtures/s7/golden-plan-minimal.dxf.
 
 - RED: test exact header/section/table/block order, LTYPE-before-LAYER, model/paper records/definitions, handle map/HANDSEED, all six writers/common fields, layers, full bounded source/part/revision XDATA, LF/no BOM/ASCII, determinism/golden hashes.
 - GREEN: plan all entities, allocate handles, emit scaffold/entities, build non-circular private manifest, and use no CAD library.
@@ -1463,7 +1461,7 @@ Files: src/lib/s7-dxf-writer.ts; tests/s7-dxf-writer.test.ts; tests/fixtures/s7/
 
 ### Task 6 - Implement strict independent raw-DXF readback
 
-Files: src/lib/s7-dxf-readback.ts; tests/s7-dxf-readback.test.ts; tests/fixtures/s7/hand-authored-*.dxf.
+Files: src/lib/s7-dxf-readback.ts; tests/s7-dxf.test.ts; tests/fixtures/s7/hand-authored-valid-ac1015.dxf.
 
 - RED: add independently hand-authored valid fixtures and all wrong-order/missing/metadata/entity/XDATA/handle/number/bound/manifest cases; prove no writer import/call and keep raw parser/version separate from the durable validation receipt.
 - GREEN: implement tokenizer/state machine/allowlist, raw parsing, manifest comparison, and canonical readback receipt.
@@ -1471,7 +1469,7 @@ Files: src/lib/s7-dxf-readback.ts; tests/s7-dxf-readback.test.ts; tests/fixtures
 
 ### Task 7 - Implement lifecycle, publication phases, idempotency, recovery
 
-Files: src/lib/s7-cad.ts; tests/s7-cad-lifecycle.test.ts.
+Files: src/lib/s7-cad.ts; tests/s7-persistence.test.ts; tests/s7-api.test.ts.
 
 - RED: test every status/phase, replay/reuse/busy, claim/liveness, two attempts, staging/promote/commit, exact hash/size, no overwrite, restart, stale/superseded download and handoff.
 - GREEN: implement exact sequence/key formulas with shared repository/object-store primitives, retain fences/claims through commit, and return safe DTOs.
@@ -1487,7 +1485,7 @@ Files: src/lib/api.ts; app/components/S7Client.tsx; app/projects/[projectId]/s7/
 
 ### Task 9 - Add telemetry and S7-to-S8 handoff
 
-Files: src/lib/s7-telemetry.ts; src/lib/s7-cad.ts; tests/s7-telemetry.test.ts; tests/s7-api.test.ts; tests/s7-cad-lifecycle.test.ts.
+Files: src/lib/s7-telemetry.ts; src/lib/s7-cad.ts; tests/s7-handoff.test.ts; tests/s7-api.test.ts.
 
 - RED: test zero/unavailable costs, durable failure/fence counts, source/export/readback identity, currentness, hash/size, open sides, stable correspondence, and no private/evidence fields.
 - GREEN: implement exact telemetry/handoff and require internal readback/currentness, not external CAD, for download/handoff.
@@ -1499,7 +1497,7 @@ Files: tests/s7-security.test.ts; package.json; S7 implementation files only for
 
 - RED: add cross-project, traversal, injection, parser exhaustion, malformed manifest, stale race, secret, no-provider/no-CAD/evidence-coupling cases.
 - GREEN: enforce bounds/generic errors; confirm no CAD SDK/provider/credential/cloud call, lockfile change, DWG, 3D, image reconstruction, or product evidence collection; append tests without removing prior tests.
-- REFACTOR: run focused security tests, pnpm typecheck, and pnpm test. Run pnpm audit --prod only if existing repository policy requires it.
+- REFACTOR: run the accepted six-file focused test command, pnpm typecheck, pnpm lint, pnpm build, pnpm audit --prod, git diff --check, and then the full pnpm test regression.
 
 ### Task 11 - G3 self-review and later evidence packet
 
@@ -1537,15 +1535,12 @@ Do not run product tests merely to validate this docs-only branch and do not mod
 ### Later G3 focused validation
 
 ~~~powershell
-pnpm exec tsx --test tests/s7-geometry.test.ts
-pnpm exec tsx --test tests/s7-dxf-writer.test.ts
-pnpm exec tsx --test tests/s7-dxf-readback.test.ts
-pnpm exec tsx --test tests/s7-persistence.test.ts
-pnpm exec tsx --test tests/s7-cad-lifecycle.test.ts
-pnpm exec tsx --test tests/s7-api.test.ts
-pnpm exec tsx --test tests/s7-security.test.ts
-pnpm exec tsx --test tests/s7-telemetry.test.ts
+pnpm exec tsx --test tests/s7-geometry.test.ts tests/s7-dxf.test.ts tests/s7-persistence.test.ts tests/s7-api.test.ts tests/s7-security.test.ts tests/s7-handoff.test.ts
 pnpm typecheck
+pnpm lint
+pnpm build
+pnpm audit --prod
+git diff --check
 ~~~
 
 Later full regression:
