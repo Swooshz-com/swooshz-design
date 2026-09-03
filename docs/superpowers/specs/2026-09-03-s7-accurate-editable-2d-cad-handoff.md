@@ -38,6 +38,25 @@ Can an AutoCAD-compatible tool open an editable millimetre plan that accurately 
 
 S7 is a plan/correspondence export. It is design CAD, not fabrication or shop drawings, engineering certification, venue approval, or a 3D production scene.
 
+## Version contracts
+
+The accepted runtime and handoff literals are fixed:
+
+~~~text
+s7-cad-export-v1
+s7-cad-job-v1
+s7-cad-manifest-v1
+s7-cad-readback-v1
+s7-cad-validation-receipt-v1
+s7-cad-idempotency-v1
+s7-dxf-r2000-ascii-v1
+s7-world-to-plan-v1
+s7-to-s8-handoff-v1
+s7-telemetry-v1
+~~~
+
+`s7-cad-readback-v1` is the raw parser/readback contract; `s7-cad-validation-receipt-v1` is the durable validation receipt persisted in `s7CadReadbackReceipts`. `s7-cad-evidence-v1`, if used later, is release/G3/G4 evidence only and is not a product StoreState record.
+
 ## Tooling HOLD
 
 TOOLING_HOLD: YES
@@ -127,6 +146,8 @@ DXF X = S6 world X
 DXF Y = S6 world Z
 DXF Z = 0
 ~~~
+
+This mapping is versioned as s7-world-to-plan-v1. The exact version is persisted on the generated manifest, export record, durable validation/readback receipt, and S7-to-S8 handoff wherever plan coordinates are carried. It does not change S6 authority or the accepted source revision.
 
 The booth envelope is the closed plan rectangle from world (0, 0, 0) to (widthMm, max-height-or-derived, depthMm). The DXF boundary is the closed rectangle from (0, 0) to (widthMm, depthMm). The boundary remains closed even when one or more booth sides are open.
 
@@ -275,6 +296,28 @@ The parser/output coordinate ceiling is:
 
 This is only a defensive hard cap for parser and serializer work. It does not broaden canonical S6 source authority. Valid source values still have to come from the current accepted S6 handoff and pass S6/S7 schema and source-fence checks.
 
+The accepted resource and security bounds are fixed:
+
+| Resource | Maximum |
+|---|---:|
+| DXF bytes | 8,000,000 |
+| DXF lines | 200,000 |
+| group/value line | 512 bytes |
+| entities | 4,096 |
+| vertices | 16,384 |
+| layers | 32 |
+| table records | 64 |
+| label length | 120 code points |
+| XDATA per entity | 2,048 bytes |
+| manifest bytes | 4,000,000 |
+| readback receipt bytes | 256,000 |
+| CAD release evidence bytes | 32,768 |
+| recovery items per pass | 256 |
+| attempts | 2 |
+| plan coordinate ceiling | 1,000,000,000 mm |
+
+The CAD release-evidence bound applies only to the release/G3/G4 evidence format; that evidence is not product StoreState, runtime telemetry, S7CadExport state, or a per-export gate. The 1,000,000,000 mm plan-coordinate ceiling above is defensive only and does not broaden S6 authority.
+
 ## AC1015 DXF contract
 
 The writer profile is fixed:
@@ -300,6 +343,21 @@ EOF
 ~~~
 
 CLASSES and OBJECTS remain omitted because S7 introduces no custom classes or required nongraphical objects.
+
+### HEADER
+
+The deterministic HEADER variables are emitted in this order:
+
+~~~text
+$ACADVER  AC1015
+$INSUNITS  4
+$MEASUREMENT  1
+$EXTMIN   minimum X/Y of all emitted plan geometry and annotation insertion points; Z = 0
+$EXTMAX   maximum X/Y of all emitted plan geometry and annotation insertion points; Z = 0
+$HANDSEED  first unused handle
+~~~
+
+$EXTMIN and $EXTMAX are calculated after the locked world-to-plan mapping and quantisation over every emitted plan boundary, curve, line, marker, and annotation insertion point. Valid out-of-envelope geometry is included; extents are not reduced to the booth envelope.
 
 ### Tables
 
@@ -371,7 +429,7 @@ Every graphical entity begins with these exact common fields before its entity-s
 
 370 = -1 means ByLayer. The owner handle, layer, subclass marker, and all entity data are read back and checked. No entity omits the common metadata because it is visually understandable.
 
-Each graphical entity also carries bounded XDATA under APPID SWOOSHZ_S7. XDATA is a locator, not a second manifest and not a place for arbitrary user text.
+Each graphical entity also carries bounded source/part/revision identity XDATA under APPID SWOOSHZ_S7. XDATA is not a second manifest and is not a place for arbitrary user text; its total size is at most 2,048 bytes per entity.
 
 ### Deterministic handle allocation
 
@@ -444,13 +502,13 @@ The layer mapping is:
 | S7-OVERHEAD | overhead geometry shown in plan and marked by role |
 | S7-DIMENSIONS | deterministic width/depth and useful object dimensions |
 | S7-LABELS | bounded human-readable role/zone/opening labels |
-| S7-UNKNOWN | explicit unresolved/diagnostic markers; never invented geometry |
+| S7-UNKNOWN | bounded source geometry with `geometryState = bounded_inference` or relevant `unknownIds`, plus explicit unresolved markers; never invented geometry |
 
 Source objects are sorted by stable objectId/identityKey, not source array order. A profile union may create several cycles, arcs may create several entities, and each emitted part has a zero-based partIndex. A stable entity is never matched by display order alone.
 
 Out-of-envelope geometry that is valid in the accepted source remains represented. S7 records an out-of-envelope diagnostic in the private manifest/readback result and telemetry; it does not clip, shrink, move, or hide the geometry. Only malformed source, unsupported/ambiguous analytic classification, invalid numeric data, or failed independent validation causes a closed failure.
 
-Unknowns remain explicit. S7-UNKNOWN may carry a POINT and sanitized TEXT describing an unknown ID/category, but it never becomes a made-up rectangle, circle, wall, label, or requirement fulfillment.
+Unknowns remain explicit. When `geometryState = bounded_inference`, or when source `unknownIds` remain relevant to emitted geometry, the primary emitted geometry layer is `S7-UNKNOWN`. The geometry remains bounded, source-derived, and visibly unresolved; S7 does not invent a rectangle, circle, wall, label, or requirement fulfillment. The intended semantic layer is retained in the private manifest. `S7-UNKNOWN` is not a diagnostics-only POINT/TEXT layer.
 
 ## Identity and private manifest
 
@@ -461,6 +519,15 @@ SWOOSHZ_S7
 ~~~
 
 The private immutable manifest is the complete correspondence authority. It is stored beside the final DXF under a private immutable object key and is never returned as a public storage path.
+
+Every durable manifest has a stable identity and content hash:
+
+~~~text
+manifestId = UUID
+manifestHash = SHA-256(canonical manifest bytes with manifestHash empty)
+~~~
+
+The `manifestId` is the identity of the immutable manifest bytes; `manifestHash` is the exact hash of those bytes. The export record, durable readback receipt, and `s7-to-s8-handoff-v1` carry both values. The `s7CadManifests` collection contains one immutable linkage record for each final export, including `schemaVersion = s7-cad-manifest-v1`, `manifestId`, `projectId`, `exportId`, the exact S6 source revision/hash, `worldToPlanVersion`, the DXF profile version, `manifestHash`, manifest byte size, the private manifest key, and creation time. The record is metadata/linkage only; manifest bytes remain private and immutable, and the collection is not product CAD evidence.
 
 Each manifest entity contains at minimum:
 
@@ -475,23 +542,40 @@ sourceRevisionId
 sourceRevisionHash
 ~~~
 
-It also contains entityHandle, entityType, layer, xdataEntityKey, geometryDigest, quantized bounds, and a derived/diagnostic marker. Source object records use the exact S6 identityKey, parentObjectId, role, and geometryState. Derived booth/opening/dimension/label/unknown records use sourceObjectId = null and a deterministic identityKey such as booth-envelope or opening-north while retaining the same source revision fields. This makes derived records explicit rather than pretending they are S6 objects.
+It also contains entityHandle, entityType, layer, intendedSemanticLayer, xdataEntityKey, geometryDigest, quantized bounds, and a derived/diagnostic marker. Source object records use the exact S6 identityKey, parentObjectId, role, and geometryState. Derived booth/opening/dimension/label/unknown records use sourceObjectId = null and a deterministic identityKey such as booth-envelope or opening-north while retaining the same source revision fields. This makes derived records explicit rather than pretending they are S6 objects.
 
-The manifest includes the source binding, DXF writer/profile version, layer list, deterministic entity order, exact quantized entity parameters, source object counts, open-side set, and diagnostics. It does not contain image bytes, prompts, secrets, credentials, private storage values, or arbitrary raw customer text.
+The manifest includes the source binding, DXF writer/profile version, `worldToPlanVersion`, layer list, deterministic entity order, exact quantized entity parameters, source object counts, open-side set, intended semantic layer, and diagnostics. It does not contain image bytes, prompts, secrets, credentials, private storage values, or arbitrary raw customer text.
 
-XDATA is a compact bounded locator:
+Every emitted entity carries bounded stable source/part/revision identity under the fixed `SWOOSHZ_S7` APPID. The XDATA is:
 
 ~~~text
 1001 SWOOSHZ_S7
-1000 s7-loc-v1
-1000 m=<manifest-sha256>;e=<entity-key>
+1000 s7-identity-v1
+1000 sourceObjectId=<UUID-or-null>
+1000 identityKey=<stable-identity-token-or-hash>
+1000 parentObjectId=<UUID-or-null>
+1000 role=<allowlisted-role>
+1070 partIndex=<nonnegative-integer>
+1000 geometryState=<exact|bounded_inference|derived>
+1000 sourceRevisionId=<UUID>
+1000 sourceRevisionHash=<SHA-256>
+1000 manifestId=<UUID>
+1000 manifestHash=<SHA-256>
+1000 entityKey=<stable-entity-key>
 ~~~
 
-The entity key is a deterministic short digest over sourceObjectId, partIndex, role, sourceRevisionId, and sourceRevisionHash. The locator is bounded to the DXF XDATA string limit, contains only safe ASCII, and points to the private manifest. Full correspondence remains in the manifest; XDATA is not trusted without manifest/readback verification.
+The values are safe bounded ASCII and the complete XDATA/entity record is at most 2,048 bytes. Derived records use null source IDs only where they have no source object; they still carry deterministic identity, role, part, geometry state, and exact source revision binding. The private manifest remains the complete authority; XDATA is not trusted without manifest/readback verification.
 
 ## Validation separation
 
 S7 has two distinct validation layers.
+
+The raw readback/parser contract and durable validation receipt are separate records:
+
+- `S7CadRawReadbackResult` uses `schemaVersion = s7-cad-readback-v1`. It is the strict parser/readback result for the raw `s7-dxf-r2000-ascii-v1` bytes, including parsed sections, handles, extents, entities, XDATA, and bounded diagnostics.
+- `S7CadReadbackReceipt` is the durable record in `s7CadReadbackReceipts`. It uses `schemaVersion = s7-cad-validation-receipt-v1`, carries `readbackVersion = s7-cad-readback-v1`, and is linked to the export and manifest by receipt ID/hash and manifest ID/hash. It is the immutable validation receipt used for publication and handoff.
+
+The two literals must not be renamed or collapsed: `s7-cad-readback-v1` identifies the raw parser contract, while `s7-cad-validation-receipt-v1` identifies the durable receipt.
 
 ### Runtime per-export validation
 
@@ -516,7 +600,7 @@ Representative local CAD evidence validates the writer/profile implementation it
 
 The product runtime does not add cadEvidenceId or cadEvidenceStatus to S7CadExport. The product StoreState does not add an s7CadEvidence collection. If the release lane retains a schema named s7-cad-evidence-v1, it is a G3/G4/release evidence receipt only, bound to the exact implementation head, writer/profile version, parser version, and representative fixture hashes. It is not user-project runtime authority and is not a per-export metric.
 
-The current tooling HOLD exists because no suitable local version-pinned AutoCAD-compatible application is available. Cloud CAD substitution is not equivalent evidence.
+The current tooling HOLD exists because no suitable local version-pinned AutoCAD-compatible application is available. Cloud CAD substitution is not equivalent evidence. `TOOLING_HOLD: YES` is programme/release governance only; it is not S7 runtime state, a public DTO field, a StoreState field, a telemetry field, or a per-export download/handoff gate.
 
 ## Lifecycle, security, and privacy
 
@@ -537,6 +621,15 @@ Lifecycle invariants are:
 - public errors are generic and carry a support-safe reference ID;
 - logs contain only privacy-minimized IDs, operation/status/code/attempt and safe hashes where required;
 - logs never contain prompts, uploads, image bytes, model payloads, credentials, auth headers/cookies, storage keys, raw DXF, private connector data, or unnecessary PII.
+
+The persisted export status union is:
+
+~~~text
+queued | running | staged | promoted | committed | stale | superseded |
+failed_retryable | failed_terminal | aborted
+~~~
+
+`queued`, `running`, `staged`, and `promoted` become terminal `stale` when the captured source becomes invalid before finality. An already committed export becomes terminal `superseded` when a newer accepted S6 revision becomes current. `committed` never transitions to `stale`; committed history is retained and is not silently relabeled. Neither `stale` nor `superseded` may be downloaded or handed off as current.
 
 No fallback fabricates a success state, chooses a different source, boxes unsupported geometry, silently clips a valid solid, or downgrades an integrity failure.
 
@@ -582,14 +675,20 @@ The typed boundary is locked as:
 s7-to-s8-handoff-v1
 ~~~
 
-S8 receives a DTO containing the current S6 source binding, the committed S7 artifact identity/hash/size, the private-manifest correspondence summary, units, open sides, and stable object correspondence. The DTO explicitly marks:
+S8 receives `s7-to-s8-handoff-v1` only after authorization and committed/readback-gated validation. It contains the exact accepted S6 source binding (`sourceRevisionId` and `sourceRevisionHash`), the S7 artifact identity (`exportId`), DXF hash and byte size, `manifestId` and `manifestHash`, durable readback receipt identity/hash, `s7-dxf-r2000-ascii-v1`, `s7-world-to-plan-v1`, the locked coordinate convention, stable correspondence, and intended semantic layer. The DTO explicitly marks:
 
 ~~~text
 threeDGeometryAuthority = s6-to-s7-handoff-v1
 planEvidence = s7-dxf-r2000-ascii-v1
+worldToPlanVersion = s7-world-to-plan-v1
+coordinateConvention = booth-local-right-handed-v1
+readbackParserVersion = s7-cad-readback-v1
+readbackReceiptVersion = s7-cad-validation-receipt-v1
+dxfIsNot3DAuthority = true
+s8UsesSameAcceptedS6Model = true
 ~~~
 
-S8 must continue to consume the same accepted S6 model for 3D authority. The S7 DXF is plan/correspondence evidence only; it is not a replacement spatial model and must not become the 3D source by reverse parsing.
+No external-CAD evidence ID or status is required in this runtime handoff. S8 must continue to consume the same accepted S6 model for 3D authority. The S7 DXF is plan/correspondence evidence only; it is not a replacement spatial model and must not become the 3D source by reverse parsing.
 
 No FBX generation, 3ds Max generation, .max handling, editable 3D scene, 3D production artifact, APS integration, or S8 production work belongs in S7.
 
