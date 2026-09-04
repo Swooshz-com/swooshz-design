@@ -42,6 +42,13 @@ type PublicationPhase = "admission" | "projection" | "generation" | "staging" | 
 
 export type S7PublicationPhaseHook = (phase: PublicationPhase, context: { projectId: UUID; jobId: UUID; artifactId: UUID; attempt: 1 | 2 }) => void;
 
+export type S7RetryPhaseHook = (phase: "before-retry-cas", context: { artifactId: UUID }) => void;
+
+export type S7ClaimPhaseHook = (
+  phase: "before-claim-cas" | "claim-decision",
+  context: { jobId: UUID; acquired: boolean; claimToken: UUID | null; ownerProcessId: string | null },
+) => void;
+
 export type S7CadServiceOptions = {
   repository: JsonRepository;
   objects: PrivateObjectStore;
@@ -51,6 +58,8 @@ export type S7CadServiceOptions = {
   ownerProcessId?: string;
   isOwnerProcessAlive?: (ownerProcessId: string) => boolean;
   onPublicationPhase?: S7PublicationPhaseHook;
+  onRetryPhase?: S7RetryPhaseHook;
+  onClaimPhase?: S7ClaimPhaseHook;
 };
 
 export type S7ExportResult = {
@@ -64,6 +73,14 @@ export type S7DownloadResult = {
   contentType: "application/dxf";
   fileName: typeof S7_FIXED_DOWNLOAD_NAME;
 };
+
+type S7RetryTransition =
+  | { createdAttempt2: true; artifact: S7CadExport; job: S7CadJob }
+  | { createdAttempt2: false; artifact: S7CadExport; job: S7CadJob };
+
+type S7ClaimResult =
+  | { acquired: true; job: S7CadJob; artifact: S7CadExport; claimToken: UUID }
+  | { acquired: false; job: S7CadJob; artifact: S7CadExport; claimToken: null };
 
 const OPAQUE_KEY_MAX = 240;
 const INPUT = {} as const;
@@ -115,6 +132,8 @@ export class S7CadService {
   private readonly ownerProcessId: string;
   private readonly isOwnerProcessAlive: ((ownerProcessId: string) => boolean) | undefined;
   private readonly onPublicationPhase: S7PublicationPhaseHook | undefined;
+  private readonly onRetryPhase: S7RetryPhaseHook | undefined;
+  private readonly onClaimPhase: S7ClaimPhaseHook | undefined;
 
   constructor(options: S7CadServiceOptions) {
     this.repository = options.repository;
@@ -125,6 +144,8 @@ export class S7CadService {
     this.ownerProcessId = options.ownerProcessId ?? `s7-process-${String(process.pid)}-${this.uuid()}`;
     this.isOwnerProcessAlive = options.isOwnerProcessAlive;
     this.onPublicationPhase = options.onPublicationPhase;
+    this.onRetryPhase = options.onRetryPhase;
+    this.onClaimPhase = options.onClaimPhase;
   }
 
   private source(projectId: UUID): { handoff: S6ToS7Handoff; stamp: S7SourceStamp } {
@@ -189,6 +210,17 @@ export class S7CadService {
     }
   }
 
+  private retryPhase(artifactId: UUID): void {
+    this.onRetryPhase?.("before-retry-cas", { artifactId });
+  }
+
+  private claimPhase(
+    phase: "before-claim-cas" | "claim-decision",
+    context: { jobId: UUID; acquired: boolean; claimToken: UUID | null; ownerProcessId: string | null },
+  ): void {
+    this.onClaimPhase?.(phase, context);
+  }
+
   private claimSnapshot(jobId: UUID, claimToken: UUID): { job: S7CadJob; artifact: S7CadExport } {
     const state = this.repository.state();
     const job = state.s7CadJobs?.find((item) => item.jobId === jobId);
@@ -215,24 +247,21 @@ export class S7CadService {
     });
   }
 
-  private claimQueued(jobId: UUID): { job: S7CadJob; artifact: S7CadExport; claimToken: UUID } {
-    const state = this.repository.state();
-    const existing = state.s7CadJobs?.find((item) => item.jobId === jobId);
-    const existingArtifact = existing ? state.s7CadExports?.find((item) => item.artifactId === existing.artifactId) : undefined;
-    if (!existing || !existingArtifact) fail(404, "NOT_FOUND", "job");
-    if (existing.status !== "queued") return { job: existing, artifact: existingArtifact, claimToken: existing.claimToken! };
+  private claimQueued(jobId: UUID): S7ClaimResult {
     const claimToken = this.uuid();
     const at = this.clock();
+    this.claimPhase("before-claim-cas", { jobId, acquired: false, claimToken: null, ownerProcessId: null });
     const claimed = this.repository.transact((current) => {
       const job = current.s7CadJobs?.find((item) => item.jobId === jobId);
       const artifact = job ? current.s7CadExports?.find((item) => item.artifactId === job.artifactId) : undefined;
       if (!job || !artifact) fail(404, "NOT_FOUND", "job");
-      if (job.status !== "queued") return { job, artifact, claimToken: job.claimToken! };
+      if (job.status !== "queued") return { acquired: false as const, job, artifact, claimToken: null };
       if (!sameS7Source(job.source, artifact.source)) fail(500, "S7_PERSISTENCE_INVALID");
       job.status = "running"; job.claimToken = claimToken; job.ownerProcessId = this.ownerProcessId; job.claimedAt = at; job.heartbeatAt = at; job.updatedAt = at;
       artifact.status = "running"; artifact.privateStagingStorageKey = s7StagingDxfStorageKey(artifact.projectId, job.jobId, claimToken); artifact.updatedAt = at;
-      return { job, artifact, claimToken };
+      return { acquired: true as const, job, artifact, claimToken };
     });
+    this.claimPhase("claim-decision", { jobId, acquired: claimed.acquired, claimToken: claimed.claimToken, ownerProcessId: claimed.job.ownerProcessId });
     return claimed;
   }
 
@@ -241,7 +270,10 @@ export class S7CadService {
     this.repository.transact((state) => {
       const job = state.s7CadJobs?.find((item) => item.jobId === jobId);
       const artifact = job ? state.s7CadExports?.find((item) => item.artifactId === job.artifactId) : undefined;
-      if (!job || !artifact || (claimToken !== null && job.claimToken !== claimToken)) return;
+      const ownedByCaller = claimToken === null
+        ? job?.claimToken === null && job.ownerProcessId === null
+        : job?.claimToken === claimToken && job.ownerProcessId === this.ownerProcessId;
+      if (!job || !artifact || !ownedByCaller) return;
       if (["committed", "superseded", "stale"].includes(job.status)) return;
       job.status = "stale"; job.terminalAt = at; job.updatedAt = at; job.claimToken = null; job.ownerProcessId = null; job.claimedAt = null; job.heartbeatAt = null;
       artifact.status = "stale"; artifact.staleAt = at; artifact.failureCode = failureCode; artifact.updatedAt = at;
@@ -254,7 +286,7 @@ export class S7CadService {
     this.repository.transact((state) => {
       const job = state.s7CadJobs?.find((item) => item.jobId === jobId);
       const artifact = job ? state.s7CadExports?.find((item) => item.artifactId === job.artifactId) : undefined;
-      if (!job || !artifact || (claimToken !== null && job.claimToken !== claimToken) || ["committed", "superseded", "stale"].includes(job.status)) return;
+      if (!job || !artifact || claimToken === null || job.claimToken !== claimToken || job.ownerProcessId !== this.ownerProcessId || !["running", "staged", "promoted"].includes(job.status) || ["committed", "superseded", "stale"].includes(job.status)) return;
       const retryable = job.attempt === 1;
       const status = retryable ? "failed_retryable" : "failed_terminal";
       job.status = status; job.updatedAt = at; job.claimToken = null; job.ownerProcessId = null; job.claimedAt = null; job.heartbeatAt = null; job.terminalAt = retryable ? null : at;
@@ -262,10 +294,25 @@ export class S7CadService {
     });
   }
 
+  private recoverDeadClaim(jobId: UUID, claimToken: UUID | null, ownerProcessId: string | null, error: unknown): boolean {
+    if (claimToken === null || ownerProcessId === null) return false;
+    const failureCode = error instanceof AppError ? error.code : "S7_OWNER_DEAD";
+    const at = this.clock();
+    return this.repository.transact((state) => {
+      const job = state.s7CadJobs?.find((item) => item.jobId === jobId);
+      const artifact = job ? state.s7CadExports?.find((item) => item.artifactId === job.artifactId) : undefined;
+      if (!job || !artifact || job.jobId !== jobId || job.claimToken !== claimToken || job.ownerProcessId !== ownerProcessId || artifact.status !== job.status || !["running", "staged", "promoted"].includes(job.status)) return false;
+      const retryable = job.attempt === 1;
+      const status = retryable ? "failed_retryable" : "failed_terminal";
+      job.status = status; job.updatedAt = at; job.claimToken = null; job.ownerProcessId = null; job.claimedAt = null; job.heartbeatAt = null; job.terminalAt = retryable ? null : at;
+      artifact.status = status; artifact.failureCode = failureCode; artifact.updatedAt = at; artifact.publicationPhase = status === "failed_terminal" ? "aborted" : artifact.publicationPhase;
+      return true;
+    });
+  }
+
   private asyncLikeProcess(jobId: UUID): S7CadExport {
     const claimed = this.claimQueued(jobId);
-    if (claimed.job.status === "committed" || claimed.job.status === "superseded" || claimed.job.status === "stale" || claimed.job.status === "failed_retryable" || claimed.job.status === "failed_terminal") return claimed.artifact;
-    if (!claimed.claimToken) fail(409, "S7_CLAIM_FENCED");
+    if (!claimed.acquired) return claimed.artifact;
     const claimToken = claimed.claimToken;
     const job = claimed.job;
     const artifact = claimed.artifact;
@@ -383,38 +430,56 @@ export class S7CadService {
   }
 
   retryExport(artifactId: UUID): S7ExportResult {
-    const initial = getS7Collections(this.repository.state());
-    const priorArtifact = initial.exports.find((item) => item.artifactId === artifactId);
-    const priorJob = priorArtifact ? initial.jobs.find((item) => item.jobId === priorArtifact.jobId) : undefined;
-    if (!priorArtifact || !priorJob) fail(404, "NOT_FOUND", "artifact");
-    if (priorArtifact.attempt !== 1 || priorArtifact.status !== "failed_retryable" || priorJob.status !== "failed_retryable") fail(409, "S7_RETRY_NOT_AVAILABLE");
-    const source = this.source(priorArtifact.projectId);
-    this.reconcileCommittedSupersession(priorArtifact.projectId, source.stamp);
-    if (!sameS7Source(source.stamp, priorArtifact.source)) {
-      this.markStale(priorJob.jobId, null);
-      fail(409, "S7_SOURCE_STALE");
-    }
-    const at = this.clock(); const newArtifactId = this.uuid(); const newJobId = this.uuid(); const newManifestId = this.uuid();
-    const artifact: S7CadExport = { ...priorArtifact, artifactId: newArtifactId, jobId: newJobId, status: "queued", publicationPhase: "none", attempt: 2, retryOfArtifactId: priorArtifact.artifactId, manifestId: newManifestId, manifestHash: null, readbackReceiptId: null, readbackHash: null, sha256: null, byteSize: null, privateFinalStorageKey: s7FinalDxfStorageKey(priorArtifact.projectId, newArtifactId), privateStagingStorageKey: s7StagingDxfStorageKey(priorArtifact.projectId, newJobId, "unclaimed"), failureCode: null, createdAt: at, updatedAt: at, committedAt: null, staleAt: null, supersededAt: null, source: cloneStamp(source.stamp) };
-    const job: S7CadJob = { ...priorJob, jobId: newJobId, artifactId: newArtifactId, source: cloneStamp(source.stamp), status: "queued", attempt: 2, retryOfJobId: priorJob.jobId, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, createdAt: at, updatedAt: at, terminalAt: null };
+    this.retryPhase(artifactId);
+    let transition: S7RetryTransition;
     try {
-      this.repository.transact((state) => {
+      transition = this.repository.transact((state): S7RetryTransition => {
+        const collections = getS7Collections(state);
+        const priorArtifact = collections.exports.find((item) => item.artifactId === artifactId);
+        const priorJob = priorArtifact ? collections.jobs.find((item) => item.jobId === priorArtifact.jobId) : undefined;
+        if (!priorArtifact || !priorJob) fail(404, "NOT_FOUND", "artifact");
+        if (priorArtifact.jobId !== priorJob.jobId || priorJob.artifactId !== priorArtifact.artifactId || priorArtifact.status !== priorJob.status || priorArtifact.attempt !== priorJob.attempt || !sameS7Source(priorArtifact.source, priorJob.source)) fail(500, "S7_PERSISTENCE_INVALID");
+
+        const idempotency = collections.idempotency.find((item) => item.projectId === priorArtifact.projectId && item.operation === "export" && item.idempotencyKey === priorJob.idempotencyKey);
+        if (!idempotency || idempotency.projectId !== priorArtifact.projectId || idempotency.operation !== "export" || idempotency.idempotencyKey !== priorJob.idempotencyKey || idempotency.inputHash !== priorArtifact.inputHash || priorJob.inputHash !== priorArtifact.inputHash) fail(500, "S7_PERSISTENCE_INVALID");
+
+        const linkedArtifact = collections.exports.find((item) => item.artifactId === idempotency.artifactId);
+        const linkedJob = collections.jobs.find((item) => item.jobId === idempotency.jobId);
+        if (!linkedArtifact || !linkedJob || linkedArtifact.jobId !== linkedJob.jobId || linkedJob.artifactId !== linkedArtifact.artifactId || linkedArtifact.projectId !== priorArtifact.projectId || linkedJob.projectId !== priorArtifact.projectId || linkedJob.idempotencyKey !== priorJob.idempotencyKey || linkedArtifact.inputHash !== priorArtifact.inputHash || linkedJob.inputHash !== priorArtifact.inputHash || !sameS7Source(linkedArtifact.source, linkedJob.source) || !sameS7Source(linkedArtifact.source, idempotency.source)) fail(500, "S7_PERSISTENCE_INVALID");
+
         let live: { stamp: S7SourceStamp };
-        try { live = this.source(priorArtifact!.projectId); } catch (error) { throw sourceError(error); }
-        if (!sameS7Source(source.stamp, live.stamp)) fail(409, "S7_SOURCE_STALE");
+        try { live = this.source(priorArtifact.projectId); } catch (error) { throw sourceError(error); }
+        if (!sameS7Source(live.stamp, priorArtifact.source) || !sameS7Source(live.stamp, priorJob.source)) fail(409, "S7_SOURCE_STALE");
+
+        const pointsToPriorAttempt = idempotency.artifactId === priorArtifact.artifactId && idempotency.jobId === priorJob.jobId;
+        if (!pointsToPriorAttempt) {
+          const validAttemptTwo = priorArtifact.attempt === 1 && priorJob.attempt === 1 && priorArtifact.retryOfArtifactId === null && priorJob.retryOfJobId === null && linkedArtifact.attempt === 2 && linkedJob.attempt === 2 && linkedArtifact.retryOfArtifactId === priorArtifact.artifactId && linkedJob.retryOfJobId === priorJob.jobId && linkedArtifact.status === linkedJob.status && sameS7Source(linkedArtifact.source, live.stamp);
+          if (!validAttemptTwo) fail(409, "S7_RETRY_NOT_AVAILABLE");
+          return { createdAttempt2: false, artifact: linkedArtifact, job: linkedJob };
+        }
+
+        if (priorArtifact.attempt !== 1 || priorJob.attempt !== 1 || priorArtifact.retryOfArtifactId !== null || priorJob.retryOfJobId !== null || priorArtifact.status !== "failed_retryable" || priorJob.status !== "failed_retryable") fail(409, "S7_RETRY_NOT_AVAILABLE");
+        if (collections.exports.some((item) => item.retryOfArtifactId === priorArtifact.artifactId) || collections.jobs.some((item) => item.retryOfJobId === priorJob.jobId)) fail(500, "S7_PERSISTENCE_INVALID");
+
+        const at = this.clock(); const newArtifactId = this.uuid(); const newJobId = this.uuid(); const newManifestId = this.uuid();
+        const artifact: S7CadExport = { ...priorArtifact, artifactId: newArtifactId, jobId: newJobId, status: "queued", publicationPhase: "none", attempt: 2, retryOfArtifactId: priorArtifact.artifactId, manifestId: newManifestId, manifestHash: null, readbackReceiptId: null, readbackHash: null, sha256: null, byteSize: null, privateFinalStorageKey: s7FinalDxfStorageKey(priorArtifact.projectId, newArtifactId), privateStagingStorageKey: s7StagingDxfStorageKey(priorArtifact.projectId, newJobId, "unclaimed"), failureCode: null, createdAt: at, updatedAt: at, committedAt: null, staleAt: null, supersededAt: null, source: cloneStamp(live.stamp) };
+        const job: S7CadJob = { ...priorJob, jobId: newJobId, artifactId: newArtifactId, source: cloneStamp(live.stamp), status: "queued", attempt: 2, retryOfJobId: priorJob.jobId, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, createdAt: at, updatedAt: at, terminalAt: null };
         state.s7CadExports?.push(artifact); state.s7CadJobs?.push(job);
-        const idempotency = state.s7CadIdempotency?.find((item) => item.projectId === job.projectId && item.idempotencyKey === job.idempotencyKey);
-        if (!idempotency) fail(500, "S7_PERSISTENCE_INVALID");
-        idempotency.source = cloneStamp(source.stamp); idempotency.jobId = newJobId; idempotency.artifactId = newArtifactId;
+        idempotency.source = cloneStamp(live.stamp); idempotency.jobId = newJobId; idempotency.artifactId = newArtifactId;
+        return { createdAttempt2: true, artifact, job };
       });
     } catch (error) {
-      if (error instanceof AppError && (error.code === "S7_SOURCE_STALE" || error.code === "S7_SOURCE_NOT_READY")) this.markStale(priorJob.jobId, null);
+      if (error instanceof AppError && (error.code === "S7_SOURCE_STALE" || error.code === "S7_SOURCE_NOT_READY")) {
+        const current = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === artifactId);
+        const currentJob = current ? getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === current.jobId) : undefined;
+        if (currentJob) this.markStale(currentJob.jobId, null);
+      }
       throw error;
     }
     let result: S7CadExport;
-    try { result = this.process(newJobId); } catch { result = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === newArtifactId)!; }
+    try { result = this.process(transition.job.jobId); } catch { result = getS7Collections(this.repository.state()).exports.find((item) => item.artifactId === transition.job.artifactId)!; }
     const currentJob = getS7Collections(this.repository.state()).jobs.find((item) => item.jobId === result.jobId)!;
-    return { replayed: false, export: publicExport(result), job: { jobId: currentJob.jobId, status: currentJob.status, attempt: currentJob.attempt } };
+    return { replayed: !transition.createdAttempt2, export: publicExport(result), job: { jobId: currentJob.jobId, status: currentJob.status, attempt: currentJob.attempt } };
   }
 
   recoverPending(): number {
@@ -426,7 +491,7 @@ export class S7CadService {
       let dead = false;
       try { dead = this.isOwnerProcessAlive ? this.isOwnerProcessAlive(job.ownerProcessId!) === false : false; } catch { dead = false; }
       if (!dead) continue;
-      this.markFailure(job.jobId, job.claimToken, new AppError(500, "S7_OWNER_DEAD")); recovered += 1;
+      if (this.recoverDeadClaim(job.jobId, job.claimToken, job.ownerProcessId, new AppError(500, "S7_OWNER_DEAD"))) recovered += 1;
     }
     return recovered;
   }
