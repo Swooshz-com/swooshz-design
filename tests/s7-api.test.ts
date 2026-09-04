@@ -408,6 +408,7 @@ test("concurrent exact-key retry CAS converges onto one attempt-2 lineage throug
   assert.equal(attemptTwoArtifacts.length, 1);
   assert.equal(attemptTwoJobs.length, 1);
   assert.equal(attempts.filter((item) => Number(item.attempt) === 3).length, 0);
+  assert.equal(jobs.filter((item) => Number(item.attempt) === 3).length, 0);
   assert.equal(finalState.s7CadIdempotency?.length, 1);
   assert.equal(finalState.s7CadIdempotency?.[0]?.artifactId, attemptTwoArtifacts[0]?.artifactId);
   assert.equal(finalState.s7CadIdempotency?.[0]?.jobId, attemptTwoJobs[0]?.jobId);
