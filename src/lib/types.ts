@@ -326,6 +326,11 @@ export type StoreState = {
   s6ViewPreservationReceipts: S6ViewPreservationReceipt[];
   s6Jobs: S6JobState[];
   s6Idempotency: S6IdempotencyState[];
+  s7CadExports?: S7CadExport[];
+  s7CadJobs?: S7CadJob[];
+  s7CadIdempotency?: S7CadIdempotency[];
+  s7CadManifests?: S7CadManifestRecord[];
+  s7CadReadbackReceipts?: S7CadReadbackReceipt[];
 };
 
 export type S6RevisionStatus =
@@ -1102,6 +1107,242 @@ export type S6ToS7Handoff = {
   unknowns: S6Unknown[];
   validationReceipt: { receiptId: UUID; validationHash: Sha256; outcome: "pass" | "pass_with_warnings" };
   eligibility: { currentAccepted: true; sourceCurrent: true; stale: false };
+};
+
+export type S7SourceStamp = {
+  sourceRevisionId: UUID;
+  sourceRevisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  validationReceiptId: UUID;
+  validationHash: Sha256;
+  s6HandoffSchemaVersion: "s6-to-s7-handoff-v1";
+  handoffDigest: Sha256;
+};
+
+export type S7CadExportStatus =
+  | "queued"
+  | "running"
+  | "staged"
+  | "promoted"
+  | "committed"
+  | "stale"
+  | "superseded"
+  | "failed_retryable"
+  | "failed_terminal"
+  | "aborted";
+
+export type S7CadPublicationPhase = "none" | "staged" | "promoted" | "committed" | "aborted";
+
+export type S7CadExport = {
+  schemaVersion: "s7-cad-export-v1";
+
+  artifactId: UUID;
+  projectId: UUID;
+  jobId: UUID;
+
+  source: S7SourceStamp;
+  inputHash: Sha256;
+
+  dxfVersion: "s7-dxf-r2000-ascii-v1";
+  worldToPlanVersion: "s7-world-to-plan-v1";
+
+  format: "dxf";
+  mimeType: "application/dxf";
+  downloadFileName: "swooshz-s7-plan.dxf";
+
+  status: S7CadExportStatus;
+
+  publicationPhase: S7CadPublicationPhase;
+
+  attempt: 1 | 2;
+  retryOfArtifactId: UUID | null;
+
+  manifestId: UUID;
+  manifestHash: Sha256 | null;
+
+  readbackReceiptId: UUID | null;
+  readbackHash: Sha256 | null;
+
+  sha256: Sha256 | null;
+  byteSize: number | null;
+
+  privateFinalStorageKey: string;
+  privateStagingStorageKey: string;
+
+  failureCode: string | null;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  committedAt: Timestamp | null;
+  staleAt: Timestamp | null;
+  supersededAt: Timestamp | null;
+};
+
+export type S7CadJob = {
+  schemaVersion: "s7-cad-job-v1";
+
+  jobId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+
+  source: S7SourceStamp;
+  inputHash: Sha256;
+
+  idempotencyKey: string;
+
+  status: S7CadExportStatus;
+  attempt: 1 | 2;
+  retryOfJobId: UUID | null;
+
+  claimToken: UUID | null;
+  ownerProcessId: string | null;
+
+  claimedAt: Timestamp | null;
+  heartbeatAt: Timestamp | null;
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  terminalAt: Timestamp | null;
+};
+
+export type S7CadIdempotency = {
+  schemaVersion: "s7-cad-idempotency-v1";
+
+  projectId: UUID;
+  operation: "export";
+
+  idempotencyKey: string;
+  inputHash: Sha256;
+  source: S7SourceStamp;
+
+  jobId: UUID;
+  artifactId: UUID;
+
+  createdAt: Timestamp;
+};
+
+export type S7CadManifestRecord = {
+  schemaVersion: "s7-cad-manifest-v1";
+  manifestId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+  source: S7SourceStamp;
+  worldToPlanVersion: "s7-world-to-plan-v1";
+  dxfVersion: "s7-dxf-r2000-ascii-v1";
+  manifestHash: Sha256;
+  manifestByteSize: number;
+  privateManifestStorageKey: string;
+};
+
+export type S7CadManifestEntry = {
+  handle: string;
+  sourceObjectId: string;
+  parentObjectId: string | null;
+  identityKey: string;
+  role: string;
+  partIndex: number;
+  geometryState: S6GeometryState;
+  intendedLayer: string;
+  emittedLayer: string;
+  entityType: string;
+};
+
+export type S7CadManifestDocument = {
+  schemaVersion: "s7-cad-manifest-v1";
+  manifestId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+  source: S7SourceStamp;
+  worldToPlanVersion: "s7-world-to-plan-v1";
+  dxfVersion: "s7-dxf-r2000-ascii-v1";
+  entities: S7CadManifestEntry[];
+};
+
+export type S7CadReadbackReceipt = {
+  schemaVersion: "s7-cad-validation-receipt-v1";
+
+  receiptId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+
+  source: S7SourceStamp;
+  manifestId: UUID;
+  manifestHash: Sha256;
+  worldToPlanVersion: "s7-world-to-plan-v1";
+  dxfVersion: "s7-dxf-r2000-ascii-v1";
+
+  sha256: Sha256;
+  byteSize: number;
+  entityCount: number;
+  correspondenceResult: "pass" | "fail";
+  outcome: "pass" | "fail";
+  issues: string[];
+  checkedAt: Timestamp;
+
+  receiptHash: Sha256;
+  readbackVersion: "s7-cad-readback-v1";
+};
+
+export type S7ToS8Handoff = {
+  schemaVersion: "s7-to-s8-handoff-v1";
+
+  projectId: UUID;
+
+  sourceRevisionId: UUID;
+  sourceRevisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+
+  s7ArtifactId: UUID;
+  s7ArtifactHash: Sha256;
+  s7ArtifactByteSize: number;
+
+  manifestId: UUID;
+  manifestHash: Sha256;
+
+  readbackReceiptId: UUID;
+  readbackHash: Sha256;
+
+  dxfVersion: "s7-dxf-r2000-ascii-v1";
+  worldToPlanVersion: "s7-world-to-plan-v1";
+
+  coordinateConvention: "booth-local-right-handed-v1";
+
+  dxfIsNot3DAuthority: true;
+  s8MustReadAcceptedS6Model: true;
+};
+
+export type S7CadPublicExport = Omit<S7CadExport, "privateFinalStorageKey" | "privateStagingStorageKey">;
+
+export type S7CadMetric<T> = {
+  availability: "available" | "unavailable";
+  value: T | null;
+  reason: string | null;
+};
+
+export type S7Telemetry = {
+  schemaVersion: "s7-telemetry-v1";
+  projectId: UUID;
+  sourceReadiness: S7CadMetric<"ready" | "not_ready">;
+  exportCount: S7CadMetric<number>;
+  committedExportCount: S7CadMetric<number>;
+  retryCount: S7CadMetric<number>;
+  staleCount: S7CadMetric<number>;
+  supersededCount: S7CadMetric<number>;
+  failedCount: S7CadMetric<number>;
+  readbackPassCount: S7CadMetric<number>;
+  committedDxfByteSize: S7CadMetric<number>;
+  generatedAt: Timestamp;
+};
+
+export type S7PublicState = {
+  projectId: UUID;
+  source: {
+    readiness: "ready" | "not_ready";
+    sourceRevisionId: UUID | null;
+    sourceRevisionHash: Sha256 | null;
+    sourceS5Fingerprint: Sha256 | null;
+  };
+  exports: S7CadPublicExport[];
 };
 
 export type S6EmptyRequest = Record<string, never>;
