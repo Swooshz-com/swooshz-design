@@ -441,7 +441,24 @@ def editable_poly_node(vertices, faces, name):
     rt.convertTo(node, rt.Editable_Poly)
     rt.polyOp.deleteFaces(node, rt.Array(1), delIsoVerts=False)
     for face_indices in faces:
-        rt.polyOp.createFace(node, rt.Array(*face_indices))
+        expected_vertices = tuple(face_indices)
+        try:
+            face_index = int(node.EditablePoly.createFace(rt.Array(*expected_vertices)))
+            face_count = int(node.EditablePoly.GetNumFaces())
+            face_degree = int(node.EditablePoly.GetFaceDegree(face_index))
+            actual_vertices = tuple(
+                int(node.EditablePoly.GetFaceVertex(face_index, corner))
+                for corner in range(1, face_degree + 1)
+            )
+        except Exception:
+            fail("S8_MESH_FACE_CREATE_FAILED")
+        if (
+            face_index <= 0
+            or face_index > face_count
+            or face_degree != len(expected_vertices)
+            or actual_vertices != expected_vertices
+        ):
+            fail("S8_MESH_FACE_CREATE_FAILED")
     return node
 
 
