@@ -22,17 +22,99 @@ import { cloneJson, jcs, newUuid, nowUtc, sha256 } from "./utils";
 
 export type S8MaxProviderStage = "generation" | "validation";
 
+export type S8ProviderFailureCause =
+  | "provider_transient"
+  | "queue"
+  | "rate_limit"
+  | "auth"
+  | "compatibility"
+  | "transfer_transient"
+  | "transfer_defect"
+  | "candidate"
+  | "script"
+  | "semantic"
+  | "unknown";
+
+export type S8ProviderFailureDisposition = {
+  classification: "provider_hold" | "candidate_failure" | "stale";
+  retryable: boolean;
+  consumesCandidateAttempt: boolean;
+  controllerRequired: boolean;
+  reconciliationRequired: boolean;
+  honorRetryAfter: boolean;
+};
+
+export type S8MaxProviderFailureSpec = {
+  code: S8MaxProviderFailureCode;
+  cause?: S8ProviderFailureCause;
+  retryAfterSeconds?: number;
+};
+
+export type S8MaxProviderFailureInput = S8MaxProviderFailureCode | S8MaxProviderFailureSpec;
+
+function defaultFailureCause(code: S8MaxProviderFailureCode): S8ProviderFailureCause {
+  switch (code) {
+    case "APS_QUEUE_DELAY": return "queue";
+    case "APS_RATE_LIMIT": return "rate_limit";
+    case "APS_AUTH_FAILURE": return "auth";
+    case "APS_ENGINE_DEPRECATED":
+    case "APS_ENGINE_VERSION_MOVED": return "compatibility";
+    case "APS_INPUT_DOWNLOAD_FAILED": return "transfer_transient";
+    case "APS_OUTPUT_UPLOAD_FAILED": return "transfer_transient";
+    case "APS_OUTPUT_MISSING": return "transfer_defect";
+    case "APS_OUTPUT_INTEGRITY_MISMATCH": return "transfer_transient";
+    case "S8_NATIVE_SAVE_FAILED":
+    case "S8_UNSUPPORTED_GEOMETRY":
+    case "S8_PROFILE_TRIANGULATION_FAILED":
+    case "S7_CROSS_OUTPUT_MISMATCH": return "candidate";
+    case "APS_INSTRUCTIONS_FAILED": return "candidate";
+    case "SOURCE_STALE": return "unknown";
+    default: return "provider_transient";
+  }
+}
+
+export function classifyS8ProviderFailure(code: S8MaxProviderFailureCode, cause = defaultFailureCause(code)): S8ProviderFailureDisposition {
+  if (code === "SOURCE_STALE") {
+    return { classification: "stale", retryable: false, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false };
+  }
+  if (code === "S8_NATIVE_SAVE_FAILED" || code === "S8_UNSUPPORTED_GEOMETRY" || code === "S8_PROFILE_TRIANGULATION_FAILED" || code === "S7_CROSS_OUTPUT_MISMATCH" || code === "APS_INSTRUCTIONS_FAILED") {
+    return { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false };
+  }
+  if (code === "APS_AUTH_FAILURE" || code === "APS_ENGINE_DEPRECATED" || code === "APS_ENGINE_VERSION_MOVED" || cause === "compatibility" || cause === "auth") {
+    return { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false };
+  }
+  if (code === "APS_OUTPUT_MISSING" || cause === "transfer_defect") {
+    return { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false };
+  }
+  if (cause === "candidate" || cause === "script" || cause === "semantic") {
+    return { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false };
+  }
+  return {
+    classification: "provider_hold",
+    retryable: true,
+    consumesCandidateAttempt: false,
+    controllerRequired: false,
+    reconciliationRequired: false,
+    honorRetryAfter: cause === "rate_limit",
+  };
+}
+
 export class S8MaxProviderError extends Error {
   readonly code: S8MaxProviderFailureCode;
   readonly stage: S8MaxProviderStage;
   readonly providerRetryable: boolean;
+  readonly cause: S8ProviderFailureCause;
+  readonly retryAfterSeconds: number | null;
 
-  constructor(code: S8MaxProviderFailureCode, stage: S8MaxProviderStage, providerRetryable: boolean, detail = "provider") {
+  constructor(code: S8MaxProviderFailureCode, stage: S8MaxProviderStage, providerRetryable: boolean, detail = "provider", cause = defaultFailureCause(code), retryAfterSeconds: number | null = null) {
     super(`${code}: ${detail}`);
     this.name = "S8MaxProviderError";
     this.code = code;
     this.stage = stage;
     this.providerRetryable = providerRetryable;
+    this.cause = cause;
+    if (retryAfterSeconds !== null && (!Number.isSafeInteger(retryAfterSeconds) || retryAfterSeconds < 0)) throw new TypeError("invalid Retry-After duration");
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -116,20 +198,10 @@ export class MockOssV2Transfer {
 
 export type MockProviderOptions = {
   clock?: () => Timestamp;
-  generationFailures?: S8MaxProviderFailureCode[];
-  validationFailures?: S8MaxProviderFailureCode[];
+  generationFailures?: S8MaxProviderFailureInput[];
+  validationFailures?: S8MaxProviderFailureInput[];
   transfer?: MockOssV2Transfer;
 };
-
-const PROVIDER_ERROR_CODES = new Set<S8MaxProviderFailureCode>([
-  "APS_UNAVAILABLE", "APS_QUEUE_DELAY", "APS_RATE_LIMIT", "APS_AUTH_FAILURE", "APS_ENGINE_UNAVAILABLE", "APS_ENGINE_DEPRECATED",
-  "APS_ENGINE_VERSION_MOVED", "APS_INPUT_DOWNLOAD_FAILED", "APS_WORKITEM_FAILED", "APS_INSTRUCTIONS_FAILED", "APS_TIMEOUT",
-  "APS_OUTPUT_UPLOAD_FAILED", "APS_OUTPUT_MISSING", "APS_OUTPUT_INTEGRITY_MISMATCH", "APS_VALIDATOR_FAILED",
-]);
-
-function isProviderFailure(code: S8MaxProviderFailureCode): boolean {
-  return PROVIDER_ERROR_CODES.has(code);
-}
 
 function providerBinding(input: S8MaxProviderInput): S8SemanticBinding {
   const generationId = "swooshz-s8-max-generation-v1";
@@ -191,9 +263,10 @@ function metadata(
   };
 }
 
-function throwFailure(code: S8MaxProviderFailureCode, stage: S8MaxProviderStage): never {
-  if (isProviderFailure(code)) throw new S8MaxProviderError(code, stage, true);
-  throw new S8MaxProviderError(code, stage, false);
+function throwFailure(failure: S8MaxProviderFailureInput, stage: S8MaxProviderStage): never {
+  const spec = typeof failure === "string" ? { code: failure } : failure;
+  const disposition = classifyS8ProviderFailure(spec.code, spec.cause);
+  throw new S8MaxProviderError(spec.code, stage, disposition.classification === "provider_hold" && disposition.retryable, "mock provider failure", spec.cause, spec.retryAfterSeconds ?? null);
 }
 
 type MockArtifactEnvelope = {
@@ -218,7 +291,7 @@ export function decodeMockNativeArtifact(bytes: Uint8Array): MockArtifactEnvelop
     if (value.schemaVersion !== "s8.mock-native-max-v1" || value.transportFileName !== S8_NATIVE_FILE_NAME || !value.scene || !value.binding) throw new Error("invalid envelope");
     return value;
   } catch {
-    throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true, "mock artifact");
+    throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true, "mock artifact", "transfer_defect");
   }
 }
 
@@ -226,8 +299,8 @@ export class MockS8MaxProvider implements S8MaxProvider {
   readonly providerKind = "mock-oss-v2" as const;
   readonly transfer: MockOssV2Transfer;
   private readonly clock: () => Timestamp;
-  private readonly generationFailures: S8MaxProviderFailureCode[];
-  private readonly validationFailures: S8MaxProviderFailureCode[];
+  private readonly generationFailures: S8MaxProviderFailureInput[];
+  private readonly validationFailures: S8MaxProviderFailureInput[];
 
   constructor(options: MockProviderOptions = {}) {
     this.transfer = options.transfer ?? new MockOssV2Transfer();
@@ -269,10 +342,10 @@ export class MockS8MaxProvider implements S8MaxProvider {
     if (failure) throwFailure(failure, "validation");
     const envelope = decodeMockNativeArtifact(input.artifactBytes);
     if (envelope.projectId !== input.projectId || envelope.artifactId !== input.artifactId || envelope.sourceStampDigest !== input.sourceStampDigest || envelope.payloadSha256 !== input.payloadSha256) {
-      throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true, "source binding");
+      throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true, "source binding", "transfer_defect");
     }
     if (jcs(envelope.binding) !== jcs(input.binding)) {
-      throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true, "tool binding");
+      throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true, "tool binding", "compatibility");
     }
     const readback = buildS8IndependentReadback({
       projectId: input.projectId,
@@ -286,7 +359,7 @@ export class MockS8MaxProvider implements S8MaxProvider {
       checkedAt: this.clock(),
     });
     const comparison = compareS8SemanticManifest(input.manifest, readback);
-    if (comparison.outcome !== "pass") throw new S8MaxProviderError("APS_VALIDATOR_FAILED", "validation", true, comparison.issues.join(","));
+    if (comparison.outcome !== "pass") throw new S8MaxProviderError("APS_VALIDATOR_FAILED", "validation", false, comparison.issues.join(","), "semantic");
     return {
       provider: this.providerKind,
       binding: cloneJson(input.binding),

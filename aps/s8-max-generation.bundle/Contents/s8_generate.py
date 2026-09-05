@@ -15,7 +15,7 @@ from pymxs import runtime as rt
 
 PAYLOAD_NAME = "swooshz-s8-payload.json"
 OUTPUT_NAME = "swooshz-s8-model.max"
-RESULT_NAME = "s8-generation-result.json"
+RECEIPT_NAME = "swooshz-s8-generation-receipt.json"
 BINDING_NAME = "s8-engine-binding.json"
 ARTIFACT_ID_NAME = "s8-artifact-id.txt"
 PAYLOAD_SCHEMA = "s8.max.payload-v1"
@@ -156,11 +156,16 @@ def dot(left, right):
     return left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
 
 
-def face(vertices, face, expected):
+def oriented_face(vertices, face_indices, expected):
+    face = tuple(face_indices)
+    if len(face) not in (3, 4) or len(set(face)) != len(face):
+        fail("S8_MESH_INVALID")
     actual = cross(vertices[face[0] - 1], vertices[face[1] - 1], vertices[face[2] - 1])
     if abs(dot(actual, expected)) <= 1e-5:
         fail("S8_MESH_WINDING_INVALID")
-    return face if dot(actual, expected) > 0 else (face[0], face[2], face[1])
+    if dot(actual, expected) > 0:
+        return face
+    return (face[0],) + tuple(reversed(face[1:]))
 
 
 def rect_mesh(geometry):
@@ -170,8 +175,8 @@ def rect_mesh(geometry):
     width, depth = dimensions["widthMm"], dimensions["depthMm"]
     s6 = ((0, base, 0), (width, base, 0), (width, base, depth), (0, base, depth), (0, base + height, 0), (width, base + height, 0), (width, base + height, depth), (0, base + height, depth))
     vertices = [pmax({"xMm": point[0], "yMm": point[1], "zMm": point[2]}) for point in s6]
-    raw = (((1, 3, 2), (0, 0, -1)), ((1, 4, 3), (0, 0, -1)), ((5, 6, 7), (0, 0, 1)), ((5, 7, 8), (0, 0, 1)), ((1, 2, 6), (0, 1, 0)), ((1, 6, 5), (0, 1, 0)), ((2, 3, 7), (1, 0, 0)), ((2, 7, 6), (1, 0, 0)), ((3, 4, 8), (0, -1, 0)), ((3, 8, 7), (0, -1, 0)), ((4, 1, 5), (-1, 0, 0)), ((4, 5, 8), (-1, 0, 0)))
-    return vertices, [face(vertices, item, expected) for item, expected in raw]
+    raw = (((1, 4, 3, 2), (0, 0, -1)), ((5, 6, 7, 8), (0, 0, 1)), ((1, 2, 6, 5), (0, 1, 0)), ((2, 3, 7, 6), (1, 0, 0)), ((3, 4, 8, 7), (0, -1, 0)), ((4, 1, 5, 8), (-1, 0, 0)))
+    return vertices, [oriented_face(vertices, item, expected) for item, expected in raw]
 
 
 def round_mesh(geometry):
@@ -194,7 +199,7 @@ def round_mesh(geometry):
         t, tn = ROUND_SEGMENTS + index + 1, ROUND_SEGMENTS + next_index + 1
         angle = 2.0 * math.pi * (index + 0.5) / ROUND_SEGMENTS
         outward = (math.cos(angle), -math.sin(angle), 0)
-        faces.extend((face(vertices, (b, bn, tn), outward), face(vertices, (b, tn, t), outward), face(vertices, (bottom_center, bn, b), (0, 0, -1)), face(vertices, (top_center, t, tn), (0, 0, 1))))
+        faces.extend((oriented_face(vertices, (b, bn, tn, t), outward), oriented_face(vertices, (bottom_center, bn, b), (0, 0, -1)), oriented_face(vertices, (top_center, t, tn), (0, 0, 1))))
     return vertices, faces
 
 
@@ -257,8 +262,8 @@ def profile_mesh(geometry):
     count = len(profile)
     faces = []
     for triangle in triangulate(profile):
-        faces.append(face(vertices, (triangle[0] + count + 1, triangle[1] + count + 1, triangle[2] + count + 1), (0, 0, 1)))
-        faces.append(face(vertices, (triangle[2] + 1, triangle[1] + 1, triangle[0] + 1), (0, 0, -1)))
+        faces.append(oriented_face(vertices, (triangle[0] + count + 1, triangle[1] + count + 1, triangle[2] + count + 1), (0, 0, 1)))
+        faces.append(oriented_face(vertices, (triangle[2] + 1, triangle[1] + 1, triangle[0] + 1), (0, 0, -1)))
     winding_area = area(profile)
     for index in range(count):
         next_index = (index + 1) % count
@@ -269,7 +274,7 @@ def profile_mesh(geometry):
         if length <= 0:
             fail("S8_PROFILE_TRIANGULATION_FAILED")
         expected = (outside[0] / length, -outside[1] / length, 0)
-        faces.extend((face(vertices, (index + 1, next_index + 1, count + next_index + 1), expected), face(vertices, (index + 1, count + next_index + 1, count + index + 1), expected)))
+        faces.append(oriented_face(vertices, (index + 1, next_index + 1, count + next_index + 1, count + index + 1), expected))
     return vertices, faces
 
 
@@ -426,6 +431,20 @@ def ordered_objects(objects):
     return [item[2] for item in result]
 
 
+def editable_poly_node(vertices, faces, name):
+    if len(vertices) < 3 or not faces:
+        fail("S8_MESH_INVALID")
+    native_vertices = [rt.Point3(*vertex) for vertex in vertices]
+    # mesh() is only a temporary deterministic seed; the final faces are
+    # created on the converted Editable_Poly so locked quads are retained.
+    node = rt.mesh(vertices=native_vertices, faces=[rt.Point3(1, 2, 3)], name=name)
+    rt.convertTo(node, rt.Editable_Poly)
+    rt.polyOp.deleteFaces(node, rt.Array(1), delIsoVerts=False)
+    for face_indices in faces:
+        rt.polyOp.createFace(node, rt.Array(*face_indices))
+    return node
+
+
 def create_scene(payload, payload_bytes, binding, artifact_id):
     handoff = payload["s6Handoff"]
     objects = handoff["objects"]
@@ -476,12 +495,11 @@ def create_scene(payload, payload_bytes, binding, artifact_id):
             world = compose(local, world_by_id[parent_id])
             parent_node = node_by_id[parent_id]
         world = quantize_matrix(world)
-        native_vertices = [rt.Point3(*vertex) for vertex in vertices]
-        native_faces = [rt.Point3(*item_face) for item_face in faces]
-        node = rt.mesh(vertices=native_vertices, faces=native_faces, name=name)
-        rt.convertTo(node, rt.Editable_Poly)
+        node = editable_poly_node(vertices, faces, name)
         node.parent = parent_node
-        node.transform = max_matrix(local)
+        # Max node.transform is the world-space matrix. Apply the composed
+        # world matrix after parenting; local is derived by the validator.
+        node.transform = max_matrix(world)
         node.material = physical_material(material_refs.get(item["materialIds"][0]) if item.get("materialIds") else None, object_id)
         set_user_property(node, "s8.objectId", object_id)
         set_user_property(node, "s8.identityKey", item["identityKey"])
@@ -501,22 +519,27 @@ def main():
     working = Path.cwd()
     payload, payload_bytes = read_payload(working / PAYLOAD_NAME)
     output = working / OUTPUT_NAME
-    if output.exists():
+    receipt_path = working / RECEIPT_NAME
+    if output.exists() or receipt_path.exists():
         fail("S8_OUTPUT_EXISTS")
     rt.resetMaxFile(rt.Name("noprompt"))
-    rt.units.SystemType = rt.Name("Metric")
+    rt.units.SystemType = rt.Name("Millimeters")
+    rt.units.SystemScale = 1.0
+    rt.units.DisplayType = rt.Name("Metric")
     rt.units.MetricType = rt.Name("Millimeters")
     payload_hash = digest(payload_bytes)
     stamp_hash = digest(canonical(payload["sourceStamp"]).encode("utf-8"))
     binding = read_binding(working / BINDING_NAME, payload_hash, stamp_hash)
     artifact_id = read_artifact_id(working / ARTIFACT_ID_NAME)
     object_count = create_scene(payload, payload_bytes, binding, artifact_id)[2]
-    if not rt.saveMaxFile(str(output), quiet=True):
+    if rt.saveMaxFile(str(output), clearNeedSaveFlag=True, useNewFile=True, quiet=True) is not True:
         fail("S8_NATIVE_SAVE_FAILED")
     if not output.exists() or output.stat().st_size <= 0 or output.stat().st_size > MAX_NATIVE_BYTES:
         fail("S8_NATIVE_SAVE_FAILED")
-    result = {"schemaVersion": "s8-max-generation-result-v1", "payloadSha256": payload_hash, "sourceStampDigest": stamp_hash, "artifactId": artifact_id, "objectCount": object_count, "nativeFileName": OUTPUT_NAME, "nativeSaveOutcome": "pass", "binding": binding}
-    (working / RESULT_NAME).write_text(canonical(result), encoding="utf-8", newline="\n")
+    receipt_without_hash = {"schemaVersion": "s8-max-generation-receipt-v1", "payloadSha256": payload_hash, "sourceStampDigest": stamp_hash, "artifactId": artifact_id, "objectCount": object_count, "nativeFileName": OUTPUT_NAME, "nativeSaveOutcome": "pass", "binding": binding, "artifactSha256": digest(output.read_bytes()), "artifactByteSize": output.stat().st_size, "receiptHash": ""}
+    receipt = dict(receipt_without_hash)
+    receipt["receiptHash"] = digest(canonical(receipt_without_hash).encode("utf-8"))
+    receipt_path.write_text(canonical(receipt), encoding="utf-8", newline="\n")
 
 
 if __name__ == "__main__":

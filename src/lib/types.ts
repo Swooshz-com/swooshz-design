@@ -3003,7 +3003,8 @@ export type S8MaxPayloadV1 = {
 };
 
 export type S8MaxPoint = { x: number; y: number; z: number };
-export type S8MaxFace = [number, number, number];
+/** Native Editable_Poly faces retain quads for solids/sides; only caps may be triangles. */
+export type S8MaxFace = [number, number, number] | [number, number, number, number];
 export type S8MaxMatrix3 = {
   rows: [S8MaxPoint, S8MaxPoint, S8MaxPoint];
   translation: S8MaxPoint;
@@ -3142,6 +3143,7 @@ export type S8MaxExport = {
   privateStagingStorageKey: string;
   privatePayloadStorageKey: string;
   failureCode: string | null;
+  controllerRequired: boolean;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   committedAt: Timestamp | null;
@@ -3172,6 +3174,7 @@ export type S8MaxJob = {
   createdAt: Timestamp;
   updatedAt: Timestamp;
   terminalAt: Timestamp | null;
+  controllerRequired: boolean;
 };
 
 export type S8MaxIdempotency = {

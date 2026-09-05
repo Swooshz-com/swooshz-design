@@ -34,6 +34,7 @@ import {
   S8_MAX_MANIFEST_BYTES,
   S8_MAX_NATIVE_BYTES,
   S8_MAX_PROVIDER_ATTEMPTS,
+  S8_MAX_RECOVERY_HEARTBEAT_SECONDS,
   S8_MAX_READBACK_BYTES,
   S8_NATIVE_FILE_NAME,
   S8_TRANSPORT_FILE_NAME,
@@ -57,6 +58,7 @@ import {
 } from "./s8-persistence";
 import {
   ApsOssV2DirectS3Provider,
+  classifyS8ProviderFailure,
   S8MaxProviderError,
   type S8MaxProvider,
   type S8MaxProviderGenerationOutput,
@@ -121,7 +123,6 @@ const OPAQUE_KEY_MAX = 240;
 const RECOVERY_MAX = 256;
 const INPUT_OPERATION = "s8-max-export-v1";
 const RETRY_OPERATION = "s8-max-retry-v1";
-const PROVIDER_FAILURE_PREFIX = "APS_";
 
 function requireS8State(state: import("./types").StoreState): S8StoreState {
   const candidate = state as S8StoreState;
@@ -164,10 +165,6 @@ function clearClaim(job: S8MaxJob): void {
 
 function isSourceBoundaryError(error: unknown): boolean {
   return error instanceof AppError && ["SOURCE_STALE", "S8_SOURCE_NOT_READY", "S8_CLAIM_FENCED"].includes(error.code);
-}
-
-function isProviderCode(code: string): boolean {
-  return code.startsWith(PROVIDER_FAILURE_PREFIX) || code === "APS_VALIDATOR_FAILED";
 }
 
 function failureCode(error: unknown): string {
@@ -323,7 +320,8 @@ export class S8MaxService {
           artifact.publicationPhase = "committed";
           artifact.supersededAt = at;
           artifact.updatedAt = at;
-          if (job) { job.status = "superseded"; job.terminalAt = at; job.updatedAt = at; clearClaim(job); }
+          artifact.controllerRequired = false;
+          if (job) { job.status = "superseded"; job.terminalAt = at; job.updatedAt = at; job.controllerRequired = false; clearClaim(job); }
           continue;
         }
         artifact.status = "stale";
@@ -331,7 +329,7 @@ export class S8MaxService {
         artifact.failureCode = "SOURCE_STALE";
         artifact.staleAt = at;
         artifact.updatedAt = at;
-        if (job) { job.status = "stale"; job.terminalAt = at; job.updatedAt = at; clearClaim(job); }
+        if (job) { job.status = "stale"; job.terminalAt = at; job.updatedAt = at; job.controllerRequired = false; clearClaim(job); }
       }
     });
   }
@@ -426,12 +424,17 @@ export class S8MaxService {
   }
 
   private async markFailure(jobId: UUID, claimToken: UUID | null, error: unknown): Promise<void> {
-    const code = failureCode(error); const providerFailure = error instanceof S8MaxProviderError ? error.providerRetryable : isProviderCode(code);
+    const code = failureCode(error);
+    const providerDisposition = error instanceof S8MaxProviderError
+      ? classifyS8ProviderFailure(error.code, error.cause)
+      : null;
+    const providerFailure = providerDisposition?.classification === "provider_hold";
+    const providerError = providerDisposition !== null;
     const snapshot = this.snapshot(jobId); const stage: S8MaxProviderStage = snapshot.job.stage === "validation" ? "validation" : "generation";
-    if (providerFailure) {
+    if (providerError) {
       await this.recordProviderMetadata(error instanceof S8MaxProviderError
         ? errorMetadataFromProviderError(error, snapshot.job, this.provider.providerKind, this.clock, this.uuid)
-        : this.failureMetadata(snapshot.job, stage, stage === "generation" ? Math.max(snapshot.job.generationProviderAttempts, 1) : Math.max(snapshot.job.validationProviderAttempts, 1), code, "hold"));
+        : this.failureMetadata(snapshot.job, stage, stage === "generation" ? Math.max(snapshot.job.generationProviderAttempts, 1) : Math.max(snapshot.job.validationProviderAttempts, 1), code, providerFailure ? "hold" : "fail"));
     }
     this.repository.transact((state) => {
       const s8 = requireS8State(state);
@@ -440,13 +443,13 @@ export class S8MaxService {
       if (!job || !artifact) return;
       if (claimToken !== null && (job.claimToken !== claimToken || job.ownerProcessId !== this.ownerProcessId)) return;
       const at = this.clock(); artifact.failureCode = code; artifact.updatedAt = at; job.updatedAt = at;
-      if (code === "SOURCE_STALE") {
-        artifact.status = "stale"; artifact.staleAt = at; artifact.publicationPhase = artifact.publicationPhase === "aborted" ? "none" : artifact.publicationPhase; job.status = "stale"; job.terminalAt = at;
+      if (providerDisposition?.classification === "stale" || code === "SOURCE_STALE") {
+        artifact.status = "stale"; artifact.staleAt = at; artifact.publicationPhase = artifact.publicationPhase === "aborted" ? "none" : artifact.publicationPhase; artifact.controllerRequired = false; job.status = "stale"; job.terminalAt = at; job.controllerRequired = false;
       } else if (providerFailure) {
-        artifact.status = "provider_hold"; job.status = "provider_hold"; job.terminalAt = null;
+        artifact.status = "provider_hold"; artifact.controllerRequired = providerDisposition?.controllerRequired ?? false; job.status = "provider_hold"; job.controllerRequired = providerDisposition?.controllerRequired ?? false; job.terminalAt = null;
       } else {
         const terminal = job.candidateAttempt === S8_MAX_CANDIDATE_ATTEMPTS;
-        artifact.status = terminal ? "failed_terminal" : "failed_retryable"; artifact.publicationPhase = terminal ? "aborted" : artifact.publicationPhase; job.status = artifact.status; job.terminalAt = terminal ? at : null;
+        artifact.status = terminal ? "failed_terminal" : "failed_retryable"; artifact.publicationPhase = terminal ? "aborted" : artifact.publicationPhase; artifact.controllerRequired = false; job.status = artifact.status; job.controllerRequired = false; job.terminalAt = terminal ? at : null;
       }
       clearClaim(job);
     });
@@ -470,12 +473,12 @@ export class S8MaxService {
     }
     this.fence(job.projectId, job.sourceStamp, "provider-result", running);
     if (output.artifactBytes.length === 0 || output.artifactBytes.length > S8_MAX_NATIVE_BYTES || output.nativeSaveOutcome !== "pass") throw new S8MaxProviderError("S8_NATIVE_SAVE_FAILED", "generation", false);
-    if (output.binding.sourceStampDigest !== job.sourceStampDigest || output.binding.payloadSha256 !== job.payloadSha256) throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "generation", true, "binding");
-    try { validateS8SemanticBinding(output.binding); } catch { throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "generation", true, "tool binding"); }
+    if (output.binding.sourceStampDigest !== job.sourceStampDigest || output.binding.payloadSha256 !== job.payloadSha256) throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "generation", true, "binding", "transfer_defect");
+    try { validateS8SemanticBinding(output.binding); } catch { throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "generation", true, "tool binding", "compatibility"); }
     const binding = output.binding;
     const manifest = buildS8SemanticManifest({ projectId: job.projectId, artifactId: job.artifactId, sourceStamp: job.sourceStamp, payloadSha256: job.payloadSha256, binding }, payload.payload);
     const bytes = manifestBytes(manifest);
-    if (bytes.length > S8_MAX_MANIFEST_BYTES) throw new S8MaxProviderError("APS_OUTPUT_UPLOAD_FAILED", "generation", true, "manifest limit");
+    if (bytes.length > S8_MAX_MANIFEST_BYTES) throw new S8MaxProviderError("APS_OUTPUT_UPLOAD_FAILED", "generation", true, "manifest limit", "transfer_defect");
     return { job: this.snapshot(job.jobId).job, artifact: this.snapshot(job.jobId).artifact, output, manifest, manifestHash: sha256(bytes), manifestBytes: bytes };
   }
 
@@ -507,7 +510,7 @@ export class S8MaxService {
         s8.s8MaxManifests.push(manifest);
       }
       if (!s8.s8MaxGenerationReceipts.some((item) => item.receiptId === receipt.receiptId)) s8.s8MaxGenerationReceipts.push(receipt);
-      const at = this.clock(); liveArtifact.status = "staged"; liveArtifact.publicationPhase = "staged"; liveArtifact.generationReceiptId = receipt.receiptId; liveArtifact.artifactSha256 = receipt.artifactSha256; liveArtifact.artifactByteSize = receipt.artifactByteSize; liveArtifact.failureCode = null; liveArtifact.updatedAt = at; liveJob.status = "staged"; liveJob.stage = "generation"; liveJob.updatedAt = at; liveJob.heartbeatAt = at;
+      const at = this.clock(); liveArtifact.status = "staged"; liveArtifact.publicationPhase = "staged"; liveArtifact.generationReceiptId = receipt.receiptId; liveArtifact.artifactSha256 = receipt.artifactSha256; liveArtifact.artifactByteSize = receipt.artifactByteSize; liveArtifact.failureCode = null; liveArtifact.controllerRequired = false; liveArtifact.updatedAt = at; liveJob.status = "staged"; liveJob.stage = "generation"; liveJob.controllerRequired = false; liveJob.updatedAt = at; liveJob.heartbeatAt = at;
     });
   }
 
@@ -520,7 +523,7 @@ export class S8MaxService {
       const s8 = requireS8State(state);
       const liveJob = s8.s8MaxJobs.find((item) => item.jobId === job.jobId); const liveArtifact = liveJob ? s8.s8MaxExports.find((item) => item.artifactId === liveJob.artifactId) : undefined;
       if (!liveJob || !liveArtifact || liveJob.claimToken !== claimToken || liveJob.ownerProcessId !== this.ownerProcessId) fail(409, "S8_CLAIM_FENCED");
-      const at = this.clock(); liveArtifact.status = "validating"; liveArtifact.publicationPhase = "promoted"; liveArtifact.updatedAt = at; liveJob.status = "validating"; liveJob.stage = "validation"; liveJob.updatedAt = at; liveJob.heartbeatAt = at;
+      const at = this.clock(); liveArtifact.status = "validating"; liveArtifact.publicationPhase = "promoted"; liveArtifact.controllerRequired = false; liveArtifact.updatedAt = at; liveJob.status = "validating"; liveJob.stage = "validation"; liveJob.controllerRequired = false; liveJob.updatedAt = at; liveJob.heartbeatAt = at;
     });
   }
 
@@ -528,7 +531,7 @@ export class S8MaxService {
     const current = this.snapshot(job.jobId); const manifestRecord = getS8Collections(this.repository.state()).manifests.find((item) => item.manifestId === current.artifact.manifestId);
     if (!manifestRecord) fail(500, "S8_PERSISTENCE_INVALID");
     const finalBytes = this.objects.read(current.artifact.privateFinalStorageKey); const artifactHash = sha256(finalBytes);
-    if (current.artifact.artifactSha256 !== artifactHash || current.artifact.artifactByteSize !== finalBytes.length) throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true);
+    if (current.artifact.artifactSha256 !== artifactHash || current.artifact.artifactByteSize !== finalBytes.length) throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true, "final artifact", "transfer_defect");
     this.repository.transact((state) => {
       const s8 = requireS8State(state);
       const liveJob = s8.s8MaxJobs.find((item) => item.jobId === job.jobId); if (!liveJob || liveJob.claimToken !== claimToken || liveJob.ownerProcessId !== this.ownerProcessId) fail(409, "S8_CLAIM_FENCED");
@@ -543,30 +546,30 @@ export class S8MaxService {
       throw error;
     }
     this.fence(job.projectId, job.sourceStamp, "validation", running);
-    if (output.readback.artifactSha256 !== artifactHash || output.readback.artifactByteSize !== finalBytes.length || output.readback.sourceStampDigest !== job.sourceStampDigest || output.readback.payloadSha256 !== job.payloadSha256) throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true);
+    if (output.readback.artifactSha256 !== artifactHash || output.readback.artifactByteSize !== finalBytes.length || output.readback.sourceStampDigest !== job.sourceStampDigest || output.readback.payloadSha256 !== job.payloadSha256) throw new S8MaxProviderError("APS_OUTPUT_INTEGRITY_MISMATCH", "validation", true, "readback binding", "transfer_defect");
     const comparison = compareS8SemanticManifest(manifestRecord.document, output.readback);
-    if (comparison.outcome !== "pass") throw new S8MaxProviderError("APS_VALIDATOR_FAILED", "validation", true, comparison.issues.join(","));
+    if (comparison.outcome !== "pass") throw new S8MaxProviderError("APS_VALIDATOR_FAILED", "validation", false, comparison.issues.join(","), "semantic");
     const checkedAt = this.clock();
     const receiptWithoutHash: S8MaxValidationReceipt = {
       schemaVersion: "s8-max-validation-receipt-v1", receiptId: this.uuid(), projectId: job.projectId, artifactId: artifact.artifactId, sourceStamp: cloneStamp(job.sourceStamp), sourceStampDigest: job.sourceStampDigest, payloadSha256: job.payloadSha256,
       binding: cloneJson(output.binding), manifestId: artifact.manifestId, manifestHash: manifestRecord.manifestHash, artifactSha256: artifactHash, artifactByteSize: finalBytes.length, readback: cloneJson(output.readback), readbackHash: output.readback.readbackHash, outcome: "pass", issues: [], checkedAt, receiptHash: "" as Sha256,
     };
     const validationReceipt = { ...receiptWithoutHash, receiptHash: hashS8ValidationReceipt(receiptWithoutHash) };
-    if (Buffer.byteLength(jcs(validationReceipt), "utf8") > S8_MAX_READBACK_BYTES) throw new S8MaxProviderError("APS_VALIDATOR_FAILED", "validation", true, "receipt limit");
+    if (Buffer.byteLength(jcs(validationReceipt), "utf8") > S8_MAX_READBACK_BYTES) throw new S8MaxProviderError("APS_VALIDATOR_FAILED", "validation", true, "receipt limit", "transfer_defect");
     await this.recordProviderMetadata(output.metadata);
     this.repository.transact((state) => {
       const s8 = requireS8State(state);
       const liveJob = s8.s8MaxJobs.find((item) => item.jobId === job.jobId); const liveArtifact = liveJob ? s8.s8MaxExports.find((item) => item.artifactId === liveJob.artifactId) : undefined;
       if (!liveJob || !liveArtifact || liveJob.claimToken !== claimToken || liveJob.ownerProcessId !== this.ownerProcessId) fail(409, "S8_CLAIM_FENCED");
       if (!s8.s8MaxValidationReceipts.some((item) => item.receiptId === validationReceipt.receiptId)) s8.s8MaxValidationReceipts.push(validationReceipt);
-      const at = this.clock(); liveArtifact.validationReceiptId = validationReceipt.receiptId; liveArtifact.status = "validated"; liveArtifact.publicationPhase = "promoted"; liveArtifact.failureCode = null; liveArtifact.updatedAt = at; liveJob.status = "validated"; liveJob.stage = "validation"; liveJob.updatedAt = at; liveJob.heartbeatAt = at;
+      const at = this.clock(); liveArtifact.validationReceiptId = validationReceipt.receiptId; liveArtifact.status = "validated"; liveArtifact.publicationPhase = "promoted"; liveArtifact.failureCode = null; liveArtifact.controllerRequired = false; liveArtifact.updatedAt = at; liveJob.status = "validated"; liveJob.stage = "validation"; liveJob.controllerRequired = false; liveJob.updatedAt = at; liveJob.heartbeatAt = at;
     });
     const validated = this.snapshot(job.jobId); this.fence(job.projectId, job.sourceStamp, "commit", validated.job);
     this.repository.transact((state) => {
       const s8 = requireS8State(state);
       const liveJob = s8.s8MaxJobs.find((item) => item.jobId === job.jobId); const liveArtifact = liveJob ? s8.s8MaxExports.find((item) => item.artifactId === liveJob.artifactId) : undefined;
       if (!liveJob || !liveArtifact || liveJob.claimToken !== claimToken || liveJob.ownerProcessId !== this.ownerProcessId) fail(409, "S8_CLAIM_FENCED");
-      const at = this.clock(); liveArtifact.status = "committed"; liveArtifact.publicationPhase = "committed"; liveArtifact.committedAt = at; liveArtifact.updatedAt = at; liveJob.status = "committed"; liveJob.stage = "complete"; liveJob.terminalAt = at; liveJob.updatedAt = at; clearClaim(liveJob);
+      const at = this.clock(); liveArtifact.status = "committed"; liveArtifact.publicationPhase = "committed"; liveArtifact.committedAt = at; liveArtifact.updatedAt = at; liveArtifact.controllerRequired = false; liveJob.status = "committed"; liveJob.stage = "complete"; liveJob.terminalAt = at; liveJob.controllerRequired = false; liveJob.updatedAt = at; clearClaim(liveJob);
     });
     this.currentSource(job.projectId, job.sourceStamp);
   }
@@ -603,6 +606,7 @@ export class S8MaxService {
   async process(jobId: UUID): Promise<S8MaxExport> {
     const before = this.snapshot(jobId);
     if (!["queued", "provider_hold"].includes(before.job.status)) return before.artifact;
+    if (before.job.status === "provider_hold" && before.job.controllerRequired) return before.artifact;
     const providerAttempts = before.job.stage === "validation" ? before.job.validationProviderAttempts : before.job.generationProviderAttempts;
     if (before.job.status === "provider_hold" && providerAttempts >= S8_MAX_PROVIDER_ATTEMPTS) return before.artifact;
     const admitted = this.currentSource(before.job.projectId, before.job.sourceStamp);
@@ -618,15 +622,15 @@ export class S8MaxService {
     this.reconcileSourceMovement(projectId, admitted.stamp);
     const digest = sourceStampDigest(admitted.stamp); const operationInput = inputHash(projectId, admitted.stamp, admitted.payload.sha256);
     this.onPublicationPhase?.("admission", { projectId, jobId: admitted.s6Handoff.acceptedRevisionId, artifactId: admitted.s7Handoff.s7ArtifactId, candidateAttempt: 1 });
-    this.fence(projectId, admitted.stamp, "payload", { jobId: admitted.s6Handoff.acceptedRevisionId, artifactId: admitted.s7Handoff.s7ArtifactId, projectId, sourceStamp: admitted.stamp, sourceStampDigest: digest, payloadSha256: admitted.payload.sha256, inputHash: operationInput, idempotencyKey, candidateAttempt: 1, retryOfJobId: null, stage: "generation", status: "queued", generationProviderAttempts: 0, validationProviderAttempts: 0, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, terminalAt: null, createdAt: this.clock(), updatedAt: this.clock(), schemaVersion: "s8-max-job-v1" });
+    this.fence(projectId, admitted.stamp, "payload", { jobId: admitted.s6Handoff.acceptedRevisionId, artifactId: admitted.s7Handoff.s7ArtifactId, projectId, sourceStamp: admitted.stamp, sourceStampDigest: digest, payloadSha256: admitted.payload.sha256, inputHash: operationInput, idempotencyKey, candidateAttempt: 1, retryOfJobId: null, stage: "generation", status: "queued", generationProviderAttempts: 0, validationProviderAttempts: 0, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, terminalAt: null, controllerRequired: false, createdAt: this.clock(), updatedAt: this.clock(), schemaVersion: "s8-max-job-v1" });
     const existing = getS8Collections(this.repository.state()).idempotency.find((item) => item.projectId === projectId && item.operation === "export" && item.idempotencyKey === idempotencyKey);
     if (existing) {
       if (existing.inputHash !== operationInput || existing.sourceStampDigest !== digest) fail(409, "S8_IDEMPOTENCY_CONFLICT", "Idempotency-Key");
       const current = this.snapshot(existing.jobId); return { replayed: true, export: publicExport(current.artifact), job: { jobId: current.job.jobId, status: current.job.status, candidateAttempt: current.job.candidateAttempt, stage: current.job.stage } };
     }
     const at = this.clock(); const artifactId = this.uuid(); const jobId = this.uuid(); const manifestId = this.uuid();
-    const artifact: S8MaxExport = { schemaVersion: "s8-max-export-v1", artifactId, projectId, jobId, sourceStamp: cloneStamp(admitted.stamp), sourceStampDigest: digest, payloadSha256: admitted.payload.sha256, payloadByteSize: admitted.payload.byteSize, inputHash: operationInput, status: "queued", publicationPhase: "none", candidateAttempt: 1, retryOfArtifactId: null, manifestId, generationReceiptId: null, validationReceiptId: null, artifactSha256: null, artifactByteSize: null, privateFinalStorageKey: s8FinalMaxStorageKey(projectId, artifactId), privateStagingStorageKey: s8StagingMaxStorageKey(projectId, jobId, "unclaimed"), privatePayloadStorageKey: s8StagingPayloadStorageKey(projectId, jobId, "unclaimed"), failureCode: null, createdAt: at, updatedAt: at, committedAt: null, staleAt: null, supersededAt: null };
-    const job: S8MaxJob = { schemaVersion: "s8-max-job-v1", jobId, projectId, artifactId, sourceStamp: cloneStamp(admitted.stamp), sourceStampDigest: digest, payloadSha256: admitted.payload.sha256, inputHash: operationInput, idempotencyKey, candidateAttempt: 1, retryOfJobId: null, stage: "generation", status: "queued", generationProviderAttempts: 0, validationProviderAttempts: 0, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, createdAt: at, updatedAt: at, terminalAt: null };
+    const artifact: S8MaxExport = { schemaVersion: "s8-max-export-v1", artifactId, projectId, jobId, sourceStamp: cloneStamp(admitted.stamp), sourceStampDigest: digest, payloadSha256: admitted.payload.sha256, payloadByteSize: admitted.payload.byteSize, inputHash: operationInput, status: "queued", publicationPhase: "none", candidateAttempt: 1, retryOfArtifactId: null, manifestId, generationReceiptId: null, validationReceiptId: null, artifactSha256: null, artifactByteSize: null, privateFinalStorageKey: s8FinalMaxStorageKey(projectId, artifactId), privateStagingStorageKey: s8StagingMaxStorageKey(projectId, jobId, "unclaimed"), privatePayloadStorageKey: s8StagingPayloadStorageKey(projectId, jobId, "unclaimed"), failureCode: null, controllerRequired: false, createdAt: at, updatedAt: at, committedAt: null, staleAt: null, supersededAt: null };
+    const job: S8MaxJob = { schemaVersion: "s8-max-job-v1", jobId, projectId, artifactId, sourceStamp: cloneStamp(admitted.stamp), sourceStampDigest: digest, payloadSha256: admitted.payload.sha256, inputHash: operationInput, idempotencyKey, candidateAttempt: 1, retryOfJobId: null, stage: "generation", status: "queued", generationProviderAttempts: 0, validationProviderAttempts: 0, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, createdAt: at, updatedAt: at, terminalAt: null, controllerRequired: false };
     this.repository.transact((state) => {
       const s8 = requireS8State(state);
       const collision = s8.s8MaxIdempotency.find((item) => item.projectId === projectId && item.operation === "export" && item.idempotencyKey === idempotencyKey);
@@ -641,6 +645,7 @@ export class S8MaxService {
     const currentSource = this.readSource(projectId); const existingArtifact = getS8Collections(this.repository.state()).exports.find((item) => item.projectId === projectId && item.artifactId === artifactId);
     if (!existingArtifact) fail(404, "S8_UNAUTHORIZED_OR_NOT_FOUND", "artifact");
     if (!sameS8Source(existingArtifact.sourceStamp, currentSource.stamp)) { this.reconcileSourceMovement(projectId, currentSource.stamp); fail(409, "SOURCE_STALE", "source"); }
+    if (existingArtifact.status === "provider_hold" && existingArtifact.controllerRequired) fail(409, "S8_RETRY_NOT_AVAILABLE", "artifact");
     this.onPublicationPhase?.("retry", { projectId, jobId: existingArtifact.jobId, artifactId, candidateAttempt: existingArtifact.candidateAttempt });
     this.currentSource(projectId, currentSource.stamp);
     const existingRetry = getS8Collections(this.repository.state()).idempotency.find((item) => item.projectId === projectId && item.operation === "retry" && item.idempotencyKey === idempotencyKey);
@@ -655,13 +660,14 @@ export class S8MaxService {
       if (!prior || !priorJob) fail(404, "S8_UNAUTHORIZED_OR_NOT_FOUND", "artifact");
       if (!sameS8Source(prior.sourceStamp, currentSource.stamp) || priorJob.status !== prior.status) fail(409, "SOURCE_STALE", "source");
       if (prior.status === "provider_hold") {
+        if (prior.controllerRequired || priorJob.controllerRequired) fail(409, "S8_RETRY_NOT_AVAILABLE", "artifact");
         s8.s8MaxIdempotency.push({ schemaVersion: "s8-max-idempotency-v1", projectId, operation: "retry", idempotencyKey, sourceStamp: cloneStamp(currentSource.stamp), sourceStampDigest: sourceStampDigest(currentSource.stamp), inputHash: prior.inputHash, jobId: priorJob.jobId, artifactId: prior.artifactId, createdAt: this.clock() });
         targetJobId = priorJob.jobId; targetArtifactId = prior.artifactId; return;
       }
       if (prior.status !== "failed_retryable" || prior.candidateAttempt !== 1 || prior.retryOfArtifactId !== null || priorJob.retryOfJobId !== null || s8.s8MaxExports.some((item) => item.retryOfArtifactId === prior.artifactId) || s8.s8MaxJobs.some((item) => item.retryOfJobId === priorJob.jobId)) fail(409, "S8_RETRY_NOT_AVAILABLE", "artifact");
       const at = this.clock(); targetArtifactId = this.uuid(); targetJobId = this.uuid(); const manifestId = this.uuid();
-      const artifact: S8MaxExport = { ...cloneJson(prior), artifactId: targetArtifactId, jobId: targetJobId, sourceStamp: cloneStamp(currentSource.stamp), sourceStampDigest: sourceStampDigest(currentSource.stamp), status: "queued", publicationPhase: "none", candidateAttempt: 2, retryOfArtifactId: prior.artifactId, manifestId, generationReceiptId: null, validationReceiptId: null, artifactSha256: null, artifactByteSize: null, privateFinalStorageKey: s8FinalMaxStorageKey(projectId, targetArtifactId), privateStagingStorageKey: s8StagingMaxStorageKey(projectId, targetJobId, "unclaimed"), privatePayloadStorageKey: s8StagingPayloadStorageKey(projectId, targetJobId, "unclaimed"), failureCode: null, createdAt: at, updatedAt: at, committedAt: null, staleAt: null, supersededAt: null };
-      const job: S8MaxJob = { ...cloneJson(priorJob), jobId: targetJobId, artifactId: targetArtifactId, sourceStamp: cloneStamp(currentSource.stamp), sourceStampDigest: sourceStampDigest(currentSource.stamp), status: "queued", candidateAttempt: 2, retryOfJobId: priorJob.jobId, stage: "generation", generationProviderAttempts: 0, validationProviderAttempts: 0, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, terminalAt: null, createdAt: at, updatedAt: at };
+      const artifact: S8MaxExport = { ...cloneJson(prior), artifactId: targetArtifactId, jobId: targetJobId, sourceStamp: cloneStamp(currentSource.stamp), sourceStampDigest: sourceStampDigest(currentSource.stamp), status: "queued", publicationPhase: "none", candidateAttempt: 2, retryOfArtifactId: prior.artifactId, manifestId, generationReceiptId: null, validationReceiptId: null, artifactSha256: null, artifactByteSize: null, privateFinalStorageKey: s8FinalMaxStorageKey(projectId, targetArtifactId), privateStagingStorageKey: s8StagingMaxStorageKey(projectId, targetJobId, "unclaimed"), privatePayloadStorageKey: s8StagingPayloadStorageKey(projectId, targetJobId, "unclaimed"), failureCode: null, controllerRequired: false, createdAt: at, updatedAt: at, committedAt: null, staleAt: null, supersededAt: null };
+      const job: S8MaxJob = { ...cloneJson(priorJob), jobId: targetJobId, artifactId: targetArtifactId, sourceStamp: cloneStamp(currentSource.stamp), sourceStampDigest: sourceStampDigest(currentSource.stamp), status: "queued", candidateAttempt: 2, retryOfJobId: priorJob.jobId, stage: "generation", generationProviderAttempts: 0, validationProviderAttempts: 0, claimToken: null, ownerProcessId: null, claimedAt: null, heartbeatAt: null, terminalAt: null, controllerRequired: false, createdAt: at, updatedAt: at };
       s8.s8MaxExports.push(artifact); s8.s8MaxJobs.push(job); s8.s8MaxIdempotency.push({ schemaVersion: "s8-max-idempotency-v1", projectId, operation: "retry", idempotencyKey, sourceStamp: cloneStamp(currentSource.stamp), sourceStampDigest: sourceStampDigest(currentSource.stamp), inputHash: prior.inputHash, jobId: targetJobId, artifactId: targetArtifactId, createdAt: at });
       createdAttemptTwo = true;
     });
@@ -671,18 +677,33 @@ export class S8MaxService {
   recoverPending(): number {
     const state = this.state(); const pending = state.s8MaxJobs.filter((job) => ["running", "provider_pending", "provider_running", "staged", "validating", "validated"].includes(job.status) && job.ownerProcessId !== null);
     if (pending.length > RECOVERY_MAX) fail(500, "S8_RESOURCE_LIMIT", "recovery");
+    const heartbeatTimeoutMs = S8_MAX_RECOVERY_HEARTBEAT_SECONDS * 1000;
     let recovered = 0;
     for (const pendingJob of pending) {
-      let dead = false;
-      try { dead = this.isOwnerProcessAlive ? this.isOwnerProcessAlive(pendingJob.ownerProcessId!) === false : false; } catch { dead = false; }
-      if (!dead) continue;
+      const nowMs = Date.parse(this.clock()); const heartbeatMs = pendingJob.heartbeatAt === null ? Number.NaN : Date.parse(pendingJob.heartbeatAt);
+      if (!Number.isFinite(nowMs) || !Number.isFinite(heartbeatMs) || nowMs - heartbeatMs <= heartbeatTimeoutMs) continue;
+      let ownerAlive: boolean;
+      try { ownerAlive = this.isOwnerProcessAlive ? this.isOwnerProcessAlive(pendingJob.ownerProcessId!) : true; } catch { continue; }
+      if (ownerAlive !== false) continue;
+      try { this.currentSource(pendingJob.projectId, pendingJob.sourceStamp); } catch { continue; }
+      let reclaimed = false;
       this.repository.transact((fresh) => {
         const s8 = requireS8State(fresh);
-        const job = s8.s8MaxJobs.find((item) => item.jobId === pendingJob.jobId); const artifact = job ? s8.s8MaxExports.find((item) => item.artifactId === job.artifactId) : undefined; if (!job || !artifact || job.ownerProcessId !== pendingJob.ownerProcessId) return;
+        const job = s8.s8MaxJobs.find((item) => item.jobId === pendingJob.jobId); const artifact = job ? s8.s8MaxExports.find((item) => item.artifactId === job.artifactId) : undefined;
+        if (!job || !artifact || job.ownerProcessId !== pendingJob.ownerProcessId || job.heartbeatAt !== pendingJob.heartbeatAt || !["running", "provider_pending", "provider_running", "staged", "validating", "validated"].includes(job.status)) return;
+        const freshNowMs = Date.parse(this.clock()); const freshHeartbeatMs = job.heartbeatAt === null ? Number.NaN : Date.parse(job.heartbeatAt);
+        if (!Number.isFinite(freshNowMs) || !Number.isFinite(freshHeartbeatMs) || freshNowMs - freshHeartbeatMs <= heartbeatTimeoutMs) return;
         const at = this.clock(); const uncertainProvider = ["provider_pending", "provider_running", "staged", "validating", "validated"].includes(job.status);
-        if (uncertainProvider) { job.status = "provider_hold"; artifact.status = "provider_hold"; artifact.failureCode = "APS_WORKITEM_FAILED"; } else { job.status = "queued"; artifact.status = "queued"; artifact.publicationPhase = "none"; artifact.generationReceiptId = null; artifact.validationReceiptId = null; artifact.artifactSha256 = null; artifact.artifactByteSize = null; artifact.privateStagingStorageKey = s8StagingMaxStorageKey(artifact.projectId, job.jobId, "unclaimed"); artifact.privatePayloadStorageKey = s8StagingPayloadStorageKey(artifact.projectId, job.jobId, "unclaimed"); }
-        clearClaim(job); job.updatedAt = at; artifact.updatedAt = at; recovered += 1;
+        if (uncertainProvider) {
+          job.status = "provider_hold"; job.controllerRequired = true; artifact.status = "provider_hold"; artifact.failureCode = "APS_WORKITEM_FAILED"; artifact.controllerRequired = true;
+        } else {
+          job.status = "queued"; job.controllerRequired = false; artifact.status = "queued"; artifact.publicationPhase = "none"; artifact.generationReceiptId = null; artifact.validationReceiptId = null; artifact.artifactSha256 = null; artifact.artifactByteSize = null; artifact.failureCode = null; artifact.controllerRequired = false; artifact.privateStagingStorageKey = s8StagingMaxStorageKey(artifact.projectId, job.jobId, "unclaimed"); artifact.privatePayloadStorageKey = s8StagingPayloadStorageKey(artifact.projectId, job.jobId, "unclaimed");
+        }
+        clearClaim(job); job.updatedAt = at; artifact.updatedAt = at; reclaimed = true;
       });
+      if (!reclaimed) continue;
+      try { this.currentSource(pendingJob.projectId, pendingJob.sourceStamp); } catch { /* source reconciliation is the safe post-recovery outcome */ }
+      recovered += 1;
     }
     return recovered;
   }
@@ -736,7 +757,8 @@ function putExactOrThrow(objects: PrivateObjectStore, key: string, bytes: Uint8A
 function errorMetadataFromProviderError(error: S8MaxProviderError, job: S8MaxJob, provider: S8MaxProvider["providerKind"], clock: () => Timestamp, uuid: () => UUID): S8MaxProviderMetadata {
   const binding = providerBindingFallback(job.sourceStamp, job.payloadSha256, error.stage, provider);
   const attempt = error.stage === "generation" ? Math.max(job.generationProviderAttempts, 1) : Math.max(job.validationProviderAttempts, 1);
-  return { schemaVersion: "s8-max-provider-metadata-v1", metadataId: uuid(), projectId: job.projectId, artifactId: job.artifactId, jobId: job.jobId, stage: error.stage, provider, providerAttempt: Math.min(attempt, S8_MAX_PROVIDER_ATTEMPTS), outcome: error.providerRetryable ? "hold" : "fail", failureCode: error.code, engineId: binding.engineId, productVersion: binding.productVersion, engineVersion: binding.engineVersion, appBundleId: error.stage === "generation" ? binding.generationAppBundleId : binding.validatorAppBundleId, appBundleVersion: error.stage === "generation" ? binding.generationAppBundleVersion : binding.validatorAppBundleVersion, appBundleHash: error.stage === "generation" ? binding.generationAppBundleHash : binding.validatorAppBundleHash, activityId: error.stage === "generation" ? binding.generationActivityId : binding.validatorActivityId, activityVersion: error.stage === "generation" ? binding.generationActivityVersion : binding.validatorActivityVersion, activityHash: error.stage === "generation" ? binding.generationActivityHash : binding.validatorActivityHash, occurredAt: clock() };
+  const disposition = classifyS8ProviderFailure(error.code, error.cause);
+  return { schemaVersion: "s8-max-provider-metadata-v1", metadataId: uuid(), projectId: job.projectId, artifactId: job.artifactId, jobId: job.jobId, stage: error.stage, provider, providerAttempt: Math.min(attempt, S8_MAX_PROVIDER_ATTEMPTS), outcome: disposition.classification === "provider_hold" && disposition.retryable ? "hold" : "fail", failureCode: error.code, engineId: binding.engineId, productVersion: binding.productVersion, engineVersion: binding.engineVersion, appBundleId: error.stage === "generation" ? binding.generationAppBundleId : binding.validatorAppBundleId, appBundleVersion: error.stage === "generation" ? binding.generationAppBundleVersion : binding.validatorAppBundleVersion, appBundleHash: error.stage === "generation" ? binding.generationAppBundleHash : binding.validatorAppBundleHash, activityId: error.stage === "generation" ? binding.generationActivityId : binding.validatorActivityId, activityVersion: error.stage === "generation" ? binding.generationActivityVersion : binding.validatorActivityVersion, activityHash: error.stage === "generation" ? binding.generationActivityHash : binding.validatorActivityHash, occurredAt: clock() };
 }
 
 export const createS8MaxService = (options: S8MaxServiceOptions): S8MaxService => new S8MaxService(options);

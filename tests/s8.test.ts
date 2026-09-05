@@ -36,7 +36,7 @@ import {
   triangulateS8Profile,
 } from "../src/lib/s8-semantic";
 import { S8MaxService, type S8PublicationPhase } from "../src/lib/s8";
-import { createMockS8MaxProvider, MockOssV2Transfer, type S8MaxProvider } from "../src/lib/s8-max-provider";
+import { classifyS8ProviderFailure, createMockS8MaxProvider, MockOssV2Transfer, S8MaxProviderError, type S8MaxProvider } from "../src/lib/s8-max-provider";
 import { getS8Collections, validateS8Graph } from "../src/lib/s8-persistence";
 import { jcs, sha256 } from "../src/lib/utils";
 
@@ -216,8 +216,8 @@ test("every accepted geometry family builds deterministic editable-poly semantic
   const scene = buildS8Scene(payload.payload, "50000000-0000-4000-8000-000000000001" as UUID, payload.sha256);
   assert.equal(scene.objectCount, 8);
   assert.equal(scene.nodes.find((node) => node.objectId === "counter")!.mesh!.vertices.length, 2 * S8_MAX_ROUND_SEGMENTS + 2);
-  assert.equal(scene.nodes.find((node) => node.objectId === "counter")!.mesh!.faces.length, 4 * S8_MAX_ROUND_SEGMENTS);
-  assert.equal(scene.nodes.find((node) => node.objectId === "partition")!.mesh!.faces.length, 12);
+  assert.equal(scene.nodes.find((node) => node.objectId === "counter")!.mesh!.faces.length, 3 * S8_MAX_ROUND_SEGMENTS);
+  assert.equal(scene.nodes.find((node) => node.objectId === "partition")!.mesh!.faces.length, 8);
   assert.ok(scene.nodes.every((node) => (node.mesh?.vertices.length ?? 0) <= S8_MAX_VERTICES_PER_OBJECT && (node.mesh?.faces.length ?? 0) <= S8_MAX_FACES_PER_OBJECT));
   const glass = scene.nodes.find((node) => node.objectId === "screen")!.material!;
   assert.equal(glass.nativeClass, "PhysicalMaterial");
@@ -237,6 +237,29 @@ test("every accepted geometry family builds deterministic editable-poly semantic
     }
   }
   assert.deepEqual(scene.nodes.map((node) => node.parentObjectId), [null, "floor", "floor", "floor", "floor", "floor", "wall", "counter"]);
+});
+
+test("G3 repair regression: locked final topology keeps quads for solids and sides", () => {
+  const handoff = fixtureHandoff();
+  const rectanglePayload = buildS8Payload(stampFor(handoff), handoff);
+  const rectangle = buildS8Scene(rectanglePayload.payload, "50000000-0000-4000-8000-000000000001" as UUID, rectanglePayload.sha256).nodes[0]!;
+  assert.deepEqual(rectangle.mesh!.faces, [[1, 2, 3, 4], [5, 8, 7, 6], [1, 5, 6, 2], [2, 6, 7, 3], [3, 7, 8, 4], [4, 8, 5, 1]]);
+
+  const roundGeometry = { kind: "round_prism", radiusMm: 400, heightMm: 1000, geometryState: "exact", localAnchor: "floor" } as const;
+  const roundHandoff = fixtureHandoff({ objects: [objectValue({ geometry: roundGeometry, boundsMm: { widthMm: 800, depthMm: 800, heightMm: 1000 } })] });
+  const roundPayload = buildS8Payload(stampFor(roundHandoff), roundHandoff);
+  const round = buildS8Scene(roundPayload.payload, "50000000-0000-4000-8000-000000000002" as UUID, roundPayload.sha256).nodes[0]!;
+  assert.equal(round.mesh!.faces.length, 3 * S8_MAX_ROUND_SEGMENTS);
+  assert.equal(round.mesh!.faces.filter((face) => face.length === 4).length, S8_MAX_ROUND_SEGMENTS);
+  assert.equal(round.mesh!.faces.filter((face) => face.length === 3).length, 2 * S8_MAX_ROUND_SEGMENTS);
+
+  const profileGeometry = { kind: "profile_extrusion", profile: { winding: "ccw-from-positive-y-v1", vertices: [{ xMm: 0, zMm: 0 }, { xMm: 0, zMm: 200 }, { xMm: 400, zMm: 200 }, { xMm: 400, zMm: 0 }] }, heightMm: 2400, geometryState: "exact", localAnchor: "floor" } as const;
+  const profileHandoff = fixtureHandoff({ objects: [objectValue({ geometry: profileGeometry, boundsMm: { widthMm: 400, depthMm: 200, heightMm: 2400 } })] });
+  const profilePayload = buildS8Payload(stampFor(profileHandoff), profileHandoff);
+  const profile = buildS8Scene(profilePayload.payload, "50000000-0000-4000-8000-000000000003" as UUID, profilePayload.sha256).nodes[0]!;
+  assert.equal(profile.mesh!.faces.length, 2 * (profileGeometry.profile.vertices.length - 2) + profileGeometry.profile.vertices.length);
+  assert.equal(profile.mesh!.faces.filter((face) => face.length === 3).length, 2 * (profileGeometry.profile.vertices.length - 2));
+  assert.equal(profile.mesh!.faces.filter((face) => face.length === 4).length, profileGeometry.profile.vertices.length);
 });
 
 test("concave profiles use deterministic first-valid-ear clipping and fail closed for self-intersection", () => {
@@ -332,6 +355,47 @@ test("provider holds retry without consuming candidate budget, while candidate f
   assert.equal(repaired.export.candidateAttempt, 2);
   assert.equal(getS8Collections(candidate.repository.state()).exports.length, 2);
   await assert.rejects(() => candidate.service.retryExport(PROJECT_ID, repaired.export.artifactId, "candidate-third-key"), /S8_RETRY_NOT_AVAILABLE/u);
+});
+
+test("G3 repair regression: provider dispositions distinguish candidate and terminal compatibility failures", async () => {
+  const instructions = makeContext({ provider: createMockS8MaxProvider({ generationFailures: ["APS_INSTRUCTIONS_FAILED"] }) });
+  const instructionFailure = await instructions.service.createExport(PROJECT_ID, "instructions-failure-key");
+  assert.equal(instructionFailure.export.status, "failed_retryable");
+
+  for (const [code, key] of [["APS_AUTH_FAILURE", "auth-failure-key"], ["APS_ENGINE_DEPRECATED", "deprecated-key"], ["APS_ENGINE_VERSION_MOVED", "moved-key"]] as const) {
+    const terminal = makeContext({ provider: createMockS8MaxProvider({ generationFailures: [code] }) });
+    const held = await terminal.service.createExport(PROJECT_ID, key);
+    assert.equal(held.export.status, "provider_hold");
+    await assert.rejects(() => terminal.service.retryExport(PROJECT_ID, held.export.artifactId, `${key}-retry`), /S8_RETRY_NOT_AVAILABLE/u);
+  }
+});
+
+test("G3 provider taxonomy is explicit for transfer, semantic, retry-after, and stale outcomes", () => {
+  for (const code of ["S8_NATIVE_SAVE_FAILED", "S8_UNSUPPORTED_GEOMETRY", "S8_PROFILE_TRIANGULATION_FAILED", "S7_CROSS_OUTPUT_MISMATCH", "APS_INSTRUCTIONS_FAILED"] as const) {
+    const disposition = classifyS8ProviderFailure(code);
+    assert.equal(disposition.classification, "candidate_failure");
+    assert.equal(disposition.consumesCandidateAttempt, true);
+    assert.equal(disposition.controllerRequired, false);
+  }
+  for (const code of ["APS_UNAVAILABLE", "APS_QUEUE_DELAY", "APS_RATE_LIMIT", "APS_ENGINE_UNAVAILABLE", "APS_INPUT_DOWNLOAD_FAILED", "APS_WORKITEM_FAILED", "APS_TIMEOUT", "APS_OUTPUT_UPLOAD_FAILED", "APS_OUTPUT_INTEGRITY_MISMATCH", "APS_VALIDATOR_FAILED"] as const) {
+    const disposition = classifyS8ProviderFailure(code);
+    assert.equal(disposition.classification, "provider_hold");
+    assert.equal(disposition.consumesCandidateAttempt, false);
+  }
+  for (const code of ["APS_AUTH_FAILURE", "APS_ENGINE_DEPRECATED", "APS_ENGINE_VERSION_MOVED", "APS_OUTPUT_MISSING"] as const) {
+    const disposition = classifyS8ProviderFailure(code);
+    assert.equal(disposition.classification, "provider_hold");
+    assert.equal(disposition.retryable, false);
+    assert.equal(disposition.controllerRequired, true);
+    assert.equal(disposition.reconciliationRequired, true);
+  }
+  assert.equal(classifyS8ProviderFailure("APS_ENGINE_UNAVAILABLE", "compatibility").controllerRequired, true);
+  assert.equal(classifyS8ProviderFailure("APS_VALIDATOR_FAILED", "semantic").classification, "candidate_failure");
+  assert.equal(classifyS8ProviderFailure("APS_INPUT_DOWNLOAD_FAILED", "transfer_defect").controllerRequired, true);
+  assert.equal(classifyS8ProviderFailure("SOURCE_STALE").classification, "stale");
+  const rateLimited = new S8MaxProviderError("APS_RATE_LIMIT", "generation", true, "rate limited", "rate_limit", 37);
+  assert.equal(rateLimited.retryAfterSeconds, 37);
+  assert.equal(classifyS8ProviderFailure(rateLimited.code, rateLimited.cause).honorRetryAfter, true);
 });
 
 test("validation provider hold resumes from promoted staging without a second candidate", async () => {
@@ -437,6 +501,10 @@ test("S8 claim CAS and recovery distinguish the live or uncertain owner from a p
   assert.equal(getS8Collections(value.repository.state()).jobs[0]!.status, "provider_pending");
 
   const dead = new S8MaxService({ repository: value.repository, objects: value.objects, s6: value.s6, s7: value.s7, provider: underlying, ownerProcessId: "recovery-owner", isOwnerProcessAlive: () => false });
+  value.repository.transact((state) => {
+    const current = getS8Collections(state).jobs[0]!;
+    current.heartbeatAt = "2020-01-01T00:00:00.000Z";
+  });
   assert.equal(dead.recoverPending(), 1);
   assert.equal(getS8Collections(value.repository.state()).jobs[0]!.status, "provider_hold");
 
@@ -454,6 +522,75 @@ test("S7 cross-output evidence is required and mismatched identity is rejected",
   } as never;
   const mismatched = new S8MaxService({ repository: value.repository, objects: value.objects, s6: value.s6, s7: fakeS7, provider: createMockS8MaxProvider(), ownerProcessId: "s8-mismatch-owner" });
   assert.throws(() => mismatched.getHandoff(PROJECT_ID), /S7_CROSS_OUTPUT_MISMATCH/u);
+});
+
+test("G3 repair regression: dead-owner recovery waits for an expired heartbeat", async () => {
+  const underlying = createMockS8MaxProvider();
+  let startedResolve: (() => void) | null = null;
+  let releaseResolve: (() => void) | null = null;
+  const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+  const released = new Promise<void>((resolve) => { releaseResolve = resolve; });
+  const provider: S8MaxProvider = {
+    providerKind: "mock-oss-v2",
+    async generate(input) {
+      startedResolve?.();
+      await released;
+      return underlying.generate(input);
+    },
+    validate: (input) => underlying.validate(input),
+  };
+  const value = makeContext({ provider });
+  const firstPromise = value.service.createExport(PROJECT_ID, "heartbeat-regression-key");
+  await started;
+  const pending = getS8Collections(value.repository.state()).jobs[0]!;
+  const freshDead = new S8MaxService({ repository: value.repository, objects: value.objects, s6: value.s6, s7: value.s7, provider: underlying, ownerProcessId: "fresh-dead-owner", clock: () => pending.heartbeatAt!, isOwnerProcessAlive: () => false });
+  assert.equal(freshDead.recoverPending(), 0);
+  assert.equal(getS8Collections(value.repository.state()).jobs[0]!.status, "provider_pending");
+
+  value.repository.transact((state) => {
+    const job = getS8Collections(state).jobs[0]!;
+    job.heartbeatAt = "2020-01-01T00:00:00.000Z";
+  });
+  const expiredDead = new S8MaxService({ repository: value.repository, objects: value.objects, s6: value.s6, s7: value.s7, provider: underlying, ownerProcessId: "expired-dead-owner", clock: () => "2026-09-05T00:00:00.000Z", isOwnerProcessAlive: () => false });
+  assert.equal(expiredDead.recoverPending(), 1);
+  assert.equal(getS8Collections(value.repository.state()).jobs[0]!.status, "provider_hold");
+  releaseResolve!();
+  await assert.rejects(() => firstPromise, /S8_CLAIM_FENCED/u);
+});
+
+test("G3 recovery requeues only pre-provider work and fences source movement", async () => {
+  const value = makeContext({ provider: createMockS8MaxProvider({ generationFailures: ["S8_UNSUPPORTED_GEOMETRY"] }) });
+  const failed = await value.service.createExport(PROJECT_ID, "recovery-local-key");
+  const jobId = failed.job.jobId;
+  const claimToken = "60000000-0000-4000-8000-000000000001" as UUID;
+  value.repository.transact((state) => {
+    const current = getS8Collections(state);
+    const job = current.jobs.find((item) => item.jobId === jobId)!;
+    const artifact = current.exports.find((item) => item.artifactId === job.artifactId)!;
+    job.status = "running"; job.stage = "generation"; job.claimToken = claimToken; job.ownerProcessId = "dead-local-owner"; job.claimedAt = "2020-01-01T00:00:00.000Z"; job.heartbeatAt = "2020-01-01T00:00:00.000Z"; job.terminalAt = null; job.controllerRequired = false;
+    artifact.status = "running"; artifact.publicationPhase = "none"; artifact.committedAt = null; artifact.failureCode = null; artifact.controllerRequired = false;
+  });
+  const recovered = new S8MaxService({ repository: value.repository, objects: value.objects, s6: value.s6, s7: value.s7, provider: createMockS8MaxProvider(), ownerProcessId: "recovery-local-owner", clock: () => "2026-09-05T00:00:00.000Z", isOwnerProcessAlive: () => false });
+  assert.equal(recovered.recoverPending(), 1);
+  const requeued = getS8Collections(value.repository.state()).jobs.find((item) => item.jobId === jobId)!;
+  assert.equal(requeued.status, "queued");
+  assert.equal(requeued.controllerRequired, false);
+  assert.equal(requeued.claimToken, null);
+
+  const moved = makeContext();
+  const movedExport = await moved.service.createExport(PROJECT_ID, "recovery-source-key");
+  moved.repository.transact((state) => {
+    const current = getS8Collections(state);
+    const job = current.jobs.find((item) => item.jobId === movedExport.job.jobId)!;
+    const artifact = current.exports.find((item) => item.artifactId === job.artifactId)!;
+    job.status = "provider_running"; job.stage = "generation"; job.claimToken = claimToken; job.ownerProcessId = "moved-owner"; job.claimedAt = "2020-01-01T00:00:00.000Z"; job.heartbeatAt = "2020-01-01T00:00:00.000Z"; job.terminalAt = null; job.controllerRequired = false;
+    artifact.status = "provider_running"; artifact.publicationPhase = "none"; artifact.committedAt = null; artifact.failureCode = null; artifact.controllerRequired = false;
+  });
+  let movedOnce = false;
+  const next = fixtureHandoff({ revisionId: "30000000-0000-4000-8000-000000000099" as UUID, revisionHash: SECOND_HASH });
+  const movingRecovery = new S8MaxService({ repository: moved.repository, objects: moved.objects, s6: moved.s6, s7: moved.s7, provider: createMockS8MaxProvider(), ownerProcessId: "moving-recovery-owner", clock: () => "2026-09-05T00:00:00.000Z", isOwnerProcessAlive: () => { if (!movedOnce) { movedOnce = true; moved.move(next); moved.s7.createExport(PROJECT_ID, "s7-recovery-source-moved"); } return false; } });
+  assert.equal(movingRecovery.recoverPending(), 0);
+  assert.equal(getS8Collections(moved.repository.state()).exports.find((item) => item.artifactId === movedExport.export.artifactId)?.status, "stale");
 });
 
 test("mock OSS v2 transfer is private, write-once, and integrity-preserving", () => {

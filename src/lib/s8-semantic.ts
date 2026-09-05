@@ -246,10 +246,11 @@ function orientFace(vertices: readonly S8MaxPoint[], face: S8MaxFace, expected: 
   const current = normal(vertices[face[0] - 1]!, vertices[face[1] - 1]!, vertices[face[2] - 1]!);
   const dot = current.x * expected.x + current.y * expected.y + current.z * expected.z;
   if (Math.abs(dot) <= S8_NORMAL_TOLERANCE) fail("S8_MESH_WINDING_INVALID", "face");
-  return dot > 0 ? face : [face[0], face[2], face[1]];
+  if (dot > 0) return face;
+  return face.length === 3 ? [face[0], face[2], face[1]] : [face[0], face[3], face[2], face[1]];
 }
 
-function addFace(mesh: Mesh, face: [number, number, number], expected: Vector): void {
+function addFace(mesh: Mesh, face: S8MaxFace, expected: Vector): void {
   mesh.faces.push(orientFace(mesh.vertices, face, expected));
 }
 
@@ -268,18 +269,12 @@ function rectMesh(geometry: Extract<S6GeometryPrimitive, { kind: "rect_prism" }>
     ],
     faces: [],
   };
-  addFace(mesh, [1, 3, 2], { x: 0, y: 0, z: -1 });
-  addFace(mesh, [1, 4, 3], { x: 0, y: 0, z: -1 });
-  addFace(mesh, [5, 6, 7], { x: 0, y: 0, z: 1 });
-  addFace(mesh, [5, 7, 8], { x: 0, y: 0, z: 1 });
-  addFace(mesh, [1, 2, 6], { x: 0, y: 1, z: 0 });
-  addFace(mesh, [1, 6, 5], { x: 0, y: 1, z: 0 });
-  addFace(mesh, [2, 3, 7], { x: 1, y: 0, z: 0 });
-  addFace(mesh, [2, 7, 6], { x: 1, y: 0, z: 0 });
-  addFace(mesh, [3, 4, 8], { x: 0, y: -1, z: 0 });
-  addFace(mesh, [3, 8, 7], { x: 0, y: -1, z: 0 });
-  addFace(mesh, [4, 1, 5], { x: -1, y: 0, z: 0 });
-  addFace(mesh, [4, 5, 8], { x: -1, y: 0, z: 0 });
+  addFace(mesh, [1, 4, 3, 2], { x: 0, y: 0, z: -1 });
+  addFace(mesh, [5, 6, 7, 8], { x: 0, y: 0, z: 1 });
+  addFace(mesh, [1, 2, 6, 5], { x: 0, y: 1, z: 0 });
+  addFace(mesh, [2, 3, 7, 6], { x: 1, y: 0, z: 0 });
+  addFace(mesh, [3, 4, 8, 7], { x: 0, y: -1, z: 0 });
+  addFace(mesh, [4, 1, 5, 8], { x: -1, y: 0, z: 0 });
   return mesh;
 }
 
@@ -300,8 +295,7 @@ function roundMesh(geometry: Extract<S6GeometryPrimitive, { kind: "round_prism" 
     const next = (index + 1) % S8_MAX_ROUND_SEGMENTS;
     const b = index + 1; const bn = next + 1; const t = S8_MAX_ROUND_SEGMENTS + index + 1; const tn = S8_MAX_ROUND_SEGMENTS + next + 1;
     const angle = 2 * Math.PI * (index + 0.5) / S8_MAX_ROUND_SEGMENTS;
-    addFace(mesh, [b, bn, tn], { x: Math.cos(angle), y: -Math.sin(angle), z: 0 });
-    addFace(mesh, [b, tn, t], { x: Math.cos(angle), y: -Math.sin(angle), z: 0 });
+    addFace(mesh, [b, bn, tn, t], { x: Math.cos(angle), y: -Math.sin(angle), z: 0 });
     addFace(mesh, [bottomCenter, bn, b], { x: 0, y: 0, z: -1 });
     addFace(mesh, [topCenter, t, tn], { x: 0, y: 0, z: 1 });
   }
@@ -328,8 +322,7 @@ function profileMesh(geometry: Extract<S6GeometryPrimitive, { kind: "profile_ext
     const outside = area > 0 ? { x: dz, z: -dx } : { x: -dz, z: dx };
     const length = Math.hypot(outside.x, outside.z);
     if (length <= 0) fail("S8_PROFILE_TRIANGULATION_FAILED", "profile.edge");
-    addFace(mesh, [index + 1, next + 1, n + next + 1], { x: outside.x / length, y: -outside.z / length, z: 0 });
-    addFace(mesh, [index + 1, n + next + 1, n + index + 1], { x: outside.x / length, y: -outside.z / length, z: 0 });
+    addFace(mesh, [index + 1, next + 1, n + next + 1, n + index + 1], { x: outside.x / length, y: -outside.z / length, z: 0 });
   }
   return mesh;
 }
@@ -432,7 +425,10 @@ function materialFor(material: S6ToS7Handoff["materials"][number] | undefined, o
 
 function validateMesh(mesh: Mesh, objectId: string): void {
   if (mesh.vertices.length > S8_MAX_VERTICES_PER_OBJECT || mesh.faces.length > S8_MAX_FACES_PER_OBJECT) fail("S8_RESOURCE_LIMIT", `objects.${objectId}.mesh`);
-  for (const face of mesh.faces) for (const index of face) if (!Number.isInteger(index) || index < 1 || index > mesh.vertices.length) fail("S8_MESH_INVALID", `objects.${objectId}.faces`);
+  for (const face of mesh.faces) {
+    if ((face.length !== 3 && face.length !== 4) || new Set(face).size !== face.length) fail("S8_MESH_INVALID", `objects.${objectId}.faces`);
+    for (const index of face) if (!Number.isInteger(index) || index < 1 || index > mesh.vertices.length) fail("S8_MESH_INVALID", `objects.${objectId}.faces`);
+  }
 }
 
 function sourceObjectDepth(objectId: string, byId: ReadonlyMap<string, S6ToS7Handoff["objects"][number]>, visiting: Set<string>, memo: Map<string, number>): number {
@@ -478,7 +474,10 @@ function buildObjectNode(
     if (error instanceof S8SemanticError) throw error;
     fail(geometry.kind === "profile_extrusion" ? "S8_PROFILE_TRIANGULATION_FAILED" : "S8_MESH_INVALID", object.objectId);
   }
-  mesh = { vertices: mesh.vertices.map(quantizePoint), faces: mesh.faces.map((face) => [face[0], face[1], face[2]]) };
+  mesh = {
+    vertices: mesh.vertices.map(quantizePoint),
+    faces: mesh.faces.map((face) => face.length === 3 ? [face[0], face[1], face[2]] : [face[0], face[1], face[2], face[3]]) as S8MaxFace[],
+  };
   validateMesh(mesh, object.objectId);
   const expectedLocal = localBounds(geometry);
   const actualLocal = dimensionsFromMaxBounds(boundsOf(mesh.vertices));
