@@ -2962,3 +2962,392 @@ export type S5Artifact = {
   createdAt: Timestamp;
   updatedAt: Timestamp;
 };
+
+/** S8 is intentionally additive: these records are absent from pre-S8 JSON snapshots. */
+export type S8SourceStampV1 = {
+  schemaVersion: "s8-source-stamp-v1";
+  projectId: UUID;
+  s6RevisionId: UUID;
+  s6RevisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  sourceS5ApprovalEventId: UUID;
+  sourceS5Generation: number;
+  s6ValidationReceiptId: UUID;
+  s6ValidationReceiptHash: Sha256;
+  s6HandoffSchemaVersion: "s6-to-s7-handoff-v1";
+  s6HandoffDigest: Sha256;
+  s7ArtifactId: UUID;
+  s7ArtifactHash: Sha256;
+  s7ArtifactSize: number;
+  s7ManifestId: UUID;
+  s7ManifestHash: Sha256;
+  s7ReadbackReceiptId: UUID;
+  s7ReadbackReceiptHash: Sha256;
+};
+
+export type S8ConstructionV1 = {
+  algorithmVersion: "s8-max-scene-construction-v1";
+  nativeGeometryClass: "Editable_Poly";
+  axisConvention: "s6-to-max-x-right-zup-minus-yfront-v1";
+  roundSegments: 24;
+  profileTriangulation: "ear-clipping-s6-order-v1";
+  materialPolicy: "physical-material-bounded-v1";
+  noExternalAssets: true;
+};
+
+export type S8MaxPayloadV1 = {
+  schemaVersion: "s8.max.payload-v1";
+  sourceStamp: S8SourceStampV1;
+  s6Handoff: S6ToS7Handoff;
+  construction: S8ConstructionV1;
+};
+
+export type S8MaxPoint = { x: number; y: number; z: number };
+/** Native Editable_Poly faces retain quads for solids/sides; only caps may be triangles. */
+export type S8MaxFace = [number, number, number] | [number, number, number, number];
+export type S8MaxMatrix3 = {
+  rows: [S8MaxPoint, S8MaxPoint, S8MaxPoint];
+  translation: S8MaxPoint;
+};
+export type S8MaxBounds = { min: S8MaxPoint; max: S8MaxPoint };
+
+export type S8MaterialSemantic = {
+  materialId: string;
+  nativeClass: "PhysicalMaterial";
+  baseColorHex: string;
+  metalness: 0 | 1;
+  roughness: number;
+  transparency: number;
+  emission: number;
+  degradationCodes: string[];
+};
+
+export type S8SemanticNode = {
+  nodeKind: "root" | "geometry";
+  objectId: string | null;
+  name: string;
+  parentObjectId: string | null;
+  nativeGeometryClass: "Dummy" | "Editable_Poly";
+  geometryFamily: "rect_prism" | "round_prism" | "profile_extrusion" | null;
+  mesh: { vertices: S8MaxPoint[]; faces: S8MaxFace[] } | null;
+  localTransform: S8MaxMatrix3;
+  worldTransform: S8MaxMatrix3;
+  localBoundsMm: S6Dimensions | null;
+  worldBoundsMm: S8MaxBounds | null;
+  material: S8MaterialSemantic | null;
+  userProperties: Record<string, string>;
+};
+
+export type S8SemanticBinding = {
+  sourceStampDigest: Sha256;
+  payloadSha256: Sha256;
+  generationAppBundleId: string;
+  generationAppBundleVersion: string;
+  generationAppBundleHash: Sha256;
+  generationActivityId: string;
+  generationActivityVersion: string;
+  generationActivityHash: Sha256;
+  validatorAppBundleId: string;
+  validatorAppBundleVersion: string;
+  validatorAppBundleHash: Sha256;
+  validatorActivityId: string;
+  validatorActivityVersion: string;
+  validatorActivityHash: Sha256;
+  engineId: string;
+  productVersion: string;
+  engineVersion: string;
+  constructionAlgorithmVersion: "s8-max-scene-construction-v1";
+  semanticAlgorithmVersion: "s8-max-semantic-v1";
+};
+
+export type S8MaxSemanticManifestDocument = {
+  schemaVersion: "s8-max-semantic-manifest-v1";
+  projectId: UUID;
+  artifactId: UUID;
+  sourceStamp: S8SourceStampV1;
+  sourceStampDigest: Sha256;
+  payloadSha256: Sha256;
+  binding: S8SemanticBinding;
+  units: "millimetres";
+  axisConvention: "s6-to-max-x-right-zup-minus-yfront-v1";
+  rootName: string;
+  nodes: S8SemanticNode[];
+  objectCount: number;
+  externalAssetCount: 0;
+  externalDependencyCount: 0;
+  semanticDigest: Sha256;
+};
+
+export type S8MaxReadback = {
+  schemaVersion: "s8-max-readback-v1";
+  projectId: UUID;
+  artifactId: UUID;
+  sourceStampDigest: Sha256;
+  payloadSha256: Sha256;
+  binding: S8SemanticBinding;
+  artifactSha256: Sha256;
+  artifactByteSize: number;
+  units: "millimetres";
+  axisConvention: "s6-to-max-x-right-zup-minus-yfront-v1";
+  objectCount: number;
+  nodes: S8SemanticNode[];
+  checks: string[];
+  externalAssetCount: 0;
+  externalDependencyCount: 0;
+  missingPluginCount: 0;
+  unsupportedSaveVersion: false;
+  outcome: "pass" | "fail";
+  readbackHash: Sha256;
+  checkedAt: Timestamp;
+};
+
+export type S8MaxExportStatus =
+  | "queued"
+  | "running"
+  | "provider_pending"
+  | "provider_running"
+  | "staged"
+  | "validating"
+  | "validated"
+  | "committed"
+  | "stale"
+  | "superseded"
+  | "failed_retryable"
+  | "failed_terminal"
+  | "provider_hold"
+  | "aborted";
+
+export type S8MaxPublicationPhase = "none" | "staged" | "promoted" | "committed" | "aborted";
+export type S8MaxJobStage = "generation" | "validation" | "complete";
+
+export type S8MaxExport = {
+  schemaVersion: "s8-max-export-v1";
+  artifactId: UUID;
+  projectId: UUID;
+  jobId: UUID;
+  sourceStamp: S8SourceStampV1;
+  sourceStampDigest: Sha256;
+  payloadSha256: Sha256;
+  payloadByteSize: number;
+  inputHash: Sha256;
+  status: S8MaxExportStatus;
+  publicationPhase: S8MaxPublicationPhase;
+  candidateAttempt: 1 | 2;
+  retryOfArtifactId: UUID | null;
+  manifestId: UUID;
+  generationReceiptId: UUID | null;
+  validationReceiptId: UUID | null;
+  artifactSha256: Sha256 | null;
+  artifactByteSize: number | null;
+  privateFinalStorageKey: string;
+  privateStagingStorageKey: string;
+  privatePayloadStorageKey: string;
+  failureCode: string | null;
+  providerRetryAfterAt: Timestamp | null;
+  controllerRequired: boolean;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  committedAt: Timestamp | null;
+  staleAt: Timestamp | null;
+  supersededAt: Timestamp | null;
+};
+
+export type S8MaxJob = {
+  schemaVersion: "s8-max-job-v1";
+  jobId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+  sourceStamp: S8SourceStampV1;
+  sourceStampDigest: Sha256;
+  payloadSha256: Sha256;
+  inputHash: Sha256;
+  idempotencyKey: string;
+  candidateAttempt: 1 | 2;
+  retryOfJobId: UUID | null;
+  stage: S8MaxJobStage;
+  status: S8MaxExportStatus;
+  generationProviderAttempts: number;
+  validationProviderAttempts: number;
+  claimToken: UUID | null;
+  ownerProcessId: string | null;
+  claimedAt: Timestamp | null;
+  heartbeatAt: Timestamp | null;
+  providerRetryAfterAt: Timestamp | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  terminalAt: Timestamp | null;
+  controllerRequired: boolean;
+};
+
+export type S8MaxIdempotency = {
+  schemaVersion: "s8-max-idempotency-v1";
+  projectId: UUID;
+  operation: "export" | "retry";
+  idempotencyKey: string;
+  sourceStamp: S8SourceStampV1;
+  sourceStampDigest: Sha256;
+  inputHash: Sha256;
+  jobId: UUID;
+  artifactId: UUID;
+  createdAt: Timestamp;
+};
+
+export type S8MaxManifestRecord = {
+  schemaVersion: "s8-max-manifest-record-v1";
+  manifestId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+  sourceStamp: S8SourceStampV1;
+  sourceStampDigest: Sha256;
+  payloadSha256: Sha256;
+  manifestHash: Sha256;
+  manifestByteSize: number;
+  document: S8MaxSemanticManifestDocument;
+  privateStorageKey: string;
+};
+
+export type S8MaxGenerationReceipt = {
+  schemaVersion: "s8-max-generation-receipt-v1";
+  receiptId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+  sourceStamp: S8SourceStampV1;
+  sourceStampDigest: Sha256;
+  payloadSha256: Sha256;
+  binding: S8SemanticBinding;
+  artifactSha256: Sha256;
+  artifactByteSize: number;
+  manifestId: UUID;
+  manifestHash: Sha256;
+  nativeSaveOutcome: "pass" | "fail";
+  outcome: "pass" | "fail";
+  checkedAt: Timestamp;
+  receiptHash: Sha256;
+};
+
+export type S8MaxValidationReceipt = {
+  schemaVersion: "s8-max-validation-receipt-v1";
+  receiptId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+  sourceStamp: S8SourceStampV1;
+  sourceStampDigest: Sha256;
+  payloadSha256: Sha256;
+  binding: S8SemanticBinding;
+  manifestId: UUID;
+  manifestHash: Sha256;
+  artifactSha256: Sha256;
+  artifactByteSize: number;
+  readback: S8MaxReadback;
+  readbackHash: Sha256;
+  outcome: "pass" | "fail";
+  issues: string[];
+  checkedAt: Timestamp;
+  receiptHash: Sha256;
+};
+
+export type S8MaxProviderFailureCode =
+  | "APS_UNAVAILABLE"
+  | "APS_QUEUE_DELAY"
+  | "APS_RATE_LIMIT"
+  | "APS_AUTH_FAILURE"
+  | "APS_ENGINE_UNAVAILABLE"
+  | "APS_ENGINE_DEPRECATED"
+  | "APS_ENGINE_VERSION_MOVED"
+  | "APS_INPUT_DOWNLOAD_FAILED"
+  | "APS_WORKITEM_FAILED"
+  | "APS_INSTRUCTIONS_FAILED"
+  | "APS_TIMEOUT"
+  | "APS_OUTPUT_UPLOAD_FAILED"
+  | "APS_OUTPUT_MISSING"
+  | "APS_OUTPUT_INTEGRITY_MISMATCH"
+  | "APS_VALIDATOR_FAILED"
+  | "S8_NATIVE_SAVE_FAILED"
+  | "S8_UNSUPPORTED_GEOMETRY"
+  | "S8_PROFILE_TRIANGULATION_FAILED"
+  | "S7_CROSS_OUTPUT_MISMATCH"
+  | "SOURCE_STALE";
+
+export type S8MaxProviderMetadata = {
+  schemaVersion: "s8-max-provider-metadata-v1";
+  metadataId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+  jobId: UUID;
+  stage: "generation" | "validation";
+  provider: "aps-oss-v2-direct-s3" | "mock-oss-v2" | "unavailable";
+  providerAttempt: number;
+  outcome: "pass" | "hold" | "fail";
+  failureCode: S8MaxProviderFailureCode | null;
+  engineId: string;
+  productVersion: string;
+  engineVersion: string;
+  appBundleId: string;
+  appBundleVersion: string;
+  appBundleHash: Sha256;
+  activityId: string;
+  activityVersion: string;
+  activityHash: Sha256;
+  occurredAt: Timestamp;
+};
+
+export type S8MaxPublicExport = Omit<S8MaxExport, "privateFinalStorageKey" | "privateStagingStorageKey" | "privatePayloadStorageKey">;
+
+export type S8MaxPublicState = {
+  projectId: UUID;
+  source: {
+    readiness: "ready" | "not_ready";
+    sourceStampDigest: Sha256 | null;
+    s6RevisionId: UUID | null;
+    s6RevisionHash: Sha256 | null;
+  };
+  exports: S8MaxPublicExport[];
+};
+
+export type S8MaxTelemetryMetric<T> = { availability: "available" | "unavailable"; value: T | null; reason: string | null };
+
+export type S8MaxTelemetry = {
+  schemaVersion: "s8-max-telemetry-v1";
+  projectId: UUID;
+  sourceReadiness: S8MaxTelemetryMetric<"ready" | "not_ready">;
+  exportCount: S8MaxTelemetryMetric<number>;
+  committedExportCount: S8MaxTelemetryMetric<number>;
+  retryCount: S8MaxTelemetryMetric<number>;
+  providerHoldCount: S8MaxTelemetryMetric<number>;
+  staleCount: S8MaxTelemetryMetric<number>;
+  supersededCount: S8MaxTelemetryMetric<number>;
+  failedCount: S8MaxTelemetryMetric<number>;
+  validationPassCount: S8MaxTelemetryMetric<number>;
+  committedArtifactByteSize: S8MaxTelemetryMetric<number>;
+  generatedAt: Timestamp;
+};
+
+export type S8MaxHandoff = {
+  schemaVersion: "s8-max-handoff-v1";
+  projectId: UUID;
+  sourceStamp: S8SourceStampV1;
+  sourceStampDigest: Sha256;
+  payloadSha256: Sha256;
+  payloadByteSize: number;
+  transportFileName: "swooshz-s8-payload.json";
+  nativeOutputFileName: "swooshz-s8-model.max";
+  construction: S8ConstructionV1;
+  s6Handoff: S6ToS7Handoff;
+  eligibility: { sourceCurrent: true; s6Accepted: true; s7Committed: true; stale: false };
+};
+
+export type S8MaxExportResult = {
+  replayed: boolean;
+  export: S8MaxPublicExport;
+  job: Pick<S8MaxJob, "jobId" | "status" | "candidateAttempt" | "stage">;
+};
+
+export type S8StoreState = StoreState & {
+  s8MaxExports: S8MaxExport[];
+  s8MaxJobs: S8MaxJob[];
+  s8MaxIdempotency: S8MaxIdempotency[];
+  s8MaxManifests: S8MaxManifestRecord[];
+  s8MaxGenerationReceipts: S8MaxGenerationReceipt[];
+  s8MaxValidationReceipts: S8MaxValidationReceipt[];
+  s8MaxProviderMetadata: S8MaxProviderMetadata[];
+};

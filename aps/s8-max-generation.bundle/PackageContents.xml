@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationPackage SchemaVersion="1.0" AutodeskProduct="3ds Max" ProductType="Application" Name="swooshz-s8-max-generation-v1" Description="Swooshz S8 deterministic editable Max scene generation" Author="Swooshz Design" AppVersion="1.0.0">
+  <CompanyDetails Name="Swooshz Design" Url="https://swooshz.design" Email="support@swooshz.design" />
+  <Components Description="Python 3 pymxs native scene generation">
+    <RuntimeRequirements OS="Win64" Platform="3ds Max" />
+    <ComponentEntry AppName="swooshz-s8-max-generation-v1" ModuleName="./Contents/s8_generate.py" />
+  </Components>
+</ApplicationPackage>

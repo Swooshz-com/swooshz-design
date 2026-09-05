@@ -9,6 +9,7 @@ const MAX_MULTIPART_BODY_BYTES = MAX_BRIEF_BYTES + 1024 * 1024;
 const MAX_S4_BODY_BYTES = 131072;
 const MAX_S6_BODY_BYTES = 64000;
 const MAX_S7_BODY_BYTES = 256;
+const MAX_S8_BODY_BYTES = 256;
 const PUBLIC_S3_ERROR_CODES = new Set<string>([
   "INVALID_REQUEST",
   "IDEMPOTENCY_KEY_REQUIRED",
@@ -98,6 +99,14 @@ const PUBLIC_S7_ERROR_CODES = new Set<string>([
   "S7_DXF_HANDLE_INVALID", "S7_DXF_HANDLE_DUPLICATE", "S7_DXF_EXTENTS_INVALID", "S7_MANIFEST_INVALID",
   "S7_MANIFEST_CORRESPONDENCE_FAILED", "S7_RESOURCE_LIMIT", "NOT_FOUND",
 ]);
+const PUBLIC_S8_ERROR_CODES = new Set<string>([
+  "INVALID_REQUEST", "METHOD_NOT_ALLOWED", "IDEMPOTENCY_KEY_REQUIRED", "S8_UNAUTHORIZED_OR_NOT_FOUND", "S8_SOURCE_NOT_READY", "SOURCE_STALE",
+  "S8_IDEMPOTENCY_CONFLICT", "S8_EXPORT_NOT_READY", "S8_RETRY_NOT_AVAILABLE", "S8_CLAIM_FENCED", "S8_READBACK_FAILED", "S8_OUTPUT_INTEGRITY_MISMATCH",
+  "S8_OUTPUT_EXISTS", "S8_PROFILE_TRIANGULATION_FAILED", "S8_UNSUPPORTED_GEOMETRY", "S8_BOUNDS_MISMATCH", "S8_RESOURCE_LIMIT", "S7_CROSS_OUTPUT_MISMATCH",
+  "APS_UNAVAILABLE", "APS_QUEUE_DELAY", "APS_RATE_LIMIT", "APS_AUTH_FAILURE", "APS_ENGINE_UNAVAILABLE", "APS_ENGINE_DEPRECATED", "APS_ENGINE_VERSION_MOVED",
+  "APS_INPUT_DOWNLOAD_FAILED", "APS_WORKITEM_FAILED", "APS_INSTRUCTIONS_FAILED", "APS_TIMEOUT", "APS_OUTPUT_UPLOAD_FAILED", "APS_OUTPUT_MISSING",
+  "APS_OUTPUT_INTEGRITY_MISMATCH", "APS_VALIDATOR_FAILED", "S8_NATIVE_SAVE_FAILED", "S8_PROVIDER_ATTEMPTS_EXHAUSTED", "METHOD_NOT_ALLOWED",
+]);
 const S4_PUBLIC_FIELDS = new Set(["body", "projectId", "baseRevisionId", "expectedSelectionVersion", "primitives", "instructionText", "editId", "targetId", "Idempotency-Key", "x-request-id", "request"]);
 const S4_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
 const S5_PUBLIC_FIELDS = new Set(["body", "projectId", "layoutGroupId", "artifactId", "expectedGenerationSetId", "expectedSelectionStateId", "expectedSelectionVersion", "expectedActiveRevisionId", "expectedApprovalEventId", "expectedApprovalGeneration", "expectedApprovalEventSequence", "reopenReason", "Idempotency-Key", "x-request-id", "request"]);
@@ -109,6 +118,8 @@ const S6_PUBLIC_FIELDS = new Set([
 const S6_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INTEGER_REQUIRED", "INVALID_REQUEST"]);
 const S7_PUBLIC_FIELDS = new Set(["body", "projectId", "artifactId", "Idempotency-Key", "x-request-id", "request"]);
 const S7_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
+const S8_PUBLIC_FIELDS = new Set(["body", "projectId", "artifactId", "Idempotency-Key", "x-request-id", "request"]);
+const S8_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
 
 function safeS4Field(field: string): string {
   if (S4_PUBLIC_FIELDS.has(field) || /^primitives(?:\[\d+\])?(?:\.(?:kind|xQ16|yQ16|widthQ16|heightQ16|radiusQ8|points)(?:\[\d+\])?(?:\.(?:xQ16|yQ16))?)?$/.test(field)) return field;
@@ -130,23 +141,27 @@ function safeS6FieldErrors(fieldErrors: readonly { field: string; code: string }
 }
 function safeS7Field(field: string): string { return S7_PUBLIC_FIELDS.has(field) ? field : "body"; }
 function safeS7FieldErrors(fieldErrors: readonly { field: string; code: string }[]): { field: string; code: string }[] { return fieldErrors.map((item) => ({ field: safeS7Field(item.field), code: S7_PUBLIC_FIELD_CODES.has(item.code) ? item.code : "INVALID_REQUEST" })); }
+function safeS8Field(field: string): string { return S8_PUBLIC_FIELDS.has(field) ? field : "body"; }
+function safeS8FieldErrors(fieldErrors: readonly { field: string; code: string }[]): { field: string; code: string }[] { return fieldErrors.map((item) => ({ field: safeS8Field(item.field), code: S8_PUBLIC_FIELD_CODES.has(item.code) ? item.code : "INVALID_REQUEST" })); }
 
 function requestReferenceId(request: Request): UUID {
   const supplied = request.headers.get("x-request-id");
   return supplied && uuidV4Pattern.test(supplied) ? supplied : crypto.randomUUID();
 }
 
-function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false, s5 = false, s6 = false, s7 = false): NextResponse {
+function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false, s5 = false, s6 = false, s7 = false, s8 = false): NextResponse {
   const candidate = error instanceof AppError
     ? error
-    : new AppError(500, s7 ? "S7_INTERNAL_ERROR" : s6 ? "S6_INTERNAL_ERROR" : s5 ? "S5_INTERNAL_ERROR" : s4 ? "S4_INTERNAL_ERROR" : s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
+    : new AppError(500, s8 ? "S8_INTERNAL_ERROR" : s7 ? "S7_INTERNAL_ERROR" : s6 ? "S6_INTERNAL_ERROR" : s5 ? "S5_INTERNAL_ERROR" : s4 ? "S4_INTERNAL_ERROR" : s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
   const s7SurfaceCandidate = s7 && candidate.code === "INVALID_REQUEST"
     ? new AppError(candidate.status, "INVALID_REQUEST", candidate.fieldErrors, candidate.logContext)
     : candidate;
   const surfaceCandidate = s7SurfaceCandidate.code === "INVALID_REQUEST" && s6 && !s7
     ? new AppError(candidate.status, "S6_INVALID_REQUEST", candidate.fieldErrors, candidate.logContext)
     : s7SurfaceCandidate;
-  const appError = s7 && !PUBLIC_S7_ERROR_CODES.has(surfaceCandidate.code)
+  const appError = s8 && !PUBLIC_S8_ERROR_CODES.has(surfaceCandidate.code)
+    ? new AppError(500, "S8_INTERNAL_ERROR", safeS8FieldErrors(surfaceCandidate.fieldErrors))
+    : s7 && !PUBLIC_S7_ERROR_CODES.has(surfaceCandidate.code)
     ? new AppError(500, "S7_INTERNAL_ERROR", safeS7FieldErrors(surfaceCandidate.fieldErrors))
     : s6 && !PUBLIC_S6_ERROR_CODES.has(surfaceCandidate.code)
     ? new AppError(500, "S6_INTERNAL_ERROR", safeS6FieldErrors(surfaceCandidate.fieldErrors))
@@ -162,7 +177,7 @@ function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false, s5
       code: appError.code,
       message: "The request could not be completed. Try again or contact support with the reference ID.",
       referenceId,
-      fieldErrors: s7 ? safeS7FieldErrors(appError.fieldErrors) : s6 ? safeS6FieldErrors(appError.fieldErrors) : s5 ? safeS5FieldErrors(appError.fieldErrors) : s4 ? safeS4FieldErrors(appError.fieldErrors) : appError.fieldErrors,
+      fieldErrors: s8 ? safeS8FieldErrors(appError.fieldErrors) : s7 ? safeS7FieldErrors(appError.fieldErrors) : s6 ? safeS6FieldErrors(appError.fieldErrors) : s5 ? safeS5FieldErrors(appError.fieldErrors) : s4 ? safeS4FieldErrors(appError.fieldErrors) : appError.fieldErrors,
     },
   };
   console.error(JSON.stringify({ referenceId, operation: "api_request", status: appError.status, code: appError.code }));
@@ -614,6 +629,10 @@ export function isS6Path(segments: string[]): boolean {
 
 export function isS7Path(segments: string[]): boolean {
   return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s7";
+}
+
+export function isS8Path(segments: string[]): boolean {
+  return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s8";
 }
 
 export type AuthorizedS6Service = {
@@ -1163,11 +1182,51 @@ export async function authorizedS7Service(
   return { service: dependencies.workflowService ?? serviceForRequest(), subjectId: context.subjectId };
 }
 
+export type AuthorizedS8Service = {
+  service: WorkflowService;
+  subjectId: string;
+};
+
+export async function authorizedS8Service(
+  request: Request,
+  segments: string[],
+  supplied: WorkflowService | ApiRequestDependencies | undefined,
+): Promise<AuthorizedS8Service> {
+  const projectId = segments[1];
+  if (typeof projectId !== "string" || !uuidV4Pattern.test(projectId)) throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND");
+  const dependencies = isApiRequestDependencies(supplied)
+    ? supplied
+    : { workflowService: supplied, s3Authorization: productionS3Authorization };
+  let context: S3AccessContext | null;
+  try { context = await dependencies.s3Authorization.resolveContext(request); }
+  catch { throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND"); }
+  if (!context || typeof context.subjectId !== "string" || context.subjectId.length === 0) throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND");
+  try {
+    if (!(await dependencies.s3Authorization.authorizeProject(context, projectId))) throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND");
+  } catch (error) {
+    if (error instanceof AppError && error.code === "S8_UNAUTHORIZED_OR_NOT_FOUND") throw error;
+    throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND");
+  }
+  return { service: dependencies.workflowService ?? serviceForRequest(), subjectId: context.subjectId };
+}
+
 async function s7JsonBody(request: Request): Promise<Record<string, unknown>> {
   return boundedJsonBody(request, MAX_S7_BODY_BYTES);
 }
 
+async function s8JsonBody(request: Request): Promise<Record<string, unknown>> {
+  return boundedJsonBody(request, MAX_S8_BODY_BYTES);
+}
+
 function s7IdempotencyKeyFromHeader(request: Request): string {
+  const key = request.headers.get("Idempotency-Key");
+  if (key === null || key.length === 0 || Array.from(key).length > 240 || /[\u0000-\u001f\u007f-\u009f]/u.test(key) || key.includes("\\")) {
+    throw new AppError(400, "IDEMPOTENCY_KEY_REQUIRED", [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]);
+  }
+  return key;
+}
+
+function s8IdempotencyKeyFromHeader(request: Request): string {
   const key = request.headers.get("Idempotency-Key");
   if (key === null || key.length === 0 || Array.from(key).length > 240 || /[\u0000-\u001f\u007f-\u009f]/u.test(key) || key.includes("\\")) {
     throw new AppError(400, "IDEMPOTENCY_KEY_REQUIRED", [{ field: "Idempotency-Key", code: "IDEMPOTENCY_KEY_REQUIRED" }]);
@@ -1325,6 +1384,63 @@ async function handleS7(
     if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
     await requireEmptyBody(request);
     return NextResponse.json(service.s7.getHandoff(projectId), { status: 200 });
+  }
+  throw new AppError(400, "INVALID_REQUEST");
+}
+
+async function handleS8(
+  request: Request,
+  method: string,
+  segments: string[],
+  service: WorkflowService,
+  subjectId: string,
+  referenceId: UUID,
+): Promise<NextResponse> {
+  void subjectId;
+  void referenceId;
+  const projectId = segments[1] as UUID;
+  if (segments.length === 3) {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s8.getState(projectId), { status: 200 });
+  }
+  if (segments.length === 4 && segments[3] === "exports") {
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    const body = await s8JsonBody(request);
+    exactKeys(body, []);
+    const result = await service.s8.createExport(projectId, s8IdempotencyKeyFromHeader(request));
+    const status = result.replayed ? 200 : result.export.status === "committed" ? 201 : 202;
+    return NextResponse.json(result, { status });
+  }
+  if (segments.length === 5 && segments[3] === "exports") {
+    assertUuid(segments[4], "artifactId");
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s8.getExport(projectId, segments[4]), { status: 200 });
+  }
+  if (segments.length === 6 && segments[3] === "exports" && segments[5] === "retry") {
+    assertUuid(segments[4], "artifactId");
+    if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    const result = await service.s8.retryExport(projectId, segments[4], s8IdempotencyKeyFromHeader(request));
+    const status = result.replayed ? 200 : result.export.status === "committed" ? 201 : 202;
+    return NextResponse.json(result, { status });
+  }
+  if (segments.length === 6 && segments[3] === "exports" && segments[5] === "download") {
+    assertUuid(segments[4], "artifactId");
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return s5DownloadResponse(service.s8.download(projectId, segments[4]));
+  }
+  if (segments.length === 4 && segments[3] === "telemetry") {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s8.getTelemetry(projectId), { status: 200 });
+  }
+  if (segments.length === 4 && segments[3] === "handoff") {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    return NextResponse.json(service.s8.getHandoff(projectId), { status: 200 });
   }
   throw new AppError(400, "INVALID_REQUEST");
 }
@@ -1496,6 +1612,10 @@ export async function handleApiRequest(
 ): Promise<NextResponse> {
   const referenceId = requestReferenceId(request);
   try {
+    if (isS8Path(path)) {
+      const authorized = await authorizedS8Service(request, path, supplied);
+      return await handleS8(request, request.method.toUpperCase(), path, authorized.service, authorized.subjectId, referenceId);
+    }
     if (isS7Path(path)) {
       const authorized = await authorizedS7Service(request, path, supplied);
       return await handleS7(request, request.method.toUpperCase(), path, authorized.service, authorized.subjectId, referenceId);
@@ -1521,6 +1641,6 @@ export async function handleApiRequest(
       : supplied ?? serviceForRequest();
     return await handle(request, request.method.toUpperCase(), path, service, referenceId);
   } catch (error) {
-    return jsonError(referenceId, error, isS3Path(path), isS4Path(path), isS5Path(path), isS6Path(path), isS7Path(path));
+    return jsonError(referenceId, error, isS3Path(path), isS4Path(path), isS5Path(path), isS6Path(path), isS7Path(path), isS8Path(path));
   }
 }
