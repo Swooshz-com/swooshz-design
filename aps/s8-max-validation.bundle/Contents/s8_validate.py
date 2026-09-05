@@ -51,6 +51,10 @@ def digest(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def max_name(value):
+    return str(value).lstrip("#").lower()
+
+
 def require_keys(value, keys):
     if not isinstance(value, dict) or set(value) != set(keys):
         fail("S8_READBACK_INPUT_INVALID")
@@ -268,6 +272,7 @@ def material_readback(node, expected):
     if material is None or "Physical" not in str(rt.classOf(material)):
         fail("S8_MATERIAL_CLASS_INVALID")
     base = material.base_color
+    degradation_value = user_prop(node, "s8.degradationCode")
     actual = {
         "materialId": expected["materialId"],
         "nativeClass": "PhysicalMaterial",
@@ -276,13 +281,12 @@ def material_readback(node, expected):
         "roughness": float(material.roughness),
         "transparency": float(material.transparency),
         "emission": 0.0,
-        "degradationCodes": [user_prop(node, "s8.degradationCode")],
+        "degradationCodes": degradation_value.split(",") if degradation_value else [],
     }
     emit = material.emit_color
     if any(int(channel) != 0 for channel in (emit.r, emit.g, emit.b)):
         fail("S8_MATERIAL_VALUE_INVALID")
-    expected_codes = [",".join(expected["degradationCodes"])]
-    if actual["baseColorHex"] != expected["baseColorHex"] or actual["metalness"] != expected["metalness"] or abs(actual["roughness"] - expected["roughness"]) > 1e-6 or abs(actual["transparency"] - expected["transparency"]) > 1e-6 or actual["degradationCodes"] != expected_codes:
+    if actual["baseColorHex"] != expected["baseColorHex"] or actual["metalness"] != expected["metalness"] or abs(actual["roughness"] - expected["roughness"]) > 1e-6 or abs(actual["transparency"] - expected["transparency"]) > 1e-6 or actual["degradationCodes"] != expected["degradationCodes"]:
         fail("S8_MATERIAL_VALUE_INVALID")
     return actual
 
@@ -393,7 +397,7 @@ def main():
     if loaded is not True:
         fail("APS_OUTPUT_MISSING")
     try:
-        if "millimeter" not in str(rt.units.SystemType).lower() or abs(float(rt.units.SystemScale) - 1.0) > MATRIX_TOLERANCE or "metric" not in str(rt.units.DisplayType).lower() or "millimeter" not in str(rt.units.MetricType).lower():
+        if max_name(rt.units.SystemType) != "millimeters" or abs(float(rt.units.SystemScale) - 1.0) > MATRIX_TOLERANCE or max_name(rt.units.DisplayType) != "metric" or max_name(rt.units.MetricType) != "millimeters":
             fail("S8_UNITS_INVALID")
         if rt.maxVersion() is None:
             fail("S8_SUPPORTED_SAVE_VERSION")

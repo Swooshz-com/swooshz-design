@@ -3143,6 +3143,7 @@ export type S8MaxExport = {
   privateStagingStorageKey: string;
   privatePayloadStorageKey: string;
   failureCode: string | null;
+  providerRetryAfterAt: Timestamp | null;
   controllerRequired: boolean;
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -3171,6 +3172,7 @@ export type S8MaxJob = {
   ownerProcessId: string | null;
   claimedAt: Timestamp | null;
   heartbeatAt: Timestamp | null;
+  providerRetryAfterAt: Timestamp | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   terminalAt: Timestamp | null;

@@ -31,6 +31,7 @@ export type S8ProviderFailureCause =
   | "transfer_transient"
   | "transfer_defect"
   | "candidate"
+  | "business"
   | "script"
   | "semantic"
   | "unknown";
@@ -42,6 +43,7 @@ export type S8ProviderFailureDisposition = {
   controllerRequired: boolean;
   reconciliationRequired: boolean;
   honorRetryAfter: boolean;
+  terminal: boolean;
 };
 
 export type S8MaxProviderFailureSpec = {
@@ -52,51 +54,97 @@ export type S8MaxProviderFailureSpec = {
 
 export type S8MaxProviderFailureInput = S8MaxProviderFailureCode | S8MaxProviderFailureSpec;
 
+const DEFAULT_FAILURE_CAUSE: { [Code in S8MaxProviderFailureCode]: S8ProviderFailureCause } = {
+  APS_UNAVAILABLE: "provider_transient",
+  APS_QUEUE_DELAY: "queue",
+  APS_RATE_LIMIT: "rate_limit",
+  APS_AUTH_FAILURE: "auth",
+  APS_ENGINE_UNAVAILABLE: "provider_transient",
+  APS_ENGINE_DEPRECATED: "compatibility",
+  APS_ENGINE_VERSION_MOVED: "compatibility",
+  APS_INPUT_DOWNLOAD_FAILED: "transfer_transient",
+  APS_WORKITEM_FAILED: "provider_transient",
+  APS_INSTRUCTIONS_FAILED: "candidate",
+  APS_TIMEOUT: "provider_transient",
+  APS_OUTPUT_UPLOAD_FAILED: "transfer_transient",
+  APS_OUTPUT_MISSING: "transfer_defect",
+  APS_OUTPUT_INTEGRITY_MISMATCH: "transfer_transient",
+  APS_VALIDATOR_FAILED: "provider_transient",
+  S8_NATIVE_SAVE_FAILED: "candidate",
+  S8_UNSUPPORTED_GEOMETRY: "candidate",
+  S8_PROFILE_TRIANGULATION_FAILED: "candidate",
+  S7_CROSS_OUTPUT_MISMATCH: "candidate",
+  SOURCE_STALE: "unknown",
+};
+
 function defaultFailureCause(code: S8MaxProviderFailureCode): S8ProviderFailureCause {
-  switch (code) {
-    case "APS_QUEUE_DELAY": return "queue";
-    case "APS_RATE_LIMIT": return "rate_limit";
-    case "APS_AUTH_FAILURE": return "auth";
-    case "APS_ENGINE_DEPRECATED":
-    case "APS_ENGINE_VERSION_MOVED": return "compatibility";
-    case "APS_INPUT_DOWNLOAD_FAILED": return "transfer_transient";
-    case "APS_OUTPUT_UPLOAD_FAILED": return "transfer_transient";
-    case "APS_OUTPUT_MISSING": return "transfer_defect";
-    case "APS_OUTPUT_INTEGRITY_MISMATCH": return "transfer_transient";
-    case "S8_NATIVE_SAVE_FAILED":
-    case "S8_UNSUPPORTED_GEOMETRY":
-    case "S8_PROFILE_TRIANGULATION_FAILED":
-    case "S7_CROSS_OUTPUT_MISMATCH": return "candidate";
-    case "APS_INSTRUCTIONS_FAILED": return "candidate";
-    case "SOURCE_STALE": return "unknown";
-    default: return "provider_transient";
-  }
+  return DEFAULT_FAILURE_CAUSE[code];
+}
+
+function candidateFailureDisposition(): S8ProviderFailureDisposition {
+  return { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false };
+}
+
+function providerRetryDisposition(honorRetryAfter = false): S8ProviderFailureDisposition {
+  return { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter, terminal: false };
+}
+
+function controllerHoldDisposition(): S8ProviderFailureDisposition {
+  return { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false, terminal: true };
+}
+
+function staleDisposition(): S8ProviderFailureDisposition {
+  return { classification: "stale", retryable: false, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: true };
+}
+
+function oneOf(cause: S8ProviderFailureCause, values: readonly S8ProviderFailureCause[]): boolean {
+  return values.includes(cause);
 }
 
 export function classifyS8ProviderFailure(code: S8MaxProviderFailureCode, cause = defaultFailureCause(code)): S8ProviderFailureDisposition {
-  if (code === "SOURCE_STALE") {
-    return { classification: "stale", retryable: false, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false };
+  switch (code) {
+    case "SOURCE_STALE":
+      return staleDisposition();
+    case "S8_NATIVE_SAVE_FAILED":
+    case "S8_UNSUPPORTED_GEOMETRY":
+    case "S8_PROFILE_TRIANGULATION_FAILED":
+    case "S7_CROSS_OUTPUT_MISMATCH":
+    case "APS_INSTRUCTIONS_FAILED":
+      return candidateFailureDisposition();
+    case "APS_UNAVAILABLE":
+    case "APS_QUEUE_DELAY":
+      return providerRetryDisposition();
+    case "APS_RATE_LIMIT":
+      return providerRetryDisposition(true);
+    case "APS_AUTH_FAILURE":
+    case "APS_ENGINE_DEPRECATED":
+    case "APS_ENGINE_VERSION_MOVED":
+      return controllerHoldDisposition();
+    case "APS_ENGINE_UNAVAILABLE":
+      return oneOf(cause, ["provider_transient", "queue"]) ? providerRetryDisposition() : controllerHoldDisposition();
+    case "APS_INPUT_DOWNLOAD_FAILED":
+      return oneOf(cause, ["provider_transient", "queue", "rate_limit", "transfer_transient"]) ? providerRetryDisposition(cause === "rate_limit") : controllerHoldDisposition();
+    case "APS_WORKITEM_FAILED":
+      if (oneOf(cause, ["provider_transient", "queue", "rate_limit", "transfer_transient"])) return providerRetryDisposition(cause === "rate_limit");
+      if (oneOf(cause, ["candidate", "business", "script", "semantic"])) return candidateFailureDisposition();
+      return controllerHoldDisposition();
+    case "APS_TIMEOUT":
+      if (oneOf(cause, ["provider_transient", "queue", "rate_limit"])) return providerRetryDisposition(cause === "rate_limit");
+      if (oneOf(cause, ["candidate", "script", "semantic"])) return candidateFailureDisposition();
+      return controllerHoldDisposition();
+    case "APS_OUTPUT_UPLOAD_FAILED":
+      return oneOf(cause, ["provider_transient", "queue", "rate_limit", "transfer_transient"]) ? providerRetryDisposition(cause === "rate_limit") : controllerHoldDisposition();
+    case "APS_OUTPUT_MISSING":
+      return controllerHoldDisposition();
+    case "APS_OUTPUT_INTEGRITY_MISMATCH":
+      if (oneOf(cause, ["provider_transient", "queue", "rate_limit", "transfer_transient"])) return providerRetryDisposition(cause === "rate_limit");
+      if (oneOf(cause, ["candidate", "script", "semantic"])) return candidateFailureDisposition();
+      return controllerHoldDisposition();
+    case "APS_VALIDATOR_FAILED":
+      if (oneOf(cause, ["provider_transient", "queue", "rate_limit", "transfer_transient"])) return providerRetryDisposition(cause === "rate_limit");
+      if (oneOf(cause, ["candidate", "script", "semantic"])) return candidateFailureDisposition();
+      return controllerHoldDisposition();
   }
-  if (code === "S8_NATIVE_SAVE_FAILED" || code === "S8_UNSUPPORTED_GEOMETRY" || code === "S8_PROFILE_TRIANGULATION_FAILED" || code === "S7_CROSS_OUTPUT_MISMATCH" || code === "APS_INSTRUCTIONS_FAILED") {
-    return { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false };
-  }
-  if (code === "APS_AUTH_FAILURE" || code === "APS_ENGINE_DEPRECATED" || code === "APS_ENGINE_VERSION_MOVED" || cause === "compatibility" || cause === "auth") {
-    return { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false };
-  }
-  if (code === "APS_OUTPUT_MISSING" || cause === "transfer_defect") {
-    return { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false };
-  }
-  if (cause === "candidate" || cause === "script" || cause === "semantic") {
-    return { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false };
-  }
-  return {
-    classification: "provider_hold",
-    retryable: true,
-    consumesCandidateAttempt: false,
-    controllerRequired: false,
-    reconciliationRequired: false,
-    honorRetryAfter: cause === "rate_limit",
-  };
 }
 
 export class S8MaxProviderError extends Error {

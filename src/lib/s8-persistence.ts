@@ -308,13 +308,13 @@ function validateReadback(value: unknown): S8MaxReadback {
 const EXPORT_KEYS = [
   "schemaVersion", "artifactId", "projectId", "jobId", "sourceStamp", "sourceStampDigest", "payloadSha256", "payloadByteSize", "inputHash",
   "status", "publicationPhase", "candidateAttempt", "retryOfArtifactId", "manifestId", "generationReceiptId", "validationReceiptId", "artifactSha256",
-  "artifactByteSize", "privateFinalStorageKey", "privateStagingStorageKey", "privatePayloadStorageKey", "failureCode", "controllerRequired", "createdAt", "updatedAt",
+  "artifactByteSize", "privateFinalStorageKey", "privateStagingStorageKey", "privatePayloadStorageKey", "failureCode", "providerRetryAfterAt", "controllerRequired", "createdAt", "updatedAt",
   "committedAt", "staleAt", "supersededAt",
 ] as const;
 const JOB_KEYS = [
   "schemaVersion", "jobId", "projectId", "artifactId", "sourceStamp", "sourceStampDigest", "payloadSha256", "inputHash", "idempotencyKey",
   "candidateAttempt", "retryOfJobId", "stage", "status", "generationProviderAttempts", "validationProviderAttempts", "claimToken", "ownerProcessId",
-  "claimedAt", "heartbeatAt", "createdAt", "updatedAt", "terminalAt", "controllerRequired",
+  "claimedAt", "heartbeatAt", "providerRetryAfterAt", "createdAt", "updatedAt", "terminalAt", "controllerRequired",
 ] as const;
 const IDEMPOTENCY_KEYS = ["schemaVersion", "projectId", "operation", "idempotencyKey", "sourceStamp", "sourceStampDigest", "inputHash", "jobId", "artifactId", "createdAt"] as const;
 const MANIFEST_KEYS = ["schemaVersion", "manifestId", "projectId", "artifactId", "sourceStamp", "sourceStampDigest", "payloadSha256", "manifestHash", "manifestByteSize", "document", "privateStorageKey"] as const;
@@ -330,7 +330,7 @@ function validateExport(value: unknown): S8MaxExport {
   text(item.privateFinalStorageKey, 2048); text(item.privateStagingStorageKey, 2048); text(item.privatePayloadStorageKey, 2048);
   if (item.privateFinalStorageKey !== s8FinalMaxStorageKey(result.projectId, result.artifactId)) return invalid("S8_FINAL_PATH_INVALID");
   if (!expectedStagingPath(result.projectId, result.jobId, result.privateStagingStorageKey, S8_NATIVE_FILE_NAME) || !expectedStagingPath(result.projectId, result.jobId, result.privatePayloadStorageKey, S8_TRANSPORT_FILE_NAME)) return invalid("S8_STAGING_PATH_INVALID");
-  nullableText(item.failureCode, 200); bool(item.controllerRequired); timestamp(item.createdAt); timestamp(item.updatedAt); nullableTimestamp(item.committedAt); nullableTimestamp(item.staleAt); nullableTimestamp(item.supersededAt);
+  nullableText(item.failureCode, 200); nullableTimestamp(item.providerRetryAfterAt); bool(item.controllerRequired); timestamp(item.createdAt); timestamp(item.updatedAt); nullableTimestamp(item.committedAt); nullableTimestamp(item.staleAt); nullableTimestamp(item.supersededAt);
   if ((item.artifactSha256 === null) !== (item.artifactByteSize === null)) return invalid("S8_ARTIFACT_REFERENCE_INVALID");
   const allowed: Record<string, readonly string[]> = {
     queued: ["none"], running: ["none"], provider_pending: ["none", "staged", "promoted"], provider_running: ["none", "staged", "promoted"], staged: ["staged"], validating: ["promoted"], validated: ["promoted"],
@@ -348,6 +348,7 @@ function validateExport(value: unknown): S8MaxExport {
   if (status === "failed_retryable" && attempt !== 1) return invalid("S8_RETRY_CHAIN_INVALID");
   if (status === "failed_terminal" && attempt !== 2) return invalid("S8_RETRY_CHAIN_INVALID");
   if (item.controllerRequired && status !== "provider_hold") return invalid("S8_CONTROLLER_STATE_INVALID");
+  if (item.providerRetryAfterAt !== null && (status !== "provider_hold" || item.controllerRequired)) return invalid("S8_RETRY_AFTER_STATE_INVALID");
   return result;
 }
 
@@ -355,12 +356,13 @@ function validateJob(value: unknown): S8MaxJob {
   const item = record(value, JOB_KEYS); const result = item as unknown as S8MaxJob;
   enumValue(item.schemaVersion, [S8_JOB_VERSION]); uuid(item.jobId); uuid(item.projectId); uuid(item.artifactId); source(item.sourceStamp); sha(item.sourceStampDigest); if (item.sourceStampDigest !== sourceStampDigest(result.sourceStamp)) return invalid("S8_SOURCE_STAMP_DIGEST_INVALID"); sha(item.payloadSha256); sha(item.inputHash); opaque(item.idempotencyKey);
   const attempt = integer(item.candidateAttempt, 1, S8_MAX_CANDIDATE_ATTEMPTS); if (attempt !== 1 && attempt !== 2) return invalid("S8_ATTEMPT_INVALID"); nullableUuid(item.retryOfJobId); enumValue(item.stage, ["generation", "validation", "complete"]); const status = enumValue(item.status, EXPORT_STATUSES);
-  integer(item.generationProviderAttempts, 0, S8_MAX_PROVIDER_ATTEMPTS); integer(item.validationProviderAttempts, 0, S8_MAX_PROVIDER_ATTEMPTS); nullableUuid(item.claimToken); nullableText(item.ownerProcessId, 240); nullableTimestamp(item.claimedAt); nullableTimestamp(item.heartbeatAt); timestamp(item.createdAt); timestamp(item.updatedAt); nullableTimestamp(item.terminalAt); bool(item.controllerRequired);
+  integer(item.generationProviderAttempts, 0, S8_MAX_PROVIDER_ATTEMPTS); integer(item.validationProviderAttempts, 0, S8_MAX_PROVIDER_ATTEMPTS); nullableUuid(item.claimToken); nullableText(item.ownerProcessId, 240); nullableTimestamp(item.claimedAt); nullableTimestamp(item.heartbeatAt); nullableTimestamp(item.providerRetryAfterAt); timestamp(item.createdAt); timestamp(item.updatedAt); nullableTimestamp(item.terminalAt); bool(item.controllerRequired);
   const claimFields = [item.claimToken, item.ownerProcessId, item.claimedAt, item.heartbeatAt]; if (claimFields.some((field) => field === null) && claimFields.some((field) => field !== null)) return invalid("S8_CLAIM_STATE_INVALID");
   const active = ACTIVE_STATUSES.includes(status as typeof ACTIVE_STATUSES[number]); if (active !== claimFields.every((field) => field !== null)) return invalid("S8_CLAIM_STATE_INVALID");
   const terminal = TERMINAL_STATUSES.includes(status as typeof TERMINAL_STATUSES[number]); if (terminal !== (item.terminalAt !== null)) return invalid("S8_TERMINAL_STATE_INVALID");
   if (status === "failed_retryable" && attempt !== 1) return invalid("S8_RETRY_CHAIN_INVALID"); if (status === "failed_terminal" && attempt !== 2) return invalid("S8_RETRY_CHAIN_INVALID");
   if (item.controllerRequired && status !== "provider_hold") return invalid("S8_CONTROLLER_STATE_INVALID");
+  if (item.providerRetryAfterAt !== null && (status !== "provider_hold" || item.controllerRequired)) return invalid("S8_RETRY_AFTER_STATE_INVALID");
   return result;
 }
 
@@ -486,7 +488,7 @@ export function validateS8Graph(state: StoreState): void {
     if (item.operation === "export" && (job.idempotencyKey !== item.idempotencyKey || artifact.candidateAttempt !== 1 || artifact.retryOfArtifactId !== null || job.retryOfJobId !== null)) return invalid("S8_IDEMPOTENCY_LINK_INVALID");
   }
   for (const artifact of exports) {
-    const job = jobById.get(artifact.jobId); if (!job || job.projectId !== artifact.projectId || job.artifactId !== artifact.artifactId || job.status !== artifact.status || job.candidateAttempt !== artifact.candidateAttempt || job.sourceStampDigest !== artifact.sourceStampDigest || !sameS8Source(job.sourceStamp, artifact.sourceStamp) || job.controllerRequired !== artifact.controllerRequired) return invalid("S8_ARTIFACT_REFERENCE_INVALID");
+    const job = jobById.get(artifact.jobId); if (!job || job.projectId !== artifact.projectId || job.artifactId !== artifact.artifactId || job.status !== artifact.status || job.candidateAttempt !== artifact.candidateAttempt || job.sourceStampDigest !== artifact.sourceStampDigest || !sameS8Source(job.sourceStamp, artifact.sourceStamp) || job.controllerRequired !== artifact.controllerRequired || job.providerRetryAfterAt !== artifact.providerRetryAfterAt) return invalid("S8_ARTIFACT_REFERENCE_INVALID");
     const manifest = manifestById.get(artifact.manifestId); if (artifact.generationReceiptId !== null && !manifest) return invalid("S8_MANIFEST_REFERENCE_INVALID");
     if (artifact.generationReceiptId !== null) { const receipt = generationById.get(artifact.generationReceiptId); if (!receipt || receipt.artifactId !== artifact.artifactId || receipt.manifestId !== artifact.manifestId || receipt.artifactSha256 !== artifact.artifactSha256 || receipt.artifactByteSize !== artifact.artifactByteSize || receipt.sourceStampDigest !== artifact.sourceStampDigest) return invalid("S8_RECEIPT_REFERENCE_INVALID"); }
     if (artifact.validationReceiptId !== null) { const receipt = validationById.get(artifact.validationReceiptId); if (!receipt || receipt.artifactId !== artifact.artifactId || receipt.manifestId !== artifact.manifestId || receipt.artifactSha256 !== artifact.artifactSha256 || receipt.artifactByteSize !== artifact.artifactByteSize || receipt.sourceStampDigest !== artifact.sourceStampDigest || receipt.outcome !== "pass") return invalid("S8_RECEIPT_REFERENCE_INVALID"); }

@@ -10,6 +10,7 @@ import {
   type S6ToS7Handoff,
   type S8MaxPayloadV1,
   type S8SourceStampV1,
+  type Timestamp,
   type UUID,
 } from "../src/lib/types";
 import { emptyStoreState, JsonRepository, PrivateObjectStore } from "../src/lib/store";
@@ -168,7 +169,7 @@ function sourceRevision(handoff: S6ToS7Handoff): Record<string, unknown> {
   };
 }
 
-function makeContext(options: { provider?: S8MaxProvider; handoff?: S6ToS7Handoff; s7Failure?: boolean; onPublicationPhase?: (phase: S8PublicationPhase) => void } = {}) {
+function makeContext(options: { provider?: S8MaxProvider; handoff?: S6ToS7Handoff; s7Failure?: boolean; clock?: () => Timestamp; onPublicationPhase?: (phase: S8PublicationPhase) => void } = {}) {
   const root = mkdtempSync(join(tmpdir(), "s8-g3-"));
   const repository = new JsonRepository(root);
   repository.transact((state) => state.projects.push(project()));
@@ -180,7 +181,7 @@ function makeContext(options: { provider?: S8MaxProvider; handoff?: S6ToS7Handof
   } as never;
   const s7 = new S7CadService({ repository, objects, s6 });
   if (!options.s7Failure) s7.createExport(PROJECT_ID, "s7-fixture-key");
-  const service = new S8MaxService({ repository, objects, s6, s7, provider: options.provider ?? createMockS8MaxProvider(), ownerProcessId: "s8-test-owner", onPublicationPhase: options.onPublicationPhase ? (phase) => options.onPublicationPhase?.(phase) : undefined });
+  const service = new S8MaxService({ repository, objects, s6, s7, provider: options.provider ?? createMockS8MaxProvider(), ownerProcessId: "s8-test-owner", clock: options.clock, onPublicationPhase: options.onPublicationPhase ? (phase) => options.onPublicationPhase?.(phase) : undefined });
   return { repository, objects, s6, s7, service, move(next: S6ToS7Handoff) { current = next; } };
 }
 
@@ -282,6 +283,23 @@ test("Max basis mapping, mixed rotations, nested transforms, and inverse are det
   assert.ok(Math.abs(restored.translation.z - child.translation.z) <= 1e-6);
   for (let row = 0; row < 3; row += 1) for (const axis of ["x", "y", "z"] as const) assert.ok(Math.abs(restored.rows[row]![axis] - child.rows[row]![axis]) <= 1e-6);
   assert.deepEqual(s8MaxMatrixFromS6Transform({ positionMm: { xMm: 0, yMm: 0, zMm: 0 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } }).rows, [{ x: 1, y: 0, z: 0 }, { x: 0, y: 0, z: 1 }, { x: 0, y: -1, z: 0 }]);
+  const parentTransform = { positionMm: { xMm: 140, yMm: 35, zMm: 80 }, rotationMd: { xMd: 15000, yMd: 25000, zMd: 90000 } };
+  const childTransform = { positionMm: { xMm: 25, yMm: 40, zMm: -15 }, rotationMd: { xMd: 30000, yMd: 45000, zMd: 60000 } };
+  const nested = fixtureHandoff({ objects: [
+    objectValue({ objectId: "nested-parent", identityKey: "nested-parent", transform: parentTransform }),
+    objectValue({ objectId: "nested-child", identityKey: "nested-child", parentObjectId: "nested-parent", transform: childTransform }),
+  ] });
+  const nestedPayload = buildS8Payload(stampFor(nested), nested);
+  const nestedScene = buildS8Scene(nestedPayload.payload, "50000000-0000-4000-8000-000000000003" as UUID, nestedPayload.sha256);
+  const nestedParent = nestedScene.nodes.find((node) => node.objectId === "nested-parent")!;
+  const nestedChild = nestedScene.nodes.find((node) => node.objectId === "nested-child")!;
+  const nestedLocal = s8MaxMatrixFromS6Transform(childTransform);
+  for (let row = 0; row < 3; row += 1) for (const axis of ["x", "y", "z"] as const) assert.ok(Math.abs(nestedChild.localTransform.rows[row]![axis] - nestedLocal.rows[row]![axis]) <= 1e-6);
+  for (const axis of ["x", "y", "z"] as const) assert.ok(Math.abs(nestedChild.localTransform.translation[axis] - nestedLocal.translation[axis]) <= 1e-6);
+  assert.notDeepEqual(nestedChild.localTransform, nestedChild.worldTransform);
+  const nestedWorld = multiplyS8MaxMatrices(nestedChild.localTransform, nestedParent.worldTransform);
+  for (let row = 0; row < 3; row += 1) for (const axis of ["x", "y", "z"] as const) assert.ok(Math.abs(nestedChild.worldTransform.rows[row]![axis] - nestedWorld.rows[row]![axis]) <= 1e-6);
+  for (const axis of ["x", "y", "z"] as const) assert.ok(Math.abs(nestedChild.worldTransform.translation[axis] - nestedWorld.translation[axis]) <= 1e-6);
 });
 
 test("semantic manifest and independent readback compare separately and bind all tool versions", () => {
@@ -398,6 +416,49 @@ test("G3 provider taxonomy is explicit for transfer, semantic, retry-after, and 
   assert.equal(classifyS8ProviderFailure(rateLimited.code, rateLimited.cause).honorRetryAfter, true);
 });
 
+test("G3 repair regression: every provider failure class has an explicit terminal disposition", () => {
+  const cases = [
+    ["APS_UNAVAILABLE", undefined, { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_QUEUE_DELAY", undefined, { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_RATE_LIMIT", undefined, { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: true, terminal: false }],
+    ["APS_AUTH_FAILURE", undefined, { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false, terminal: true }],
+    ["APS_ENGINE_UNAVAILABLE", "provider_transient", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_ENGINE_UNAVAILABLE", "compatibility", { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false, terminal: true }],
+    ["APS_ENGINE_DEPRECATED", undefined, { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false, terminal: true }],
+    ["APS_ENGINE_VERSION_MOVED", undefined, { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false, terminal: true }],
+    ["APS_INPUT_DOWNLOAD_FAILED", "transfer_transient", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_INPUT_DOWNLOAD_FAILED", "rate_limit", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: true, terminal: false }],
+    ["APS_INPUT_DOWNLOAD_FAILED", "transfer_defect", { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false, terminal: true }],
+    ["APS_WORKITEM_FAILED", "provider_transient", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_WORKITEM_FAILED", "rate_limit", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: true, terminal: false }],
+    ["APS_WORKITEM_FAILED", "script", { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_WORKITEM_FAILED", "business", { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_TIMEOUT", "queue", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_TIMEOUT", "rate_limit", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: true, terminal: false }],
+    ["APS_TIMEOUT", "script", { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_OUTPUT_UPLOAD_FAILED", "transfer_transient", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_OUTPUT_UPLOAD_FAILED", "rate_limit", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: true, terminal: false }],
+    ["APS_OUTPUT_UPLOAD_FAILED", "transfer_defect", { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false, terminal: true }],
+    ["APS_OUTPUT_MISSING", undefined, { classification: "provider_hold", retryable: false, consumesCandidateAttempt: false, controllerRequired: true, reconciliationRequired: true, honorRetryAfter: false, terminal: true }],
+    ["APS_OUTPUT_INTEGRITY_MISMATCH", "transfer_transient", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_OUTPUT_INTEGRITY_MISMATCH", "rate_limit", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: true, terminal: false }],
+    ["APS_OUTPUT_INTEGRITY_MISMATCH", "semantic", { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_VALIDATOR_FAILED", "provider_transient", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_VALIDATOR_FAILED", "rate_limit", { classification: "provider_hold", retryable: true, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: true, terminal: false }],
+    ["APS_VALIDATOR_FAILED", "semantic", { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["S8_NATIVE_SAVE_FAILED", undefined, { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["S8_UNSUPPORTED_GEOMETRY", undefined, { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["S8_PROFILE_TRIANGULATION_FAILED", undefined, { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["S7_CROSS_OUTPUT_MISMATCH", undefined, { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["APS_INSTRUCTIONS_FAILED", undefined, { classification: "candidate_failure", retryable: true, consumesCandidateAttempt: true, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: false }],
+    ["SOURCE_STALE", undefined, { classification: "stale", retryable: false, consumesCandidateAttempt: false, controllerRequired: false, reconciliationRequired: false, honorRetryAfter: false, terminal: true }],
+  ] as const;
+  for (const [code, cause, expected] of cases) {
+    const actual = cause === undefined ? classifyS8ProviderFailure(code) : classifyS8ProviderFailure(code, cause);
+    assert.deepEqual(actual, expected, `${code}/${cause ?? "default"}`);
+  }
+});
+
 test("validation provider hold resumes from promoted staging without a second candidate", async () => {
   const value = makeContext({ provider: createMockS8MaxProvider({ validationFailures: ["APS_TIMEOUT"] }) });
   const held = await value.service.createExport(PROJECT_ID, "validation-hold-key");
@@ -406,6 +467,32 @@ test("validation provider hold resumes from promoted staging without a second ca
   const resumed = await value.service.retryExport(PROJECT_ID, held.export.artifactId, "validation-hold-retry");
   assert.equal(resumed.export.status, "committed");
   assert.equal(resumed.export.candidateAttempt, 1);
+  validateS8Graph(value.repository.state());
+});
+
+test("G3 repair regression: Retry-After is durable and gates provider retry without consuming candidate budget", async () => {
+  let now: Timestamp = "2026-09-05T00:00:00.000Z";
+  const value = makeContext({
+    clock: () => now,
+    provider: createMockS8MaxProvider({ generationFailures: [{ code: "APS_RATE_LIMIT", retryAfterSeconds: 37 }] }),
+  });
+  const held = await value.service.createExport(PROJECT_ID, "retry-after-key");
+  const initial = getS8Collections(value.repository.state());
+  assert.equal(held.export.status, "provider_hold");
+  assert.equal(held.export.providerRetryAfterAt, "2026-09-05T00:00:37.000Z");
+  assert.equal(initial.jobs[0]!.providerRetryAfterAt, "2026-09-05T00:00:37.000Z");
+  assert.equal(initial.jobs[0]!.generationProviderAttempts, 1);
+  assert.equal(held.export.candidateAttempt, 1);
+
+  const early = await value.service.retryExport(PROJECT_ID, held.export.artifactId, "retry-after-early");
+  assert.equal(early.export.status, "provider_hold");
+  assert.equal(getS8Collections(value.repository.state()).jobs[0]!.generationProviderAttempts, 1);
+
+  now = "2026-09-05T00:00:37.000Z";
+  const resumed = await value.service.retryExport(PROJECT_ID, held.export.artifactId, "retry-after-due");
+  assert.equal(resumed.export.status, "committed");
+  assert.equal(resumed.export.candidateAttempt, 1);
+  assert.equal(getS8Collections(value.repository.state()).jobs[0]!.providerRetryAfterAt, null);
   validateS8Graph(value.repository.state());
 });
 
@@ -591,6 +678,71 @@ test("G3 recovery requeues only pre-provider work and fences source movement", a
   const movingRecovery = new S8MaxService({ repository: moved.repository, objects: moved.objects, s6: moved.s6, s7: moved.s7, provider: createMockS8MaxProvider(), ownerProcessId: "moving-recovery-owner", clock: () => "2026-09-05T00:00:00.000Z", isOwnerProcessAlive: () => { if (!movedOnce) { movedOnce = true; moved.move(next); moved.s7.createExport(PROJECT_ID, "s7-recovery-source-moved"); } return false; } });
   assert.equal(movingRecovery.recoverPending(), 0);
   assert.equal(getS8Collections(moved.repository.state()).exports.find((item) => item.artifactId === movedExport.export.artifactId)?.status, "stale");
+});
+
+test("G3 repair regression: expired recovery requires proven death and fences every uncertain phase", async () => {
+  const seed = async (status: "running" | "provider_running" | "staged" | "validating", publicationPhase: "none" | "staged" | "promoted") => {
+    const value = makeContext({ provider: createMockS8MaxProvider({ generationFailures: ["S8_UNSUPPORTED_GEOMETRY"] }) });
+    const failed = await value.service.createExport(PROJECT_ID, `recovery-matrix-${status}`);
+    const token = (`60000000-0000-4000-8000-${String(status.length).padStart(12, "0")}`) as UUID;
+    value.repository.transact((state) => {
+      const current = getS8Collections(state);
+      const job = current.jobs.find((item) => item.jobId === failed.job.jobId)!;
+      const artifact = current.exports.find((item) => item.artifactId === job.artifactId)!;
+      job.status = status; job.stage = status === "validating" ? "validation" : "generation"; job.claimToken = token; job.ownerProcessId = "expired-owner"; job.claimedAt = "2020-01-01T00:00:00.000Z"; job.heartbeatAt = "2020-01-01T00:00:00.000Z"; job.providerRetryAfterAt = null; job.terminalAt = null; job.controllerRequired = false;
+      artifact.status = status; artifact.publicationPhase = publicationPhase; artifact.committedAt = null; artifact.staleAt = null; artifact.supersededAt = null; artifact.failureCode = null; artifact.providerRetryAfterAt = null; artifact.controllerRequired = false;
+    });
+    return { value, jobId: failed.job.jobId, artifactId: failed.export.artifactId, token };
+  };
+  const future = () => "2026-09-05T00:00:00.000Z" as Timestamp;
+
+  const live = await seed("provider_running", "none");
+  const liveRecovery = new S8MaxService({ repository: live.value.repository, objects: live.value.objects, s6: live.value.s6, s7: live.value.s7, provider: createMockS8MaxProvider(), ownerProcessId: "live-recovery", clock: future, isOwnerProcessAlive: () => true });
+  assert.equal(liveRecovery.recoverPending(), 0);
+  assert.equal(getS8Collections(live.value.repository.state()).jobs[0]!.status, "provider_running");
+
+  const unknown = await seed("provider_running", "none");
+  const unknownRecovery = new S8MaxService({ repository: unknown.value.repository, objects: unknown.value.objects, s6: unknown.value.s6, s7: unknown.value.s7, provider: createMockS8MaxProvider(), ownerProcessId: "unknown-recovery", clock: future });
+  assert.equal(unknownRecovery.recoverPending(), 0);
+  assert.equal(getS8Collections(unknown.value.repository.state()).jobs[0]!.status, "provider_running");
+
+  const dead = await seed("provider_running", "none");
+  const deadRecovery = new S8MaxService({ repository: dead.value.repository, objects: dead.value.objects, s6: dead.value.s6, s7: dead.value.s7, provider: createMockS8MaxProvider(), ownerProcessId: "dead-recovery", clock: future, isOwnerProcessAlive: () => false });
+  assert.equal(deadRecovery.recoverPending(), 1);
+  assert.equal(getS8Collections(dead.value.repository.state()).jobs[0]!.status, "provider_hold");
+  assert.equal(getS8Collections(dead.value.repository.state()).exports[0]!.failureCode, "APS_WORKITEM_FAILED");
+  assert.equal(getS8Collections(dead.value.repository.state()).jobs[0]!.claimToken, null);
+
+  for (const [status, phase] of [["staged", "staged"], ["validating", "promoted"]] as const) {
+    const uncertain = await seed(status, phase);
+    const recovery = new S8MaxService({ repository: uncertain.value.repository, objects: uncertain.value.objects, s6: uncertain.value.s6, s7: uncertain.value.s7, provider: createMockS8MaxProvider(), ownerProcessId: `${status}-recovery`, clock: future, isOwnerProcessAlive: () => false });
+    assert.equal(recovery.recoverPending(), 1);
+    assert.equal(getS8Collections(uncertain.value.repository.state()).jobs[0]!.status, "provider_hold");
+    assert.equal(getS8Collections(uncertain.value.repository.state()).exports[0]!.providerRetryAfterAt, null);
+  }
+
+  const local = await seed("running", "none");
+  const localRecovery = new S8MaxService({ repository: local.value.repository, objects: local.value.objects, s6: local.value.s6, s7: local.value.s7, provider: createMockS8MaxProvider(), ownerProcessId: "local-recovery", clock: future, isOwnerProcessAlive: () => false });
+  assert.equal(localRecovery.recoverPending(), 1);
+  assert.equal(getS8Collections(local.value.repository.state()).jobs[0]!.status, "queued");
+
+  const raced = await seed("provider_running", "none");
+  let racedOnce = false;
+  const replacementToken = "60000000-0000-4000-8000-000000000099" as UUID;
+  const raceRecovery = new S8MaxService({ repository: raced.value.repository, objects: raced.value.objects, s6: raced.value.s6, s7: raced.value.s7, provider: createMockS8MaxProvider(), ownerProcessId: "race-recovery", clock: future, isOwnerProcessAlive: () => {
+    if (!racedOnce) {
+      racedOnce = true;
+      raced.value.repository.transact((state) => {
+        const job = getS8Collections(state).jobs.find((item) => item.jobId === raced.jobId)!;
+        job.claimToken = replacementToken; job.ownerProcessId = "replacement-owner";
+      });
+    }
+    return false;
+  } });
+  assert.equal(raceRecovery.recoverPending(), 0);
+  const racedJob = getS8Collections(raced.value.repository.state()).jobs[0]!;
+  assert.equal(racedJob.status, "provider_running");
+  assert.equal(racedJob.claimToken, replacementToken);
 });
 
 test("mock OSS v2 transfer is private, write-once, and integrity-preserving", () => {
