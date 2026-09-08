@@ -1,6 +1,7 @@
 import ast
 import pathlib
 import unittest
+import uuid
 import xml.etree.ElementTree as ET
 
 
@@ -10,17 +11,77 @@ VAL_XML = ROOT / "aps" / "s8-max-validation.bundle" / "PackageContents.xml"
 GEN = ROOT / "aps" / "s8-max-generation.bundle" / "Contents" / "s8_generate.py"
 VAL = ROOT / "aps" / "s8-max-validation.bundle" / "Contents" / "s8_validate.py"
 
+EXPECTED_UPGRADE_CODES = {
+    GEN_XML: "{D6B2C8A4-4E1F-4F9D-8A73-5C0E1B2D9F40}",
+    VAL_XML: "{A7C3D9B5-5F20-4A8E-9B64-6D1F2C3E8A51}",
+}
+
 
 class S8AppBundleContractTests(unittest.TestCase):
-    def test_package_manifests_are_native_python_entries(self):
-        generation = ET.parse(GEN_XML).getroot()
-        validation = ET.parse(VAL_XML).getroot()
-        self.assertEqual(generation.attrib["Name"], "swooshz-s8-max-generation-v1")
-        self.assertEqual(validation.attrib["Name"], "swooshz-s8-max-validation-v1")
-        self.assertEqual(generation.find(".//ComponentEntry").attrib["ModuleName"], "./Contents/s8_generate.py")
-        self.assertEqual(validation.find(".//ComponentEntry").attrib["ModuleName"], "./Contents/s8_validate.py")
-        self.assertEqual(generation.find(".//RuntimeRequirements").attrib["Platform"], "3ds Max")
-        self.assertEqual(validation.find(".//RuntimeRequirements").attrib["Platform"], "3ds Max")
+    def assert_resource_manifest(
+        self,
+        path,
+        expected_name,
+        expected_description,
+        expected_script,
+    ):
+        root = ET.parse(path).getroot()
+        self.assertEqual(root.tag, "ApplicationPackage")
+        self.assertEqual(root.attrib["SchemaVersion"], "1.0")
+        self.assertEqual(root.attrib["AutodeskProduct"], "3ds Max")
+        self.assertEqual(root.attrib["ProductType"], "Application")
+        self.assertEqual(root.attrib["Name"], expected_name)
+        self.assertEqual(root.attrib["Description"], expected_description)
+        self.assertEqual(root.attrib["Author"], "Swooshz Design")
+        self.assertEqual(root.attrib["AppVersion"], "1.0.0")
+        company_details = root.findall("./CompanyDetails")
+        self.assertEqual(len(company_details), 1)
+        self.assertEqual(
+            company_details[0].attrib,
+            {
+                "Name": "Swooshz Design",
+                "Url": "https://swooshz.design",
+                "Email": "support@swooshz.design",
+            },
+        )
+
+        upgrade_code = root.attrib.get("UpgradeCode")
+        self.assertIsNotNone(upgrade_code)
+        uuid.UUID(upgrade_code.strip("{}"))
+        self.assertEqual(upgrade_code, EXPECTED_UPGRADE_CODES[path])
+
+        components = root.findall(".//Components")
+        self.assertEqual(len(components), 0)
+        self.assertEqual(len(root.findall(".//ComponentEntry")), 0)
+        self.assertFalse(any(component.attrib.get("Description") for component in components))
+        forbidden_tags = {
+            "ComponentEntry",
+            "Components",
+            "DependentBundles",
+            "EnvironmentVariables",
+            "LoadAfterBundles",
+        }
+        self.assertFalse(any(element.tag in forbidden_tags for element in root.iter()))
+        self.assertTrue((path.parent / "Contents" / expected_script).is_file())
+
+    def test_generation_manifest_is_a_resource_only_native_package(self):
+        self.assert_resource_manifest(
+            GEN_XML,
+            "swooshz-s8-max-generation-v1",
+            "Swooshz S8 deterministic editable Max scene generation",
+            "s8_generate.py",
+        )
+
+    def test_validation_manifest_is_a_resource_only_native_package(self):
+        self.assert_resource_manifest(
+            VAL_XML,
+            "swooshz-s8-max-validation-v1",
+            "Swooshz S8 independent native Max scene validation",
+            "s8_validate.py",
+        )
+
+    def test_generation_and_validation_upgrade_codes_are_distinct(self):
+        self.assertNotEqual(EXPECTED_UPGRADE_CODES[GEN_XML], EXPECTED_UPGRADE_CODES[VAL_XML])
 
     def test_sources_parse_without_importing_pymxs(self):
         for path in (GEN, VAL):
