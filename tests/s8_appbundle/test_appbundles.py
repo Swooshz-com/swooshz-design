@@ -177,6 +177,14 @@ class S8AppBundleContractTests(unittest.TestCase):
         self.assertNotIn('"degradationCodes": [user_prop(node, "s8.degradationCode")]', source)
         self.assertNotIn('expected_codes = [",".join(expected["degradationCodes"])]', source)
 
+    def test_validation_external_dependency_check_uses_texture_map_max_classes(self):
+        source = VAL.read_text(encoding="utf-8")
+        self.assertNotIn("rt.getClassInstances(rt.TextureMap)", source)
+        self.assertIn("rt.TextureMap.classes", source)
+        self.assertIn("rt.getClassInstances(texture_map_class)", source)
+        self.assertIn("if rt.xrefs.getXRefFileCount() != 0 or texture_map_instances:", source)
+        self.assertIn('fail("S8_EXTERNAL_DEPENDENCY")', source)
+
     def test_no_secret_or_private_provider_values_are_bundled(self):
         for path in (GEN_XML, VAL_XML, GEN, VAL):
             source = path.read_text(encoding="utf-8").lower()

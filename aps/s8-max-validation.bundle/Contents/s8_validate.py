@@ -417,7 +417,11 @@ def main():
         fail("S8_EXTRA_SCENE_NODE")
     if len({user_prop(node, "s8.objectId") for node in geometry_nodes}) != len(geometry_nodes):
         fail("S8_IDENTITY_HIERARCHY_INVALID")
-    if rt.xrefs.getXRefFileCount() != 0 or len(rt.getClassInstances(rt.TextureMap)) != 0:
+    texture_map_instances = any(
+        len(rt.getClassInstances(texture_map_class)) != 0
+        for texture_map_class in rt.TextureMap.classes
+    )
+    if rt.xrefs.getXRefFileCount() != 0 or texture_map_instances:
         fail("S8_EXTERNAL_DEPENDENCY")
     nodes_by_id = {user_prop(node, "s8.objectId"): node for node in geometry_nodes}
     readback_geometry = []
