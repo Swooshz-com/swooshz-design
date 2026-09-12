@@ -263,19 +263,23 @@ export class S8MaxService {
       const sourceObjects = new Map(s6Handoff.objects.map((item) => [item.objectId, item]));
       const sourceEvidence = new Map<string, typeof manifest.entities[number]>();
       for (const entity of manifest.entities) {
-        if (!sourceObjects.has(entity.sourceObjectId) || sourceEvidence.has(entity.sourceObjectId)) continue;
+        const sourceObject = sourceObjects.get(entity.sourceObjectId);
+        if (!sourceObject || sourceEvidence.has(entity.sourceObjectId) || entity.identityKey !== sourceObject.identityKey) continue;
         sourceEvidence.set(entity.sourceObjectId, entity);
       }
       for (const object of s6Handoff.objects) {
         const evidence = sourceEvidence.get(object.objectId);
         if (!evidence || evidence.identityKey !== object.identityKey || evidence.parentObjectId !== object.parentObjectId || evidence.role !== object.role || evidence.geometryState !== object.geometry.geometryState) fail(409, "S7_CROSS_OUTPUT_MISMATCH", `s7.objects.${object.objectId}`);
       }
+      const unresolvedUnknownIds = new Set(s6Handoff.unknowns.filter((item) => item.status === "unresolved").map((item) => item.unknownId));
       const expectedLayers: Array<[string, string]> = [
         ["wall", "S7-WALLS-PARTITIONS"], ["partition", "S7-WALLS-PARTITIONS"], ["overhead_volume", "S7-OVERHEAD"], ["zone_region", "S7-ZONES"],
       ];
       for (const [objectType, layer] of expectedLayers) {
         for (const object of s6Handoff.objects.filter((item) => item.objectType === objectType)) {
-          if (!manifest.entities.some((entity) => entity.sourceObjectId === object.objectId && entity.emittedLayer === layer)) fail(409, "S7_CROSS_OUTPUT_MISMATCH", `s7.layer.${object.objectId}`);
+          const isUnknown = object.geometry.geometryState === "bounded_inference" || object.unknownIds.some((id) => unresolvedUnknownIds.has(id));
+          const expectedLayer = isUnknown ? "S7-UNKNOWN" : layer;
+          if (!manifest.entities.some((entity) => entity.sourceObjectId === object.objectId && entity.emittedLayer === expectedLayer)) fail(409, "S7_CROSS_OUTPUT_MISMATCH", `s7.layer.${object.objectId}`);
         }
       }
       const observedOpenSides = new Set(manifest.entities.filter((entity) => entity.identityKey.startsWith("booth-opening:") && entity.emittedLayer === "S7-BOOTH-OPENINGS").map((entity) => entity.identityKey.slice("booth-opening:".length)));

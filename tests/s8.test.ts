@@ -36,8 +36,10 @@ import {
   s8MaxMatrixFromS6Transform,
   triangulateS8Profile,
 } from "../src/lib/s8-semantic";
+import { decodeS7Manifest } from "../src/lib/s7-dxf-readback";
 import { S8MaxService, type S8PublicationPhase } from "../src/lib/s8";
 import { classifyS8ProviderFailure, createMockS8MaxProvider, MockOssV2Transfer, S8MaxProviderError, type S8MaxProvider } from "../src/lib/s8-max-provider";
+import { getS7Collections, hashS7ReadbackReceipt } from "../src/lib/s7-persistence";
 import { getS8Collections, validateS8Graph } from "../src/lib/s8-persistence";
 import { jcs, sha256 } from "../src/lib/utils";
 
@@ -183,6 +185,23 @@ function makeContext(options: { provider?: S8MaxProvider; handoff?: S6ToS7Handof
   if (!options.s7Failure) s7.createExport(PROJECT_ID, "s7-fixture-key");
   const service = new S8MaxService({ repository, objects, s6, s7, provider: options.provider ?? createMockS8MaxProvider(), ownerProcessId: "s8-test-owner", clock: options.clock, onPublicationPhase: options.onPublicationPhase ? (phase) => options.onPublicationPhase?.(phase) : undefined });
   return { repository, objects, s6, s7, service, move(next: S6ToS7Handoff) { current = next; } };
+}
+
+function relevantObject(objectType: "partition" | "overhead_volume", geometryState: "exact" | "bounded_inference", unknownIds: string[] = []): Record<string, unknown> {
+  return objectValue({
+    objectId: objectType,
+    identityKey: objectType,
+    objectType,
+    role: objectType === "partition" ? "booth_partition" : "overhead",
+    geometry: { kind: "rect_prism", dimensionsMm: { widthMm: 1000, depthMm: 500, heightMm: 900 }, geometryState, localAnchor: "floor" },
+    unknownIds,
+  });
+}
+
+function persistedS7Manifest(value: ReturnType<typeof makeContext>) {
+  const record = getS7Collections(value.repository.state()).manifests.find((item) => item.projectId === PROJECT_ID);
+  assert.ok(record);
+  return decodeS7Manifest(value.objects.read(record.privateManifestStorageKey));
 }
 
 test("S8 payload stamp and canonical bytes are deterministic and bind the exact S6 handoff", () => {
@@ -609,6 +628,70 @@ test("S7 cross-output evidence is required and mismatched identity is rejected",
   } as never;
   const mismatched = new S8MaxService({ repository: value.repository, objects: value.objects, s6: value.s6, s7: fakeS7, provider: createMockS8MaxProvider(), ownerProcessId: "s8-mismatch-owner" });
   assert.throws(() => mismatched.getHandoff(PROJECT_ID), /S7_CROSS_OUTPUT_MISMATCH/u);
+});
+
+test("S8 admits bounded-inference partitions emitted on S7-UNKNOWN", () => {
+  const value = makeContext({ handoff: fixtureHandoff({ objects: [relevantObject("partition", "bounded_inference")] }) });
+  const manifest = persistedS7Manifest(value);
+  assert.ok(manifest.entities.some((entity) => entity.sourceObjectId === "partition" && entity.emittedLayer === "S7-UNKNOWN"));
+  assert.doesNotThrow(() => value.service.getHandoff(PROJECT_ID));
+});
+
+test("S8 admits bounded-inference overhead objects emitted on S7-UNKNOWN", () => {
+  const value = makeContext({ handoff: fixtureHandoff({ objects: [relevantObject("overhead_volume", "bounded_inference")] }) });
+  const manifest = persistedS7Manifest(value);
+  assert.ok(manifest.entities.some((entity) => entity.sourceObjectId === "overhead_volume" && entity.emittedLayer === "S7-UNKNOWN"));
+  assert.doesNotThrow(() => value.service.getHandoff(PROJECT_ID));
+});
+
+test("S8 preserves exact-state semantic layer admission", () => {
+  const value = makeContext({ handoff: fixtureHandoff({ objects: [relevantObject("partition", "exact"), relevantObject("overhead_volume", "exact")] }) });
+  const manifest = persistedS7Manifest(value);
+  assert.ok(manifest.entities.some((entity) => entity.sourceObjectId === "partition" && entity.emittedLayer === "S7-WALLS-PARTITIONS"));
+  assert.ok(manifest.entities.some((entity) => entity.sourceObjectId === "overhead_volume" && entity.emittedLayer === "S7-OVERHEAD"));
+  assert.doesNotThrow(() => value.service.getHandoff(PROJECT_ID));
+});
+
+test("S8 rejects a tampered emitted layer with S7_CROSS_OUTPUT_MISMATCH", () => {
+  const value = makeContext({ handoff: fixtureHandoff({ objects: [relevantObject("partition", "exact")] }) });
+  const originalS7Handoff = value.s7.getHandoff(PROJECT_ID);
+  const originalManifestRecord = getS7Collections(value.repository.state()).manifests.find((item) => item.projectId === PROJECT_ID);
+  assert.ok(originalManifestRecord);
+  const originalManifest = decodeS7Manifest(value.objects.read(originalManifestRecord.privateManifestStorageKey));
+  const tamperedManifest = {
+    ...originalManifest,
+    entities: originalManifest.entities.map((entity) => entity.sourceObjectId === "partition" && entity.emittedLayer === "S7-WALLS-PARTITIONS"
+      ? { ...entity, emittedLayer: "S7-UNKNOWN" }
+      : entity),
+  };
+  const tamperedBytes = Buffer.from(jcs(tamperedManifest), "utf8");
+  const tamperedManifestHash = sha256(tamperedBytes);
+  const originalReceipt = getS7Collections(value.repository.state()).receipts.find((item) => item.receiptId === originalS7Handoff.readbackReceiptId);
+  assert.ok(originalReceipt);
+  const tamperedReadbackHash = hashS7ReadbackReceipt({ ...originalReceipt, manifestHash: tamperedManifestHash, receiptHash: "" });
+
+  value.repository.transact((state) => {
+    const collections = getS7Collections(state);
+    const artifact = collections.exports.find((item) => item.artifactId === originalS7Handoff.s7ArtifactId);
+    const manifestRecord = collections.manifests.find((item) => item.manifestId === originalS7Handoff.manifestId);
+    const receipt = collections.receipts.find((item) => item.receiptId === originalS7Handoff.readbackReceiptId);
+    if (!artifact || !manifestRecord || !receipt) throw new Error("S7 fixture state incomplete");
+    artifact.manifestHash = tamperedManifestHash;
+    artifact.readbackHash = tamperedReadbackHash;
+    manifestRecord.manifestHash = tamperedManifestHash;
+    manifestRecord.manifestByteSize = tamperedBytes.length;
+    receipt.manifestHash = tamperedManifestHash;
+    receipt.receiptHash = tamperedReadbackHash;
+  });
+
+  const tamperedObjects = new PrivateObjectStore(mkdtempSync(join(tmpdir(), "s8-g3-tampered-")));
+  tamperedObjects.put(originalManifestRecord.privateManifestStorageKey, tamperedBytes);
+  const fakeS7 = {
+    repository: value.repository,
+    getHandoff: () => ({ ...originalS7Handoff, manifestHash: tamperedManifestHash, readbackHash: tamperedReadbackHash }),
+  } as never;
+  const mismatched = new S8MaxService({ repository: value.repository, objects: tamperedObjects, s6: value.s6, s7: fakeS7, provider: createMockS8MaxProvider(), ownerProcessId: "s8-tampered-layer" });
+  assert.throws(() => mismatched.getHandoff(PROJECT_ID), (error: unknown) => errorCode(error) === "S7_CROSS_OUTPUT_MISMATCH");
 });
 
 test("G3 repair regression: dead-owner recovery waits for an expired heartbeat", async () => {
