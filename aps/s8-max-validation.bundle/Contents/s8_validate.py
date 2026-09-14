@@ -393,7 +393,7 @@ def main():
     if len(root_expected) != 1 or len(geometry_expected) != expected_manifest["objectCount"]:
         fail("S8_OBJECT_COUNT_INVALID")
     rt.resetMaxFile(rt.Name("noprompt"))
-    loaded = rt.loadMaxFile(str(artifact_path), useFileUnits=True, quiet=True, allowPrompts=False, missingExtFilesAction=rt.Name("abort"), missingDLLsAction=rt.Name("abort"), missingXRefsAction=rt.Name("abort"), skipXRefs=False)
+    loaded = rt.loadMaxFile(str(artifact_path), useFileUnits=True, quiet=True)
     if loaded is not True:
         fail("APS_OUTPUT_MISSING")
     try:

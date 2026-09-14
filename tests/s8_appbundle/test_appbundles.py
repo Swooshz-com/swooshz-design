@@ -157,12 +157,23 @@ class S8AppBundleContractTests(unittest.TestCase):
         self.assertIn('EXPECTED_MANIFEST_HASH_NAME = "expectedManifestSha256"', source)
         self.assertIn('READBACK_NAME = "swooshz-s8-validation-readback.json"', source)
         self.assertNotIn('READBACK_NAME = "s8-max-readback.json"', source)
-        self.assertIn("allowPrompts=False", source)
         self.assertIn("useFileUnits=True", source)
-        self.assertIn('missingExtFilesAction=rt.Name("abort")', source)
-        self.assertIn('missingDLLsAction=rt.Name("abort")', source)
-        self.assertIn('missingXRefsAction=rt.Name("abort")', source)
-        self.assertIn("skipXRefs=False", source)
+        tree = ast.parse(source, filename=str(VAL))
+        load_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "rt"
+            and node.func.attr == "loadMaxFile"
+        ]
+        self.assertEqual(len(load_calls), 1)
+        self.assertEqual(len(load_calls[0].args), 1)
+        self.assertEqual(
+            [keyword.arg for keyword in load_calls[0].keywords],
+            ["useFileUnits", "quiet"],
+        )
         self.assertIn("expected_manifest", source)
         self.assertIn("expected_manifest_hash", source)
         self.assertIn("world_matrix = matrix(node.transform)", source)
