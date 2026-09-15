@@ -18,6 +18,61 @@ EXPECTED_UPGRADE_CODES = {
 
 
 class S8AppBundleContractTests(unittest.TestCase):
+    def validator_dependency_functions(self):
+        source = VAL.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(VAL))
+        selected = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "fail",
+                "external_file_dependencies",
+                "validate_external_dependencies",
+            }
+        ]
+        namespace = {}
+        exec(
+            compile(ast.Module(body=selected, type_ignores=[]), str(VAL), "exec"),
+            namespace,
+        )
+        return namespace["validate_external_dependencies"]
+
+    class DependencyRuntime:
+        class XRefs:
+            def __init__(self, count):
+                self.count = count
+
+            def getXRefFileCount(self):
+                return self.count
+
+        class TextureMaps:
+            classes = ("ai_imager_denoiser_oidn",)
+
+        TextureMap = TextureMaps()
+
+        def __init__(self, *, xrefs=0, files=(), enumeration_error=None):
+            self.xrefs = self.XRefs(xrefs)
+            self.files = files
+            self.enumeration_error = enumeration_error
+            self.enumerated = False
+
+        def Array(self):
+            return []
+
+        def execute(self, _source):
+            return lambda filename, output: output.append(filename)
+
+        def enumerateFiles(self, collector, output):
+            self.enumerated = True
+            if self.enumeration_error is not None:
+                raise self.enumeration_error
+            for filename in self.files:
+                collector(filename, output)
+
+        def getClassInstances(self, _texture_map_class):
+            raise AssertionError("untargeted TextureMap enumeration must not run")
+
     def assert_resource_manifest(
         self,
         path,
@@ -188,12 +243,43 @@ class S8AppBundleContractTests(unittest.TestCase):
         self.assertNotIn('"degradationCodes": [user_prop(node, "s8.degradationCode")]', source)
         self.assertNotIn('expected_codes = [",".join(expected["degradationCodes"])]', source)
 
-    def test_validation_external_dependency_check_uses_texture_map_max_classes(self):
+    def test_validation_external_dependency_check_rejects_xrefs(self):
+        validate = self.validator_dependency_functions()
+        runtime = self.DependencyRuntime(xrefs=1)
+        with self.assertRaisesRegex(RuntimeError, "^S8_EXTERNAL_DEPENDENCY$"):
+            validate(runtime)
+        self.assertFalse(runtime.enumerated)
+
+    def test_validation_external_dependency_check_rejects_scene_files(self):
+        validate = self.validator_dependency_functions()
+        for filename in ("texture.png", "missing-texture.png"):
+            with self.subTest(filename=filename):
+                runtime = self.DependencyRuntime(files=(filename,))
+                with self.assertRaisesRegex(RuntimeError, "^S8_EXTERNAL_DEPENDENCY$"):
+                    validate(runtime)
+                self.assertTrue(runtime.enumerated)
+
+    def test_validation_external_dependency_check_ignores_non_file_runtime_maps(self):
+        validate = self.validator_dependency_functions()
+        runtime = self.DependencyRuntime()
+        validate(runtime)
+        self.assertTrue(runtime.enumerated)
+
+    def test_validation_external_dependency_check_fails_closed_on_enumeration_error(self):
+        validate = self.validator_dependency_functions()
+        runtime = self.DependencyRuntime(enumeration_error=RuntimeError("unresolved"))
+        with self.assertRaisesRegex(RuntimeError, "^S8_EXTERNAL_DEPENDENCY$"):
+            validate(runtime)
+
+    def test_validation_external_dependency_check_cannot_regress_to_texturemap_scan(self):
         source = VAL.read_text(encoding="utf-8")
-        self.assertNotIn("rt.getClassInstances(rt.TextureMap)", source)
-        self.assertIn("rt.TextureMap.classes", source)
-        self.assertIn("rt.getClassInstances(texture_map_class)", source)
-        self.assertIn("if rt.xrefs.getXRefFileCount() != 0 or texture_map_instances:", source)
+        tree = ast.parse(source, filename=str(VAL))
+        attributes = {
+            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        }
+        self.assertNotIn("getClassInstances", attributes)
+        self.assertNotIn("TextureMap", attributes)
+        self.assertIn("enumerateFiles", attributes)
         self.assertIn('fail("S8_EXTERNAL_DEPENDENCY")', source)
 
     def test_no_secret_or_private_provider_values_are_bundled(self):

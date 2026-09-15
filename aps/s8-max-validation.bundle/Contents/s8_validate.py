@@ -258,6 +258,35 @@ def maybe_user_prop(node, key):
     return value if isinstance(value, str) else None
 
 
+def external_file_dependencies(runtime):
+    """Return auxiliary files actually referenced by the loaded scene.
+
+    MAXScript enumerateFiles is the documented scene auxiliary-file enumerator.
+    With no filter flags it includes active, inactive, render, video-post, and
+    missing files without treating non-file-backed runtime objects as assets.
+    """
+    try:
+        dependencies = runtime.Array()
+        collector = runtime.execute(
+            "(fn filename output = append output filename)"
+        )
+        runtime.enumerateFiles(collector, dependencies)
+        return [str(filename) for filename in dependencies]
+    except Exception:
+        fail("S8_EXTERNAL_DEPENDENCY")
+
+
+def validate_external_dependencies(runtime):
+    try:
+        xref_count = runtime.xrefs.getXRefFileCount()
+    except Exception:
+        fail("S8_EXTERNAL_DEPENDENCY")
+    if not isinstance(xref_count, int) or xref_count != 0:
+        fail("S8_EXTERNAL_DEPENDENCY")
+    if external_file_dependencies(runtime):
+        fail("S8_EXTERNAL_DEPENDENCY")
+
+
 def node_name(object_id, identity_key):
     value = "S8__OBJ__%s__I__%s" % (object_id, hashlib.sha256(identity_key.encode("utf-8")).hexdigest()[:12])
     if len(value) > 120:
@@ -417,12 +446,7 @@ def main():
         fail("S8_EXTRA_SCENE_NODE")
     if len({user_prop(node, "s8.objectId") for node in geometry_nodes}) != len(geometry_nodes):
         fail("S8_IDENTITY_HIERARCHY_INVALID")
-    texture_map_instances = any(
-        len(rt.getClassInstances(texture_map_class)) != 0
-        for texture_map_class in rt.TextureMap.classes
-    )
-    if rt.xrefs.getXRefFileCount() != 0 or texture_map_instances:
-        fail("S8_EXTERNAL_DEPENDENCY")
+    validate_external_dependencies(rt)
     nodes_by_id = {user_prop(node, "s8.objectId"): node for node in geometry_nodes}
     readback_geometry = []
     for expected in geometry_expected:
