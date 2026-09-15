@@ -16,7 +16,7 @@ import {
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { flockSync } from "fs-ext-extra-prebuilt";
-import { AppError, type StoreState } from "./types";
+import { AppError, type S8StoreState, type StoreState } from "./types";
 import { codePointLength, uuidV4Pattern } from "./utils";
 import { validateS2Graph } from "./s2-persistence";
 import { validateS3Collections, validateS3Graph } from "./s3-persistence";
@@ -24,6 +24,7 @@ import { validateS4Collections, validateS4Graph } from "./s4-persistence";
 import { validateS5Collections, validateS5Graph } from "./s5-persistence";
 import { validateS6Collections, validateS6Graph } from "./s6-persistence";
 import { validateS7Collections, validateS7Graph } from "./s7-persistence";
+import { validateS8Collections, validateS8Graph } from "./s8-persistence";
 
 const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
@@ -91,7 +92,7 @@ function sleepSync(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
-export function emptyStoreState(): StoreState {
+export function emptyStoreState(): S8StoreState {
   return {
     projects: [],
     briefAssets: [],
@@ -154,6 +155,13 @@ export function emptyStoreState(): StoreState {
     s7CadIdempotency: [],
     s7CadManifests: [],
     s7CadReadbackReceipts: [],
+    s8MaxExports: [],
+    s8MaxJobs: [],
+    s8MaxIdempotency: [],
+    s8MaxManifests: [],
+    s8MaxGenerationReceipts: [],
+    s8MaxValidationReceipts: [],
+    s8MaxProviderMetadata: [],
   };
 }
 
@@ -778,12 +786,14 @@ export class JsonRepository {
       validateS5Collections(parsedRecord, merged);
       validateS6Collections(parsedRecord, merged);
       validateS7Collections(parsedRecord, merged);
+      validateS8Collections(parsedRecord, merged);
       validateS2Graph(merged);
       validateS3Graph(merged);
       validateS4Graph(merged);
       validateS5Graph(merged);
       validateS6Graph(merged);
       validateS7Graph(merged);
+      validateS8Graph(merged);
       return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
@@ -1141,6 +1151,8 @@ export class JsonRepository {
         validateS6Graph(fresh);
         validateS7Collections(fresh, fresh);
         validateS7Graph(fresh);
+        validateS8Collections(fresh, fresh);
+        validateS8Graph(fresh);
       } catch {
         throw new AppError(500, "PERSISTENCE_FAILED");
       }
