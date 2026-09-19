@@ -46,6 +46,7 @@ import { S6WorkflowService, type S6WorkflowServiceOptions } from "./s6";
 import { createS6SourceReader, type S6SourceReader } from "./s6-source";
 import { assertS5MutationAllowed } from "./s5-lock";
 import { S7CadService, type S7PublicationPhaseHook } from "./s7-cad";
+import { prepareS8Export } from "./s8";
 
 
 export type WorkflowServiceOptions = {
@@ -288,6 +289,25 @@ export class WorkflowService {
 
   private state(): StoreState {
     return this.repository.state();
+  }
+
+  getS8Preparation(projectId: UUID): {
+    profile: "swooshz-fbx-static-mesh-v1";
+    semanticVersion: "swooshz-fbx-semantic-v1";
+    sourceRevisionId: UUID;
+    sourceRevisionHash: Sha256;
+    objectNames: string[];
+    payloadSha256: Sha256;
+  } {
+    const prepared = prepareS8Export(this.s6.getS7Handoff(projectId), this.s7.getHandoff(projectId));
+    return {
+      profile: prepared.profile,
+      semanticVersion: prepared.semanticVersion,
+      sourceRevisionId: prepared.sourceRevisionId,
+      sourceRevisionHash: prepared.sourceRevisionHash,
+      objectNames: prepared.objectNames,
+      payloadSha256: prepared.payloadSha256,
+    };
   }
 
   private projectIn(state: StoreState, projectId: UUID): Project {
