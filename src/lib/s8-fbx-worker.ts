@@ -180,7 +180,7 @@ function makeSandboxCommand(config: S8WorkerConfig, blenderRoot: string, blender
   return {
     command: sandbox,
     args: [
-      "--unshare-net", "--die-with-parent", "--new-session",
+      "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session",
       "--ro-bind", blenderRoot, "/runtime/blender-root",
       "--ro-bind", writer, "/runtime/writer.py",
       "--ro-bind", privateExporter, "/runtime/export_fbx_bin.py",

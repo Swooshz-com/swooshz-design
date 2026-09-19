@@ -53,7 +53,7 @@ def sandboxed_blender_command(
     if script is not None:
         shutil.copy2(script, work / script.name)
         blender_args[blender_args.index("/runtime/writer/writer.py")] = "/work/" + script.name
-    return [str(sandbox), "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", str(blender_root), "/runtime/blender-root", "--ro-bind", str(writer_dir), "/runtime/writer", "--bind", str(work), "/work", "--chdir", "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"], blender_args
+    return [str(sandbox), "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", str(blender_root), "/runtime/blender-root", "--ro-bind", str(writer_dir), "/runtime/writer", "--bind", str(work), "/work", "--chdir", "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"], blender_args
 
 
 def run_command(command: list[str], work: pathlib.Path, runner: pathlib.Path | None, address_space: int, file_bytes: int, timeout_ms: int, stdout_bytes: int, stderr_bytes: int, sandbox_prefix: list[str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -103,7 +103,7 @@ def main() -> int:
     expected_names = [item["name"] for item in payload["objects"]]
     (baseline_work / "expected.json").write_text(json.dumps({"objectNames": expected_names}, sort_keys=True, separators=(",", ":")), encoding="ascii")
     if args.validator:
-        validator_prefix = None if args.sandbox is None else [str(args.sandbox), "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", str(args.validator.parent.resolve()), "/runtime/validator", "--bind", str(baseline_work), "/work", "--chdir", "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+        validator_prefix = None if args.sandbox is None else [str(args.sandbox), "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", str(args.validator.parent.resolve()), "/runtime/validator", "--bind", str(baseline_work), "/work", "--chdir", "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
         validator_command = [str(args.validator), str(baseline_work / "artifact.fbx")] if args.sandbox is None else ["/runtime/validator/" + args.validator.name, "/work/artifact.fbx"]
         validation = run_command(validator_command, baseline_work, args.runner, 1536 * 1024 * 1024, 256 * 1024 * 1024, 120000, 8 * 1024 * 1024, 1024 * 1024, validator_prefix)
         if validation.returncode != 0 or '"schemaVersion":"s8-ufbx-readback-v1"' not in validation.stdout:
