@@ -13,7 +13,7 @@ export type S8WorkerConfig = {
   privateWorkRoot: string;
   /** Native Linux process runner. There is no spawnSync/maxBuffer production fallback. */
   processRunnerExecutable?: string;
-  /** Optional bwrap-style filesystem/network sandbox, executed under the native runner. */
+  /** Optional bwrap-style filesystem/network sandbox. The native runner executes inside it. */
   sandboxExecutable?: string;
   nativeValidatorExecutable?: string;
   blenderExecutableSha256: string;
@@ -69,6 +69,9 @@ type RunnerOptions = {
   stderrBytes: number;
 };
 
+type CommandSpec = { command: string; args: string[] };
+type SandboxCommand = CommandSpec & { target: CommandSpec };
+
 function fail(code: string, field = "worker"): never {
   throw new AppError(502, code, [{ field, code }]);
 }
@@ -115,9 +118,8 @@ function runnerPath(config: S8WorkerConfig): string {
   return assertRegularFile(config.processRunnerExecutable, "processRunnerExecutable");
 }
 
-function runUnderNativeRunner(command: string, args: readonly string[], config: S8WorkerConfig, options: RunnerOptions): { stdout: string; stderr: string } {
-  const runner = runnerPath(config);
-  const child = spawnSync(runner, [
+function runnerArgs(options: RunnerOptions, command: string, args: readonly string[]): string[] {
+  return [
     "--address-space-bytes", String(options.addressSpaceBytes),
     "--file-bytes", String(options.fileBytes),
     "--timeout-ms", String(options.timeoutMs),
@@ -125,7 +127,17 @@ function runUnderNativeRunner(command: string, args: readonly string[], config: 
     "--stderr-bytes", String(options.stderrBytes),
     "--max-children", "0",
     "--", command, ...args,
-  ], {
+  ];
+}
+
+function runUnderNativeRunner(command: string, args: readonly string[], config: S8WorkerConfig, options: RunnerOptions, sandbox?: CommandSpec): { stdout: string; stderr: string } {
+  const runner = runnerPath(config);
+  const limits = runnerArgs(options, command, args);
+  const executable = sandbox?.command ?? runner;
+  const childArgs = sandbox
+    ? [...sandbox.args, "--ro-bind", runner, "/runtime/process-runner", "/runtime/process-runner", ...limits]
+    : limits;
+  const child = spawnSync(executable, childArgs, {
     cwd: options.cwd,
     env: { NODE_ENV: "production", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
     shell: false,
@@ -160,7 +172,7 @@ function parseReceipt(bytes: Buffer, payloadSha256: string, writerSha256: string
   return receipt;
 }
 
-function makeSandboxCommand(config: S8WorkerConfig, blenderRoot: string, blender: string, writer: string, privateExporter: string, patchManifest: string, work: string): { command: string; args: string[] } {
+function makeSandboxCommand(config: S8WorkerConfig, blenderRoot: string, blender: string, writer: string, privateExporter: string, patchManifest: string, work: string): SandboxCommand {
   if (!config.sandboxExecutable) fail("S8_WORKER_SANDBOX_REQUIRED");
   const sandbox = assertRegularFile(config.sandboxExecutable, "sandboxExecutable");
   const blenderRelativePath = relative(blenderRoot, blender);
@@ -175,10 +187,14 @@ function makeSandboxCommand(config: S8WorkerConfig, blenderRoot: string, blender
       "--ro-bind", patchManifest, "/runtime/patch-manifest.json",
       "--bind", work, "/work", "--chdir", "/work",
       "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-      `/runtime/blender-root/${blenderRelativePath.replaceAll("\\", "/")}`,
-      "--background", "--factory-startup", "--disable-autoexec", "--offline-mode",
-      "--python-exit-code", "50", "--python", "/runtime/writer.py", "--",
     ],
+    target: {
+      command: `/runtime/blender-root/${blenderRelativePath.replaceAll("\\", "/")}`,
+      args: [
+        "--background", "--factory-startup", "--disable-autoexec", "--offline-mode",
+        "--python-exit-code", "50", "--python", "/runtime/writer.py", "--",
+      ],
+    },
   };
 }
 
@@ -206,7 +222,7 @@ export function runS8BlenderWriter(payloadBytes: Buffer, config: S8WorkerConfig,
   try {
     onHeartbeat?.();
     const sandbox = makeSandboxCommand(config, blenderRoot, blender, writer, privateExporter, patchManifest, work);
-    const processResult = runUnderNativeRunner(sandbox.command, sandbox.args, config, { cwd: work, addressSpaceBytes: S8_LIMITS.writerAddressSpaceBytes, fileBytes: S8_LIMITS.artifactBytes, timeoutMs: S8_LIMITS.timeoutMs, stdoutBytes: S8_LIMITS.stdoutBytes, stderrBytes: S8_LIMITS.stderrBytes });
+    const processResult = runUnderNativeRunner(sandbox.target.command, sandbox.target.args, config, { cwd: work, addressSpaceBytes: S8_LIMITS.writerAddressSpaceBytes, fileBytes: S8_LIMITS.artifactBytes, timeoutMs: S8_LIMITS.timeoutMs, stdoutBytes: S8_LIMITS.stdoutBytes, stderrBytes: S8_LIMITS.stderrBytes }, sandbox);
     onHeartbeat?.();
     const artifactPath = join(work, "artifact.fbx");
     const receiptPath = join(work, "writer-receipt.json");

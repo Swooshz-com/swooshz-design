@@ -35,36 +35,46 @@ def default_payload() -> dict[str, Any]:
     }
 
 
-def sandbox_command(blender: pathlib.Path, writer: pathlib.Path, work: pathlib.Path, sandbox: pathlib.Path | None, extra: list[str]) -> list[str]:
+def sandboxed_blender_command(
+    blender: pathlib.Path,
+    writer: pathlib.Path,
+    work: pathlib.Path,
+    sandbox: pathlib.Path | None,
+    extra: list[str],
+    script: pathlib.Path | None = None,
+) -> tuple[list[str] | None, list[str]]:
     blender_root = blender.parent.resolve()
     writer_dir = writer.parent.resolve()
     blender_relative = blender.resolve().relative_to(blender_root).as_posix()
     blender_args = [f"/runtime/blender-root/{blender_relative}", "--background", "--factory-startup", "--disable-autoexec", "--offline-mode", "--python-exit-code", "50", "--python", "/runtime/writer/writer.py", "--", *extra]
     if sandbox is None:
-        return [str(blender), "--background", "--factory-startup", "--disable-autoexec", "--offline-mode", "--python-exit-code", "50", "--python", str(writer), "--", *extra]
-    return [str(sandbox), "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", str(blender_root), "/runtime/blender-root", "--ro-bind", str(writer_dir), "/runtime/writer", "--bind", str(work), "/work", "--chdir", "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", *blender_args]
+        python_script = str(script or writer)
+        return None, [str(blender), "--background", "--factory-startup", "--disable-autoexec", "--offline-mode", "--python-exit-code", "50", "--python", python_script, "--", *extra]
+    if script is not None:
+        shutil.copy2(script, work / script.name)
+        blender_args[blender_args.index("/runtime/writer/writer.py")] = "/work/" + script.name
+    return [str(sandbox), "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", str(blender_root), "/runtime/blender-root", "--ro-bind", str(writer_dir), "/runtime/writer", "--bind", str(work), "/work", "--chdir", "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"], blender_args
 
 
-def run_command(command: list[str], work: pathlib.Path, runner: pathlib.Path | None, address_space: int, file_bytes: int, timeout_ms: int, stdout_bytes: int, stderr_bytes: int) -> subprocess.CompletedProcess[str]:
+def run_command(command: list[str], work: pathlib.Path, runner: pathlib.Path | None, address_space: int, file_bytes: int, timeout_ms: int, stdout_bytes: int, stderr_bytes: int, sandbox_prefix: list[str] | None = None) -> subprocess.CompletedProcess[str]:
     if runner is not None:
-        command = [str(runner), "--address-space-bytes", str(address_space), "--file-bytes", str(file_bytes), "--timeout-ms", str(timeout_ms), "--stdout-bytes", str(stdout_bytes), "--stderr-bytes", str(stderr_bytes), "--max-children", "0", "--", *command]
+        runner_args = ["--address-space-bytes", str(address_space), "--file-bytes", str(file_bytes), "--timeout-ms", str(timeout_ms), "--stdout-bytes", str(stdout_bytes), "--stderr-bytes", str(stderr_bytes), "--max-children", "0", "--", *command]
+        if sandbox_prefix is None:
+            command = [str(runner), *runner_args]
+        else:
+            command = [*sandbox_prefix, "--ro-bind", str(runner.resolve()), "/runtime/process-runner", "/runtime/process-runner", *runner_args]
     return subprocess.run(command, cwd=work, text=True, capture_output=True, check=False, timeout=timeout_ms / 1000 + 10)
 
 
 def run_writer(payload: dict[str, Any], blender: pathlib.Path, writer: pathlib.Path, runner: pathlib.Path | None, sandbox: pathlib.Path | None, work: pathlib.Path) -> subprocess.CompletedProcess[str]:
     (work / "input.json").write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-    return run_command(sandbox_command(blender, writer, work, sandbox, []), work, runner, 4 * 1024 * 1024 * 1024, 128 * 1024 * 1024, 300000, 1024 * 1024, 1024 * 1024)
+    sandbox_prefix, command = sandboxed_blender_command(blender, writer, work, sandbox, [])
+    return run_command(command, work, runner, 4 * 1024 * 1024 * 1024, 128 * 1024 * 1024, 300000, 1024 * 1024, 1024 * 1024, sandbox_prefix)
 
 
 def run_blender_script(script: pathlib.Path, blender: pathlib.Path, writer: pathlib.Path, runner: pathlib.Path | None, sandbox: pathlib.Path | None, work: pathlib.Path, extra: list[str]) -> subprocess.CompletedProcess[str]:
-    command = sandbox_command(blender, writer, work, sandbox, [])
-    if sandbox is None:
-        command[command.index("--python") + 1] = str(script)
-    else:
-        command[command.index("/runtime/writer/writer.py") + 1] = "/work/" + script.name
-        shutil.copy2(script, work / script.name)
-    command.extend(extra)
-    return run_command(command, work, runner, 4 * 1024 * 1024 * 1024, 128 * 1024 * 1024, 300000, 1024 * 1024, 1024 * 1024)
+    sandbox_prefix, command = sandboxed_blender_command(blender, writer, work, sandbox, extra, script)
+    return run_command(command, work, runner, 4 * 1024 * 1024 * 1024, 128 * 1024 * 1024, 300000, 1024 * 1024, 1024 * 1024, sandbox_prefix)
 
 
 def main() -> int:
@@ -93,8 +103,9 @@ def main() -> int:
     expected_names = [item["name"] for item in payload["objects"]]
     (baseline_work / "expected.json").write_text(json.dumps({"objectNames": expected_names}, sort_keys=True, separators=(",", ":")), encoding="ascii")
     if args.validator:
-        validator_command = [str(args.validator), str(baseline_work / "artifact.fbx")] if args.sandbox is None else [str(args.sandbox), "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", str(args.validator.parent.resolve()), "/runtime/validator", "--bind", str(baseline_work), "/work", "--chdir", "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "/runtime/validator/" + args.validator.name, "/work/artifact.fbx"]
-        validation = run_command(validator_command, baseline_work, args.runner, 1536 * 1024 * 1024, 256 * 1024 * 1024, 120000, 8 * 1024 * 1024, 1024 * 1024)
+        validator_prefix = None if args.sandbox is None else [str(args.sandbox), "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", str(args.validator.parent.resolve()), "/runtime/validator", "--bind", str(baseline_work), "/work", "--chdir", "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+        validator_command = [str(args.validator), str(baseline_work / "artifact.fbx")] if args.sandbox is None else ["/runtime/validator/" + args.validator.name, "/work/artifact.fbx"]
+        validation = run_command(validator_command, baseline_work, args.runner, 1536 * 1024 * 1024, 256 * 1024 * 1024, 120000, 8 * 1024 * 1024, 1024 * 1024, validator_prefix)
         if validation.returncode != 0 or '"schemaVersion":"s8-ufbx-readback-v1"' not in validation.stdout:
             raise SystemExit(f"native validator failed: {validation.stderr[-400:]}")
     imported = run_blender_script(pathlib.Path(__file__).with_name("blender_validate.py"), args.blender, args.writer, args.runner, args.sandbox, baseline_work, [])
