@@ -71,7 +71,8 @@ jobs:
           set -euo pipefail
           cmake -S native/s8-process-runner -B "$RUNNER_TEMP/s8-runner" -DCMAKE_BUILD_TYPE=Release
           cmake --build "$RUNNER_TEMP/s8-runner" --config Release --parallel
-          registered="$(ctest --test-dir "$RUNNER_TEMP/s8-runner" -N | grep -E -c 'Test #[0-9]+: s8-runner\.')"
+          registered="$(ctest --test-dir "$RUNNER_TEMP/s8-runner" -N | awk 'index($0, "s8-runner.") { count += 1 } END { print count + 0 }')"
+          printf 'REGISTERED_NATIVE_CASES=%s\n' "$registered"
           test "$registered" -eq 20
           ctest --test-dir "$RUNNER_TEMP/s8-runner" -R '^s8-runner\.' --output-on-failure
       - name: Build and run native validator
@@ -236,12 +237,13 @@ jobs:
           launcher="$RUNNER_TEMP/s8-bwrap-launcher"
           if ! "$launcher" \
             --unshare-user --unshare-net --die-with-parent --new-session \
-            --ro-bind "$carrier/runtime/blender-5.2.2-linux-x64" /runtime/blender-root \
-            --ro-bind "$carrier/native/s8-process-runner" /runtime/process-runner \
-            --ro-bind "$carrier/native/s8-fbx-validator" /runtime/validator \
-            --ro-bind "$carrier/writer" /runtime/writer \
-            --ro-bind "$carrier/support" /runtime/support \
-            --bind "$carrier/work" /work --chdir /work \
+            --ro-bind "$carrier" /carrier \
+            --ro-bind /carrier/runtime/blender-5.2.2-linux-x64 /runtime/blender-root \
+            --ro-bind /carrier/native/s8-process-runner /runtime/process-runner \
+            --ro-bind /carrier/native/s8-fbx-validator /runtime/validator \
+            --ro-bind /carrier/writer /runtime/writer \
+            --ro-bind /carrier/support /runtime/support \
+            --bind /carrier/work /work --chdir /work \
             --proc /proc --dev /dev --tmpfs /tmp \
             -- /usr/bin/sh -ceu 'test -r /runtime/blender-root/blender; test -r /runtime/writer/writer.py; test -x /runtime/process-runner; test -x /runtime/validator; test -x /usr/bin/true; /usr/bin/true; touch /work/.s8-preflight; rm -f /work/.s8-preflight; test "$(stat -f -c %T /tmp)" = tmpfs; grep -q "^NoNewPrivs:" /proc/self/status; grep -q "^Seccomp:" /proc/self/status'; then
             echo "FAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD" >&2

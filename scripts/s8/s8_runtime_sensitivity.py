@@ -42,6 +42,14 @@ def directory(path_value: str, label: str) -> pathlib.Path:
     return path
 
 
+def carrier_mount(path: pathlib.Path, carrier_root: pathlib.Path, label: str) -> str:
+    try:
+        relative = path.relative_to(carrier_root)
+    except ValueError:
+        fail(f"{label}_OUTSIDE_CARRIER", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+    return f"/carrier/{relative.as_posix()}"
+
+
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -118,19 +126,27 @@ def run_sandbox(
     validator: pathlib.Path | None = None,
     support_script: pathlib.Path | None = None,
 ) -> bytes:
+    carrier_root = work.parent
+    if carrier_root.is_symlink() or not carrier_root.is_dir():
+        fail("CARRIER_ROOT_INVALID", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+    runtime_mount = carrier_mount(runtime_root, carrier_root, "RUNTIME")
+    writer_mount = carrier_mount(writer_root, carrier_root, "WRITER")
+    runner_mount = carrier_mount(runner, carrier_root, "RUNNER")
+    work_mount = carrier_mount(work, carrier_root, "WORK")
     command = [
         str(sandbox),
         "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session",
-        "--ro-bind", str(runtime_root), "/runtime/blender-root",
-        "--ro-bind", str(writer_root), "/runtime/writer",
-        "--ro-bind", str(runner), "/runtime/process-runner",
-        "--bind", str(work), "/work", "--chdir", "/work",
+        "--ro-bind", str(carrier_root), "/carrier",
+        "--ro-bind", runtime_mount, "/runtime/blender-root",
+        "--ro-bind", writer_mount, "/runtime/writer",
+        "--ro-bind", runner_mount, "/runtime/process-runner",
+        "--bind", work_mount, "/work", "--chdir", "/work",
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
     ]
     if validator is not None:
-        command.extend(["--ro-bind", str(validator), "/runtime/validator"])
+        command.extend(["--ro-bind", carrier_mount(validator, carrier_root, "VALIDATOR"), "/runtime/validator"])
     if support_script is not None:
-        command.extend(["--ro-bind", str(support_script), f"/runtime/support/{support_script.name}"])
+        command.extend(["--ro-bind", carrier_mount(support_script, carrier_root, "SUPPORT"), f"/runtime/support/{support_script.name}"])
     command.extend([
         "--", "/runtime/process-runner",
         "--address-space-bytes", str(4 * 1024 * 1024 * 1024),
