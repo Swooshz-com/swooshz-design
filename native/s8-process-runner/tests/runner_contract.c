@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/sched.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -32,6 +33,7 @@
 #define RECEIPT_PROTOCOL "\"protocol\":\"s8-process-runner-receipt-v2\""
 #define RECEIPT_POLICY "\"policyId\":\"s8-zero-child-seccomp-x86_64-v2\""
 #define RECEIPT_MAX_BYTES (4U * 1024U * 1024U)
+#define SELF_EXECUTABLE_CAPACITY (PATH_MAX + 1U)
 
 typedef struct {
     const char *name;
@@ -93,6 +95,17 @@ static int has_sha256_after(const char *text, const char *marker)
         if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f'))) return 0;
     }
     return value[64] == '"';
+}
+
+static int resolve_contract_test_executable(char *path, size_t capacity)
+{
+    ssize_t length;
+    if (capacity < 2U) return 0;
+    length = readlink("/proc/self/exe", path, capacity - 1U);
+    if (length < 0 || (size_t)length >= capacity - 1U) return 0;
+    path[length] = '\0';
+    if (path[0] != '/' || path[1] == '\0') return 0;
+    return access(path, X_OK) == 0;
 }
 
 static void *thread_main(void *argument)
@@ -217,7 +230,7 @@ static int receipt_has_limits(const char *receipt, const runner_case *test_case)
     return strstr(receipt, requested) != NULL && strstr(receipt, applied) != NULL && strstr(receipt, observed) != NULL;
 }
 
-static int run_case(const char *runner, const runner_case *test_case)
+static int run_case(const char *runner, const char *target_executable, const runner_case *test_case, const char **observation)
 {
     int output_pipe[2] = {-1, -1};
     int error_pipe[2] = {-1, -1};
@@ -227,11 +240,18 @@ static int run_case(const char *runner, const runner_case *test_case)
     char *errors = NULL;
     char *newline;
     char result_fragment[256];
+    const char *failure_stage = "harness-setup-failed";
     int passed = 0;
 
-    if (pipe(output_pipe) != 0 || pipe(error_pipe) != 0) goto done;
+    if (pipe(output_pipe) != 0 || pipe(error_pipe) != 0) {
+        failure_stage = "pipe-setup-failed";
+        goto done;
+    }
     child = fork();
-    if (child < 0) goto done;
+    if (child < 0) {
+        failure_stage = "runner-fork-failed";
+        goto done;
+    }
     if (child == 0) {
         (void)dup2(output_pipe[1], STDOUT_FILENO);
         (void)dup2(error_pipe[1], STDERR_FILENO);
@@ -243,25 +263,62 @@ static int run_case(const char *runner, const runner_case *test_case)
             "--stdout-bytes", test_case->stdout_bytes,
             "--stderr-bytes", test_case->stderr_bytes,
             "--max-children", "0",
-            "--", "/proc/self/exe", "--child", test_case->mode,
+            "--", target_executable, "--child", test_case->mode,
             (char *)NULL);
         _exit(127);
     }
     close(output_pipe[1]); output_pipe[1] = -1;
     close(error_pipe[1]); error_pipe[1] = -1;
-    if (waitpid(child, &status, 0) < 0) goto done;
-    if (!read_all(output_pipe[0], &output) || !read_all(error_pipe[0], &errors)) goto done;
+    if (waitpid(child, &status, 0) < 0) {
+        failure_stage = "runner-wait-failed";
+        goto done;
+    }
+    if (!read_all(output_pipe[0], &output) || !read_all(error_pipe[0], &errors)) {
+        failure_stage = "runner-output-read-failed";
+        goto done;
+    }
     newline = strchr(output, '\n');
-    if (!newline || strncmp(output, RECEIPT_PREFIX, strlen(RECEIPT_PREFIX)) != 0) goto done;
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != test_case->expected_status) goto done;
-    if (strstr(output, RECEIPT_SCHEMA) == NULL || strstr(output, RECEIPT_PROTOCOL) == NULL || strstr(output, RECEIPT_POLICY) == NULL) goto done;
-    if (!receipt_has_limits(output, test_case)) goto done;
-    if (strstr(output, "\"runnerParentVerification\":{\"status\":\"PASS\",\"mismatchCode\":null}") == NULL) goto done;
-    if (!has_sha256_after(output, "\"runnerBinary\":{\"selfSha256\":\"")) goto done;
+    if (strncmp(output, RECEIPT_PREFIX, strlen(RECEIPT_PREFIX)) != 0) {
+        failure_stage = "receipt-prefix-missing";
+        goto done;
+    }
+    if (!newline) {
+        failure_stage = "receipt-framing-mismatch";
+        goto done;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != test_case->expected_status) {
+        failure_stage = "runner-exit-mismatch";
+        goto done;
+    }
+    if (strstr(output, RECEIPT_SCHEMA) == NULL || strstr(output, RECEIPT_PROTOCOL) == NULL || strstr(output, RECEIPT_POLICY) == NULL) {
+        failure_stage = "receipt-schema-mismatch";
+        goto done;
+    }
+    if (!receipt_has_limits(output, test_case)) {
+        failure_stage = "requested-applied-mismatch";
+        goto done;
+    }
+    if (strstr(output, "\"runnerParentVerification\":{\"status\":\"PASS\",\"mismatchCode\":null}") == NULL) {
+        failure_stage = "runner-parent-verification-mismatch";
+        goto done;
+    }
+    if (!has_sha256_after(output, "\"runnerBinary\":{\"selfSha256\":\"")) {
+        failure_stage = "runner-sha-mismatch";
+        goto done;
+    }
     (void)snprintf(result_fragment, sizeof(result_fragment), "\"result\":{\"code\":%d,\"name\":\"%s\",\"terminationClass\":\"%s\"", test_case->expected_code, test_case->expected_name, test_case->expected_termination);
-    if (strstr(output, result_fragment) == NULL) goto done;
-    if (test_case->receipt_extra != NULL && strstr(output, test_case->receipt_extra) == NULL) goto done;
-    if (test_case->target_output != NULL && strstr(newline + 1, test_case->target_output) == NULL) goto done;
+    if (strstr(output, result_fragment) == NULL) {
+        failure_stage = "result-code-mismatch";
+        goto done;
+    }
+    if (test_case->receipt_extra != NULL && strstr(output, test_case->receipt_extra) == NULL) {
+        failure_stage = "receipt-detail-mismatch";
+        goto done;
+    }
+    if (test_case->target_output != NULL && strstr(newline + 1, test_case->target_output) == NULL) {
+        failure_stage = "target-output-mismatch";
+        goto done;
+    }
     passed = 1;
 
 done:
@@ -271,6 +328,7 @@ done:
     if (error_pipe[1] >= 0) close(error_pipe[1]);
     free(output);
     free(errors);
+    if (observation != NULL) *observation = passed ? "code-and-v2-evidence-verified" : failure_stage;
     return passed;
 }
 
@@ -306,15 +364,24 @@ static const runner_case *find_case(const char *name)
 int main(int argc, char **argv)
 {
     const runner_case *test_case;
+    const char *observation = "harness-setup-failed";
+    char contract_test_executable[SELF_EXECUTABLE_CAPACITY];
     int passed;
     if (argc == 3 && !strcmp(argv[1], "--child")) return child_mode(argv[2]);
     if (argc != 4 || strcmp(argv[1], "--case") != 0) return 2;
     test_case = find_case(argv[2]);
     if (!test_case) return 2;
-    passed = run_case(argv[3], test_case);
+    if (!resolve_contract_test_executable(contract_test_executable, sizeof(contract_test_executable))) {
+        printf("CASE=s8-runner.%s\n", test_case->name);
+        printf("EXPECTED=code=%d;name=%s;termination=%s\n", test_case->expected_code, test_case->expected_name, test_case->expected_termination);
+        printf("OBSERVED=test-executable-resolution-failed\n");
+        printf("RESULT=FAIL\n");
+        return 1;
+    }
+    passed = run_case(argv[3], contract_test_executable, test_case, &observation);
     printf("CASE=s8-runner.%s\n", test_case->name);
     printf("EXPECTED=code=%d;name=%s;termination=%s\n", test_case->expected_code, test_case->expected_name, test_case->expected_termination);
-    printf("OBSERVED=%s\n", passed ? "code-and-v2-evidence-verified" : "validation-failed");
+    printf("OBSERVED=%s\n", observation);
     printf("RESULT=%s\n", passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
