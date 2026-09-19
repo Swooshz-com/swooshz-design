@@ -331,6 +331,10 @@ export type StoreState = {
   s7CadIdempotency?: S7CadIdempotency[];
   s7CadManifests?: S7CadManifestRecord[];
   s7CadReadbackReceipts?: S7CadReadbackReceipt[];
+  s8ExportJobs?: S8ExportJob[];
+  s8Artifacts?: S8Artifact[];
+  s8ValidationReceipts?: S8ValidationReceipt[];
+  s8IdempotencyRecords?: S8IdempotencyRecord[];
 };
 
 export type S6RevisionStatus =
@@ -1309,6 +1313,142 @@ export type S7ToS8Handoff = {
 
   dxfIsNot3DAuthority: true;
   s8MustReadAcceptedS6Model: true;
+};
+
+export type S8SourceStamp = {
+  projectId: UUID;
+  sourceRevisionId: UUID;
+  sourceRevisionHash: Sha256;
+  sourceS5Fingerprint: Sha256;
+  s6ValidationReceiptId: UUID;
+  s6ValidationHash: Sha256;
+  s6HandoffDigest: Sha256;
+  s7ArtifactId: UUID;
+  s7ArtifactHash: Sha256;
+  s7ReadbackHash: Sha256;
+  s7ManifestId: UUID;
+  s7ManifestHash: Sha256;
+  s8Profile: "swooshz-fbx-static-mesh-v1";
+  s8ProtocolVersion: "s8-end-to-end-executable-contract-v1";
+};
+
+export type S8ExportStatus =
+  | "queued"
+  | "running"
+  | "staged"
+  | "validated"
+  | "promoted"
+  | "committed"
+  | "stale"
+  | "failed_retryable"
+  | "failed_terminal"
+  | "aborted";
+
+export type S8PublicationPhase =
+  | "source_admission"
+  | "claim"
+  | "private_staging"
+  | "independent_validation"
+  | "source_claim_recheck"
+  | "immutable_promotion"
+  | "verified_readback"
+  | "commit";
+
+export type S8ExportJob = {
+  schemaVersion: "s8-export-job-v2";
+  jobId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+  source: S8SourceStamp;
+  inputHash: Sha256;
+  idempotencyKey: string;
+  status: S8ExportStatus;
+  publicationPhase: S8PublicationPhase;
+  attempt: 1;
+  claimToken: UUID | null;
+  ownerId: string | null;
+  ownerProcessId: number | null;
+  claimedAt: Timestamp | null;
+  heartbeatAt: Timestamp | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  terminalAt: Timestamp | null;
+  failureCode: string | null;
+};
+
+export type S8ArtifactObjectHashes = {
+  artifactSha256: Sha256;
+  artifactByteSize: number;
+  writerReceiptSha256: Sha256;
+  nativeReadbackSha256: Sha256;
+  semanticReceiptSha256: Sha256;
+  publicationReceiptSha256: Sha256;
+};
+
+export type S8Artifact = {
+  schemaVersion: "s8-artifact-v2";
+  artifactId: UUID;
+  projectId: UUID;
+  jobId: UUID;
+  source: S8SourceStamp;
+  inputHash: Sha256;
+  profile: "swooshz-fbx-static-mesh-v1";
+  format: "fbx";
+  mimeType: "application/octet-stream";
+  downloadFileName: "swooshz-s8-scene.fbx";
+  status: S8ExportStatus;
+  publicationPhase: S8PublicationPhase;
+  payloadSha256: Sha256 | null;
+  objectHashes: S8ArtifactObjectHashes | null;
+  writerReceiptHash: Sha256 | null;
+  nativeReadbackHash: Sha256 | null;
+  semanticReceiptHash: Sha256 | null;
+  publicationReceiptHash: Sha256 | null;
+  validationReceiptId: UUID | null;
+  validationReceiptHash: Sha256 | null;
+  immutableReuseFingerprint: Sha256 | null;
+  privateStagingPrefix: string;
+  privateFinalPrefix: string;
+  attempt: 1;
+  retryOfArtifactId: UUID | null;
+  failureCode: string | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  committedAt: Timestamp | null;
+  staleAt: Timestamp | null;
+};
+
+export type S8ValidationReceipt = {
+  schemaVersion: "s8-validation-receipt-v2";
+  receiptId: UUID;
+  projectId: UUID;
+  artifactId: UUID;
+  source: S8SourceStamp;
+  payloadSha256: Sha256;
+  artifactSha256: Sha256;
+  artifactByteSize: number;
+  writerReceiptHash: Sha256;
+  nativeReadbackHash: Sha256;
+  semanticReceiptHash: Sha256;
+  nativeOutcome: "pass";
+  semanticOutcome: "pass";
+  fingerprintVersion: "s8-immutable-reuse-fingerprint-v2";
+  immutableReuseFingerprint: Sha256;
+  resourceLimitsHash: Sha256;
+  checkedAt: Timestamp;
+  receiptHash: Sha256;
+};
+
+export type S8IdempotencyRecord = {
+  schemaVersion: "s8-idempotency-v2";
+  projectId: UUID;
+  operation: "export";
+  idempotencyKey: string;
+  inputHash: Sha256;
+  source: S8SourceStamp;
+  jobId: UUID;
+  artifactId: UUID;
+  createdAt: Timestamp;
 };
 
 export type S7CadPublicExport = Omit<S7CadExport, "privateFinalStorageKey" | "privateStagingStorageKey">;

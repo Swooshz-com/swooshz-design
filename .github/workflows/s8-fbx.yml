@@ -1,0 +1,256 @@
+name: S8 FBX end-to-end contract
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  s8-static:
+    name: S8 static and TypeScript floor
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Verify exact PR head
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Enable pnpm
+        run: corepack enable
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Secret preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -I -n -E '(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' -- .; then
+            echo "credential-like material detected in tracked files" >&2
+            exit 1
+          fi
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit --pretty false
+      - name: Full repository tests
+        run: pnpm test
+      - name: Writer contract regression
+        run: python3 scripts/s8/blender_writer_contract_regression.py
+      - name: Python syntax
+        run: python3 -m py_compile blender/s8-fbx-writer/writer.py scripts/s8/*.py
+      - name: Diff hygiene
+        run: git diff --check
+      - name: Application build
+        run: pnpm run build
+
+  s8-native:
+    name: S8 native validator and process runner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Verify exact PR head
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Build and run native process boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S native/s8-process-runner -B "$RUNNER_TEMP/s8-runner" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/s8-runner" --config Release --parallel
+          registered="$(ctest --test-dir "$RUNNER_TEMP/s8-runner" -N | grep -E -c 'Test #[0-9]+: s8-runner\.')"
+          test "$registered" -eq 20
+          ctest --test-dir "$RUNNER_TEMP/s8-runner" -R '^s8-runner\.' --output-on-failure
+      - name: Build and run native validator
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S native/s8-fbx-validator -B "$RUNNER_TEMP/s8-validator" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/s8-validator" --config Release --parallel
+          ctest --test-dir "$RUNNER_TEMP/s8-validator" --output-on-failure
+          "$RUNNER_TEMP/s8-validator/s8-fbx-validator" --self-test
+
+  s8-pinned-blender:
+    name: S8 pinned Blender workspace carrier
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Verify exact PR head
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Install and preflight privileged bubblewrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes bubblewrap
+          fi
+          test -x /usr/bin/bwrap
+          launcher="$RUNNER_TEMP/s8-bwrap-launcher"
+          if [[ -e "$launcher" || -L "$launcher" ]]; then
+            echo "sandbox launcher path is not fresh" >&2
+            exit 1
+          fi
+          cat > "$launcher" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec sudo -n /usr/bin/bwrap "$@"
+          SH
+          chmod 700 "$launcher"
+          "$launcher" --unshare-user --unshare-net --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp -- /bin/true
+      - name: Stage verified carrier and run qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          carrier_root="$GITHUB_WORKSPACE/.s8-ci-carrier"
+          carrier="$carrier_root/${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          temp_root="$RUNNER_TEMP/s8-g3-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          archive="$temp_root/blender-5.2.2-linux-x64.tar.xz"
+          source_layout="$temp_root/source-layout"
+          source_manifest="$temp_root/source.manifest"
+          staged_manifest="$temp_root/staged.manifest"
+          carrier_created=0
+          temp_created=0
+
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [[ "$carrier_created" == 1 && ( -e "$carrier" || -L "$carrier" ) ]]; then
+              carrier_root_resolved="$(realpath -e -- "$carrier_root")"
+              carrier_resolved="$(realpath -e -- "$carrier")"
+              case "$carrier_resolved" in
+                "$carrier_root_resolved"/*) rm -rf -- "$carrier" ;;
+                *) echo "refusing carrier cleanup outside workspace carrier root" >&2; status=1 ;;
+              esac
+            fi
+            if [[ "$temp_created" == 1 && ( -e "$temp_root" || -L "$temp_root" ) ]]; then
+              temp_parent_resolved="$(realpath -e -- "$RUNNER_TEMP")"
+              temp_resolved="$(realpath -e -- "$temp_root")"
+              case "$temp_resolved" in
+                "$temp_parent_resolved"/*) rm -rf -- "$temp_root" ;;
+                *) echo "refusing temporary cleanup outside runner temp" >&2; status=1 ;;
+              esac
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          if [[ -L "$carrier_root" ]]; then
+            echo "carrier root is an unexpected symlink" >&2
+            exit 1
+          fi
+          install -d -m 0755 "$carrier_root"
+          if [[ -e "$carrier" || -L "$carrier" ]]; then
+            echo "carrier path is not fresh" >&2
+            exit 1
+          fi
+          install -d -m 0755 "$carrier"
+          carrier_created=1
+          install -d -m 0755 "$temp_root"
+          temp_created=1
+          install -d -m 0755 "$source_layout/runtime" "$source_layout/native" "$source_layout/writer" "$source_layout/support"
+
+          curl --fail --location --retry 3 --output "$archive" \
+            https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz
+          echo "84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168  $archive" | sha256sum --check --status
+          install -d -m 0755 "$temp_root/extracted"
+          tar -xJf "$archive" --directory "$temp_root/extracted"
+          blender_source="$temp_root/extracted/blender-5.2.2-linux-x64"
+          test -d "$blender_source"; test ! -L "$blender_source"
+          test -x "$blender_source/blender"
+
+          cmake -S native/s8-process-runner -B "$temp_root/s8-runner" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$temp_root/s8-runner" --config Release --parallel
+          cmake -S native/s8-fbx-validator -B "$temp_root/s8-validator" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$temp_root/s8-validator" --config Release --parallel
+
+          cp -a "$blender_source" "$source_layout/runtime/"
+          install -m 0755 "$temp_root/s8-runner/s8-process-runner" "$source_layout/native/s8-process-runner"
+          install -m 0755 "$temp_root/s8-validator/s8-fbx-validator" "$source_layout/native/s8-fbx-validator"
+          cp -a blender/s8-fbx-writer/. "$source_layout/writer/"
+          install -m 0644 scripts/s8/blender_validate.py "$source_layout/support/blender_validate.py"
+          install -m 0644 scripts/s8/blender_reopen_validate.py "$source_layout/support/blender_reopen_validate.py"
+          cp -a "$source_layout/." "$carrier/"
+          install -d -m 0700 "$carrier/work"
+
+          find -P "$carrier" -type d -exec chmod 755 {} +
+          find -P "$carrier/runtime" "$carrier/native" "$carrier/writer" "$carrier/support" -type f -exec chmod go-w,a+r {} +
+          chmod 755 "$carrier/runtime/blender-5.2.2-linux-x64/blender" "$carrier/native/s8-process-runner" "$carrier/native/s8-fbx-validator"
+          chmod 700 "$carrier/work"
+          for direct_path in "$carrier" "$carrier/runtime" "$carrier/native" "$carrier/writer" "$carrier/support" "$carrier/work"; do
+            test -d "$direct_path"
+            test ! -L "$direct_path"
+          done
+          if find -P "$carrier" -type d -perm /022 -print -quit | grep -q .; then
+            echo "carrier directory is group/world writable" >&2
+            exit 1
+          fi
+
+          manifest() {
+            root="$1"
+            {
+              while IFS= read -r -d '' path; do
+                relative_path="${path#"$root/"}"
+                digest_value="$(sha256sum -- "$path" | awk '{print $1}')"
+                printf 'F\t%s\t%s\n' "$relative_path" "$digest_value"
+              done < <(find -P "$root" -type f -print0)
+              while IFS= read -r -d '' path; do
+                relative_path="${path#"$root/"}"
+                printf 'L\t%s\t%s\n' "$relative_path" "$(readlink -- "$path")"
+              done < <(find -P "$root" -type l -print0)
+            } | LC_ALL=C sort
+          }
+          manifest "$source_layout" > "$source_manifest"
+          manifest "$carrier" > "$staged_manifest"
+          cmp --silent "$source_manifest" "$staged_manifest"
+          sha256sum -- "$blender_source/blender" "$carrier/runtime/blender-5.2.2-linux-x64/blender" | awk '{print $1}' | uniq -c | grep -q '^      2 '
+          sha256sum -- "$temp_root/s8-runner/s8-process-runner" "$carrier/native/s8-process-runner" | awk '{print $1}' | uniq -c | grep -q '^      2 '
+          sha256sum -- "$temp_root/s8-validator/s8-fbx-validator" "$carrier/native/s8-fbx-validator" | awk '{print $1}' | uniq -c | grep -q '^      2 '
+
+          launcher="$RUNNER_TEMP/s8-bwrap-launcher"
+          if ! "$launcher" \
+            --unshare-user --unshare-net --die-with-parent --new-session \
+            --ro-bind "$carrier/runtime/blender-5.2.2-linux-x64" /runtime/blender-root \
+            --ro-bind "$carrier/native/s8-process-runner" /runtime/process-runner \
+            --ro-bind "$carrier/native/s8-fbx-validator" /runtime/validator \
+            --ro-bind "$carrier/writer" /runtime/writer \
+            --ro-bind "$carrier/support" /runtime/support \
+            --bind "$carrier/work" /work --chdir /work \
+            --proc /proc --dev /dev --tmpfs /tmp \
+            -- /bin/sh -ceu 'test -r /runtime/blender-root/blender; test -r /runtime/writer/writer.py; test -x /runtime/process-runner; test -x /runtime/validator; test -x /usr/bin/true; /usr/bin/true; touch /work/.s8-preflight; rm -f /work/.s8-preflight; test "$(stat -f -c %T /tmp)" = tmpfs; grep -q "^NoNewPrivs:" /proc/self/status; grep -q "^Seccomp:" /proc/self/status'; then
+            echo "FAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD" >&2
+            echo "CANDIDATE_FAILURE_PROVEN=NO" >&2
+            exit 1
+          fi
+          echo "SANDBOX_ADMISSION=PASS"
+
+          python3 scripts/s8/s8_runtime_sensitivity.py \
+            --blender "$carrier/runtime/blender-5.2.2-linux-x64/blender" \
+            --writer "$carrier/writer/writer.py" \
+            --runner "$carrier/native/s8-process-runner" \
+            --sandbox "$launcher" \
+            --validator "$carrier/native/s8-fbx-validator" \
+            --import-script "$carrier/support/blender_validate.py" \
+            --reopen-script "$carrier/support/blender_reopen_validate.py" \
+            --output-dir "$carrier/work"

@@ -24,6 +24,7 @@ import { validateS4Collections, validateS4Graph } from "./s4-persistence";
 import { validateS5Collections, validateS5Graph } from "./s5-persistence";
 import { validateS6Collections, validateS6Graph } from "./s6-persistence";
 import { validateS7Collections, validateS7Graph } from "./s7-persistence";
+import { validateS8Collections, validateS8Graph } from "./s8-fbx-persistence";
 
 const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
@@ -154,6 +155,10 @@ export function emptyStoreState(): StoreState {
     s7CadIdempotency: [],
     s7CadManifests: [],
     s7CadReadbackReceipts: [],
+    s8ExportJobs: [],
+    s8Artifacts: [],
+    s8ValidationReceipts: [],
+    s8IdempotencyRecords: [],
   };
 }
 
@@ -778,12 +783,14 @@ export class JsonRepository {
       validateS5Collections(parsedRecord, merged);
       validateS6Collections(parsedRecord, merged);
       validateS7Collections(parsedRecord, merged);
+      validateS8Collections(parsedRecord, merged);
       validateS2Graph(merged);
       validateS3Graph(merged);
       validateS4Graph(merged);
       validateS5Graph(merged);
       validateS6Graph(merged);
       validateS7Graph(merged);
+      validateS8Graph(merged);
       return merged;
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED");
@@ -1141,6 +1148,8 @@ export class JsonRepository {
         validateS6Graph(fresh);
         validateS7Collections(fresh, fresh);
         validateS7Graph(fresh);
+        validateS8Collections(fresh, fresh);
+        validateS8Graph(fresh);
       } catch {
         throw new AppError(500, "PERSISTENCE_FAILED");
       }
