@@ -311,8 +311,8 @@ static int child_limits(const runner_options *options)
 
 static int write_receipt(const runner_options *options)
 {
-    char runner_sha256[65];
-    if (!runner_sha256(runner_sha256)) return 0;
+    char runner_digest[65];
+    if (!runner_sha256(runner_digest)) return 0;
     if (printf(RUNNER_RECEIPT_PREFIX
                "{\"schemaVersion\":\"%s\",\"protocol\":\"%s\",\"runnerSha256\":\"%s\","
                "\"requestedAddressSpaceBytes\":%llu,\"appliedAddressSpaceBytes\":%llu,"
@@ -322,7 +322,7 @@ static int write_receipt(const runner_options *options)
                "\"requestedStderrBytes\":%llu,\"appliedStderrBytes\":%llu,"
                "\"requestedMaxChildren\":%llu,\"appliedMaxChildren\":%llu,"
                "\"seccompPolicy\":\"%s\",\"limitsApplied\":true,\"seccompEnabled\":true,\"filterInstalled\":true}\n",
-               RUNNER_RECEIPT_SCHEMA, RUNNER_RECEIPT_SCHEMA, runner_sha256,
+               RUNNER_RECEIPT_SCHEMA, RUNNER_RECEIPT_SCHEMA, runner_digest,
                (unsigned long long)options->address_space_bytes, (unsigned long long)options->address_space_bytes,
                (unsigned long long)options->file_bytes, (unsigned long long)options->file_bytes,
                (unsigned long long)options->timeout_ms, (unsigned long long)options->timeout_ms,

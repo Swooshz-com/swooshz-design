@@ -39,42 +39,8 @@ jobs:
           fi
       - name: Typecheck
         run: pnpm exec tsc --noEmit --pretty false
-      - name: Test suite with exact S4 baseline classification
-        shell: bash
-        run: |
-          set +e
-          pnpm test 2>&1 | tee "$RUNNER_TEMP/s8-test.log"
-          test_status=${PIPESTATUS[0]}
-          set -e
-          python3 - "$RUNNER_TEMP/s8-test.log" "$test_status" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          log = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-          test_status = int(sys.argv[2])
-          failures = []
-          matches = list(re.finditer(r"^not ok \d+ - (.+)$", log, re.MULTILINE))
-          for index, match in enumerate(matches):
-              end = matches[index + 1].start() if index + 1 < len(matches) else len(log)
-              failures.append((match.group(1).strip(), log[match.start():end]))
-          baseline_name = "S4 repository audit enforces exact resolved package identity and fails closed"
-          baseline_signature = "2e01a90b6b2f40f4729764970a8cb89f25bbe0c8:package.json"
-          accepted = [
-              body for name, body in failures
-              if name == baseline_name
-              and baseline_signature in body
-              and "fatal: path 'package.json' exists on disk, but not in" in body
-          ]
-          unexpected = [
-              name for name, body in failures
-              if not (name == baseline_name and baseline_signature in body and "fatal: path 'package.json' exists on disk, but not in" in body)
-          ]
-          if test_status == 0 or len(accepted) != 1 or unexpected:
-              print(f"unexpected test result: status={test_status} accepted_baseline={len(accepted)} unexpected={unexpected}", file=sys.stderr)
-              raise SystemExit(1)
-          print("accepted exactly one known S4 baseline failure; no unexpected failures")
-          PY
+      - name: Test suite
+        run: pnpm test
       - name: Writer contract regression
         run: python3 scripts/s8/blender_writer_contract_regression.py
       - name: Python syntax
