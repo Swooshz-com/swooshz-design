@@ -3,10 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { S8ExportService, type S8ExportAdapters } from "../src/lib/s8";
+import { S8ExportService, type S8ExportAdapters, type S8NativeValidationResult } from "../src/lib/s8";
 import type { S8SemanticResult, S8UfbxReadback } from "../src/lib/s8-fbx-semantic";
+import { type S8RunnerEvidence, type S8WriterResult } from "../src/lib/s8-fbx-worker";
 import { JsonRepository, PrivateObjectStore } from "../src/lib/store";
-import { s8Sha256 } from "../src/lib/s8-fbx-profile";
+import { S8_LIMITS, S8_PROCESS_RUNNER_PIN, s8Sha256 } from "../src/lib/s8-fbx-profile";
 import type { S6ToS7Handoff, S7ToS8Handoff, S8Artifact, UUID } from "../src/lib/types";
 
 const projectId = "11111111-1111-4111-8111-111111111111" as UUID;
@@ -52,7 +53,42 @@ function result(): S8SemanticResult {
   return { outcome: "pass", localPositionMm: distribution, worldPositionMm: distribution, dimensionMm: distribution, worldBoundMm: distribution, matrixElement: distribution, normalAngularDegrees: distribution, roundSagittaMm: distribution };
 }
 
-function serviceFixture() {
+function runnerEvidence(kind: "writer" | "validator", overrides: Partial<S8RunnerEvidence> = {}): S8RunnerEvidence {
+  const validator = kind === "validator";
+  return {
+    schemaVersion: S8_PROCESS_RUNNER_PIN.protocol,
+    protocol: S8_PROCESS_RUNNER_PIN.protocol,
+    runnerSha256: "b".repeat(64),
+    requestedAddressSpaceBytes: validator ? S8_LIMITS.validatorMemoryBytes : S8_LIMITS.writerAddressSpaceBytes,
+    appliedAddressSpaceBytes: validator ? S8_LIMITS.validatorMemoryBytes : S8_LIMITS.writerAddressSpaceBytes,
+    requestedFileBytes: validator ? S8_LIMITS.validatorTempBytes : S8_LIMITS.artifactBytes,
+    appliedFileBytes: validator ? S8_LIMITS.validatorTempBytes : S8_LIMITS.artifactBytes,
+    requestedTimeoutMs: validator ? S8_LIMITS.validatorTimeoutMs : S8_LIMITS.timeoutMs,
+    appliedTimeoutMs: validator ? S8_LIMITS.validatorTimeoutMs : S8_LIMITS.timeoutMs,
+    requestedStdoutBytes: validator ? S8_LIMITS.readbackBytes : S8_LIMITS.stdoutBytes,
+    appliedStdoutBytes: validator ? S8_LIMITS.readbackBytes : S8_LIMITS.stdoutBytes,
+    requestedStderrBytes: S8_LIMITS.stderrBytes,
+    appliedStderrBytes: S8_LIMITS.stderrBytes,
+    requestedMaxChildren: 0,
+    appliedMaxChildren: 0,
+    seccompPolicy: "s8-zero-child-seccomp-v1",
+    limitsApplied: true,
+    seccompEnabled: true,
+    filterInstalled: true,
+    ...overrides,
+  };
+}
+
+type FixtureOptions = {
+  omitWriterEvidence?: boolean;
+  omitValidatorEvidence?: boolean;
+  omitValidatorIdentity?: boolean;
+  writerEvidence?: S8RunnerEvidence;
+  validatorEvidence?: S8RunnerEvidence;
+  validatorIdentity?: string;
+};
+
+function serviceFixture(options: FixtureOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), "s8-publication-"));
   const repository = new JsonRepository(root);
   repository.transact((state) => {
@@ -64,9 +100,16 @@ function serviceFixture() {
   const adapters: S8ExportAdapters = {
     writer: (payloadBytes) => {
       const artifact = Buffer.alloc(32, 7);
-      return { artifact, stdout: "", stderr: "", receipt: { schemaVersion: "swooshz-fbx-writer-receipt-v1", profile: "swooshz-fbx-static-mesh-v1", payloadSha256: s8Sha256(payloadBytes), writerScriptSha256: hash, artifactSha256: s8Sha256(artifact), artifactByteSize: artifact.length, fbxHeaderVersion: 7400, objectCount: 1, controlPointCount: 8, triangleCount: 12, runtime: {} } as any };
+      const value: Record<string, unknown> = { artifact, stdout: "", stderr: "", receipt: { schemaVersion: "swooshz-fbx-writer-receipt-v1", profile: "swooshz-fbx-static-mesh-v1", payloadSha256: s8Sha256(payloadBytes), writerScriptSha256: hash, artifactSha256: s8Sha256(artifact), artifactByteSize: artifact.length, fbxHeaderVersion: 7400, objectCount: 1, controlPointCount: 8, triangleCount: 12, runtime: {} } };
+      if (!options.omitWriterEvidence) value.runnerEvidence = options.writerEvidence ?? runnerEvidence("writer");
+      return value as unknown as S8WriterResult;
     },
-    nativeValidator: () => ({ readback: nativeReadback, readbackBytes: Buffer.from(JSON.stringify(nativeReadback)), validatorIdentity: "test-validator", runnerIdentity: "test-runner", appliedLimits: {} }),
+    nativeValidator: () => {
+      const value: Record<string, unknown> = { readback: nativeReadback, readbackBytes: Buffer.from(JSON.stringify(nativeReadback)) };
+      if (!options.omitValidatorIdentity) value.validatorIdentity = options.validatorIdentity ?? "test-validator";
+      if (!options.omitValidatorEvidence) value.runnerEvidence = options.validatorEvidence ?? runnerEvidence("validator");
+      return value as unknown as S8NativeValidationResult;
+    },
     semanticValidator: () => result(),
   };
   const service = new S8ExportService({ repository, objects, s6: { getS7Handoff: () => s6 } as any, s7: { getHandoff: () => s7 } as any, adapters, ownerId: "test-owner", processId: process.pid, isProcessAlive: () => false });
@@ -86,6 +129,39 @@ test("S8 export publishes an immutable five-object receipt graph and reuses it",
     assert.equal(replay.replayed, true);
     assert.deepEqual(replay.export.objectHashes, first.export.objectHashes);
     assert.deepEqual(replay.export, first.export);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("S8 publication fails closed when writer runner evidence is missing", () => {
+  const fixture = serviceFixture({ omitWriterEvidence: true });
+  try {
+    assert.throws(() => fixture.service.createExport(projectId, "missing-writer-runner", "77777777-7777-4777-8777-777777777778"), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("S8 publication fails closed when validator identity or runner evidence is missing", () => {
+  const missingIdentity = serviceFixture({ omitValidatorIdentity: true });
+  try {
+    assert.throws(() => missingIdentity.service.createExport(projectId, "missing-validator-identity", "77777777-7777-4777-8777-777777777779"), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  } finally {
+    rmSync(missingIdentity.root, { recursive: true, force: true });
+  }
+  const missingEvidence = serviceFixture({ omitValidatorEvidence: true });
+  try {
+    assert.throws(() => missingEvidence.service.createExport(projectId, "missing-validator-runner", "77777777-7777-4777-8777-777777777780"), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  } finally {
+    rmSync(missingEvidence.root, { recursive: true, force: true });
+  }
+});
+
+test("S8 publication rejects mismatched applied resource evidence", () => {
+  const fixture = serviceFixture({ writerEvidence: runnerEvidence("writer", { appliedAddressSpaceBytes: S8_LIMITS.writerAddressSpaceBytes - 1 }) });
+  try {
+    assert.throws(() => fixture.service.createExport(projectId, "mismatched-memory", "77777777-7777-4777-8777-777777777781"), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }

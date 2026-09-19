@@ -48,14 +48,35 @@ export type S8WriterReceipt = {
   };
 };
 
-export type S8WriterResult = { artifact: Buffer; receipt: S8WriterReceipt; stdout: string; stderr: string };
+export type S8RunnerEvidence = {
+  schemaVersion: typeof S8_PROCESS_RUNNER_PIN.protocol;
+  protocol: typeof S8_PROCESS_RUNNER_PIN.protocol;
+  runnerSha256: string;
+  requestedAddressSpaceBytes: number;
+  appliedAddressSpaceBytes: number;
+  requestedFileBytes: number;
+  appliedFileBytes: number;
+  requestedTimeoutMs: number;
+  appliedTimeoutMs: number;
+  requestedStdoutBytes: number;
+  appliedStdoutBytes: number;
+  requestedStderrBytes: number;
+  appliedStderrBytes: number;
+  requestedMaxChildren: number;
+  appliedMaxChildren: number;
+  seccompPolicy: "s8-zero-child-seccomp-v1";
+  limitsApplied: true;
+  seccompEnabled: true;
+  filterInstalled: true;
+};
+
+export type S8WriterResult = { artifact: Buffer; receipt: S8WriterReceipt; runnerEvidence: S8RunnerEvidence; stdout: string; stderr: string };
 
 export type S8NativeValidatorResult = {
   readback: S8UfbxReadback;
   readbackBytes: Buffer;
   validatorIdentity: string;
-  runnerIdentity: string;
-  appliedLimits: Record<string, number | string>;
+  runnerEvidence: S8RunnerEvidence;
   stdout: string;
   stderr: string;
 };
@@ -68,6 +89,10 @@ type RunnerOptions = {
   stdoutBytes: number;
   stderrBytes: number;
 };
+
+export type S8RunnerLimits = Omit<RunnerOptions, "cwd">;
+
+type RunnerResult = { stdout: string; stderr: string; evidence: S8RunnerEvidence };
 
 type CommandSpec = { command: string; args: string[] };
 type SandboxCommand = CommandSpec & { target: CommandSpec };
@@ -130,8 +155,39 @@ function runnerArgs(options: RunnerOptions, command: string, args: readonly stri
   ];
 }
 
-function runUnderNativeRunner(command: string, args: readonly string[], config: S8WorkerConfig, options: RunnerOptions, sandbox?: CommandSpec): { stdout: string; stderr: string } {
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isNonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function parseS8RunnerReceipt(output: Buffer, expected: S8RunnerLimits, runnerSha256: string): { stdout: string; evidence: S8RunnerEvidence } {
+  const text = output.toString("utf8");
+  const newline = text.indexOf("\n");
+  const prefix = "S8_RUNNER_RECEIPT:";
+  if (!text.startsWith(prefix) || newline < prefix.length) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  let parsed: unknown;
+  try { parsed = JSON.parse(text.slice(prefix.length, newline)); } catch { fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const value = parsed as Record<string, unknown>;
+  const numericFields = [
+    "requestedAddressSpaceBytes", "appliedAddressSpaceBytes", "requestedFileBytes", "appliedFileBytes",
+    "requestedTimeoutMs", "appliedTimeoutMs", "requestedStdoutBytes", "appliedStdoutBytes",
+    "requestedStderrBytes", "appliedStderrBytes", "requestedMaxChildren", "appliedMaxChildren",
+  ] as const;
+  if (value.schemaVersion !== S8_PROCESS_RUNNER_PIN.protocol || value.protocol !== S8_PROCESS_RUNNER_PIN.protocol || value.runnerSha256 !== runnerSha256 || !/^[0-9a-f]{64}$/u.test(String(value.runnerSha256))) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  for (const field of numericFields) if (!isNonnegativeInteger(value[field])) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if (!isPositiveInteger(value.requestedAddressSpaceBytes) || !isPositiveInteger(value.appliedAddressSpaceBytes) || !isPositiveInteger(value.requestedFileBytes) || !isPositiveInteger(value.appliedFileBytes) || !isPositiveInteger(value.requestedTimeoutMs) || !isPositiveInteger(value.appliedTimeoutMs) || !isPositiveInteger(value.requestedStdoutBytes) || !isPositiveInteger(value.appliedStdoutBytes) || !isPositiveInteger(value.requestedStderrBytes) || !isPositiveInteger(value.appliedStderrBytes) || value.requestedMaxChildren !== 0 || value.appliedMaxChildren !== 0) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if (value.requestedAddressSpaceBytes !== expected.addressSpaceBytes || value.appliedAddressSpaceBytes !== expected.addressSpaceBytes || value.requestedFileBytes !== expected.fileBytes || value.appliedFileBytes !== expected.fileBytes || value.requestedTimeoutMs !== expected.timeoutMs || value.appliedTimeoutMs !== expected.timeoutMs || value.requestedStdoutBytes !== expected.stdoutBytes || value.appliedStdoutBytes !== expected.stdoutBytes || value.requestedStderrBytes !== expected.stderrBytes || value.appliedStderrBytes !== expected.stderrBytes || value.requestedMaxChildren !== 0 || value.appliedMaxChildren !== 0) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if (value.seccompPolicy !== "s8-zero-child-seccomp-v1" || value.limitsApplied !== true || value.seccompEnabled !== true || value.filterInstalled !== true) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  return { stdout: text.slice(newline + 1), evidence: value as unknown as S8RunnerEvidence };
+}
+
+function runUnderNativeRunner(command: string, args: readonly string[], config: S8WorkerConfig, options: RunnerOptions, sandbox?: CommandSpec): RunnerResult {
   const runner = runnerPath(config);
+  const expectedRunnerSha256 = fileSha256(runner);
   const limits = runnerArgs(options, command, args);
   const executable = sandbox?.command ?? runner;
   const childArgs = sandbox
@@ -145,17 +201,19 @@ function runUnderNativeRunner(command: string, args: readonly string[], config: 
     // This is only a transport guard around the runner itself. Resource enforcement
     // is owned by the native runner, never by Node's timeout/maxBuffer options.
     timeout: options.timeoutMs + 10_000,
+    maxBuffer: Math.max(options.stdoutBytes, options.stderrBytes) + 64 * 1024,
     encoding: null,
     killSignal: "SIGKILL",
   });
-  const stdout = boundedOutput(child.stdout, options.stdoutBytes, "S8_STDOUT_LIMIT");
+  const parsed = parseS8RunnerReceipt(Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(child.stdout ?? ""), options, expectedRunnerSha256);
+  const stdout = boundedOutput(parsed.stdout, options.stdoutBytes, "S8_STDOUT_LIMIT");
   const stderr = boundedOutput(child.stderr, options.stderrBytes, "S8_STDERR_LIMIT");
   if (child.error) {
     const errorCode = "code" in child.error ? child.error.code : undefined;
     fail(errorCode === "ETIMEDOUT" ? "S8_PROCESS_RUNNER_TIMEOUT" : "S8_PROCESS_RUNNER_FAILED");
   }
   if (child.signal || child.status !== 0) fail(child.status === 124 ? "S8_PROCESS_RUNNER_TIMEOUT" : "S8_WORKER_FAILED");
-  return { stdout, stderr };
+  return { stdout, stderr, evidence: parsed.evidence };
 }
 
 function parseReceipt(bytes: Buffer, payloadSha256: string, writerSha256: string, executableSha256: string, artifact: Buffer, privateExporterSha256: string, manifestSha256: string): S8WriterReceipt {
@@ -232,13 +290,13 @@ export function runS8BlenderWriter(payloadBytes: Buffer, config: S8WorkerConfig,
     if (artifactInfo.size <= 27 || artifactInfo.size > S8_LIMITS.artifactBytes) fail("S8_ARTIFACT_RESOURCE_LIMIT");
     const artifact = readFileSync(artifactPath);
     const receipt = parseReceipt(readFileSync(receiptPath), s8Sha256(payloadBytes), writerSha256, executableSha256, artifact, privateExporterSha256, manifestSha256);
-    return { artifact, receipt, stdout: processResult.stdout, stderr: processResult.stderr };
+    return { artifact, receipt, runnerEvidence: processResult.evidence, stdout: processResult.stdout, stderr: processResult.stderr };
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
 }
 
-function parseNativeReadback(stdout: string): { readback: S8UfbxReadback; validatorIdentity: string; runnerIdentity: string; appliedLimits: Record<string, number | string> } {
+function parseNativeReadback(stdout: string): S8UfbxReadback {
   let parsed: unknown;
   try { parsed = JSON.parse(stdout); } catch { fail("S8_NATIVE_READBACK_INVALID"); }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) fail("S8_NATIVE_READBACK_INVALID");
@@ -247,18 +305,14 @@ function parseNativeReadback(stdout: string): { readback: S8UfbxReadback; valida
   if (!readbackValue || typeof readbackValue !== "object" || Array.isArray(readbackValue)) fail("S8_NATIVE_READBACK_INVALID");
   const readback = readbackValue as S8UfbxReadback;
   if (readback.schemaVersion !== "s8-ufbx-readback-v1" || readback.fbxVersion !== 7400 || !Array.isArray(readback.nodes) || !Array.isArray(readback.materials)) fail("S8_NATIVE_READBACK_INVALID");
-  return {
-    readback,
-    validatorIdentity: typeof wrapper.validatorIdentity === "string" ? wrapper.validatorIdentity : S8_PROCESS_RUNNER_PIN.identity,
-    runnerIdentity: typeof wrapper.runnerIdentity === "string" ? wrapper.runnerIdentity : S8_PROCESS_RUNNER_PIN.identity,
-    appliedLimits: wrapper.appliedLimits && typeof wrapper.appliedLimits === "object" && !Array.isArray(wrapper.appliedLimits) ? wrapper.appliedLimits as Record<string, number | string> : { addressSpaceBytes: S8_LIMITS.validatorMemoryBytes, timeoutMs: S8_LIMITS.validatorTimeoutMs, maxChildren: S8_LIMITS.validatorChildProcesses },
-  };
+  return readback;
 }
 
 export function runS8NativeValidator(artifact: Buffer, config: S8WorkerConfig, onHeartbeat?: () => void): S8NativeValidatorResult {
   if (process.platform !== "linux" || process.arch !== "x64") fail("S8_TOOLING_HOLD_PLATFORM");
   if (!config.nativeValidatorExecutable) fail("S8_NATIVE_VALIDATOR_REQUIRED");
   const validator = assertRegularFile(config.nativeValidatorExecutable, "nativeValidatorExecutable");
+  const validatorIdentity = `s8-validator-sha256:${fileSha256(validator)}`;
   const root = assertDirectory(config.privateWorkRoot, "privateWorkRoot");
   const work = mkdtempSync(join(root, "s8-validator-"));
   const artifactPath = join(work, "artifact.fbx");
@@ -268,8 +322,8 @@ export function runS8NativeValidator(artifact: Buffer, config: S8WorkerConfig, o
     const result = runUnderNativeRunner(validator, [artifactPath], config, { cwd: work, addressSpaceBytes: S8_LIMITS.validatorMemoryBytes, fileBytes: S8_LIMITS.validatorTempBytes, timeoutMs: S8_LIMITS.validatorTimeoutMs, stdoutBytes: S8_LIMITS.readbackBytes, stderrBytes: S8_LIMITS.stderrBytes });
     onHeartbeat?.();
     if (Buffer.byteLength(result.stdout, "utf8") > S8_LIMITS.readbackBytes) fail("S8_NATIVE_READBACK_LIMIT");
-    const parsed = parseNativeReadback(result.stdout);
-    return { ...parsed, readbackBytes: Buffer.from(result.stdout, "utf8"), stdout: result.stdout, stderr: result.stderr };
+    const readback = parseNativeReadback(result.stdout);
+    return { readback, readbackBytes: Buffer.from(result.stdout, "utf8"), validatorIdentity, runnerEvidence: result.evidence, stdout: result.stdout, stderr: result.stderr };
   } finally {
     rmSync(work, { recursive: true, force: true });
   }

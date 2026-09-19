@@ -3,13 +3,13 @@ import { Buffer } from "node:buffer";
 import { AppError, type S6ToS7Handoff, type S7ToS8Handoff, type S8Artifact, type S8ExportJob, type S8IdempotencyRecord, type S8SourceStamp, type S8ValidationReceipt, type Timestamp, type UUID } from "./types";
 import { buildS8WriterPayload, canonicalS8Json, canonicalS8SourceJson, type S8WriterPayload } from "./s8-fbx-payload";
 import { compareS8UfbxReadback, type S8SemanticResult, type S8UfbxReadback } from "./s8-fbx-semantic";
-import { S8_BLENDER_PIN, S8_EXPORTER_PATCH_PIN, S8_EXPORTER_SETTINGS, S8_FBX_PROFILE, S8_LIMITS, S8_PROCESS_RUNNER_PIN, S8_PROTOCOL_VERSION, S8_RESOURCE_TABLE, S8_REUSE_FINGERPRINT_VERSION, S8_SEMANTIC_VERSION, S8_UFBX_PIN, S8_VALIDATOR_PIN, S8_WRITER_RECEIPT_VERSION, s8Sha256 } from "./s8-fbx-profile";
+import { S8_BLENDER_PIN, S8_EXPORTER_PATCH_PIN, S8_EXPORTER_SETTINGS, S8_FBX_PROFILE, S8_LIMITS, S8_PROCESS_RUNNER_PIN, S8_PROTOCOL_VERSION, S8_RESOURCE_TABLE, S8_REUSE_FINGERPRINT_VERSION, S8_SEMANTIC_VERSION, S8_UFBX_PIN, S8_WRITER_RECEIPT_VERSION, s8Sha256 } from "./s8-fbx-profile";
 import { getS8Collections, sameS8Source, s8FinalKey, s8FinalPrefix, s8ObjectKey, s8ResourceLimitsHash, s8StagingKey, s8StagingPrefix, S8_OBJECT_NAMES, S8_STALE_CLAIM_MS } from "./s8-fbx-persistence";
 import { JsonRepository, PrivateObjectStore } from "./store";
 import { jcs, newUuid, nowUtc, sha256, uuidV4Pattern } from "./utils";
 import { S6WorkflowService } from "./s6";
 import { S7CadService } from "./s7-cad";
-import { runS8BlenderWriter, runS8NativeValidator, type S8WorkerConfig, type S8WriterReceipt, type S8WriterResult } from "./s8-fbx-worker";
+import { runS8BlenderWriter, runS8NativeValidator, type S8RunnerEvidence, type S8WorkerConfig, type S8WriterReceipt, type S8WriterResult } from "./s8-fbx-worker";
 
 export type S8PreparedExport = {
   profile: typeof S8_FBX_PROFILE;
@@ -39,8 +39,7 @@ export type S8NativeValidationResult = {
   readback: S8UfbxReadback;
   readbackBytes?: Buffer;
   validatorIdentity?: string;
-  runnerIdentity?: string;
-  appliedLimits?: Record<string, number | string>;
+  runnerEvidence?: S8RunnerEvidence;
   stdout?: string;
   stderr?: string;
 };
@@ -89,7 +88,7 @@ type PublicationIdentity = {
   exporterPatch: { identity: string; manifest: string; privateExporterSha256: string; manifestSha256: string };
   settingsHash: string;
   validator: { identity: string; ufbx: typeof S8_UFBX_PIN };
-  runner: { identity: string; platform: string; childProcesses: number };
+  runner: { writer: S8RunnerEvidence; validator: S8RunnerEvidence };
   resourceLimitsHash: string;
   payloadSha256: string;
   artifactSha256: string;
@@ -133,6 +132,42 @@ function parseJson(bytes: Buffer, code: string): Record<string, unknown> {
   } catch {
     fail(422, code);
   }
+}
+
+type ExpectedRunnerLimits = {
+  addressSpaceBytes: number;
+  fileBytes: number;
+  timeoutMs: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  maxChildren: number;
+};
+
+const WRITER_RUNNER_LIMITS: ExpectedRunnerLimits = {
+  addressSpaceBytes: S8_LIMITS.writerAddressSpaceBytes,
+  fileBytes: S8_LIMITS.artifactBytes,
+  timeoutMs: S8_LIMITS.timeoutMs,
+  stdoutBytes: S8_LIMITS.stdoutBytes,
+  stderrBytes: S8_LIMITS.stderrBytes,
+  maxChildren: S8_LIMITS.writerChildProcesses,
+};
+
+const VALIDATOR_RUNNER_LIMITS: ExpectedRunnerLimits = {
+  addressSpaceBytes: S8_LIMITS.validatorMemoryBytes,
+  fileBytes: S8_LIMITS.validatorTempBytes,
+  timeoutMs: S8_LIMITS.validatorTimeoutMs,
+  stdoutBytes: S8_LIMITS.readbackBytes,
+  stderrBytes: S8_LIMITS.stderrBytes,
+  maxChildren: S8_LIMITS.validatorChildProcesses,
+};
+
+function assertRunnerEvidence(value: unknown, expected: ExpectedRunnerLimits): S8RunnerEvidence {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const evidence = value as Partial<S8RunnerEvidence>;
+  if (evidence.schemaVersion !== S8_PROCESS_RUNNER_PIN.protocol || evidence.protocol !== S8_PROCESS_RUNNER_PIN.protocol || typeof evidence.runnerSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(evidence.runnerSha256)) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if (evidence.requestedAddressSpaceBytes !== expected.addressSpaceBytes || evidence.appliedAddressSpaceBytes !== expected.addressSpaceBytes || evidence.requestedFileBytes !== expected.fileBytes || evidence.appliedFileBytes !== expected.fileBytes || evidence.requestedTimeoutMs !== expected.timeoutMs || evidence.appliedTimeoutMs !== expected.timeoutMs || evidence.requestedStdoutBytes !== expected.stdoutBytes || evidence.appliedStdoutBytes !== expected.stdoutBytes || evidence.requestedStderrBytes !== expected.stderrBytes || evidence.appliedStderrBytes !== expected.stderrBytes || evidence.requestedMaxChildren !== expected.maxChildren || evidence.appliedMaxChildren !== expected.maxChildren) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if (evidence.seccompPolicy !== "s8-zero-child-seccomp-v1" || evidence.limitsApplied !== true || evidence.seccompEnabled !== true || evidence.filterInstalled !== true) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  return evidence as S8RunnerEvidence;
 }
 
 function stampFromSource(s6: S6ToS7Handoff, s7: S7ToS8Handoff): S8SourceStamp {
@@ -302,7 +337,10 @@ export class S8ExportService {
     if (artifact.length <= 27 || artifact.length > S8_LIMITS.artifactBytes) fail(422, "S8_ARTIFACT_RESOURCE_LIMIT");
   }
 
-  private identityBase(source: S8SourceStamp, payloadSha256: string, artifactSha256: string, artifactByteSize: number, writer: S8WriterReceipt, writerHash: string, nativeHash: string, semanticHash: string, finalPrefix: string, publicationReceiptBodyHash: string, native: S8NativeValidationResult): PublicationIdentity {
+  private identityBase(source: S8SourceStamp, payloadSha256: string, artifactSha256: string, artifactByteSize: number, writer: S8WriterReceipt, writerRunnerEvidence: unknown, writerHash: string, nativeHash: string, semanticHash: string, finalPrefix: string, publicationReceiptBodyHash: string, native: S8NativeValidationResult): PublicationIdentity {
+    if (typeof native.validatorIdentity !== "string" || native.validatorIdentity.length === 0) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    const writerRunner = assertRunnerEvidence(writerRunnerEvidence, WRITER_RUNNER_LIMITS);
+    const validatorRunner = assertRunnerEvidence(native.runnerEvidence, VALIDATOR_RUNNER_LIMITS);
     return {
       fingerprintVersion: S8_REUSE_FINGERPRINT_VERSION,
       source,
@@ -313,8 +351,8 @@ export class S8ExportService {
       writerRuntime: writer.runtime,
       exporterPatch: { identity: S8_EXPORTER_PATCH_PIN.identity, manifest: S8_EXPORTER_PATCH_PIN.manifest, privateExporterSha256: String(((writer.runtime as Record<string, unknown> | undefined)?.privateExporterPatch as Record<string, unknown> | undefined)?.privateExporterSha256 ?? ""), manifestSha256: String(((writer.runtime as Record<string, unknown> | undefined)?.privateExporterPatch as Record<string, unknown> | undefined)?.manifestSha256 ?? "") },
       settingsHash: sha256(jcs(S8_EXPORTER_SETTINGS)),
-      validator: { identity: native.validatorIdentity ?? S8_VALIDATOR_PIN.identity, ufbx: S8_UFBX_PIN },
-      runner: { identity: native.runnerIdentity ?? S8_PROCESS_RUNNER_PIN.identity, platform: S8_PROCESS_RUNNER_PIN.platform, childProcesses: S8_PROCESS_RUNNER_PIN.childProcesses },
+      validator: { identity: native.validatorIdentity, ufbx: S8_UFBX_PIN },
+      runner: { writer: writerRunner, validator: validatorRunner },
       resourceLimitsHash: s8ResourceLimitsHash(S8_RESOURCE_TABLE),
       payloadSha256,
       artifactSha256,
@@ -389,6 +427,9 @@ export class S8ExportService {
       const publication = parseJson(stored.get("publication-receipt.json")!, "S8_REUSE_FINGERPRINT_INVALID");
       if (publication.complete !== true || publication.fingerprintVersion !== S8_REUSE_FINGERPRINT_VERSION || publication.immutableReuseFingerprint !== artifact.immutableReuseFingerprint || !sameS8Source(publication.source as S8SourceStamp, artifact.source) || !sameS8Source(publication.source as S8SourceStamp, current.stamp)) fail(409, "S8_REUSE_FINGERPRINT_INVALID");
       const identity = publication.identity as PublicationIdentity;
+      if (!identity || typeof identity.validator?.identity !== "string" || identity.validator.identity.length === 0) fail(409, "S8_REUSE_FINGERPRINT_INVALID");
+      assertRunnerEvidence(identity.runner?.writer, WRITER_RUNNER_LIMITS);
+      assertRunnerEvidence(identity.runner?.validator, VALIDATOR_RUNNER_LIMITS);
       const publicationObjects = publication.objects as Record<string, unknown>;
       if (publicationObjects.artifactSha256 !== expected.artifactSha256 || publicationObjects.artifactByteSize !== expected.artifactByteSize || publicationObjects.writerReceiptSha256 !== expected.writerReceiptSha256 || publicationObjects.nativeReadbackSha256 !== expected.nativeReadbackSha256 || publicationObjects.semanticReceiptSha256 !== expected.semanticReceiptSha256 || publicationObjects.publicationReceiptSha256 !== "0".repeat(64)) fail(409, "S8_REUSE_FINGERPRINT_INVALID");
       const body = { schemaVersion: "s8-publication-receipt-v2", fingerprintVersion: S8_REUSE_FINGERPRINT_VERSION, source: publication.source, identity, objects: publication.objects, complete: true };
@@ -459,10 +500,10 @@ export class S8ExportService {
 
       const objectHashes = { artifactSha256, artifactByteSize: written.artifact.length, writerReceiptSha256: s8Sha256(writerReceiptBytes), nativeReadbackSha256: nativeHash, semanticReceiptSha256: semanticHash, publicationReceiptSha256: "0".repeat(64) };
       const publicationBodyWithoutHash = { schemaVersion: "s8-publication-receipt-v2", fingerprintVersion: S8_REUSE_FINGERPRINT_VERSION, source: job.source, objects: objectHashes, complete: true };
-      const bodyHashPlaceholderIdentity = this.identityBase(job.source, payload.sha256, artifactSha256, written.artifact.length, written.receipt, objectHashes.writerReceiptSha256, nativeHash, semanticHash, finalPrefix, "", native);
+      const bodyHashPlaceholderIdentity = this.identityBase(job.source, payload.sha256, artifactSha256, written.artifact.length, written.receipt, written.runnerEvidence, objectHashes.writerReceiptSha256, nativeHash, semanticHash, finalPrefix, "", native);
       const bodyForHash = { ...publicationBodyWithoutHash, identity: { ...bodyHashPlaceholderIdentity, publicationReceiptBodyHash: "" } };
       const publicationBodyHash = sha256(jcs(bodyForHash));
-      const identity = this.identityBase(job.source, payload.sha256, artifactSha256, written.artifact.length, written.receipt, objectHashes.writerReceiptSha256, nativeHash, semanticHash, finalPrefix, publicationBodyHash, native);
+      const identity = this.identityBase(job.source, payload.sha256, artifactSha256, written.artifact.length, written.receipt, written.runnerEvidence, objectHashes.writerReceiptSha256, nativeHash, semanticHash, finalPrefix, publicationBodyHash, native);
       const fingerprint = this.fingerprint(identity);
       const publicationBytes = this.publicationBytes(job.source, identity, objectHashes, fingerprint);
       const publicationHash = s8Sha256(publicationBytes);
