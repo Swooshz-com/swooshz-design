@@ -114,10 +114,15 @@ jobs:
           cat > "$launcher" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
-          exec sudo -n /usr/bin/bwrap "$@"
+          exec sudo -n /usr/bin/bwrap \
+            --ro-bind /usr /usr \
+            --ro-bind /lib /lib \
+            --ro-bind /lib64 /lib64 \
+            --ro-bind /etc /etc \
+            "$@"
           SH
           chmod 700 "$launcher"
-          "$launcher" --unshare-user --unshare-net --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp -- /bin/true
+          "$launcher" --unshare-user --unshare-net --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp -- /usr/bin/true
       - name: Stage verified carrier and run qualification
         shell: bash
         run: |
@@ -238,7 +243,7 @@ jobs:
             --ro-bind "$carrier/support" /runtime/support \
             --bind "$carrier/work" /work --chdir /work \
             --proc /proc --dev /dev --tmpfs /tmp \
-            -- /bin/sh -ceu 'test -r /runtime/blender-root/blender; test -r /runtime/writer/writer.py; test -x /runtime/process-runner; test -x /runtime/validator; test -x /usr/bin/true; /usr/bin/true; touch /work/.s8-preflight; rm -f /work/.s8-preflight; test "$(stat -f -c %T /tmp)" = tmpfs; grep -q "^NoNewPrivs:" /proc/self/status; grep -q "^Seccomp:" /proc/self/status'; then
+            -- /usr/bin/sh -ceu 'test -r /runtime/blender-root/blender; test -r /runtime/writer/writer.py; test -x /runtime/process-runner; test -x /runtime/validator; test -x /usr/bin/true; /usr/bin/true; touch /work/.s8-preflight; rm -f /work/.s8-preflight; test "$(stat -f -c %T /tmp)" = tmpfs; grep -q "^NoNewPrivs:" /proc/self/status; grep -q "^Seccomp:" /proc/self/status'; then
             echo "FAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD" >&2
             echo "CANDIDATE_FAILURE_PROVEN=NO" >&2
             exit 1

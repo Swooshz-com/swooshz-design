@@ -188,13 +188,13 @@ static int child_mode(const char *mode)
     if (!strcmp(mode, "stdout")) {
         char buffer[4096];
         memset(buffer, 'o', sizeof(buffer));
-        (void)write(STDOUT_FILENO, buffer, sizeof(buffer));
+        (void)(write(STDOUT_FILENO, buffer, sizeof(buffer)) < 0);
         return 0;
     }
     if (!strcmp(mode, "stderr")) {
         char buffer[4096];
         memset(buffer, 'e', sizeof(buffer));
-        (void)write(STDERR_FILENO, buffer, sizeof(buffer));
+        (void)(write(STDERR_FILENO, buffer, sizeof(buffer)) < 0);
         return 0;
     }
     return 2;
