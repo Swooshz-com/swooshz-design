@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "s8-fixture-matrix-v1",
+  "fixtures": [
+    "concave-profile",
+    "odd-height-centred-anchor",
+    "nested-full-euler-transforms",
+    "maximum-depth-hierarchy",
+    "near-gimbal-rotations",
+    "round-radius-50000mm",
+    "fixed-24-large-cylinder-rejection",
+    "float32-precision-boundaries",
+    "duplicate-unicode-labels",
+    "missing-ambiguous-materials",
+    "preview-phong-effective-readback",
+    "indexed-corner-normals",
+    "corrupt-normal-indices",
+    "flipped-normals",
+    "rsrs-unit-scale-equivalence",
+    "wrong-units-axes",
+    "wrong-winding",
+    "missing-nodes-normals",
+    "corrupt-arrays",
+    "hidden-pivots-pre-post-geometric-transforms",
+    "prohibited-animation-media-external-references",
+    "metadata-private-path-leakage",
+    "source-movement-every-publication-phase",
+    "worker-crash-before-after-promotion",
+    "claim-owner-live-dead-unknown",
+    "timeout-memory-input-output-exhaustion",
+    "ufbx-warning-repair-failure",
+    "stored-artifact-blender-edit-save-reopen"
+  ]
+}

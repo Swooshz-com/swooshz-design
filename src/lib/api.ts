@@ -98,6 +98,11 @@ const PUBLIC_S7_ERROR_CODES = new Set<string>([
   "S7_DXF_HANDLE_INVALID", "S7_DXF_HANDLE_DUPLICATE", "S7_DXF_EXTENTS_INVALID", "S7_MANIFEST_INVALID",
   "S7_MANIFEST_CORRESPONDENCE_FAILED", "S7_RESOURCE_LIMIT", "NOT_FOUND",
 ]);
+const PUBLIC_S8_ERROR_CODES = new Set<string>([
+  "INVALID_REQUEST", "METHOD_NOT_ALLOWED", "S8_UNAUTHORIZED_OR_NOT_FOUND", "S8_SOURCE_NOT_READY", "S8_SOURCE_STALE",
+  "S8_SOURCE_BINDING_MISMATCH", "S8_SOURCE_INVALID", "S8_RIGID_PROVENANCE_REQUIRED", "S8_RIGID_TRANSFORM_UNSUPPORTED",
+  "S8_HIERARCHY_INVALID", "S8_HIERARCHY_CYCLE", "S8_HIERARCHY_DEPTH_LIMIT", "S8_RESOURCE_LIMIT", "NOT_FOUND",
+]);
 const S4_PUBLIC_FIELDS = new Set(["body", "projectId", "baseRevisionId", "expectedSelectionVersion", "primitives", "instructionText", "editId", "targetId", "Idempotency-Key", "x-request-id", "request"]);
 const S4_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
 const S5_PUBLIC_FIELDS = new Set(["body", "projectId", "layoutGroupId", "artifactId", "expectedGenerationSetId", "expectedSelectionStateId", "expectedSelectionVersion", "expectedActiveRevisionId", "expectedApprovalEventId", "expectedApprovalGeneration", "expectedApprovalEventSequence", "reopenReason", "Idempotency-Key", "x-request-id", "request"]);
@@ -109,6 +114,8 @@ const S6_PUBLIC_FIELDS = new Set([
 const S6_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INTEGER_REQUIRED", "INVALID_REQUEST"]);
 const S7_PUBLIC_FIELDS = new Set(["body", "projectId", "artifactId", "Idempotency-Key", "x-request-id", "request"]);
 const S7_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
+const S8_PUBLIC_FIELDS = new Set(["body", "projectId", "x-request-id", "request"]);
+const S8_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
 
 function safeS4Field(field: string): string {
   if (S4_PUBLIC_FIELDS.has(field) || /^primitives(?:\[\d+\])?(?:\.(?:kind|xQ16|yQ16|widthQ16|heightQ16|radiusQ8|points)(?:\[\d+\])?(?:\.(?:xQ16|yQ16))?)?$/.test(field)) return field;
@@ -130,23 +137,27 @@ function safeS6FieldErrors(fieldErrors: readonly { field: string; code: string }
 }
 function safeS7Field(field: string): string { return S7_PUBLIC_FIELDS.has(field) ? field : "body"; }
 function safeS7FieldErrors(fieldErrors: readonly { field: string; code: string }[]): { field: string; code: string }[] { return fieldErrors.map((item) => ({ field: safeS7Field(item.field), code: S7_PUBLIC_FIELD_CODES.has(item.code) ? item.code : "INVALID_REQUEST" })); }
+function safeS8Field(field: string): string { return S8_PUBLIC_FIELDS.has(field) ? field : "body"; }
+function safeS8FieldErrors(fieldErrors: readonly { field: string; code: string }[]): { field: string; code: string }[] { return fieldErrors.map((item) => ({ field: safeS8Field(item.field), code: S8_PUBLIC_FIELD_CODES.has(item.code) ? item.code : "INVALID_REQUEST" })); }
 
 function requestReferenceId(request: Request): UUID {
   const supplied = request.headers.get("x-request-id");
   return supplied && uuidV4Pattern.test(supplied) ? supplied : crypto.randomUUID();
 }
 
-function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false, s5 = false, s6 = false, s7 = false): NextResponse {
+function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false, s5 = false, s6 = false, s7 = false, s8 = false): NextResponse {
   const candidate = error instanceof AppError
     ? error
-    : new AppError(500, s7 ? "S7_INTERNAL_ERROR" : s6 ? "S6_INTERNAL_ERROR" : s5 ? "S5_INTERNAL_ERROR" : s4 ? "S4_INTERNAL_ERROR" : s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
+    : new AppError(500, s8 ? "S8_INTERNAL_ERROR" : s7 ? "S7_INTERNAL_ERROR" : s6 ? "S6_INTERNAL_ERROR" : s5 ? "S5_INTERNAL_ERROR" : s4 ? "S4_INTERNAL_ERROR" : s3 ? "S3_INTERNAL_ERROR" : "INTERNAL_ERROR");
   const s7SurfaceCandidate = s7 && candidate.code === "INVALID_REQUEST"
     ? new AppError(candidate.status, "INVALID_REQUEST", candidate.fieldErrors, candidate.logContext)
     : candidate;
   const surfaceCandidate = s7SurfaceCandidate.code === "INVALID_REQUEST" && s6 && !s7
     ? new AppError(candidate.status, "S6_INVALID_REQUEST", candidate.fieldErrors, candidate.logContext)
     : s7SurfaceCandidate;
-  const appError = s7 && !PUBLIC_S7_ERROR_CODES.has(surfaceCandidate.code)
+  const appError = s8 && !PUBLIC_S8_ERROR_CODES.has(surfaceCandidate.code)
+    ? new AppError(500, "S8_INTERNAL_ERROR", safeS8FieldErrors(surfaceCandidate.fieldErrors))
+    : s7 && !PUBLIC_S7_ERROR_CODES.has(surfaceCandidate.code)
     ? new AppError(500, "S7_INTERNAL_ERROR", safeS7FieldErrors(surfaceCandidate.fieldErrors))
     : s6 && !PUBLIC_S6_ERROR_CODES.has(surfaceCandidate.code)
     ? new AppError(500, "S6_INTERNAL_ERROR", safeS6FieldErrors(surfaceCandidate.fieldErrors))
@@ -162,7 +173,7 @@ function jsonError(referenceId: UUID, error: unknown, s3 = false, s4 = false, s5
       code: appError.code,
       message: "The request could not be completed. Try again or contact support with the reference ID.",
       referenceId,
-      fieldErrors: s7 ? safeS7FieldErrors(appError.fieldErrors) : s6 ? safeS6FieldErrors(appError.fieldErrors) : s5 ? safeS5FieldErrors(appError.fieldErrors) : s4 ? safeS4FieldErrors(appError.fieldErrors) : appError.fieldErrors,
+      fieldErrors: s8 ? safeS8FieldErrors(appError.fieldErrors) : s7 ? safeS7FieldErrors(appError.fieldErrors) : s6 ? safeS6FieldErrors(appError.fieldErrors) : s5 ? safeS5FieldErrors(appError.fieldErrors) : s4 ? safeS4FieldErrors(appError.fieldErrors) : appError.fieldErrors,
     },
   };
   console.error(JSON.stringify({ referenceId, operation: "api_request", status: appError.status, code: appError.code }));
@@ -614,6 +625,10 @@ export function isS6Path(segments: string[]): boolean {
 
 export function isS7Path(segments: string[]): boolean {
   return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s7";
+}
+
+export function isS8Path(segments: string[]): boolean {
+  return segments.length >= 3 && segments[0] === "projects" && segments[2] === "s8";
 }
 
 export type AuthorizedS6Service = {
@@ -1163,6 +1178,37 @@ export async function authorizedS7Service(
   return { service: dependencies.workflowService ?? serviceForRequest(), subjectId: context.subjectId };
 }
 
+export type AuthorizedS8Service = {
+  service: WorkflowService;
+  subjectId: string;
+};
+
+export async function authorizedS8Service(
+  request: Request,
+  segments: string[],
+  supplied: WorkflowService | ApiRequestDependencies | undefined,
+): Promise<AuthorizedS8Service> {
+  const projectId = segments[1];
+  if (typeof projectId !== "string" || !uuidV4Pattern.test(projectId)) throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND");
+  const dependencies = isApiRequestDependencies(supplied)
+    ? supplied
+    : { workflowService: supplied, s3Authorization: productionS3Authorization };
+  let context: S3AccessContext | null;
+  try {
+    context = await dependencies.s3Authorization.resolveContext(request);
+  } catch {
+    throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND");
+  }
+  if (!context || typeof context.subjectId !== "string" || context.subjectId.length === 0) throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND");
+  try {
+    if (!(await dependencies.s3Authorization.authorizeProject(context, projectId))) throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND");
+  } catch (error) {
+    if (error instanceof AppError && error.code === "S8_UNAUTHORIZED_OR_NOT_FOUND") throw error;
+    throw new AppError(404, "S8_UNAUTHORIZED_OR_NOT_FOUND");
+  }
+  return { service: dependencies.workflowService ?? serviceForRequest(), subjectId: context.subjectId };
+}
+
 async function s7JsonBody(request: Request): Promise<Record<string, unknown>> {
   return boundedJsonBody(request, MAX_S7_BODY_BYTES);
 }
@@ -1325,6 +1371,25 @@ async function handleS7(
     if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
     await requireEmptyBody(request);
     return NextResponse.json(service.s7.getHandoff(projectId), { status: 200 });
+  }
+  throw new AppError(400, "INVALID_REQUEST");
+}
+
+async function handleS8(
+  request: Request,
+  method: string,
+  segments: string[],
+  service: WorkflowService,
+  subjectId: string,
+  referenceId: UUID,
+): Promise<NextResponse> {
+  void subjectId;
+  void referenceId;
+  const projectId = segments[1] as UUID;
+  if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+  await requireEmptyBody(request);
+  if (segments.length === 3 || (segments.length === 4 && segments[3] === "handoff")) {
+    return NextResponse.json(service.getS8Preparation(projectId), { status: 200 });
   }
   throw new AppError(400, "INVALID_REQUEST");
 }
@@ -1496,6 +1561,10 @@ export async function handleApiRequest(
 ): Promise<NextResponse> {
   const referenceId = requestReferenceId(request);
   try {
+    if (isS8Path(path)) {
+      const authorized = await authorizedS8Service(request, path, supplied);
+      return await handleS8(request, request.method.toUpperCase(), path, authorized.service, authorized.subjectId, referenceId);
+    }
     if (isS7Path(path)) {
       const authorized = await authorizedS7Service(request, path, supplied);
       return await handleS7(request, request.method.toUpperCase(), path, authorized.service, authorized.subjectId, referenceId);
@@ -1521,6 +1590,6 @@ export async function handleApiRequest(
       : supplied ?? serviceForRequest();
     return await handle(request, request.method.toUpperCase(), path, service, referenceId);
   } catch (error) {
-    return jsonError(referenceId, error, isS3Path(path), isS4Path(path), isS5Path(path), isS6Path(path), isS7Path(path));
+    return jsonError(referenceId, error, isS3Path(path), isS4Path(path), isS5Path(path), isS6Path(path), isS7Path(path), isS8Path(path));
   }
 }
