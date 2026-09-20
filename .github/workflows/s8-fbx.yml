@@ -115,12 +115,26 @@ jobs:
           cat > "$launcher" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
+          carrier_root="${GITHUB_WORKSPACE}/.s8-ci-carrier/${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          args=("$@")
+          rewritten=()
+          for ((index = 0; index < ${#args[@]}; index++)); do
+            if [[ "${args[$index]:-}" == "--ro-bind" && "${args[$((index + 1))]:-}" == "$carrier_root" && "${args[$((index + 2))]:-}" == "/carrier" ]]; then
+              index=$((index + 2))
+              continue
+            fi
+            value="${args[$index]}"
+            if [[ "$value" == /carrier/* ]]; then
+              value="$carrier_root/${value#/carrier/}"
+            fi
+            rewritten+=("$value")
+          done
           exec sudo -n /usr/bin/bwrap \
             --ro-bind /usr /usr \
             --ro-bind /lib /lib \
             --ro-bind /lib64 /lib64 \
             --ro-bind /etc /etc \
-            "$@"
+            "${rewritten[@]}"
           SH
           chmod 700 "$launcher"
           "$launcher" --unshare-user --unshare-net --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp -- /usr/bin/true
@@ -237,13 +251,12 @@ jobs:
           launcher="$RUNNER_TEMP/s8-bwrap-launcher"
           if ! "$launcher" \
             --unshare-user --unshare-net --die-with-parent --new-session \
-            --ro-bind "$carrier" /carrier \
-            --ro-bind /carrier/runtime/blender-5.2.2-linux-x64 /runtime/blender-root \
-            --ro-bind /carrier/native/s8-process-runner /runtime/process-runner \
-            --ro-bind /carrier/native/s8-fbx-validator /runtime/validator \
-            --ro-bind /carrier/writer /runtime/writer \
-            --ro-bind /carrier/support /runtime/support \
-            --bind /carrier/work /work --chdir /work \
+            --ro-bind "$carrier/runtime/blender-5.2.2-linux-x64" /runtime/blender-root \
+            --ro-bind "$carrier/native/s8-process-runner" /runtime/process-runner \
+            --ro-bind "$carrier/native/s8-fbx-validator" /runtime/validator \
+            --ro-bind "$carrier/writer" /runtime/writer \
+            --ro-bind "$carrier/support" /runtime/support \
+            --bind "$carrier/work" /work --chdir /work \
             --proc /proc --dev /dev --tmpfs /tmp \
             -- /usr/bin/sh -ceu 'test -r /runtime/blender-root/blender; test -r /runtime/writer/writer.py; test -x /runtime/process-runner; test -x /runtime/validator; test -x /usr/bin/true; /usr/bin/true; touch /work/.s8-preflight; rm -f /work/.s8-preflight; test "$(stat -f -c %T /tmp)" = tmpfs; grep -q "^NoNewPrivs:" /proc/self/status; grep -q "^Seccomp:" /proc/self/status'; then
             echo "FAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD" >&2
