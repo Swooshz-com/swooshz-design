@@ -89,7 +89,9 @@ jobs:
   # Bubblewrap boundary; no product or native source is changed here.
   s8-pinned-blender:
     name: S8 pinned Blender hosted sandbox amendment
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      S8_RUNNER_LABEL: ubuntu-24.04
     steps:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -111,11 +113,13 @@ jobs:
           failure_reported=0
           carrier_created=0
           temp_created=0
+          provision_created=0
           carrier_parent="/opt/s8-ci-carrier"
           run_id="${GITHUB_RUN_ID:-}"
           run_attempt="${GITHUB_RUN_ATTEMPT:-}"
           carrier=""
           temp_root=""
+          provision_root=""
           candidate_marker_file=""
           tmpfs_bytes=1073741824
 
@@ -188,6 +192,27 @@ jobs:
             return 0
           }
 
+          provision_path_is_safe() {
+            local parent_resolved
+            local provision_resolved
+            local nested_mounts
+            [[ -n "$provision_root" && -n "${RUNNER_TEMP:-}" ]] || return 1
+            parent_resolved="$(realpath -e -- "$RUNNER_TEMP")" || return 1
+            provision_resolved="$(realpath -e -- "$provision_root")" || return 1
+            [[ "$provision_resolved" == "$parent_resolved/s8-bwrap-$run_id.$run_attempt" ]] || return 1
+            [[ "$provision_resolved" == "$provision_root" && ! -L "$provision_root" ]] || return 1
+            if /usr/bin/findmnt -rn --mountpoint "$provision_resolved" >/dev/null 2>&1; then
+              return 1
+            fi
+            nested_mounts="$(/usr/bin/findmnt -R -rn -o TARGET -- "$provision_resolved" 2>/dev/null)" || return 1
+            if printf '%s\n' "$nested_mounts" | awk -v p="$provision_resolved" 'NF && ($0 == p || index($0, p "/") == 1) { bad = 1 } END { exit bad }'; then
+              :
+            else
+              return 1
+            fi
+            return 0
+          }
+
           remove_carrier_exact() {
             carrier_path_is_safe || return 1
             /usr/bin/sudo -n /usr/bin/rm -rf -- "$carrier"
@@ -198,6 +223,12 @@ jobs:
             temp_path_is_safe || return 1
             /usr/bin/rm -rf -- "$temp_root"
             [[ ! -e "$temp_root" && ! -L "$temp_root" ]]
+          }
+
+          remove_provision_exact() {
+            provision_path_is_safe || return 1
+            /usr/bin/rm -rf -- "$provision_root"
+            [[ ! -e "$provision_root" && ! -L "$provision_root" ]]
           }
 
           cleanup() {
@@ -221,6 +252,15 @@ jobs:
                 cleanup_failed=1
               fi
             fi
+            if (( provision_created == 1 )); then
+              if remove_provision_exact; then
+                printf 'PROVISIONING_CLEANUP_RESULT=PASS\n'
+                provision_created=0
+              else
+                printf 'PROVISIONING_CLEANUP_RESULT=FAIL\n' >&2
+                cleanup_failed=1
+              fi
+            fi
             if [[ -n "$candidate_marker_file" && -e "$candidate_marker_file" ]]; then
               candidate_started=1
             fi
@@ -241,6 +281,21 @@ jobs:
           [[ "$run_id" =~ ^[0-9]+$ ]] || fail_hold "GITHUB_RUN_ID_NOT_DECIMAL"
           [[ "$run_attempt" =~ ^[0-9]+$ ]] || fail_hold "GITHUB_RUN_ATTEMPT_NOT_DECIMAL"
           carrier="$carrier_parent/$run_id.$run_attempt"
+          printf 'HOST_CARRIER_ROOT=%s\nHOST_CARRIER_OWNERSHIP=root:root\nSANDBOX_UID=65534\nSANDBOX_GID=65534\n' "$carrier"
+
+          runner_label="${S8_RUNNER_LABEL:-}"
+          [[ "$runner_label" == "ubuntu-24.04" ]] || fail_hold "RUNNER_LABEL_UNEXPECTED"
+          runner_arch="${RUNNER_ARCH:-}"
+          [[ "$runner_arch" == "X64" ]] || fail_hold "RUNNER_ARCH_UNEXPECTED"
+          os_id="$(awk -F= '$1 == "ID" { gsub(/\"/, "", $2); print $2 }' /etc/os-release)"
+          version_id="$(awk -F= '$1 == "VERSION_ID" { gsub(/\"/, "", $2); print $2 }' /etc/os-release)"
+          version_codename="$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/\"/, "", $2); print $2 }' /etc/os-release)"
+          dpkg_arch="$(/usr/bin/dpkg --print-architecture)"
+          [[ "$os_id" == "ubuntu" ]] || fail_hold "OS_ID_UNEXPECTED"
+          [[ "$version_id" == "24.04" ]] || fail_hold "VERSION_ID_UNEXPECTED"
+          [[ "$version_codename" == "noble" ]] || fail_hold "VERSION_CODENAME_UNEXPECTED"
+          [[ "$dpkg_arch" == "amd64" ]] || fail_hold "DPKG_ARCH_UNEXPECTED"
+          printf 'OS_ID=%s\nVERSION_ID=%s\nVERSION_CODENAME=%s\nDPKG_ARCH=%s\nRUNNER_LABEL=%s\nRUNNER_ARCH=%s\n' "$os_id" "$version_id" "$version_codename" "$dpkg_arch" "$runner_label" "$runner_arch"
 
           [[ "$EUID" -ne 0 ]] || fail_hold "HOST_ORCHESTRATOR_IS_ROOT"
           runner_uid="$(id -u)"
@@ -250,17 +305,215 @@ jobs:
           command -v /usr/bin/sudo >/dev/null 2>&1 || fail_hold "SUDO_UNAVAILABLE"
           /usr/bin/sudo -n /usr/bin/true || fail_hold "SUDO_NONINTERACTIVE_UNAVAILABLE"
 
-          [[ -x /usr/bin/bwrap && ! -L /usr/bin/bwrap ]] || fail_hold "BWRAP_PATH_INVALID"
-          bwrap_realpath="$(realpath -e -- /usr/bin/bwrap)" || fail_hold "BWRAP_REALPATH_FAILED"
-          [[ "$bwrap_realpath" == "/usr/bin/bwrap" ]] || fail_hold "BWRAP_REALPATH_UNEXPECTED"
-          bwrap_sha256="$(sha256sum -- /usr/bin/bwrap | awk '{print $1}')" || fail_hold "BWRAP_HASH_FAILED"
-          bwrap_version="$(/usr/bin/sudo -n /usr/bin/bwrap --version)" || fail_hold "BWRAP_VERSION_FAILED"
-          bwrap_package="$(/usr/bin/dpkg-query -W -f='${Package}=${Version}' bubblewrap 2>/dev/null)" || fail_hold "BWRAP_PACKAGE_VERSION_UNAVAILABLE"
-          bwrap_help="$(/usr/bin/sudo -n /usr/bin/bwrap --help)" || fail_hold "BWRAP_HELP_FAILED"
+          runner_temp_resolved="$(realpath -e -- "${RUNNER_TEMP:-}")" || fail_hold "RUNNER_TEMP_REALPATH_FAILED"
+          [[ -d "$runner_temp_resolved" && ! -L "$runner_temp_resolved" ]] || fail_hold "RUNNER_TEMP_INVALID"
+          provision_root="$runner_temp_resolved/s8-bwrap-$run_id.$run_attempt"
+          [[ ! -e "$provision_root" && ! -L "$provision_root" ]] || fail_hold "PROVISIONING_PATH_NOT_FRESH"
+          /usr/bin/install -d -m 0700 -- "$provision_root" || fail_hold "PROVISIONING_ROOT_CREATE_FAILED"
+          provision_created=1
+          provision_path_is_safe || fail_hold "PROVISIONING_ROOT_ADMISSION_FAILED"
+          printf 'BWRAP_PROVISIONING_ROOT=%s\n' "$provision_root"
+
+          expected_bwrap_version='0.9.0-1ubuntu0.3'
+          expected_bwrap_deb='bubblewrap_0.9.0-1ubuntu0.3_amd64.deb'
+          archive_base_url='https://security.ubuntu.com/ubuntu'
+          apt_root="$provision_root/apt"
+          apt_lists="$apt_root/lists"
+          apt_cache="$apt_root/cache"
+          apt_archives="$apt_cache/archives"
+          apt_sources="$apt_root/sources.list"
+          archive_root="$provision_root/archive"
+          verify_root="$provision_root/verified-package"
+          /usr/bin/install -d -m 0700 -- "$apt_lists/partial" "$apt_archives/partial" "$archive_root" "$verify_root" || fail_hold "PROVISIONING_LAYOUT_CREATE_FAILED"
+          inrelease="$archive_root/InRelease"
+          inrelease_payload="$archive_root/InRelease.payload"
+          inrelease_status="$archive_root/InRelease.gpg-status"
+          inrelease_stderr="$archive_root/InRelease.gpg-stderr"
+          packages_index="$archive_root/Packages.xz"
+          packages_plain="$archive_root/Packages"
+          bubblewrap_stanza="$archive_root/bubblewrap.stanza"
+          bubblewrap_deb="$archive_root/$expected_bwrap_deb"
+          package_plan="$archive_root/package-plan.txt"
+
+          [[ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg && ! -L /usr/share/keyrings/ubuntu-archive-keyring.gpg ]] || fail_hold "UBUNTU_ARCHIVE_KEYRING_INVALID"
+          apt_source_line='deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main'
+          printf '%s\n' "$apt_source_line" > "$apt_sources"
+          [[ "$(wc -l < "$apt_sources")" == 1 ]] || fail_hold "APT_SOURCE_LINE_COUNT_INVALID"
+          grep -Fx -- "$apt_source_line" "$apt_sources" >/dev/null || fail_hold "APT_SOURCE_LINE_INVALID"
+          printf 'APT_SOURCE=%s\n' "$apt_source_line"
+
+          existing_bwrap_status="$(/usr/bin/dpkg-query -W -f='${Status}' bubblewrap 2>/dev/null || true)"
+          if [[ -n "$existing_bwrap_status" && "$existing_bwrap_status" != 'unknown ok not-installed' ]]; then
+            fail_hold "PRE_EXISTING_BUBBLEWRAP_PACKAGE"
+          fi
+          if [[ -e /usr/bin/bwrap || -L /usr/bin/bwrap ]]; then
+            fail_hold "PRE_EXISTING_BWRAP_PATH"
+          fi
+
+          fetch_exact_archive() {
+            local destination="$1"
+            local url="$2"
+            /usr/bin/curl --config /dev/null --fail --silent --show-error --proto '=https' --tlsv1.2 --location --max-redirs 0 --retry 3 --output "$destination" "$url"
+          }
+
+          fetch_exact_archive "$inrelease" "$archive_base_url/dists/noble-security/InRelease" || fail_hold "UBUNTU_INRELEASE_DOWNLOAD_FAILED"
+          [[ -f "$inrelease" && ! -L "$inrelease" ]] || fail_hold "UBUNTU_INRELEASE_PATH_INVALID"
+          /usr/bin/gpgv --status-fd 3 --keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg --output "$inrelease_payload" "$inrelease" 3>"$inrelease_status" 2>"$inrelease_stderr" || fail_hold "UBUNTU_INRELEASE_SIGNATURE_INVALID"
+          mapfile -t valid_fingerprints < <(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $3 }' "$inrelease_status")
+          [[ "${#valid_fingerprints[@]}" == 1 && "${valid_fingerprints[0]}" == 'F6ECB3762474EDA9D21B7022871920D1991BC93C' ]] || fail_hold "UBUNTU_ARCHIVE_SIGNING_KEY_FINGERPRINT_INVALID"
+          printf 'UBUNTU_INRELEASE_SIGNATURE=PASS\nUBUNTU_ARCHIVE_KEY_FINGERPRINT=%s\n' "${valid_fingerprints[0]}"
+
+          inrelease_field() {
+            local field="$1"
+            local value_count
+            value_count="$(awk -F': ' -v key="$field" '$1 == key { count += 1 } END { print count + 0 }' "$inrelease_payload")"
+            [[ "$value_count" == 1 ]] || return 1
+            awk -F': ' -v key="$field" '$1 == key { print substr($0, index($0, ": ") + 2) }' "$inrelease_payload"
+          }
+
+          [[ "$(inrelease_field Origin)" == 'Ubuntu' ]] || fail_hold "UBUNTU_INRELEASE_ORIGIN_INVALID"
+          [[ "$(inrelease_field Suite)" == 'noble-security' ]] || fail_hold "UBUNTU_INRELEASE_SUITE_INVALID"
+          [[ "$(inrelease_field Codename)" == 'noble' ]] || fail_hold "UBUNTU_INRELEASE_CODENAME_INVALID"
+          inrelease_components="$(inrelease_field Components)" || fail_hold "UBUNTU_INRELEASE_COMPONENTS_MISSING"
+          grep -Fw -- main <<< "$inrelease_components" >/dev/null || fail_hold "UBUNTU_INRELEASE_MAIN_COMPONENT_MISSING"
+          inrelease_architectures="$(inrelease_field Architectures)" || fail_hold "UBUNTU_INRELEASE_ARCHITECTURES_MISSING"
+          grep -Fw -- amd64 <<< "$inrelease_architectures" >/dev/null || fail_hold "UBUNTU_INRELEASE_AMD64_MISSING"
+          inrelease_date="$(inrelease_field Date)" || fail_hold "UBUNTU_INRELEASE_DATE_MISSING"
+          inrelease_valid_until="$(inrelease_field 'Valid-Until')" || fail_hold "UBUNTU_INRELEASE_VALID_UNTIL_MISSING"
+          now_epoch="$(/usr/bin/date -u +%s)"
+          inrelease_date_epoch="$(/usr/bin/date -u -d "$inrelease_date" +%s)" || fail_hold "UBUNTU_INRELEASE_DATE_INVALID"
+          inrelease_valid_until_epoch="$(/usr/bin/date -u -d "$inrelease_valid_until" +%s)" || fail_hold "UBUNTU_INRELEASE_VALID_UNTIL_INVALID"
+          (( inrelease_date_epoch <= now_epoch + 300 )) || fail_hold "UBUNTU_INRELEASE_DATE_IN_FUTURE"
+          (( inrelease_valid_until_epoch > now_epoch )) || fail_hold "UBUNTU_INRELEASE_EXPIRED"
+          printf 'UBUNTU_INRELEASE_IDENTITY=PASS\nUBUNTU_INRELEASE_FRESHNESS=PASS\n'
+
+          packages_relpath='main/binary-amd64/Packages.xz'
+          packages_entry="$(awk -v expected_path="$packages_relpath" '
+            $0 == "SHA256:" { in_sha256 = 1; next }
+            in_sha256 && /^[A-Za-z0-9-]+:/ { exit }
+            in_sha256 && NF == 3 && $3 == expected_path { count += 1; value = $1 "\t" $2 "\t" $3 }
+            END { if (count != 1) exit 1; print value }
+          ' "$inrelease_payload")" || fail_hold "UBUNTU_PACKAGES_INDEX_DIGEST_MISSING"
+          IFS=$'\t' read -r packages_expected_sha packages_expected_size packages_signed_path <<< "$packages_entry"
+          [[ "$packages_signed_path" == "$packages_relpath" ]] || fail_hold "UBUNTU_PACKAGES_INDEX_PATH_INVALID"
+          [[ "$packages_expected_sha" =~ ^[A-Fa-f0-9]{64}$ ]] || fail_hold "UBUNTU_PACKAGES_INDEX_SHA_INVALID"
+          [[ "$packages_expected_size" =~ ^[0-9]+$ ]] || fail_hold "UBUNTU_PACKAGES_INDEX_SIZE_INVALID"
+          fetch_exact_archive "$packages_index" "$archive_base_url/dists/noble-security/$packages_relpath" || fail_hold "UBUNTU_PACKAGES_INDEX_DOWNLOAD_FAILED"
+          [[ "$(stat -c '%s' -- "$packages_index")" == "$packages_expected_size" ]] || fail_hold "UBUNTU_PACKAGES_INDEX_SIZE_MISMATCH"
+          printf '%s  %s\n' "$packages_expected_sha" "$packages_index" | /usr/bin/sha256sum --check --status || fail_hold "UBUNTU_PACKAGES_INDEX_SHA256_MISMATCH"
+          printf 'UBUNTU_PACKAGES_INDEX_PATH=%s\nUBUNTU_PACKAGES_INDEX_SIZE=%s\nUBUNTU_PACKAGES_INDEX_SHA256=%s\n' "$packages_signed_path" "$packages_expected_size" "$packages_expected_sha"
+          /usr/bin/xz --decompress --stdout -- "$packages_index" > "$packages_plain" || fail_hold "UBUNTU_PACKAGES_INDEX_DECOMPRESSION_FAILED"
+
+          package_match_count="$(awk -v expected_version="$expected_bwrap_version" '
+            BEGIN { RS = ""; FS = "\n" }
+            {
+              package = version = architecture = ""
+              for (index = 1; index <= NF; index += 1) {
+                if ($index == "Package: bubblewrap") package = "bubblewrap"
+                else if ($index == "Version: " expected_version) version = expected_version
+                else if ($index == "Architecture: amd64") architecture = "amd64"
+              }
+              if (package == "bubblewrap" && version == expected_version && architecture == "amd64") count += 1
+            }
+            END { print count + 0 }
+          ' "$packages_plain")"
+          [[ "$package_match_count" == 1 ]] || fail_hold "UBUNTU_BUBBLEWRAP_STANZA_COUNT_INVALID"
+          awk -v expected_version="$expected_bwrap_version" '
+            BEGIN { RS = ""; FS = "\n" }
+            {
+              package = version = architecture = ""
+              for (index = 1; index <= NF; index += 1) {
+                if ($index == "Package: bubblewrap") package = "bubblewrap"
+                else if ($index == "Version: " expected_version) version = expected_version
+                else if ($index == "Architecture: amd64") architecture = "amd64"
+              }
+              if (package == "bubblewrap" && version == expected_version && architecture == "amd64") print
+            }
+          ' "$packages_plain" > "$bubblewrap_stanza"
+          stanza_filename="$(awk -F': ' '$1 == "Filename" { print $2 }' "$bubblewrap_stanza")"
+          stanza_size="$(awk -F': ' '$1 == "Size" { print $2 }' "$bubblewrap_stanza")"
+          stanza_sha="$(awk -F': ' '$1 == "SHA256" { print $2 }' "$bubblewrap_stanza")"
+          [[ "$(grep -c '^Filename: ' "$bubblewrap_stanza")" == 1 ]] || fail_hold "UBUNTU_BUBBLEWRAP_FILENAME_FIELD_INVALID"
+          [[ "$(grep -c '^Size: ' "$bubblewrap_stanza")" == 1 ]] || fail_hold "UBUNTU_BUBBLEWRAP_SIZE_FIELD_INVALID"
+          [[ "$(grep -c '^SHA256: ' "$bubblewrap_stanza")" == 1 ]] || fail_hold "UBUNTU_BUBBLEWRAP_SHA_FIELD_INVALID"
+          [[ "$stanza_filename" == "pool/main/b/bubblewrap/$expected_bwrap_deb" ]] || fail_hold "UBUNTU_BUBBLEWRAP_FILENAME_INVALID"
+          [[ "$stanza_size" =~ ^[0-9]+$ ]] || fail_hold "UBUNTU_BUBBLEWRAP_SIZE_INVALID"
+          [[ "$stanza_sha" =~ ^[A-Fa-f0-9]{64}$ ]] || fail_hold "UBUNTU_BUBBLEWRAP_SHA_INVALID"
+          fetch_exact_archive "$bubblewrap_deb" "$archive_base_url/$stanza_filename" || fail_hold "UBUNTU_BUBBLEWRAP_DOWNLOAD_FAILED"
+          [[ "$(stat -c '%s' -- "$bubblewrap_deb")" == "$stanza_size" ]] || fail_hold "UBUNTU_BUBBLEWRAP_SIZE_MISMATCH"
+          printf '%s  %s\n' "$stanza_sha" "$bubblewrap_deb" | /usr/bin/sha256sum --check --status || fail_hold "UBUNTU_BUBBLEWRAP_SHA256_MISMATCH"
+          printf 'BUBBLEWRAP_DEB_FILENAME=%s\nBUBBLEWRAP_DEB_SIZE=%s\nBUBBLEWRAP_DEB_SHA256=%s\n' "$stanza_filename" "$stanza_size" "$stanza_sha"
+
+          deb_package="$(/usr/bin/dpkg-deb -f "$bubblewrap_deb" Package)" || fail_hold "UBUNTU_BUBBLEWRAP_DEB_METADATA_FAILED"
+          deb_version="$(/usr/bin/dpkg-deb -f "$bubblewrap_deb" Version)" || fail_hold "UBUNTU_BUBBLEWRAP_DEB_VERSION_FAILED"
+          deb_architecture="$(/usr/bin/dpkg-deb -f "$bubblewrap_deb" Architecture)" || fail_hold "UBUNTU_BUBBLEWRAP_DEB_ARCHITECTURE_FAILED"
+          [[ "$deb_package" == bubblewrap ]] || fail_hold "UBUNTU_BUBBLEWRAP_DEB_PACKAGE_INVALID"
+          [[ "$deb_version" == "$expected_bwrap_version" ]] || fail_hold "UBUNTU_BUBBLEWRAP_DEB_VERSION_INVALID"
+          [[ "$deb_architecture" == amd64 ]] || fail_hold "UBUNTU_BUBBLEWRAP_DEB_ARCHITECTURE_INVALID"
+          /usr/bin/dpkg-deb -x "$bubblewrap_deb" "$verify_root" || fail_hold "UBUNTU_BUBBLEWRAP_DEB_EXTRACTION_FAILED"
+          verified_bwrap="$verify_root/usr/bin/bwrap"
+          [[ -f "$verified_bwrap" && ! -L "$verified_bwrap" ]] || fail_hold "VERIFIED_BWRAP_PAYLOAD_PATH_INVALID"
+          verified_bwrap_sha256="$(sha256sum -- "$verified_bwrap" | awk '{print $1}')" || fail_hold "VERIFIED_BWRAP_PAYLOAD_HASH_FAILED"
+          [[ "$verified_bwrap_sha256" =~ ^[A-Fa-f0-9]{64}$ ]] || fail_hold "VERIFIED_BWRAP_PAYLOAD_HASH_INVALID"
+          printf 'PACKAGE=bubblewrap\nPACKAGE_VERSION_EXACT=%s\nPACKAGE_ARCHITECTURE=amd64\nVERIFIED_DEB_BWRAP_PAYLOAD_SHA256=%s\n' "$deb_version" "$verified_bwrap_sha256"
+
+          /usr/bin/cp -- "$packages_index" "$apt_lists/security.ubuntu.com_ubuntu_dists_noble-security_main_binary-amd64_Packages.xz"
+          /usr/bin/cp -- "$inrelease" "$apt_lists/security.ubuntu.com_ubuntu_dists_noble-security_InRelease"
+          apt_plan_output="$(/usr/bin/apt-get --simulate --no-remove --no-install-recommends \
+            -o Debug::NoLocking=true \
+            -o Dir::Etc::sourcelist="$apt_sources" \
+            -o Dir::Etc::sourceparts=- \
+            -o Dir::State::lists="$apt_lists/" \
+            -o Dir::State::status=/var/lib/dpkg/status \
+            -o Dir::Cache="$apt_cache/" \
+            -o Dir::Cache::archives="$apt_archives/" \
+            -o Acquire::AllowInsecureRepositories=false \
+            -o Acquire::AllowDowngradeToInsecureRepositories=false \
+            install "$bubblewrap_deb" 2>&1)" || {
+              printf '%s\n' "$apt_plan_output" > "$package_plan"
+              fail_hold "BUBBLEWRAP_INSTALL_PLAN_SIMULATION_FAILED"
+            }
+          printf '%s\n' "$apt_plan_output" > "$package_plan"
+          mapfile -t plan_installs < <(awk '$1 == "Inst" { print $2 }' "$package_plan")
+          mapfile -t plan_confs < <(awk '$1 == "Conf" { print $2 }' "$package_plan")
+          [[ "${#plan_installs[@]}" == 1 && "${plan_installs[0]}" == bubblewrap ]] || fail_hold "BUBBLEWRAP_INSTALL_PLAN_PACKAGE_SET_INVALID"
+          [[ "${#plan_confs[@]}" == 1 && "${plan_confs[0]}" == bubblewrap ]] || fail_hold "BUBBLEWRAP_INSTALL_PLAN_CONFIGURATION_SET_INVALID"
+          if grep -Eiq '^(Trig|Processing triggers)' "$package_plan"; then
+            fail_hold "BUBBLEWRAP_INSTALL_PLAN_TRIGGER_SET_INVALID"
+          fi
+          if grep -E '^(Remv|Purg|Del|Downgrade|Remove|Inst )' "$package_plan" | grep -Ev '^Inst bubblewrap( |$)' >/dev/null; then
+            fail_hold "BUBBLEWRAP_INSTALL_PLAN_MUTATION_SET_INVALID"
+          fi
+          grep -F "Inst bubblewrap ($expected_bwrap_version" "$package_plan" >/dev/null || fail_hold "BUBBLEWRAP_INSTALL_PLAN_VERSION_INVALID"
+          printf 'ONE_NEW_PACKAGE=bubblewrap:amd64=0.9.0-1ubuntu0.3\nNO_VERSION_SUBSTITUTION=PASS\nPACKAGE_INSTALL_PLAN=PASS\n'
+
+          /usr/bin/sudo -n /usr/bin/dpkg --install "$bubblewrap_deb" || fail_hold "BUBBLEWRAP_INSTALL_FAILED"
+          installed_status="$(/usr/bin/dpkg-query -W -f='${Status}' bubblewrap 2>/dev/null)" || fail_hold "BUBBLEWRAP_INSTALLED_STATUS_UNAVAILABLE"
+          installed_version="$(/usr/bin/dpkg-query -W -f='${Version}' bubblewrap 2>/dev/null)" || fail_hold "BUBBLEWRAP_INSTALLED_VERSION_UNAVAILABLE"
+          installed_architecture="$(/usr/bin/dpkg-query -W -f='${Architecture}' bubblewrap 2>/dev/null)" || fail_hold "BUBBLEWRAP_INSTALLED_ARCHITECTURE_UNAVAILABLE"
+          [[ "$installed_status" == 'install ok installed' ]] || fail_hold "BUBBLEWRAP_INSTALLED_STATUS_INVALID"
+          [[ "$installed_version" == "$expected_bwrap_version" ]] || fail_hold "BUBBLEWRAP_INSTALLED_VERSION_INVALID"
+          [[ "$installed_architecture" == amd64 ]] || fail_hold "BUBBLEWRAP_INSTALLED_ARCHITECTURE_INVALID"
+
+          bwrap_path=/usr/bin/bwrap
+          bwrap_realpath="$(realpath -e -- "$bwrap_path")" || fail_hold "BWRAP_REALPATH_FAILED"
+          [[ "$bwrap_realpath" == "$bwrap_path" ]] || fail_hold "BWRAP_REALPATH_UNEXPECTED"
+          [[ -f "$bwrap_path" && ! -L "$bwrap_path" ]] || fail_hold "BWRAP_PATH_INVALID"
+          [[ "$(stat -c '%u:%g' -- "$bwrap_path")" == '0:0' ]] || fail_hold "BWRAP_OWNER_INVALID"
+          bwrap_mode="$(stat -c '%a' -- "$bwrap_path")"
+          (( (8#$bwrap_mode & 6000) == 0 )) || fail_hold "BWRAP_SUID_SGID_PRESENT"
+          command -v /usr/sbin/getcap >/dev/null 2>&1 || fail_hold "GETCAP_UNAVAILABLE"
+          [[ -z "$(/usr/sbin/getcap -n "$bwrap_path" 2>/dev/null)" ]] || fail_hold "BWRAP_FILE_CAPABILITIES_PRESENT"
+          bwrap_owner_record="$(/usr/bin/dpkg-query -S "$bwrap_path" 2>/dev/null)" || fail_hold "BWRAP_DPKG_OWNER_UNAVAILABLE"
+          [[ "${bwrap_owner_record%%:*}" == bubblewrap ]] || fail_hold "BWRAP_DPKG_OWNER_INVALID"
+          bwrap_sha256="$(sha256sum -- "$bwrap_path" | awk '{print $1}')" || fail_hold "BWRAP_HASH_FAILED"
+          [[ "$bwrap_sha256" == "$verified_bwrap_sha256" ]] || fail_hold "BWRAP_INSTALLED_HASH_MISMATCH"
+          bwrap_version="$(/usr/bin/sudo -n "$bwrap_path" --version)" || fail_hold "BWRAP_VERSION_FAILED"
+          bwrap_help="$(/usr/bin/sudo -n "$bwrap_path" --help)" || fail_hold "BWRAP_HELP_FAILED"
           for required_option in --unshare-user --unshare-net --unshare-pid --unshare-ipc --unshare-uts --disable-userns --assert-userns-disabled --uid --gid --cap-drop --die-with-parent --new-session --clearenv --ro-bind --bind --proc --dev --tmpfs --size --chdir; do
             grep -F -- "$required_option" <<< "$bwrap_help" >/dev/null || fail_hold "BWRAP_OPTION_UNAVAILABLE_${required_option#--}"
           done
-          printf 'BWRAP_PATH=/usr/bin/bwrap\nBWRAP_SHA256=%s\nBWRAP_VERSION=%s\nBWRAP_PACKAGE_VERSION=%s\n' "$bwrap_sha256" "$bwrap_version" "$bwrap_package"
+          printf 'PATH=%s\nREALPATH=%s\nTYPE=regular_file\nOWNER=root:root\nNO_SYMLINK=PASS\nNO_SUID=PASS\nNO_SGID=PASS\nNO_FILE_CAPABILITIES=PASS\nDPKG_OWNER=bubblewrap\nDPKG_VERSION=%s\nINSTALLED_HASH=%s\nBWRAP_PATH=%s\nBWRAP_VERSION=%s\nBWRAP_ADMISSION=PASS\n' "$bwrap_path" "$bwrap_realpath" "$installed_version" "$bwrap_sha256" "$bwrap_path" "$bwrap_version"
 
           for system_path in /usr /lib /etc; do
             [[ -e "$system_path" ]] || fail_hold "SYSTEM_BIND_SOURCE_MISSING_${system_path#/}"
@@ -322,6 +575,144 @@ jobs:
             printf 'WORK_ACL_RESULT=PASS\nWORK_HOST_OWNER_MODE_RESULT=PASS\n'
           }
 
+          validate_bwrap_destination_order() {
+            local context="$1"
+            local expected_payload="$2"
+            shift 2
+            local -a setup_args=( "$@" )
+            local -a destinations=()
+            local index=0
+            local option source destination name value prior
+            local separator_seen=0
+            local work_bind_seen=0
+            local work_chdir_seen=0
+            local proc_seen=0
+            local dev_seen=0
+            local tmpfs_seen=0
+            local size_seen=0
+            local probe_seen=0
+            local runtime_seen=0
+            local runner_seen=0
+            local validator_seen=0
+            local writer_seen=0
+            local support_seen=0
+            local array_length="${#setup_args[@]}"
+            while (( index < array_length )); do
+              option="${setup_args[index]}"
+              case "$option" in
+                --ro-bind|--bind)
+                  (( index + 2 < array_length )) || return 1
+                  source="${setup_args[index + 1]}"
+                  destination="${setup_args[index + 2]}"
+                  [[ -n "$source" && -n "$destination" && "$destination" == /* ]] || return 1
+                  case "$destination" in
+                    /|/work/*) return 1 ;;
+                  esac
+                  case "$destination" in
+                    /usr|/lib|/etc|/lib64|/probe|/runtime/blender-root|/runtime/process-runner|/runtime/validator|/runtime/writer|/runtime/support|/runtime/support/blender_validate.py|/runtime/support/blender_reopen_validate.py|/work) ;;
+                    *) return 1 ;;
+                  esac
+                  for prior in "${destinations[@]}"; do
+                    [[ "$destination" != "$prior" && "$destination" != "$prior"/* ]] || return 1
+                  done
+                  if [[ "$option" == --bind ]]; then
+                    [[ "$destination" == /work && "$work_bind_seen" == 0 ]] || return 1
+                    work_bind_seen=1
+                  else
+                    [[ "$destination" != /work ]] || return 1
+                  fi
+                  case "$destination" in
+                    /probe) probe_seen=1 ;;
+                    /runtime/blender-root) runtime_seen=1 ;;
+                    /runtime/process-runner) runner_seen=1 ;;
+                    /runtime/validator) validator_seen=1 ;;
+                    /runtime/writer) writer_seen=1 ;;
+                    /runtime/support|/runtime/support/blender_validate.py|/runtime/support/blender_reopen_validate.py) support_seen=1 ;;
+                  esac
+                  destinations+=("$destination")
+                  index=$((index + 3))
+                  ;;
+                --proc|--dev|--tmpfs)
+                  (( index + 1 < array_length )) || return 1
+                  destination="${setup_args[index + 1]}"
+                  case "$option:$destination" in
+                    --proc:/proc) [[ "$proc_seen" == 0 ]] || return 1; proc_seen=1 ;;
+                    --dev:/dev) [[ "$dev_seen" == 0 ]] || return 1; dev_seen=1 ;;
+                    --tmpfs:/tmp) [[ "$tmpfs_seen" == 0 ]] || return 1; tmpfs_seen=1 ;;
+                    *) return 1 ;;
+                  esac
+                  for prior in "${destinations[@]}"; do
+                    [[ "$destination" != "$prior" && "$destination" != "$prior"/* ]] || return 1
+                  done
+                  destinations+=("$destination")
+                  index=$((index + 2))
+                  ;;
+                --chdir)
+                  (( index + 1 < array_length )) || return 1
+                  [[ "${setup_args[index + 1]}" == /work && "$work_bind_seen" == 1 && "$work_chdir_seen" == 0 ]] || return 1
+                  work_chdir_seen=1
+                  index=$((index + 2))
+                  ;;
+                --size)
+                  (( index + 1 < array_length )) || return 1
+                  [[ "${setup_args[index + 1]}" == "$tmpfs_bytes" && "$size_seen" == 0 ]] || return 1
+                  size_seen=1
+                  index=$((index + 2))
+                  ;;
+                --setenv)
+                  (( index + 2 < array_length )) || return 1
+                  name="${setup_args[index + 1]}"
+                  value="${setup_args[index + 2]}"
+                  [[ -n "$value" ]] || return 1
+                  case "$name" in
+                    PATH|LANG|LC_ALL|HOME|EXPECTED_HOST_USER_NS|EXPECTED_HOST_PID_NS|EXPECTED_HOST_NET_NS|EXPECTED_HOST_IPC_NS|EXPECTED_HOST_UTS_NS|S8_ADMISSION_MODE) ;;
+                    *) return 1 ;;
+                  esac
+                  index=$((index + 3))
+                  ;;
+                --unshare-user|--unshare-net|--unshare-pid|--unshare-ipc|--unshare-uts|--disable-userns|--assert-userns-disabled|--die-with-parent|--new-session|--clearenv)
+                  index=$((index + 1))
+                  ;;
+                --uid|--gid|--cap-drop)
+                  (( index + 1 < array_length )) || return 1
+                  case "$option:${setup_args[index + 1]}" in
+                    --uid:65534|--gid:65534|--cap-drop:ALL) ;;
+                    *) return 1 ;;
+                  esac
+                  index=$((index + 2))
+                  ;;
+                --)
+                  [[ "$separator_seen" == 0 && $((index + 1)) -lt array_length ]] || return 1
+                  [[ "${setup_args[index + 1]}" == "$expected_payload" ]] || return 1
+                  separator_seen=1
+                  break
+                  ;;
+                *)
+                  return 1
+                  ;;
+              esac
+            done
+            [[ "$separator_seen" == 1 && "$work_bind_seen" == 1 && "$work_chdir_seen" == 1 && "$proc_seen" == 1 && "$dev_seen" == 1 && "$tmpfs_seen" == 1 && "$size_seen" == 1 ]] || return 1
+            if [[ "$context" == initial ]]; then
+              [[ "$probe_seen" == 1 && "$runtime_seen" == 0 && "$runner_seen" == 0 && "$validator_seen" == 0 && "$writer_seen" == 0 && "$support_seen" == 0 ]] || return 1
+            elif [[ "$context" == staged ]]; then
+              [[ "$probe_seen" == 0 && "$runtime_seen" == 1 && "$runner_seen" == 1 && "$validator_seen" == 1 && "$writer_seen" == 1 && "$support_seen" == 1 ]] || return 1
+            elif [[ "$context" == candidate ]]; then
+              [[ "$probe_seen" == 0 && "$runtime_seen" == 1 && "$runner_seen" == 1 && "$writer_seen" == 1 ]] || return 1
+              (( validator_seen + support_seen <= 1 )) || return 1
+            else
+              return 1
+            fi
+            printf 'BWRAP_DESTINATION_ORDER_ADMISSION=%s\n' "$context"
+            printf 'BWRAP_SETUP_DESTINATION_INVARIANT=fresh_bwrap_owned_root+fixed_top_level_destinations_only+no_bind_destination_root+writable_/work_mounted_only_at_/work+no_bwrap_file_dir_symlink_creation_beneath_/work+no_destination_beneath_any_prior_candidate_controlled_or_writable_bind+destination_order_mechanically_validated_before_bwrap_execution\n'
+          }
+
+          destination_validator="$provision_root/s8-bwrap-destination-validator.sh"
+          declare -f validate_bwrap_destination_order > "$destination_validator"
+          /usr/bin/chmod 0555 -- "$destination_validator"
+          /usr/bin/bash -n "$destination_validator" || fail_amendment "DESTINATION_VALIDATOR_SYNTAX"
+          printf 'BWRAP_DESTINATION_VALIDATOR=%s\n' "$destination_validator"
+
           build_common_bwrap_args() {
             common_bwrap_args=(
               --unshare-user
@@ -347,11 +738,7 @@ jobs:
               common_bwrap_args+=(--ro-bind "$lib64_source" /lib64)
             fi
             common_bwrap_args+=(
-              --proc /proc
-              --dev /dev
               --size "$tmpfs_bytes"
-              --tmpfs /tmp
-              --chdir /work
               --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
               --setenv LANG C.UTF-8
               --setenv LC_ALL C.UTF-8
@@ -443,7 +830,7 @@ jobs:
             local -a args
             args=( "${common_bwrap_args[@]}" )
             if [[ "$mode" == initial ]]; then
-              args+=(--dir /probe --ro-bind "$carrier/probe/input.txt" /probe/input.txt)
+              args+=(--ro-bind "$carrier/probe" /probe)
             else
               args+=(
                 --ro-bind "$carrier/runtime/blender-5.2.2-linux-x64" /runtime/blender-root
@@ -453,7 +840,13 @@ jobs:
                 --ro-bind "$carrier/support" /runtime/support
               )
             fi
-            args+=(--bind "$carrier/work" /work)
+            args+=(
+              --bind "$carrier/work" /work
+              --proc /proc
+              --dev /dev
+              --tmpfs /tmp
+              --chdir /work
+            )
             args+=(
               --setenv EXPECTED_HOST_USER_NS "$host_user_ns"
               --setenv EXPECTED_HOST_PID_NS "$host_pid_ns"
@@ -464,6 +857,9 @@ jobs:
               --
               /usr/bin/sh -ceu "$capability_script"
             )
+            if ! validate_bwrap_destination_order "$mode" /usr/bin/sh "${args[@]}"; then
+              fail_hold "BWRAP_DESTINATION_ORDER_ADMISSION_FAILED"
+            fi
             /usr/bin/sudo -n /usr/bin/bwrap "${args[@]}"
           }
 
@@ -482,7 +878,7 @@ jobs:
           remove_carrier_exact || fail_hold "PROBE_CARRIER_CLEANUP_FAILED"
           carrier_created=0
 
-          temp_parent_resolved="$(realpath -e -- "$RUNNER_TEMP")" || fail_hold "RUNNER_TEMP_REALPATH_FAILED"
+          temp_parent_resolved="$runner_temp_resolved"
           [[ -d "$temp_parent_resolved" && ! -L "$temp_parent_resolved" ]] || fail_hold "RUNNER_TEMP_INVALID"
           temp_root="$temp_parent_resolved/s8-g3-$run_id.$run_attempt"
           [[ ! -e "$temp_root" && ! -L "$temp_root" ]] || fail_hold "TEMP_PATH_NOT_FRESH"
@@ -601,14 +997,22 @@ jobs:
           fi
           printf 'ACTUAL_STAGED_PATH_ADMISSION=PASS\n'
 
+          candidate_marker_file="$temp_root/candidate-started"
           launcher="$temp_root/s8-bwrap-launcher"
           {
             printf '%s\n' '#!/usr/bin/bash'
             printf '%s\n' 'set -Eeuo pipefail'
             printf 'carrier_root=%q\n' "$carrier"
             printf 'tmpfs_bytes=%q\n' "$tmpfs_bytes"
+            printf 'destination_validator=%q\n' "$destination_validator"
             cat <<'SH'
+          source "$destination_validator"
           args=("$@")
+          admission_only=0
+          if [[ "${args[0]:-}" == --s8-destination-admission-only ]]; then
+            admission_only=1
+            args=("${args[@]:1}")
+          fi
           separator=-1
           for ((index = 0; index < ${#args[@]}; index++)); do
             if [[ "${args[$index]}" == "--" ]]; then
@@ -716,12 +1120,15 @@ jobs:
             --
             "${args[@]:$((separator + 1))}"
           )
+          validate_bwrap_destination_order candidate /runtime/process-runner "${final_args[@]}" || { echo "BWRAP_DESTINATION_ORDER_ADMISSION_FAILED" >&2; exit 78; }
+          if (( admission_only == 1 )); then
+            exit 0
+          fi
           exec /usr/bin/sudo -n /usr/bin/bwrap "${final_args[@]}"
           SH
           } > "$launcher"
           /usr/bin/chmod 0700 -- "$launcher"
           /usr/bin/bash -n "$launcher" || fail_amendment "SANDBOX_LAUNCHER_SYNTAX"
-          candidate_marker_file="$temp_root/candidate-started"
           qualified_helper="$temp_root/s8-runtime-sensitivity-hosted.py"
           /usr/bin/python3 - "$GITHUB_WORKSPACE/scripts/s8/s8_runtime_sensitivity.py" "$qualified_helper" "$candidate_marker_file" <<'PY'
           from pathlib import Path
@@ -732,15 +1139,32 @@ jobs:
           target_path = Path(sys.argv[2])
           marker_path = Path(sys.argv[3])
           source = source_path.read_text(encoding="utf-8")
-          marker_anchor = "    writer_output = run_sandbox(\n"
-          if source.count(marker_anchor) != 1:
-              raise SystemExit("candidate marker anchor is not unique")
-          marker_line = (
-              "    marker_path = pathlib.Path(" + json.dumps(str(marker_path)) + ")\n"
-              "    marker_path.write_text('1\\n', encoding='ascii')\n"
-              "    print('CANDIDATE_EXECUTION_START=S8_PINNED_BLENDER_PRIVATE_EXPORTER', flush=True)\n"
+          admission_anchor = "    try:\n        result = subprocess.run(\n"
+          if source.count(admission_anchor) != 1:
+              raise SystemExit("destination admission anchor is not unique")
+          admission_block = (
+              "    admission_command = [str(sandbox), \"--s8-destination-admission-only\", *command[1:]]\n"
+              "    try:\n"
+              "        admission_result = subprocess.run(\n"
+              "            admission_command,\n"
+              "            cwd=work,\n"
+              "            env={\"PATH\": \"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\", \"LANG\": \"C.UTF-8\", \"LC_ALL\": \"C.UTF-8\"},\n"
+              "            stdout=subprocess.PIPE,\n"
+              "            stderr=subprocess.PIPE,\n"
+              "            timeout=30,\n"
+              "            check=False,\n"
+              "        )\n"
+              "    except (OSError, subprocess.TimeoutExpired):\n"
+              "        fail(\"BWRAP_DESTINATION_ORDER_ADMISSION_FAILED\", \"HOSTED_SANDBOX_ENVIRONMENT_HOLD\")\n"
+              "    if admission_result.returncode != 0:\n"
+              "        fail(\"BWRAP_DESTINATION_ORDER_ADMISSION_FAILED\", \"HOSTED_SANDBOX_ENVIRONMENT_HOLD\")\n"
+              "    if not marker_path.exists():\n"
+              "        marker_path.write_text(\"1\\n\", encoding=\"ascii\")\n"
+              "        print(\"BWRAP_DESTINATION_ORDER_ADMISSION=candidate\", flush=True)\n"
+              "        print(\"BWRAP_SETUP_DESTINATION_INVARIANT=fresh_bwrap_owned_root+fixed_top_level_destinations_only+no_bind_destination_root+writable_/work_mounted_only_at_/work+no_bwrap_file_dir_symlink_creation_beneath_/work+no_destination_beneath_any_prior_candidate_controlled_or_writable_bind+destination_order_mechanically_validated_before_bwrap_execution\", flush=True)\n"
+              "        print(\"CANDIDATE_EXECUTION_START=S8_PINNED_BLENDER_PRIVATE_EXPORTER\", flush=True)\n"
           )
-          source = source.replace(marker_anchor, marker_line + marker_anchor, 1)
+          source = source.replace(admission_anchor, admission_block + admission_anchor, 1)
           broad_bind_anchor = (
               "        " + chr(34) + "--ro-bind" + chr(34) + ", str(carrier_root), "
               + chr(34) + "/carrier" + chr(34) + ",\n"
