@@ -451,6 +451,300 @@ jobs:
             awk -F': ' -v key="$field" '$1 == key { print substr($0, index($0, ": ") + 2) }' "$inrelease_payload"
           }
 
+          ubuntu_inrelease_freshness() {
+            /usr/bin/python3 - "$@" <<'PY'
+import calendar
+import datetime
+import re
+import sys
+
+LOCAL_MAX_AGE = 172800
+MAX_FUTURE_SKEW = 10
+MAX_SIGNED_EPOCH = 9223372036854775807
+TIMESTAMP_RE = re.compile(
+    r"^(?P<weekday>Mon|Tue|Wed|Thu|Fri|Sat|Sun),[ \t]+"
+    r"(?P<day>[0-9]{1,2})[ \t]+"
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[ \t]+"
+    r"(?P<year>[0-9]{4})[ \t]+"
+    r"(?P<hour>[0-9]{1,2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2})[ \t]+UTC$"
+)
+MONTHS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
+
+class Reject(Exception):
+    pass
+
+
+def reject(code):
+    raise Reject(code)
+
+
+def parse_archive_timestamp(raw):
+    value = raw.strip(" \t")
+    match = TIMESTAMP_RE.fullmatch(value)
+    if match is None:
+        reject("TIMESTAMP_SYNTAX")
+    parts = match.groupdict()
+    try:
+        timestamp = datetime.datetime(
+            int(parts["year"]),
+            MONTHS[parts["month"]],
+            int(parts["day"]),
+            int(parts["hour"]),
+            int(parts["minute"]),
+            int(parts["second"]),
+            tzinfo=datetime.timezone.utc,
+        )
+    except (KeyError, OverflowError, ValueError):
+        reject("TIMESTAMP_CALENDAR")
+    if timestamp.strftime("%a") != parts["weekday"]:
+        reject("TIMESTAMP_WEEKDAY")
+    try:
+        epoch = calendar.timegm(timestamp.utctimetuple())
+    except (OverflowError, ValueError):
+        reject("TIMESTAMP_EPOCH")
+    if not -MAX_SIGNED_EPOCH <= epoch <= MAX_SIGNED_EPOCH:
+        reject("TIMESTAMP_EPOCH_OVERFLOW")
+    return epoch
+
+
+def parse_epoch(raw, label):
+    if re.fullmatch(r"[0-9]+", raw or "") is None:
+        reject(f"{label}_NOT_DECIMAL")
+    try:
+        value = int(raw, 10)
+    except (OverflowError, ValueError):
+        reject(f"{label}_OVERFLOW")
+    if value > MAX_SIGNED_EPOCH:
+        reject(f"{label}_OVERFLOW")
+    return value
+
+
+def parse_lines(lines):
+    date_values = []
+    valid_until_values = []
+    for line in lines:
+        if line.startswith("Date:"):
+            date_values.append(line[len("Date:"):].strip(" \t"))
+        elif line.startswith("Valid-Until:"):
+            valid_until_values.append(line[len("Valid-Until:"):].strip(" \t"))
+    if len(date_values) != 1:
+        reject("DATE_CARDINALITY")
+    if not date_values[0]:
+        reject("DATE_EMPTY")
+    if len(valid_until_values) > 1:
+        reject("VALID_UNTIL_CARDINALITY")
+    if valid_until_values and not valid_until_values[0]:
+        reject("VALID_UNTIL_EMPTY")
+    signed_date = parse_archive_timestamp(date_values[0])
+    valid_until = None
+    if valid_until_values:
+        valid_until = parse_archive_timestamp(valid_until_values[0])
+    return {
+        "date_count": len(date_values),
+        "valid_until_count": len(valid_until_values),
+        "signed_date": signed_date,
+        "valid_until": valid_until,
+    }
+
+
+def parse_payload(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="strict", newline="") as handle:
+            return parse_lines(handle.read().splitlines())
+    except (OSError, UnicodeError):
+        reject("PAYLOAD_READ")
+
+
+def evaluate(parsed, before, after):
+    if after < before:
+        reject("BACKWARD_CLOCK")
+    now = after
+    signed_date = parsed["signed_date"]
+    local_expiry = signed_date + LOCAL_MAX_AGE
+    if signed_date > now + MAX_FUTURE_SKEW:
+        reject("DATE_IN_FUTURE")
+    if now >= local_expiry:
+        reject("DATE_TOO_OLD")
+    valid_until = parsed["valid_until"]
+    if valid_until is not None:
+        if valid_until <= signed_date:
+            reject("VALID_UNTIL_NOT_AFTER_DATE")
+        if now >= valid_until:
+            reject("VALID_UNTIL_EXPIRED")
+        effective_expiry = min(local_expiry, valid_until)
+    else:
+        effective_expiry = local_expiry
+    if now >= effective_expiry:
+        reject("EFFECTIVE_EXPIRY_REACHED")
+    return {
+        "now": now,
+        "effective_expiry": effective_expiry,
+    }
+
+
+def archive_timestamp(epoch):
+    value = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+    return value.strftime("%a, %d %b %Y %H:%M:%S UTC")
+
+
+def synthetic_payload(date_value=None, valid_until_value=None, extra_lines=()):
+    lines = []
+    if date_value is not None:
+        lines.append(f"Date: {date_value}")
+    if valid_until_value is not None:
+        lines.append(f"Valid-Until: {valid_until_value}")
+    lines.extend(extra_lines)
+    return "\n".join(lines) + "\n"
+
+
+def expect_pass(name, payload, before, after, expected_effective=None, label="PASS"):
+    result = evaluate(
+        parse_lines(payload.splitlines()),
+        parse_epoch(str(before), "BEFORE"),
+        parse_epoch(str(after), "AFTER"),
+    )
+    if expected_effective is not None and result["effective_expiry"] != expected_effective:
+        reject(f"REGRESSION_{name}_EFFECTIVE_EXPIRY")
+    print(f"UBUNTU_INRELEASE_FRESHNESS_REGRESSION_{name}={label}")
+
+
+def expect_reject(name, payload, before, after):
+    try:
+        evaluate(
+            parse_lines(payload.splitlines()),
+            parse_epoch(str(before), "BEFORE"),
+            parse_epoch(str(after), "AFTER"),
+        )
+    except Reject:
+        print(f"UBUNTU_INRELEASE_FRESHNESS_REGRESSION_{name}=REJECT")
+        return
+    reject(f"REGRESSION_{name}_ACCEPTED")
+
+
+def run_regressions():
+    base = 1700000000
+    no_valid = lambda signed: synthetic_payload(archive_timestamp(signed))
+    expect_pass("NO_VALID_UNTIL__AGE_BELOW_48H", no_valid(base), base + 172799, base + 172799)
+    expect_reject("NO_VALID_UNTIL__AGE_EXACTLY_48H", no_valid(base), base + 172800, base + 172800)
+    expect_reject("NO_VALID_UNTIL__AGE_ABOVE_48H", no_valid(base), base + 172801, base + 172801)
+    expect_pass("DATE_10_SECONDS_IN_FUTURE", no_valid(base + 10), base, base)
+    expect_reject("DATE_11_SECONDS_IN_FUTURE", no_valid(base + 11), base, base)
+    expect_pass(
+        "VALID_UNTIL_PRESENT__EARLIER_THAN_LOCAL_EXPIRY__NOT_EXPIRED",
+        synthetic_payload(archive_timestamp(base), archive_timestamp(base + 3600)),
+        base + 3599,
+        base + 3599,
+        base + 3600,
+    )
+    expect_reject(
+        "VALID_UNTIL_PRESENT__EXPIRED",
+        synthetic_payload(archive_timestamp(base), archive_timestamp(base + 3600)),
+        base + 3600,
+        base + 3600,
+    )
+    expect_pass(
+        "VALID_UNTIL_PRESENT__LATER_THAN_LOCAL_EXPIRY",
+        synthetic_payload(archive_timestamp(base), archive_timestamp(base + 200000)),
+        base + 172799,
+        base + 172799,
+        base + LOCAL_MAX_AGE,
+        "PASS_LOCAL_48H_EXPIRY_WINS",
+    )
+    expect_reject(
+        "DUPLICATE_DATE",
+        synthetic_payload(extra_lines=(f"Date: {archive_timestamp(base)}", f"Date: {archive_timestamp(base)}")),
+        base,
+        base,
+    )
+    expect_reject(
+        "DUPLICATE_VALID_UNTIL",
+        synthetic_payload(
+            archive_timestamp(base),
+            archive_timestamp(base + 3600),
+            (f"Valid-Until: {archive_timestamp(base + 7200)}",),
+        ),
+        base,
+        base,
+    )
+    expect_reject(
+        "MISSING_DATE",
+        synthetic_payload(valid_until_value=archive_timestamp(base + 3600)),
+        base,
+        base,
+    )
+    expect_reject(
+        "INVALID_TIMESTAMP",
+        synthetic_payload("Sun, 29 Feb 2025 2:10:56 UTC"),
+        base,
+        base,
+    )
+    expect_reject(
+        "NON_UTC_TIMESTAMP",
+        synthetic_payload("Sun, 20 Sep 2026 2:10:56 +0000"),
+        base,
+        base,
+    )
+    expect_reject("BACKWARD_CLOCK", no_valid(base), base + 1, base)
+    observed_signed = calendar.timegm((2026, 9, 20, 2, 10, 56, 0, 0, 0))
+    expect_pass(
+        "VALID_UNTIL_ABSENT__SIGNED_DATE_FRESH",
+        synthetic_payload("Sun, 20 Sep 2026  2:10:56 UTC"),
+        observed_signed + 1,
+        observed_signed + 1,
+        observed_signed + LOCAL_MAX_AGE,
+    )
+    print("UBUNTU_INRELEASE_FRESHNESS_REGRESSION=PASS")
+
+
+def emit_evidence(parsed, result, before, after):
+    valid_until = parsed["valid_until"]
+    print(f"UBUNTU_INRELEASE_DATE_COUNT={parsed['date_count']}")
+    print(f"UBUNTU_INRELEASE_VALID_UNTIL_COUNT={parsed['valid_until_count']}")
+    print(f"UBUNTU_INRELEASE_SIGNED_DATE_EPOCH={parsed['signed_date']}")
+    print(f"UBUNTU_INRELEASE_VALID_UNTIL_PRESENT={'YES' if valid_until is not None else 'NO'}")
+    print(f"UBUNTU_INRELEASE_VALID_UNTIL_EPOCH={valid_until if valid_until is not None else 'ABSENT'}")
+    print(f"UBUNTU_INRELEASE_NOW_BEFORE_EPOCH={before}")
+    print(f"UBUNTU_INRELEASE_NOW_AFTER_EPOCH={after}")
+    print(f"UBUNTU_INRELEASE_MAX_FUTURE_SKEW_SECONDS={MAX_FUTURE_SKEW}")
+    print(f"UBUNTU_INRELEASE_MAX_AGE_SECONDS={LOCAL_MAX_AGE}")
+    print(f"UBUNTU_INRELEASE_EFFECTIVE_EXPIRY_EPOCH={result['effective_expiry']}")
+    print("UBUNTU_INRELEASE_FRESHNESS=PASS")
+
+
+def main(arguments):
+    if not arguments:
+        reject("MODE_MISSING")
+    if arguments[0] == "--regression":
+        run_regressions()
+        return 0
+    if arguments[0] == "--validate" and len(arguments) == 2:
+        parse_payload(arguments[1])
+        return 0
+    if arguments[0] == "--evaluate" and len(arguments) == 4:
+        parsed = parse_payload(arguments[1])
+        before = parse_epoch(arguments[2], "NOW_UTC_BEFORE")
+        after = parse_epoch(arguments[3], "NOW_UTC_AFTER")
+        result = evaluate(parsed, before, after)
+        emit_evidence(parsed, result, before, after)
+        return 0
+    reject("ARGUMENTS_INVALID")
+
+
+try:
+    raise SystemExit(main(sys.argv[1:]))
+except Reject as error:
+    print(f"UBUNTU_INRELEASE_FRESHNESS_REJECT={error}", file=sys.stderr)
+    raise SystemExit(1)
+except Exception:
+    print("UBUNTU_INRELEASE_FRESHNESS_REJECT=INTERNAL_PARSER_FAILURE", file=sys.stderr)
+    raise SystemExit(1)
+PY
+          }
+
           [[ "$(inrelease_field Origin)" == 'Ubuntu' ]] || fail_hold "UBUNTU_INRELEASE_ORIGIN_INVALID"
           [[ "$(inrelease_field Suite)" == 'noble-security' ]] || fail_hold "UBUNTU_INRELEASE_SUITE_INVALID"
           [[ "$(inrelease_field Codename)" == 'noble' ]] || fail_hold "UBUNTU_INRELEASE_CODENAME_INVALID"
@@ -458,14 +752,16 @@ jobs:
           grep -Fw -- main <<< "$inrelease_components" >/dev/null || fail_hold "UBUNTU_INRELEASE_MAIN_COMPONENT_MISSING"
           inrelease_architectures="$(inrelease_field Architectures)" || fail_hold "UBUNTU_INRELEASE_ARCHITECTURES_MISSING"
           grep -Fw -- amd64 <<< "$inrelease_architectures" >/dev/null || fail_hold "UBUNTU_INRELEASE_AMD64_MISSING"
-          inrelease_date="$(inrelease_field Date)" || fail_hold "UBUNTU_INRELEASE_DATE_MISSING"
-          inrelease_valid_until="$(inrelease_field 'Valid-Until')" || fail_hold "UBUNTU_INRELEASE_VALID_UNTIL_MISSING"
-          now_epoch="$(/usr/bin/date -u +%s)"
-          inrelease_date_epoch="$(/usr/bin/date -u -d "$inrelease_date" +%s)" || fail_hold "UBUNTU_INRELEASE_DATE_INVALID"
-          inrelease_valid_until_epoch="$(/usr/bin/date -u -d "$inrelease_valid_until" +%s)" || fail_hold "UBUNTU_INRELEASE_VALID_UNTIL_INVALID"
-          (( inrelease_date_epoch <= now_epoch + 300 )) || fail_hold "UBUNTU_INRELEASE_DATE_IN_FUTURE"
-          (( inrelease_valid_until_epoch > now_epoch )) || fail_hold "UBUNTU_INRELEASE_EXPIRED"
-          printf 'UBUNTU_INRELEASE_IDENTITY=PASS\nUBUNTU_INRELEASE_FRESHNESS=PASS\n'
+          ubuntu_inrelease_freshness --regression || fail_hold "UBUNTU_INRELEASE_FRESHNESS_REGRESSION_FAILED"
+          NOW_UTC_BEFORE=$(/usr/bin/date -u +%s) || fail_hold "UBUNTU_INRELEASE_NOW_BEFORE_CAPTURE_FAILED"
+          [[ "$NOW_UTC_BEFORE" =~ ^[0-9]+$ ]] || fail_hold "UBUNTU_INRELEASE_NOW_BEFORE_NOT_DECIMAL"
+          ubuntu_inrelease_freshness --validate "$inrelease_payload" >/dev/null || fail_hold "UBUNTU_INRELEASE_TIMESTAMP_INVALID"
+          NOW_UTC_AFTER=$(/usr/bin/date -u +%s) || fail_hold "UBUNTU_INRELEASE_NOW_AFTER_CAPTURE_FAILED"
+          [[ "$NOW_UTC_AFTER" =~ ^[0-9]+$ ]] || fail_hold "UBUNTU_INRELEASE_NOW_AFTER_NOT_DECIMAL"
+          (( NOW_UTC_AFTER >= NOW_UTC_BEFORE )) || fail_hold "UBUNTU_INRELEASE_CLOCK_MOVED_BACKWARD"
+          NOW_UTC="$NOW_UTC_AFTER"
+          freshness_evidence="$(ubuntu_inrelease_freshness --evaluate "$inrelease_payload" "$NOW_UTC_BEFORE" "$NOW_UTC")" || fail_hold "UBUNTU_INRELEASE_FRESHNESS_REJECTED"
+          printf 'UBUNTU_INRELEASE_IDENTITY=PASS\n%s\n' "$freshness_evidence"
 
           packages_relpath='main/binary-amd64/Packages.xz'
           packages_entry="$(awk -v expected_path="$packages_relpath" '
