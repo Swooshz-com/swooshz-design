@@ -162,14 +162,77 @@ jobs:
             return 0
           }
 
-          mount_table_admission() {
-            local resolved="$1"
-            local mount_targets
-            if ! mount_targets="$(/usr/bin/findmnt --kernel=mountinfo --raw --noheadings --output TARGET 2>/dev/null)" || [[ -z "$mount_targets" ]]; then
-              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_READ_FAILED\n' >&2
+          mount_table_targets=""
+
+          read_mount_table() {
+            local stderr_file
+            local stderr_excerpt
+            stderr_file="$(/usr/bin/mktemp)" || {
+              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_READ_FAILED\nMOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=READER_TEMPFILE_CREATE_FAILED\n' >&2
+              return 1
+            }
+            if ! mount_table_targets="$(/usr/bin/findmnt -k -r -n -o TARGET 2>"$stderr_file")"; then
+              stderr_excerpt="$(/usr/bin/head -c 512 -- "$stderr_file" | /usr/bin/tr '\r\n' '  ' || true)"
+              /usr/bin/rm -f -- "$stderr_file" || true
+              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_READ_FAILED\nMOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=FINDMNT_COMMAND_FAILURE\n' >&2
+              if [[ -n "$stderr_excerpt" ]]; then
+                printf 'MOUNT_TABLE_LIVE_READER_DIAGNOSTIC=%s\n' "$stderr_excerpt" >&2
+              else
+                printf 'MOUNT_TABLE_LIVE_READER_DIAGNOSTIC=NO_STDERR\n' >&2
+              fi
               return 1
             fi
-            mount_target_admission "$resolved" "$mount_targets"
+            stderr_excerpt="$(/usr/bin/head -c 512 -- "$stderr_file" | /usr/bin/tr '\r\n' '  ' || true)"
+            /usr/bin/rm -f -- "$stderr_file" || true
+            if [[ -n "$stderr_excerpt" ]]; then
+              printf 'MOUNT_TABLE_LIVE_READER_DIAGNOSTIC=%s\n' "$stderr_excerpt" >&2
+            fi
+            if [[ -z "$mount_table_targets" ]]; then
+              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_READ_FAILED\nMOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=EMPTY_TARGET_SET\n' >&2
+              return 1
+            fi
+          }
+
+          mount_table_admission() {
+            local resolved="$1"
+            read_mount_table || return 1
+            mount_target_admission "$resolved" "$mount_table_targets"
+          }
+
+          run_live_mount_reader_admission() {
+            local findmnt_version
+            local mountinfo_lines
+            local live_probe='/s8-mount-admission-live-reader-probe'
+            if ! findmnt_version="$(/usr/bin/findmnt --version 2>&1 | /usr/bin/tr '\r\n' ' ')" || [[ -z "$findmnt_version" ]]; then
+              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=FINDMNT_VERSION_UNAVAILABLE\n' >&2
+              return 1
+            fi
+            printf 'FINDMNT_VERSION=%s\n' "$findmnt_version"
+            if [[ ! -r /proc/self/mountinfo ]]; then
+              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=KERNEL_MOUNTINFO_UNREADABLE\n' >&2
+              return 1
+            fi
+            mountinfo_lines="$(/usr/bin/wc -l < /proc/self/mountinfo)" || {
+              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=KERNEL_MOUNTINFO_READ_FAILED\n' >&2
+              return 1
+            }
+            if [[ ! "$mountinfo_lines" =~ ^[1-9][0-9]*$ ]]; then
+              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=KERNEL_MOUNTINFO_EMPTY\n' >&2
+              return 1
+            fi
+            printf 'PROC_SELF_MOUNTINFO=READABLE_NONEMPTY\n'
+            read_mount_table || return 1
+            printf 'UNFILTERED_KERNEL_TABLE_COMMAND=PASS\nCAPTURED_MOUNT_TARGET_SET=NONEMPTY\nLIVE_MOUNT_TABLE_READ=PASS\n'
+            if ! printf '%s\n' "$mount_table_targets" | /usr/bin/grep -Fx -- / >/dev/null; then
+              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=ROOT_MOUNT_TARGET_MISSING\n' >&2
+              return 1
+            fi
+            printf 'LIVE_ROOT_MOUNT_PRESENT=PASS\n'
+            mount_target_admission "$live_probe" "$mount_table_targets" >/dev/null || {
+              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=LIVE_PROBE_REJECTED\n' >&2
+              return 1
+            }
+            printf 'MOUNT_TABLE_LIVE_READER=PASS\n'
           }
 
           run_mount_admission_regression() {
@@ -178,13 +241,17 @@ jobs:
             local exact_mounts="${ordinary_mounts}"$'\n'"${fixture_root}"
             local descendant_mounts="${ordinary_mounts}"$'\n'"${fixture_root}/descendant"
             mount_target_admission "$fixture_root" "$ordinary_mounts" || fail_amendment "MOUNT_ADMISSION_REGRESSION_FRESH_REJECTED"
+            printf 'SYNTHETIC_SAFE_CASE=PASS\n'
             if mount_target_admission "$fixture_root" "$exact_mounts" >/dev/null 2>&1; then
               fail_amendment "MOUNT_ADMISSION_REGRESSION_EXACT_ACCEPTED"
             fi
+            printf 'SYNTHETIC_EXACT_MOUNT_REJECTION=PASS\n'
             if mount_target_admission "$fixture_root" "$descendant_mounts" >/dev/null 2>&1; then
               fail_amendment "MOUNT_ADMISSION_REGRESSION_DESCENDANT_ACCEPTED"
             fi
+            printf 'SYNTHETIC_DESCENDANT_MOUNT_REJECTION=PASS\n'
             printf 'CASE_1=FRESH_NON_MOUNT_DIRECTORY_WITH_NO_DESCENDANT_MOUNTS=>ACCEPT\nCASE_2_EXACT=EXACT_MOUNT_TARGET_PRESENT=>REJECT\nCASE_2_DESCENDANT=DESCENDANT_MOUNT_TARGET_PRESENT=>REJECT\nMOUNT_ADMISSION_REGRESSION=PASS\n'
+            run_live_mount_reader_admission || fail_hold "MOUNT_TABLE_LIVE_READER_FAILED"
           }
 
           carrier_path_is_safe() {
