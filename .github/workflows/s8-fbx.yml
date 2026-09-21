@@ -3852,10 +3852,10 @@ jobs:
               --setenv EXPECTED_HOST_UTS_NS "$host_uts_ns"
               --setenv S8_ADMISSION_MODE "$mode"
               --
-              /usr/bin/sh -ceu "$capability_script"
+              /usr/bin/bash -ceu "$capability_script"
             )
-            run_bwrap_argv_grammar_regression "$mode" /usr/bin/sh "${args[@]}" || fail_amendment "BWRAP_ARGV_GRAMMAR_REGRESSION_FAILED_${mode}"
-            if ! validate_bwrap_destination_order "$mode" /usr/bin/sh "${args[@]}"; then
+            run_bwrap_argv_grammar_regression "$mode" /usr/bin/bash "${args[@]}" || fail_amendment "BWRAP_ARGV_GRAMMAR_REGRESSION_FAILED_${mode}"
+            if ! validate_bwrap_destination_order "$mode" /usr/bin/bash "${args[@]}"; then
               fail_hold "BWRAP_DESTINATION_ORDER_ADMISSION_FAILED"
             fi
             admit_before_bwrap "$mode" || fail_hold "BWRAP_IDENTITY_ADMISSION_FAILED"
