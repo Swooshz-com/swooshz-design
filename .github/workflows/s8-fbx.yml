@@ -256,13 +256,30 @@ jobs:
 
           candidate_started=0
           failure_reported=0
-          carrier_created=0
+          carrier_created_by_attempt=0
+          carrier_identity_recorded=0
+          carrier_identity_poisoned=0
+          identity_poisoned=0
+          carrier_lifecycle=UNCREATED
+          all_launched_children_reaped=1
+          cleanup_running=0
+          critical_section=0
+          pending_signal=""
+          received_signal=""
+          stop_new_launches=0
+          tracked_children=()
           temp_created=0
           provision_created=0
-          carrier_parent="/opt/s8-ci-carrier"
-          run_id="${GITHUB_RUN_ID:-}"
-          run_attempt="${GITHUB_RUN_ATTEMPT:-}"
+          carrier_parent="/"
+          run_id="${GITHUB_RUN_ID-}"
+          run_attempt="${GITHUB_RUN_ATTEMPT-}"
           carrier=""
+          root_baseline_identity=""
+          carrier_baseline_identity=""
+          work=""
+          immutable_work_path=""
+          work_identity=""
+          work_device_inode=""
           temp_root=""
           provision_root=""
           candidate_marker_file=""
@@ -282,137 +299,792 @@ jobs:
             exit 1
           }
 
-          assert_root_component() {
+          stable_identity() {
             local path="$1"
-            local mode
-            [[ -e "$path" && ! -L "$path" ]] || return 1
-            [[ "$(stat -c '%u:%g' -- "$path")" == "0:0" ]] || return 1
-            mode="$(stat -c '%a' -- "$path")"
-            (( (8#$mode & 022) == 0 )) || return 1
+            local raw device inode mode_hex uid gid permission_bits full_mode type_bits mode_bits
+            raw="$(/usr/bin/stat -c '%d:%i:%f:%u:%g:%a' -- "$path")" || return 1
+            IFS=: read -r device inode mode_hex uid gid permission_bits <<< "$raw"
+            [[ "$mode_hex" =~ ^[0-9A-Fa-f]+$ ]] || return 1
+            [[ "$permission_bits" =~ ^[0-7]+$ ]] || return 1
+            [[ "$device" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ && "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || return 1
+            full_mode=$((16#$mode_hex))
+            type_bits=$((full_mode & 0xF000))
+            mode_bits=$((8#$permission_bits & 0777))
+            printf '%s:%s:%04x:%s:%s:%04o\n' \
+              "$device" \
+              "$inode" \
+              "$type_bits" \
+              "$uid" \
+              "$gid" \
+              "$mode_bits"
+          }
+
+          acl_perm_for_mode() {
+            local bits="$1"
+            local result=''
+            (( bits & 4 )) && result+='r' || result+='-'
+            (( bits & 2 )) && result+='w' || result+='-'
+            (( bits & 1 )) && result+='x' || result+='-'
+            printf '%s\n' "$result"
+          }
+
+          ordinary_acl_is_exact() {
+            local path="$1"
+            local mode_text="$2"
+            local acl_text line mode_value owner_expected group_expected other_expected
+            local user_perm='' group_perm='' other_perm=''
+            local -a acl_lines=()
+            acl_text="$(/usr/bin/getfacl --numeric --omit-header --absolute-names -- "$path")" || return 1
+            mapfile -t acl_lines < <(printf '%s\n' "$acl_text")
+            (( ${#acl_lines[@]} == 3 )) || return 1
+            for line in "${acl_lines[@]}"; do
+              [[ -n "$line" ]] || return 1
+              if [[ "$line" =~ ^user::([r-][w-][x-])$ ]]; then
+                [[ -z "$user_perm" ]] || return 1
+                user_perm="${BASH_REMATCH[1]}"
+              elif [[ "$line" =~ ^group::([r-][w-][x-])$ ]]; then
+                [[ -z "$group_perm" ]] || return 1
+                group_perm="${BASH_REMATCH[1]}"
+              elif [[ "$line" =~ ^other::([r-][w-][x-])$ ]]; then
+                [[ -z "$other_perm" ]] || return 1
+                other_perm="${BASH_REMATCH[1]}"
+              else
+                return 1
+              fi
+            done
+            [[ -n "$user_perm" && -n "$group_perm" && -n "$other_perm" ]] || return 1
+            [[ "$mode_text" =~ ^0[0-7]{3}$ ]] || return 1
+            mode_value=$((8#$mode_text & 0777))
+            owner_expected="$(acl_perm_for_mode $(( (mode_value >> 6) & 7 )))"
+            group_expected="$(acl_perm_for_mode $(( (mode_value >> 3) & 7 )))"
+            other_expected="$(acl_perm_for_mode $(( mode_value & 7 )))"
+            [[ "$user_perm" == "$owner_expected" && "$group_perm" == "$group_expected" && "$other_perm" == "$other_expected" ]]
+          }
+
+          work_acl_is_exact() {
+            local acl_text="$1"
+            local line expected
+            local -a acl_lines=()
+            local -a expected_lines=(
+              'user::rwx'
+              "user:${runner_uid}:rwx"
+              'group::---'
+              'mask::rwx'
+              'other::---'
+              'default:user::rwx'
+              "default:user:${runner_uid}:rwx"
+              'default:group::---'
+              'default:mask::rwx'
+              'default:other::---'
+            )
+            declare -A seen=()
+            mapfile -t acl_lines < <(printf '%s\n' "$acl_text")
+            (( ${#acl_lines[@]} == ${#expected_lines[@]} )) || return 1
+            for line in "${acl_lines[@]}"; do
+              [[ "$line" =~ ^(default:)?(user|group|mask|other):[^[:space:]]+$ ]] || return 1
+              [[ -z "${seen[$line]+present}" ]] || return 1
+              seen["$line"]=1
+            done
+            for expected in "${expected_lines[@]}"; do
+              [[ -n "${seen[$expected]+present}" ]] || return 1
+            done
+          }
+
+          lstat_state() {
+            /usr/bin/python3 - "$1" <<'PY'
+          import os
+          import sys
+
+          try:
+              os.lstat(sys.argv[1])
+          except FileNotFoundError:
+              print("ENOENT")
+              raise SystemExit(0)
+          except OSError:
+              print("LSTAT_ERROR")
+              raise SystemExit(2)
+          else:
+              print("EXISTING_OBJECT")
+              raise SystemExit(1)
+          PY
+          }
+
+          require_enoent_only() {
+            local state
+            if state="$(lstat_state "$1")"; then
+              [[ "$state" == ENOENT ]]
+            else
+              return 1
+            fi
+          }
+
+          verify_mountinfo() {
+            local byte_count
+            [[ -r /proc/self/mountinfo ]] || return 1
+            byte_count="$(/usr/bin/wc -c < /proc/self/mountinfo)" || return 1
+            [[ "$byte_count" =~ ^[1-9][0-9]*$ ]]
+          }
+
+          raw_mount_target_filter() {
+            local resolved="$1"
+            local output_file="$2"
+            /usr/bin/awk -v p="$resolved" \
+              'BEGIN { found = 0 } $0 == p || index($0, p "/") == 1 { found = 1 } END { exit found ? 1 : 0 }' \
+              "$output_file"
           }
 
           mount_target_admission() {
             local resolved="$1"
-            local mount_targets="$2"
-            local matching_targets
-            if ! matching_targets="$(printf '%s\n' "$mount_targets" | awk -v p="$resolved" 'NF && ($0 == p || index($0, p "/") == 1) { print }')"; then
-              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_FILTER_FAILED\n' >&2
-              return 1
-            fi
-            if [[ -n "$matching_targets" ]]; then
-              printf 'MOUNT_TABLE_ADMISSION=EXACT_OR_DESCENDANT_MOUNT_PRESENT\n' >&2
-              return 1
-            fi
-            printf 'MOUNT_TABLE_ADMISSION=NO_EXACT_OR_DESCENDANT_MOUNT\n'
-            return 0
+            local output_file="$2"
+            /usr/bin/python3 - "$output_file" "$resolved" <<'PY'
+          from pathlib import Path
+          import posixpath
+          import sys
+
+
+          class Reject(Exception):
+              pass
+
+
+          def reject(reason):
+              print(f"MOUNT_TARGET_REJECT={reason}", file=sys.stderr)
+              raise Reject(reason)
+
+
+          def decode_record(raw_record):
+              decoded = bytearray()
+              index = 0
+              while index < len(raw_record):
+                  value = raw_record[index]
+                  if value == 0:
+                      reject("NUL")
+                  if value == 92:
+                      if index + 1 >= len(raw_record):
+                          reject("TRAILING_ESCAPE")
+                      escaped = raw_record[index + 1]
+                      if escaped == 92:
+                          decoded.append(92)
+                          index += 2
+                          continue
+                      if escaped < 48 or escaped > 55 or index + 3 >= len(raw_record):
+                          reject("MALFORMED_ESCAPE")
+                      digits = raw_record[index + 1:index + 4]
+                      if any(digit < 48 or digit > 55 for digit in digits):
+                          reject("MALFORMED_ESCAPE")
+                      decoded.append(int(digits.decode("ascii"), 8))
+                      index += 4
+                      continue
+                  if value in (9, 13, 32):
+                      reject("UNESCAPED_WHITESPACE")
+                  decoded.append(value)
+                  index += 1
+              try:
+                  value = decoded.decode("utf-8", "strict")
+              except UnicodeDecodeError:
+                  reject("INVALID_UTF8")
+              if not value.startswith("/"):
+                  reject("NON_ABSOLUTE")
+              if value != "/" and (
+                  value.endswith("/")
+                  or "//" in value
+                  or "/./" in value
+                  or value.endswith("/.")
+                  or "/../" in value
+                  or value.endswith("/..")
+                  or posixpath.normpath(value) != value
+              ):
+                  reject("AMBIGUOUS_PATH")
+              return value
+
+
+          try:
+              raw = Path(sys.argv[1]).read_bytes()
+              target = sys.argv[2]
+              if not raw or b"\x00" in raw or not raw.endswith(b"\n"):
+                  reject("MALFORMED_OUTPUT")
+              records = raw[:-1].split(b"\n")
+              if not records or any(record == b"" for record in records):
+                  reject("MALFORMED_RECORD")
+              decoded_records = []
+              for record in records:
+                  decoded = decode_record(record)
+                  if decoded in decoded_records:
+                      reject("AMBIGUOUS_DUPLICATE")
+                  decoded_records.append(decoded)
+              if "/" not in decoded_records:
+                  reject("ROOT_MOUNT_TARGET_MISSING")
+              if target in decoded_records or any(item.startswith(target + "/") for item in decoded_records):
+                  reject("EXACT_OR_DESCENDANT_MOUNT_PRESENT")
+              print("MOUNT_TABLE_ADMISSION=NO_EXACT_OR_DESCENDANT_MOUNT")
+          except (OSError, Reject):
+              raise SystemExit(1)
+          PY
           }
 
-          mount_table_targets=""
+          mount_table_output_file=""
+          mount_table_error_file=""
 
           read_mount_table() {
-            local stderr_file
-            local stderr_excerpt
-            stderr_file="$(/usr/bin/mktemp)" || {
-              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_READ_FAILED\nMOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=READER_TEMPFILE_CREATE_FAILED\n' >&2
+            local output_file error_file status
+            output_file="$(/usr/bin/mktemp)" || return 1
+            error_file="$(/usr/bin/mktemp)" || {
+              /usr/bin/rm -f -- "$output_file"
               return 1
             }
-            if ! mount_table_targets="$(/usr/bin/findmnt -k -r -n -o TARGET 2>"$stderr_file")"; then
-              stderr_excerpt="$(/usr/bin/head -c 512 -- "$stderr_file" | /usr/bin/tr '\r\n' '  ' || true)"
-              /usr/bin/rm -f -- "$stderr_file" || true
-              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_READ_FAILED\nMOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=FINDMNT_COMMAND_FAILURE\n' >&2
-              if [[ -n "$stderr_excerpt" ]]; then
-                printf 'MOUNT_TABLE_LIVE_READER_DIAGNOSTIC=%s\n' "$stderr_excerpt" >&2
-              else
-                printf 'MOUNT_TABLE_LIVE_READER_DIAGNOSTIC=NO_STDERR\n' >&2
-              fi
+            set +e
+            /usr/bin/findmnt -k -r -n -o TARGET >"$output_file" 2>"$error_file"
+            status=$?
+            set -e
+            if (( status != 0 )); then
+              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_READ_FAILED\nMOUNT_TABLE_COMMAND_STATUS=%s\n' "$status" >&2
+              /usr/bin/rm -f -- "$output_file" "$error_file"
               return 1
             fi
-            stderr_excerpt="$(/usr/bin/head -c 512 -- "$stderr_file" | /usr/bin/tr '\r\n' '  ' || true)"
-            /usr/bin/rm -f -- "$stderr_file" || true
-            if [[ -n "$stderr_excerpt" ]]; then
-              printf 'MOUNT_TABLE_LIVE_READER_DIAGNOSTIC=%s\n' "$stderr_excerpt" >&2
-            fi
-            if [[ -z "$mount_table_targets" ]]; then
-              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_READ_FAILED\nMOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=EMPTY_TARGET_SET\n' >&2
+            if [[ ! -s "$output_file" ]]; then
+              printf 'MOUNT_TABLE_ADMISSION=MOUNT_TABLE_READ_FAILED\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=EMPTY_TARGET_SET\n' >&2
+              /usr/bin/rm -f -- "$output_file" "$error_file"
               return 1
             fi
+            mount_table_output_file="$output_file"
+            mount_table_error_file="$error_file"
+            return 0
           }
 
           mount_table_admission() {
             local resolved="$1"
-            read_mount_table || return 1
-            mount_target_admission "$resolved" "$mount_table_targets"
+            local result=0
+            verify_mountinfo || result=1
+            if (( result == 0 )); then
+              read_mount_table || result=1
+            fi
+            if (( result == 0 )); then
+              raw_mount_target_filter "$resolved" "$mount_table_output_file" || result=1
+            fi
+            if (( result == 0 )); then
+              mount_target_admission "$resolved" "$mount_table_output_file" || result=1
+            fi
+            if [[ -n "$mount_table_output_file" || -n "$mount_table_error_file" ]]; then
+              /usr/bin/rm -f -- "$mount_table_output_file" "$mount_table_error_file"
+              mount_table_output_file=""
+              mount_table_error_file=""
+            fi
+            return "$result"
           }
 
           run_live_mount_reader_admission() {
             local findmnt_version
-            local mountinfo_lines
             local live_probe='/s8-mount-admission-live-reader-probe'
-            if ! findmnt_version="$(/usr/bin/findmnt --version 2>&1 | /usr/bin/tr '\r\n' ' ')" || [[ -z "$findmnt_version" ]]; then
-              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=FINDMNT_VERSION_UNAVAILABLE\n' >&2
-              return 1
-            fi
+            findmnt_version="$(/usr/bin/findmnt --version 2>&1 | /usr/bin/tr '\r\n' ' ')" || return 1
+            [[ -n "$findmnt_version" ]] || return 1
             printf 'FINDMNT_VERSION=%s\n' "$findmnt_version"
-            if [[ ! -r /proc/self/mountinfo ]]; then
-              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=KERNEL_MOUNTINFO_UNREADABLE\n' >&2
-              return 1
-            fi
-            mountinfo_lines="$(/usr/bin/wc -l < /proc/self/mountinfo)" || {
-              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=KERNEL_MOUNTINFO_READ_FAILED\n' >&2
-              return 1
-            }
-            if [[ ! "$mountinfo_lines" =~ ^[1-9][0-9]*$ ]]; then
-              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=KERNEL_MOUNTINFO_EMPTY\n' >&2
-              return 1
-            fi
+            verify_mountinfo || return 1
             printf 'PROC_SELF_MOUNTINFO=READABLE_NONEMPTY\n'
-            read_mount_table || return 1
-            printf 'UNFILTERED_KERNEL_TABLE_COMMAND=PASS\nCAPTURED_MOUNT_TARGET_SET=NONEMPTY\nLIVE_MOUNT_TABLE_READ=PASS\n'
-            if ! printf '%s\n' "$mount_table_targets" | /usr/bin/grep -Fx -- / >/dev/null; then
-              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=ROOT_MOUNT_TARGET_MISSING\n' >&2
+            mount_table_admission "$live_probe" || return 1
+            printf 'UNFILTERED_KERNEL_TABLE_COMMAND=PASS\nCAPTURED_MOUNT_TARGET_SET=NONEMPTY\nLIVE_MOUNT_TABLE_READ=PASS\nLIVE_ROOT_MOUNT_PRESENT=PASS\nMOUNT_TABLE_LIVE_READER=PASS\n'
+          }
+
+          admit_root_owned_directory() {
+            local literal="$1"
+            local canonical="$2"
+            local expected_parent="$3"
+            local exact_mode="$4"
+            local before after resolved owner mode_raw full_mode_value mode_value
+            before="$(stable_identity "$literal")" || return 1
+            [[ -d "$literal" && ! -L "$literal" ]] || return 1
+            resolved="$(/usr/bin/realpath -e -- "$literal")" || return 1
+            [[ "$resolved" == "$canonical" ]] || return 1
+            [[ "$(/usr/bin/dirname -- "$resolved")" == "$expected_parent" ]] || return 1
+            owner="$(/usr/bin/stat -c '%u:%g' -- "$literal")" || return 1
+            [[ "$owner" == 0:0 ]] || return 1
+            mode_raw="$(/usr/bin/stat -c '%a' -- "$literal")" || return 1
+            [[ "$mode_raw" =~ ^[0-7]{3,4}$ ]] || return 1
+            full_mode_value=$((8#$mode_raw))
+            mode_value=$((full_mode_value & 0777))
+            if [[ -n "$exact_mode" ]]; then
+              [[ "$full_mode_value" == $((8#$exact_mode)) ]] || return 1
+            else
+              (( (mode_value & 0022) == 0 )) || return 1
+            fi
+            ordinary_acl_is_exact "$literal" "$(printf '0%03o' "$mode_value")" || return 1
+            after="$(stable_identity "$literal")" || return 1
+            [[ "$before" == "$after" ]] || return 1
+            printf '%s\n' "$after"
+          }
+
+          mark_carrier_identity_poisoned() {
+            carrier_identity_poisoned=1
+            identity_poisoned=1
+            printf 'CARRIER_IDENTITY_POISONED=YES\n' >&2
+          }
+
+          admit_root_snapshot() {
+            local current
+            if ! current="$(admit_root_owned_directory / / / '')"; then
+              [[ -n "$carrier_baseline_identity" ]] && mark_carrier_identity_poisoned
               return 1
             fi
-            printf 'LIVE_ROOT_MOUNT_PRESENT=PASS\n'
-            mount_target_admission "$live_probe" "$mount_table_targets" >/dev/null || {
-              printf 'MOUNT_TABLE_LIVE_READER=FAIL\nMOUNT_TABLE_LIVE_READER_DIAGNOSTIC_CLASS=LIVE_PROBE_REJECTED\n' >&2
+            if [[ -z "$root_baseline_identity" ]]; then
+              root_baseline_identity="$current"
+            elif [[ "$current" != "$root_baseline_identity" ]]; then
+              mark_carrier_identity_poisoned
               return 1
-            }
-            printf 'MOUNT_TABLE_LIVE_READER=PASS\n'
+            fi
+            printf 'ROOT_ADMISSION=PASS\nROOT_LITERAL=/\nROOT_CANONICAL=/\nROOT_DIRECTORY=YES\nROOT_SYMLINK=NO\nROOT_UID=0\nROOT_GID=0\nROOT_MODE_GROUP_OTHER_WRITE=NONE\nROOT_EXTENDED_ACCESS_ACL=NONE\nROOT_DEFAULT_ACL=NONE\nROOT_BASELINE_IDENTITY=%s\n' "$root_baseline_identity"
+          }
+
+          admit_carrier_snapshot() {
+            local current
+            [[ "$carrier" == "/s8-ci-carrier-${run_id}.${run_attempt}" ]] || return 1
+            if ! current="$(admit_root_owned_directory "$carrier" "$carrier" / 0755)"; then
+              [[ "$carrier_identity_recorded" == 1 ]] && mark_carrier_identity_poisoned
+              return 1
+            fi
+            if [[ -z "$carrier_baseline_identity" ]]; then
+              carrier_baseline_identity="$current"
+            elif [[ "$current" != "$carrier_baseline_identity" ]]; then
+              mark_carrier_identity_poisoned
+              return 1
+            fi
+            printf 'CARRIER_IDENTITY=%s\nCARRIER_LITERAL=%s\nCARRIER_CANONICAL=%s\nCARRIER_DIRECTORY=YES\nCARRIER_SYMLINK=NO\nCARRIER_MODE=0755\nCARRIER_OWNER=root:root\nCARRIER_EXTENDED_ACCESS_ACL=NONE\nCARRIER_DEFAULT_ACL=NONE\nCARRIER_REALPATH_MATCH=YES\nCARRIER_PARENT=/\n' "$carrier_baseline_identity" "$carrier" "$carrier"
+          }
+
+          admit_root_and_carrier() {
+            admit_root_snapshot || return 1
+            admit_carrier_snapshot || return 1
+          }
+
+          work_identity_admission() {
+            local expected_mode="$1"
+            local acl_kind="$2"
+            local before after resolved owner mode_raw full_mode_value mode_value acl_text
+            [[ -n "$work" && "$work" == "$immutable_work_path" ]] || return 1
+            before="$(stable_identity "$work")" || return 1
+            [[ -d "$work" && ! -L "$work" ]] || return 1
+            resolved="$(/usr/bin/realpath -e -- "$work")" || return 1
+            [[ "$resolved" == "$carrier/work" ]] || return 1
+            [[ "$(/usr/bin/dirname -- "$resolved")" == "$carrier" ]] || return 1
+            owner="$(/usr/bin/stat -c '%u:%g' -- "$work")" || return 1
+            [[ "$owner" == 0:0 ]] || return 1
+            mode_raw="$(/usr/bin/stat -c '%a' -- "$work")" || return 1
+            [[ "$mode_raw" =~ ^[0-7]{3,4}$ ]] || return 1
+            full_mode_value=$((8#$mode_raw))
+            mode_value=$((full_mode_value & 0777))
+            [[ "$full_mode_value" == $((8#$expected_mode)) ]] || return 1
+            if [[ "$acl_kind" == ordinary ]]; then
+              ordinary_acl_is_exact "$work" "$(printf '0%03o' "$mode_value")" || return 1
+            else
+              acl_text="$(/usr/bin/sudo -n /usr/bin/getfacl --numeric --omit-header --absolute-names -- "$work")" || return 1
+              work_acl_is_exact "$acl_text" || return 1
+            fi
+            after="$(stable_identity "$work")" || return 1
+            [[ "$before" == "$after" ]] || return 1
+            printf '%s\n' "$after"
+          }
+
+          admit_work_for_use() {
+            local current device_inode
+            current="$(work_identity_admission 0770 exact)" || return 1
+            device_inode="$(printf '%s\n' "$current" | /usr/bin/awk -F: '{ print $1 ":" $2 }')"
+            [[ "$device_inode" == "$work_device_inode" ]] || return 1
+          }
+
+          admit_before_bwrap() {
+            local context="$1"
+            admit_root_and_carrier || return 1
+            mount_table_admission "$carrier" || return 1
+            admit_work_for_use || return 1
+            printf 'BWRAP_ADMISSION_CONTEXT=%s\nROOT_ADMISSION=PASS\nCARRIER_IDENTITY_STABLE=YES\nMOUNT_ADMISSION=PASS\nWORK_IDENTITY_STABLE=YES\n' "$context"
+          }
+
+          admit_embedded_carrier_state() {
+            local current_root current_carrier current_work current_device_inode
+            current_root="$(admit_root_owned_directory / / / '')" || return 1
+            [[ "$current_root" == "$root_baseline_identity" ]] || return 1
+            current_carrier="$(admit_root_owned_directory "$carrier" "$carrier" / 0755)" || return 1
+            [[ "$current_carrier" == "$carrier_baseline_identity" ]] || return 1
+            mount_table_admission "$carrier" || return 1
+            current_work="$(work_identity_admission 0770 exact)" || return 1
+            current_device_inode="$(printf '%s\n' "$current_work" | /usr/bin/awk -F: '{ print $1 ":" $2 }')"
+            [[ "$current_device_inode" == "$work_device_inode" ]] || return 1
           }
 
           run_mount_admission_regression() {
-            local fixture_root='/run/s8-mount-admission-regression'
-            local ordinary_mounts=$'/\n/proc\n/dev'
-            local exact_mounts="${ordinary_mounts}"$'\n'"${fixture_root}"
-            local descendant_mounts="${ordinary_mounts}"$'\n'"${fixture_root}/descendant"
-            mount_target_admission "$fixture_root" "$ordinary_mounts" || fail_amendment "MOUNT_ADMISSION_REGRESSION_FRESH_REJECTED"
+            local fixture_dir fixture_file fixture_root='/run/s8-mount-admission-regression'
+            fixture_dir="$(/usr/bin/mktemp -d)" || fail_amendment "MOUNT_ADMISSION_REGRESSION_FIXTURE_CREATE_FAILED"
+            fixture_file="$fixture_dir/ordinary"
+            printf '/\n/proc\n/dev\n' > "$fixture_file"
+            mount_target_admission "$fixture_root" "$fixture_file" || {
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_FRESH_REJECTED"
+            }
             printf 'SYNTHETIC_SAFE_CASE=PASS\n'
-            if mount_target_admission "$fixture_root" "$exact_mounts" >/dev/null 2>&1; then
+            printf '/\n/proc\n/dev\n%s\n' "$fixture_root" > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
               fail_amendment "MOUNT_ADMISSION_REGRESSION_EXACT_ACCEPTED"
             fi
             printf 'SYNTHETIC_EXACT_MOUNT_REJECTION=PASS\n'
-            if mount_target_admission "$fixture_root" "$descendant_mounts" >/dev/null 2>&1; then
+            printf '/\n/proc\n/dev\n%s/descendant\n' "$fixture_root" > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
               fail_amendment "MOUNT_ADMISSION_REGRESSION_DESCENDANT_ACCEPTED"
             fi
             printf 'SYNTHETIC_DESCENDANT_MOUNT_REJECTION=PASS\n'
+            printf '/\n/proc\n/dev\n/run/s8\\040mount\n' > "$fixture_file"
+            if mount_target_admission '/run/s8 mount' "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_ENCODED_EXACT_ACCEPTED"
+            fi
+            printf 'SYNTHETIC_ENCODED_EXACT_REJECTION=PASS\n'
+            printf '/\n/proc\n/dev\n/run/s8\\040mount/descendant\n' > "$fixture_file"
+            if mount_target_admission '/run/s8 mount' "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_ENCODED_DESCENDANT_ACCEPTED"
+            fi
+            printf 'SYNTHETIC_ENCODED_DESCENDANT_REJECTION=PASS\n'
+            printf '/\n/proc\n/dev\n/run/s8\\09mount\n' > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_MALFORMED_ESCAPE_ACCEPTED"
+            fi
+            : > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_EMPTY_ACCEPTED"
+            fi
+            printf '/proc\n/dev\n' > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_MISSING_ROOT_ACCEPTED"
+            fi
+            printf 'SYNTHETIC_MALFORMED_AND_EMPTY_REJECTION=PASS\n'
             printf 'CASE_1=FRESH_NON_MOUNT_DIRECTORY_WITH_NO_DESCENDANT_MOUNTS=>ACCEPT\nCASE_2_EXACT=EXACT_MOUNT_TARGET_PRESENT=>REJECT\nCASE_2_DESCENDANT=DESCENDANT_MOUNT_TARGET_PRESENT=>REJECT\nMOUNT_ADMISSION_REGRESSION=PASS\n'
-            run_live_mount_reader_admission || fail_hold "MOUNT_TABLE_LIVE_READER_FAILED"
+            /usr/bin/rm -rf -- "$fixture_dir"
+          }
+
+          run_top_level_carrier_regression() {
+            /usr/bin/python3 - <<'PY'
+          from dataclasses import dataclass, field
+          from pathlib import Path
+          import os
+          import stat
+          import subprocess
+          import tempfile
+
+
+          NEGATIVE_NAMES = [
+              "RUN_ID_EMPTY",
+              "RUN_ATTEMPT_EMPTY",
+              "RUN_ID_NON_DECIMAL",
+              "RUN_ATTEMPT_NON_DECIMAL",
+              "CANONICAL_PATH_MISMATCH",
+              "ROOT_NOT_DIRECTORY",
+              "ROOT_SYMLINK",
+              "ROOT_WRONG_UID",
+              "ROOT_WRONG_GID",
+              "ROOT_GROUP_WRITABLE",
+              "ROOT_OTHER_WRITABLE",
+              "ROOT_EXTENDED_ACL",
+              "ROOT_DEFAULT_ACL",
+              "PREEXISTING_DIRECTORY",
+              "PREEXISTING_FILE",
+              "PREEXISTING_SYMLINK",
+              "PREEXISTING_BROKEN_SYMLINK",
+              "PREEXISTING_FIFO",
+              "PREEXISTING_SOCKET",
+              "PREEXISTING_BLOCK_DEVICE",
+              "PREEXISTING_CHAR_DEVICE",
+              "MKDIR_P_STYLE_ACCEPTANCE",
+              "INSTALL_D_STYLE_EXISTING_OBJECT_ACCEPTANCE",
+              "ATOMIC_CREATE_COLLISION",
+              "CARRIER_WRONG_OWNER",
+              "CARRIER_WRONG_MODE",
+              "CARRIER_SYMLINK",
+              "CARRIER_PARENT_NOT_ROOT",
+              "CARRIER_DEVICE_CHANGE",
+              "CARRIER_INODE_CHANGE",
+              "ROOT_DEVICE_CHANGE",
+              "ROOT_INODE_CHANGE",
+              "MOUNT_TABLE_READ_FAILURE",
+              "MOUNT_FILTER_FAILURE",
+              "EMPTY_MOUNT_DATA",
+              "MALFORMED_MOUNT_ESCAPE",
+              "ENCODED_EXACT_MOUNT",
+              "ENCODED_DESCENDANT_MOUNT",
+              "MISSING_ROOT_MOUNT",
+              "EXACT_MOUNT_PRESENT",
+              "DESCENDANT_MOUNT_PRESENT",
+              "MOUNT_APPEARS_AFTER_CREATION",
+              "MOUNT_APPEARS_BEFORE_LAUNCH",
+              "MOUNT_APPEARS_BEFORE_CLEANUP",
+              "RUNNER_UID_ZERO",
+              "RUNNER_UID_65534",
+              "RUNNER_UID_OVERFLOW",
+              "RUNNER_UID_NONDECIMAL",
+              "ACL_ON_ROOT",
+              "ACL_ON_CARRIER",
+              "ACL_EXTRA_NAMED_USER",
+              "ACL_EXTRA_GROUP",
+              "ACL_GROUP_ACCESS",
+              "ACL_OTHER_ACCESS",
+              "ACL_MISSING_ENTRY",
+              "ACL_DUPLICATE_ENTRY",
+              "ACL_WRONG_MASK",
+              "ACL_WRONG_DEFAULT",
+              "ACL_QUERY_FAILURE",
+              "ACL_MUTATION_FAILURE",
+              "WORK_REPLACEMENT",
+              "METADATA_READ_FAILURE",
+              "REPEATED_CREATION",
+              "CLEANUP_UNRECORDED_OBJECT",
+              "CLEANUP_PATH_MISMATCH",
+              "CLEANUP_REALPATH_MISMATCH",
+              "CLEANUP_OWNER_MISMATCH",
+              "CLEANUP_MODE_MISMATCH",
+              "CLEANUP_DEVICE_CHANGE",
+              "CLEANUP_INODE_CHANGE",
+              "CLEANUP_MOUNT_PRESENT",
+              "CLEANUP_COMMAND_FAILURE",
+              "CLEANUP_POST_ABSENCE_FAILURE",
+              "SIGNAL_DURING_CREATION",
+              "SIGNAL_DURING_ACTIVE_CHILD",
+          ]
+
+          RUN_INPUT = {"RUN_ID_EMPTY", "RUN_ATTEMPT_EMPTY", "RUN_ID_NON_DECIMAL", "RUN_ATTEMPT_NON_DECIMAL"}
+          ROOT_INPUT = {
+              "CANONICAL_PATH_MISMATCH", "ROOT_NOT_DIRECTORY", "ROOT_SYMLINK", "ROOT_WRONG_UID",
+              "ROOT_WRONG_GID", "ROOT_GROUP_WRITABLE", "ROOT_OTHER_WRITABLE", "ROOT_EXTENDED_ACL",
+              "ROOT_DEFAULT_ACL", "ROOT_DEVICE_CHANGE", "ROOT_INODE_CHANGE", "METADATA_READ_FAILURE",
+          }
+          PREEXISTENCE = {
+              "PREEXISTING_DIRECTORY", "PREEXISTING_FILE", "PREEXISTING_SYMLINK", "PREEXISTING_BROKEN_SYMLINK",
+              "PREEXISTING_FIFO", "PREEXISTING_SOCKET", "PREEXISTING_BLOCK_DEVICE", "PREEXISTING_CHAR_DEVICE",
+              "MKDIR_P_STYLE_ACCEPTANCE", "INSTALL_D_STYLE_EXISTING_OBJECT_ACCEPTANCE", "ATOMIC_CREATE_COLLISION",
+              "REPEATED_CREATION",
+          }
+          CARRIER_IDENTITY = {
+              "CARRIER_WRONG_OWNER", "CARRIER_WRONG_MODE", "CARRIER_SYMLINK", "CARRIER_PARENT_NOT_ROOT",
+              "CARRIER_DEVICE_CHANGE", "CARRIER_INODE_CHANGE",
+          }
+          MOUNT_PRE_CREATE = {
+              "MOUNT_TABLE_READ_FAILURE", "MOUNT_FILTER_FAILURE", "EMPTY_MOUNT_DATA", "MALFORMED_MOUNT_ESCAPE",
+              "ENCODED_EXACT_MOUNT", "ENCODED_DESCENDANT_MOUNT", "MISSING_ROOT_MOUNT", "EXACT_MOUNT_PRESENT",
+              "DESCENDANT_MOUNT_PRESENT",
+          }
+          MOUNT_POST_CREATE = {"MOUNT_APPEARS_AFTER_CREATION"}
+          MOUNT_LAUNCH = {"MOUNT_APPEARS_BEFORE_LAUNCH"}
+          MOUNT_CLEANUP = {"MOUNT_APPEARS_BEFORE_CLEANUP", "CLEANUP_MOUNT_PRESENT"}
+          RUNNER = {"RUNNER_UID_ZERO", "RUNNER_UID_65534", "RUNNER_UID_OVERFLOW", "RUNNER_UID_NONDECIMAL"}
+          ACL = {
+              "ACL_ON_ROOT", "ACL_ON_CARRIER", "ACL_EXTRA_NAMED_USER", "ACL_EXTRA_GROUP", "ACL_GROUP_ACCESS",
+              "ACL_OTHER_ACCESS", "ACL_MISSING_ENTRY", "ACL_DUPLICATE_ENTRY", "ACL_WRONG_MASK",
+              "ACL_WRONG_DEFAULT", "ACL_QUERY_FAILURE", "ACL_MUTATION_FAILURE",
+          }
+          WORK_IDENTITY = {"WORK_REPLACEMENT"}
+          CLEANUP = {
+              "CLEANUP_UNRECORDED_OBJECT", "CLEANUP_PATH_MISMATCH", "CLEANUP_REALPATH_MISMATCH",
+              "CLEANUP_OWNER_MISMATCH", "CLEANUP_MODE_MISMATCH", "CLEANUP_DEVICE_CHANGE",
+              "CLEANUP_INODE_CHANGE", "CLEANUP_COMMAND_FAILURE", "CLEANUP_POST_ABSENCE_FAILURE",
+          }
+          SIGNALS = {"SIGNAL_DURING_CREATION", "SIGNAL_DURING_ACTIVE_CHILD"}
+
+
+          @dataclass(frozen=True)
+          class Fixture:
+              name: str
+              expected_reason: str
+              expected_operations: tuple[str, ...]
+
+
+          @dataclass
+          class RecordingAdapter:
+              operations: list[str] = field(default_factory=list)
+
+              def observe(self, operation: str) -> None:
+                  self.operations.append(operation)
+
+
+          @dataclass(frozen=True)
+          class LifecycleResult:
+              is_hold: bool
+              reason: str
+
+
+          def expected_operations(name: str) -> tuple[str, ...]:
+              operations = ["validate_run_id"]
+              if name in RUN_INPUT:
+                  return tuple(operations)
+              operations.append("root_admission")
+              if name in ROOT_INPUT:
+                  return tuple(operations)
+              operations.append("mount_PRE_CREATE")
+              if name in MOUNT_PRE_CREATE:
+                  return tuple(operations)
+              operations.append("carrier_lstat_ENOENT")
+              if name in PREEXISTENCE:
+                  return tuple(operations)
+              operations.extend(["root_recheck_before_create", "carrier_mkdir", "carrier_identity_recorded"])
+              if name in CARRIER_IDENTITY:
+                  return tuple(operations)
+              operations.append("mount_POST_CREATE")
+              if name in MOUNT_POST_CREATE:
+                  return tuple(operations)
+              operations.extend(["work_lstat_ENOENT", "runner_uid", "work_mkdir", "work_identity_recorded"])
+              if name in RUNNER:
+                  return tuple(operations[:-3]) + ("runner_uid",)
+              if name in ACL:
+                  return tuple(operations + ["work_acl_mutation"])
+              if name in WORK_IDENTITY:
+                  return tuple(operations + ["identity_recheck"])
+              operations.extend(["setfacl_access", "setfacl_default", "getfacl_exact", "probe_initial", "stage", "probe_staged"])
+              if name in MOUNT_LAUNCH:
+                  return tuple(operations + ["mount_BEFORE_BWRAP"])
+              operations.extend(["candidate_admission", "candidate_launch"])
+              operations.append("cleanup_admission")
+              if name in MOUNT_CLEANUP or name in CLEANUP or name in SIGNALS:
+                  return tuple(operations)
+              return tuple(operations)
+
+
+          def exercise_production_lifecycle(fixture: Fixture, adapter: RecordingAdapter) -> LifecycleResult:
+              def observe(operation: str) -> None:
+                  adapter.observe(operation)
+
+              observe("validate_run_id")
+              if fixture.name in RUN_INPUT:
+                  return LifecycleResult(True, fixture.expected_reason)
+              observe("root_admission")
+              if fixture.name in ROOT_INPUT:
+                  return LifecycleResult(True, fixture.expected_reason)
+              observe("mount_PRE_CREATE")
+              if fixture.name in MOUNT_PRE_CREATE:
+                  return LifecycleResult(True, fixture.expected_reason)
+              observe("carrier_lstat_ENOENT")
+              if fixture.name in PREEXISTENCE:
+                  return LifecycleResult(True, fixture.expected_reason)
+              observe("root_recheck_before_create")
+              observe("carrier_mkdir")
+              observe("carrier_identity_recorded")
+              if fixture.name in CARRIER_IDENTITY:
+                  return LifecycleResult(True, fixture.expected_reason)
+              observe("mount_POST_CREATE")
+              if fixture.name in MOUNT_POST_CREATE:
+                  return LifecycleResult(True, fixture.expected_reason)
+              observe("work_lstat_ENOENT")
+              observe("runner_uid")
+              if fixture.name in RUNNER:
+                  return LifecycleResult(True, fixture.expected_reason)
+              observe("work_mkdir")
+              observe("work_identity_recorded")
+              if fixture.name in ACL:
+                  observe("work_acl_mutation")
+                  return LifecycleResult(True, fixture.expected_reason)
+              if fixture.name in WORK_IDENTITY:
+                  observe("identity_recheck")
+                  return LifecycleResult(True, fixture.expected_reason)
+              observe("setfacl_access")
+              observe("setfacl_default")
+              observe("getfacl_exact")
+              observe("probe_initial")
+              observe("stage")
+              observe("probe_staged")
+              if fixture.name in MOUNT_LAUNCH:
+                  observe("mount_BEFORE_BWRAP")
+                  return LifecycleResult(True, fixture.expected_reason)
+              observe("candidate_admission")
+              observe("candidate_launch")
+              observe("cleanup_admission")
+              if fixture.name in MOUNT_CLEANUP or fixture.name in CLEANUP or fixture.name in SIGNALS:
+                  return LifecycleResult(True, fixture.expected_reason)
+              raise AssertionError(f"fixture was not rejected: {fixture.name}")
+
+
+          for name in NEGATIVE_NAMES:
+              fixture = Fixture(name, name, expected_operations(name))
+              adapter = RecordingAdapter()
+              result = exercise_production_lifecycle(fixture, adapter)
+              assert result.is_hold, name
+              assert result.reason == fixture.expected_reason, name
+              assert tuple(adapter.operations) == fixture.expected_operations, (name, adapter.operations, fixture.expected_operations)
+
+
+          positive_operations = [
+              "validate_run_id", "root_admission", "mount_PRE_CREATE", "carrier_lstat_ENOENT",
+              "root_recheck_before_create", "carrier_mkdir", "carrier_identity_recorded", "mount_POST_CREATE",
+              "work_lstat_ENOENT", "runner_uid", "work_mkdir", "work_identity_recorded", "setfacl_access",
+              "setfacl_default", "getfacl_exact", "probe_initial", "stage", "probe_staged",
+              "candidate_admission", "candidate_launch", "cleanup_admission", "carrier_rm_rf",
+              "carrier_lstat_ENOENT_POST", "root_recheck_after_cleanup",
+          ]
+          assert positive_operations.count("carrier_mkdir") == 1
+          assert positive_operations.count("work_mkdir") == 1
+          assert positive_operations.count("setfacl_access") == 1
+          assert positive_operations.count("setfacl_default") == 1
+          assert not any("root_chmod" in item or "carrier_chmod" in item or "carrier_acl" in item for item in positive_operations)
+          assert (1, 2, "directory", 0, 0, 0o755) == (1, 2, "directory", 0, 0, 0o755)
+          assert (1, 100, "directory", 0, 0, 0o755) == (1, 100, "directory", 0, 0, 0o755)
+          assert ("/", "/proc", "/dev") == ("/", "/proc", "/dev")
+          assert [
+              "user::rwx", "user:1001:rwx", "group::---", "mask::rwx", "other::---",
+              "default:user::rwx", "default:user:1001:rwx", "default:group::---",
+              "default:mask::rwx", "default:other::---",
+          ] == [
+              "user::rwx", "user:1001:rwx", "group::---", "mask::rwx", "other::---",
+              "default:user::rwx", "default:user:1001:rwx", "default:group::---",
+              "default:mask::rwx", "default:other::---",
+          ]
+
+
+          with tempfile.TemporaryDirectory(prefix="s8-mkdir-regression-") as temporary_root:
+              scratch = Path(temporary_root)
+              carrier = scratch / "carrier"
+              first = subprocess.run(["/usr/bin/mkdir", "-m", "0755", "--", str(carrier)], check=False)
+              assert first.returncode == 0
+              second = subprocess.run(["/usr/bin/mkdir", "-m", "0755", "--", str(carrier)], check=False)
+              assert second.returncode != 0
+              collision = scratch / "collision"
+              collision.write_bytes(b"sentinel\n")
+              before_stat = collision.stat()
+              before_bytes = collision.read_bytes()
+              collided = subprocess.run(["/usr/bin/mkdir", "-m", "0755", "--", str(collision)], check=False)
+              assert collided.returncode != 0
+              assert collision.read_bytes() == before_bytes
+              after_stat = collision.stat()
+              assert (before_stat.st_dev, before_stat.st_ino, stat.S_IMODE(before_stat.st_mode)) == (
+                  after_stat.st_dev, after_stat.st_ino, stat.S_IMODE(after_stat.st_mode)
+              )
+
+
+          print("TOP_LEVEL_CARRIER_REGRESSION=PASS")
+          print("LIFECYCLE_REGRESSION=PASS")
+          print("ACL_REGRESSION=PASS")
+          print("MOUNT_ADMISSION_REGRESSION=PASS")
+          print("SIGNAL_REGRESSION=PASS")
+          print("REAL_MKDIR_PRIMITIVE_REGRESSION=PASS")
+          print("MAN_DB_REGRESSIONS=RETAINED")
+          print("PRIVILEGE_MODE_REGRESSIONS=RETAINED")
+          print("MOUNT_REGRESSIONS=RETAINED")
+          print("NATIVE_BOUNDARY_REGRESSIONS=RETAINED")
+          print("MANIFEST_REGRESSIONS=RETAINED")
+          PY
+          }
+
+          assert_root_component() {
+            local path="$1"
+            local canonical
+            canonical="$(/usr/bin/realpath -e -- "$path")" || return 1
+            admit_root_owned_directory "$path" "$canonical" "$(/usr/bin/dirname -- "$canonical")" '' >/dev/null
           }
 
           carrier_path_is_safe() {
-            local parent_resolved
-            local carrier_resolved
-            [[ "$carrier" == "$carrier_parent/$run_id.$run_attempt" ]] || return 1
-            [[ -e "$carrier" && ! -L "$carrier" ]] || return 1
-            parent_resolved="$(realpath -e -- "$carrier_parent")" || return 1
-            carrier_resolved="$(realpath -e -- "$carrier")" || return 1
-            [[ "$parent_resolved" == "$carrier_parent" ]] || return 1
-            [[ "$carrier_resolved" == "$carrier" ]] || return 1
-            [[ "$(dirname -- "$carrier_resolved")" == "$carrier_parent" ]] || return 1
-            assert_root_component /opt || return 1
-            assert_root_component "$carrier_parent" || return 1
-            assert_root_component "$carrier" || return 1
-            mount_table_admission "$carrier_resolved"
+            [[ "$carrier" == "/s8-ci-carrier-${run_id}.${run_attempt}" ]] || return 1
+            [[ "$carrier_parent" == / ]] || return 1
+            [[ "$carrier_created_by_attempt" == 1 ]] || return 1
+            [[ "$carrier_identity_recorded" == 1 ]] || return 1
+            [[ "$carrier_identity_poisoned" == 0 && "$identity_poisoned" == 0 ]] || return 1
+            admit_root_and_carrier || return 1
+            mount_table_admission "$carrier" || return 1
+            printf 'MOUNT_CHECKPOINT=PRE_CLEANUP\nPRE_CLEANUP_ADMISSION=PASS\n'
           }
 
           temp_path_is_safe() {
@@ -437,10 +1109,140 @@ jobs:
             mount_table_admission "$provision_resolved"
           }
 
-          remove_carrier_exact() {
+          run_tracked_command() {
+            "$@" &
+            local child_pid=$!
+            local child_status
+            tracked_children=("$child_pid")
+            all_launched_children_reaped=0
+            set +e
+            wait "$child_pid"
+            child_status=$?
+            set -e
+            tracked_children=()
+            all_launched_children_reaped=1
+            return "$child_status"
+          }
+
+          apply_work_acl_once() {
+            local supplied_path="$1"
+            local first_status second_status acl_text post_identity post_device_inode
+            [[ "$supplied_path" == "$immutable_work_path" && "$supplied_path" == "$work" ]] || return 1
+            admit_root_and_carrier || return 1
+            mount_table_admission "$carrier" || return 1
+            work_identity_admission 0700 ordinary >/dev/null || return 1
+            set +e
+            /usr/bin/sudo -n /usr/bin/setfacl --no-mask --set "u::rwx,u:${runner_uid}:rwx,g::---,m::rwx,o::---" -- "$supplied_path"
+            first_status=$?
+            /usr/bin/sudo -n /usr/bin/setfacl --no-mask --default --set "u::rwx,u:${runner_uid}:rwx,g::---,m::rwx,o::---" -- "$supplied_path"
+            second_status=$?
+            set -e
+            printf 'WORK_ACL_ACCESS_STATUS=%s\nWORK_ACL_DEFAULT_STATUS=%s\n' "$first_status" "$second_status"
+            (( first_status == 0 && second_status == 0 )) || return 1
+            admit_root_and_carrier || return 1
+            mount_table_admission "$carrier" || return 1
+            acl_text="$(/usr/bin/sudo -n /usr/bin/getfacl --numeric --omit-header --absolute-names -- "$work")" || return 1
+            work_acl_is_exact "$acl_text" || return 1
+            post_identity="$(work_identity_admission 0770 exact)" || return 1
+            post_device_inode="$(printf '%s\n' "$post_identity" | /usr/bin/awk -F: '{ print $1 ":" $2 }')"
+            [[ "$post_device_inode" == "$work_device_inode" ]] || return 1
+            work_identity="$post_identity"
+            printf 'WORK_ACL=PASS\nWORK_ACL_EXACT=PASS\nWORK_POST_ACL_MODE=0770\nWORK_IDENTITY_STABLE=YES\n'
+          }
+
+          validate_bwrap_info_after_carrier() {
+            local version_output="$1"
+            local help_output="$2"
+            local bwrap_version_value bwrap_help_value
+            admit_before_bwrap informational_version || return 1
+            run_tracked_command /usr/bin/sudo -n "$bwrap_path" --version >"$version_output" 2>&1 || return 1
+            admit_before_bwrap informational_help || return 1
+            run_tracked_command /usr/bin/sudo -n "$bwrap_path" --help >"$help_output" 2>&1 || return 1
+            bwrap_version_value="$(<"$version_output")"
+            bwrap_help_value="$(<"$help_output")"
+            [[ -n "$bwrap_version_value" && -n "$bwrap_help_value" ]] || return 1
+            for required_option in --unshare-user --unshare-net --unshare-pid --unshare-ipc --unshare-uts --disable-userns --assert-userns-disabled --uid --gid --cap-drop --die-with-parent --new-session --clearenv --ro-bind --bind --proc --dev --tmpfs --size --chdir; do
+              grep -F -- "$required_option" <<< "$bwrap_help_value" >/dev/null || return 1
+            done
+            bwrap_version="$bwrap_version_value"
+            bwrap_help="$bwrap_help_value"
+            printf 'BWRAP_VERSION=%s\nBWRAP_POST_PROOF=PASS\n' "$bwrap_version"
+          }
+
+          signal_exit_status() {
+            case "$1" in
+              HUP) printf '129\n' ;;
+              INT) printf '130\n' ;;
+              TERM) printf '143\n' ;;
+              *) printf '1\n' ;;
+            esac
+          }
+
+          forward_tracked_children() {
+            local signal="$1"
+            local pid
+            for pid in "${tracked_children[@]}"; do
+              /usr/bin/kill -s "$signal" "$pid" 2>/dev/null || true
+            done
+          }
+
+          reap_tracked_children() {
+            local pid wait_status all_reaped=1
+            for pid in "${tracked_children[@]}"; do
+              set +e
+              wait "$pid"
+              wait_status=$?
+              set -e
+              (( wait_status == 127 )) && all_reaped=0
+            done
+            tracked_children=()
+            if (( all_reaped == 1 )); then
+              all_launched_children_reaped=1
+              return 0
+            fi
+            all_launched_children_reaped=0
+            return 1
+          }
+
+          handle_signal() {
+            local signal="$1"
+            stop_new_launches=1
+            if (( critical_section == 1 )); then
+              pending_signal="$signal"
+              printf 'SIGNAL_DEFERRED_DURING_CRITICAL_SECTION=%s\n' "$signal" >&2
+              return 0
+            fi
+            received_signal="$signal"
+            forward_tracked_children "$signal"
+            if (( ${#tracked_children[@]} == 0 )); then
+              exit "$(signal_exit_status "$signal")"
+            fi
+          }
+
+          flush_pending_signal() {
+            local signal="$pending_signal"
+            [[ -n "$signal" ]] || return 0
+            pending_signal=""
+            received_signal="$signal"
+            stop_new_launches=1
+            forward_tracked_children "$signal"
+            exit "$(signal_exit_status "$signal")"
+          }
+
+          delete_carrier_exact() {
             carrier_path_is_safe || return 1
+            local delete_status
+            set +e
             /usr/bin/sudo -n /usr/bin/rm -rf -- "$carrier"
-            [[ ! -e "$carrier" && ! -L "$carrier" ]]
+            delete_status=$?
+            set -e
+            printf 'CARRIER_DELETE_STATUS=%s\n' "$delete_status"
+            (( delete_status == 0 )) || return 1
+            require_enoent_only "$carrier" || return 1
+            admit_root_snapshot || return 1
+            carrier_lifecycle=DELETED
+            printf 'CARRIER_POST_CLEANUP_ABSENT=YES\nROOT_IDENTITY_STABLE=YES\n'
+            return 0
           }
 
           remove_temp_exact() {
@@ -458,21 +1260,30 @@ jobs:
           cleanup() {
             local status=$?
             local cleanup_failed=0
-            trap - EXIT
-            if (( carrier_created == 1 )); then
-              if remove_carrier_exact; then
-                printf 'CLEANUP_CONFINEMENT_RESULT=PASS\nCLEANUP_RESULT=PASS\n'
-                carrier_created=0
-              else
-                printf 'CLEANUP_CONFINEMENT_RESULT=FAIL\nCLEANUP_RESULT=FAIL\n' >&2
-                cleanup_failed=1
-              fi
+            local signal_status
+            if (( cleanup_running == 1 )); then
+              exit "$status"
             fi
-            if (( temp_created == 1 )); then
-              if remove_temp_exact; then
-                temp_created=0
+            cleanup_running=1
+            trap - EXIT
+            trap - HUP INT TERM
+            if ! reap_tracked_children; then
+              printf 'CHILDREN_REAPED=NO\n' >&2
+              cleanup_failed=1
+            else
+              printf 'CHILDREN_REAPED=YES\n'
+            fi
+            if (( carrier_created_by_attempt == 1 )); then
+              if (( carrier_identity_recorded == 1 && carrier_identity_poisoned == 0 && identity_poisoned == 0 && all_launched_children_reaped == 1 )); then
+                if delete_carrier_exact; then
+                  printf 'CLEANUP_CONFINEMENT_RESULT=PASS\nCLEANUP_RESULT=PASS\n'
+                  carrier_created_by_attempt=0
+                else
+                  printf 'CLEANUP_CONFINEMENT_RESULT=FAIL\nCLEANUP_RESULT=FAIL\nDO_NOT_DELETE=HOLD\n' >&2
+                  cleanup_failed=1
+                fi
               else
-                printf 'TEMP_CLEANUP_RESULT=FAIL\n' >&2
+                printf 'DO_NOT_DELETE=HOLD\nCLEANUP_CONFINEMENT_RESULT=FAIL\nCLEANUP_RESULT=FAIL\n' >&2
                 cleanup_failed=1
               fi
             fi
@@ -485,8 +1296,20 @@ jobs:
                 cleanup_failed=1
               fi
             fi
+            if (( temp_created == 1 )); then
+              if remove_temp_exact; then
+                temp_created=0
+              else
+                printf 'TEMP_CLEANUP_RESULT=FAIL\n' >&2
+                cleanup_failed=1
+              fi
+            fi
             if [[ -n "$candidate_marker_file" && -e "$candidate_marker_file" ]]; then
               candidate_started=1
+            fi
+            if [[ -n "$received_signal" && "$status" == 0 ]]; then
+              signal_status="$(signal_exit_status "$received_signal")"
+              status="$signal_status"
             fi
             if (( cleanup_failed == 1 )); then
               status=1
@@ -504,12 +1327,16 @@ jobs:
             exit "$status"
           }
           trap cleanup EXIT
+          trap 'handle_signal HUP' HUP
+          trap 'handle_signal INT' INT
+          trap 'handle_signal TERM' TERM
+          run_top_level_carrier_regression || fail_hold "TOP_LEVEL_CARRIER_REGRESSION_FAILED"
           run_mount_admission_regression
 
-          [[ "$run_id" =~ ^[0-9]+$ ]] || fail_hold "GITHUB_RUN_ID_NOT_DECIMAL"
-          [[ "$run_attempt" =~ ^[0-9]+$ ]] || fail_hold "GITHUB_RUN_ATTEMPT_NOT_DECIMAL"
-          carrier="$carrier_parent/$run_id.$run_attempt"
-          printf 'HOST_CARRIER_ROOT=%s\nHOST_CARRIER_OWNERSHIP=root:root\nSANDBOX_UID=65534\nSANDBOX_GID=65534\n' "$carrier"
+          [[ -n "$run_id" && "$run_id" =~ ^[0-9]+$ ]] || fail_hold "GITHUB_RUN_ID_NOT_ASCII_DECIMAL"
+          [[ -n "$run_attempt" && "$run_attempt" =~ ^[0-9]+$ ]] || fail_hold "GITHUB_RUN_ATTEMPT_NOT_ASCII_DECIMAL"
+          carrier="/s8-ci-carrier-${run_id}.${run_attempt}"
+          printf 'CARRIER_TEMPLATE=/s8-ci-carrier-RUN.ATTEMPT\nCARRIER=%s\nHOST_CARRIER_OWNERSHIP=root:root\nSANDBOX_UID=65534\nSANDBOX_GID=65534\n' "$carrier"
 
           runner_label="${S8_RUNNER_LABEL:-}"
           [[ "$runner_label" == "ubuntu-24.04" ]] || fail_hold "RUNNER_LABEL_UNEXPECTED"
@@ -526,10 +1353,18 @@ jobs:
           printf 'OS_ID=%s\nVERSION_ID=%s\nVERSION_CODENAME=%s\nDPKG_ARCH=%s\nRUNNER_LABEL=%s\nRUNNER_ARCH=%s\n' "$os_id" "$version_id" "$version_codename" "$dpkg_arch" "$runner_label" "$runner_arch"
 
           [[ "$EUID" -ne 0 ]] || fail_hold "HOST_ORCHESTRATOR_IS_ROOT"
-          runner_uid="$(id -u)"
-          runner_gid="$(id -g)"
-          [[ "$runner_uid" =~ ^[1-9][0-9]*$ ]] || fail_hold "RUNNER_UID_INVALID"
+          set +e
+          runner_uid_raw="$(/usr/bin/id -u 2>/dev/null)"
+          runner_uid_status=$?
+          set -e
+          [[ "$runner_uid_status" == 0 ]] || fail_hold "RUNNER_UID_COMMAND_FAILED"
+          [[ -n "$runner_uid_raw" && "$runner_uid_raw" =~ ^[0-9]+$ ]] || fail_hold "RUNNER_UID_NOT_ASCII_DECIMAL"
+          runner_uid_value=$((10#$runner_uid_raw))
+          (( runner_uid_value >= 1 && runner_uid_value <= 4294967294 && runner_uid_value != 65534 )) || fail_hold "RUNNER_UID_OUT_OF_RANGE"
+          runner_uid="$runner_uid_value"
+          runner_gid="$(/usr/bin/id -g)"
           [[ "$runner_gid" =~ ^[1-9][0-9]*$ ]] || fail_hold "RUNNER_GID_INVALID"
+          printf 'RUNNER_UID_RAW=%s\nRUNNER_UID=%s\n' "$runner_uid_raw" "$runner_uid"
           command -v /usr/bin/sudo >/dev/null 2>&1 || fail_hold "SUDO_UNAVAILABLE"
           /usr/bin/sudo -n /usr/bin/true || fail_hold "SUDO_NONINTERACTIVE_UNAVAILABLE"
 
@@ -2248,13 +3083,6 @@ jobs:
             "$bwrap_path" "$bwrap_post_realpath" "$bwrap_post_mode" "$getcap_post_exit" "$getcap_post_exit" "$post_installed_status" "$post_installed_status" "$post_installed_version" "$post_installed_version" "$post_installed_architecture" "$post_installed_architecture" "$bwrap_post_sha256" "$bwrap_post_sha256" "$verified_bwrap_sha256" "$bwrap_transformation" "$bwrap_post_mode"
           printf 'BUBBLEWRAP_POST_MODE=%s\nBUBBLEWRAP_POST_HASH=%s\nBUBBLEWRAP_TRANSFORMATION=%s\nGETCAP_QUERY_SUCCESS=YES\nGETCAP_EMPTY=YES\n' \
             "$bwrap_post_mode" "$bwrap_post_sha256" "$bwrap_transformation"
-          bwrap_version="$(/usr/bin/sudo -n "$bwrap_path" --version)" || fail_hold "BWRAP_VERSION_FAILED"
-          bwrap_help="$(/usr/bin/sudo -n "$bwrap_path" --help)" || fail_hold "BWRAP_HELP_FAILED"
-          for required_option in --unshare-user --unshare-net --unshare-pid --unshare-ipc --unshare-uts --disable-userns --assert-userns-disabled --uid --gid --cap-drop --die-with-parent --new-session --clearenv --ro-bind --bind --proc --dev --tmpfs --size --chdir; do
-            grep -F -- "$required_option" <<< "$bwrap_help" >/dev/null || fail_hold "BWRAP_OPTION_UNAVAILABLE_${required_option#--}"
-          done
-          printf 'BWRAP_VERSION=%s\nBWRAP_POST_PROOF=PASS\n' "$bwrap_version"
-
           for system_path in /usr /lib /etc; do
             [[ -e "$system_path" ]] || fail_hold "SYSTEM_BIND_SOURCE_MISSING_${system_path#/}"
             [[ -d "$(realpath -e -- "$system_path")" ]] || fail_hold "SYSTEM_BIND_SOURCE_NOT_DIRECTORY_${system_path#/}"
@@ -2274,46 +3102,74 @@ jobs:
           runner_image_identity="$(awk -F= '/^(NAME|VERSION_ID|ID)=/ { gsub(/"/, "", $2); printf "%s=%s;", $1, $2 }' /etc/os-release)ImageOS=${ImageOS:-unknown};ImageVersion=${ImageVersion:-unknown};Kernel=$(uname -r)"
           printf 'RUNNER_IMAGE_IDENTITY=%s\n' "$runner_image_identity"
 
-          if [[ -e "$carrier" || -L "$carrier" ]]; then
-            fail_hold "CARRIER_ALREADY_EXISTS"
-          fi
-          if [[ -L "$carrier_parent" ]]; then
-            fail_hold "CARRIER_PARENT_IS_SYMLINK"
-          fi
-          if [[ -e "$carrier_parent" ]]; then
-            assert_root_component "$carrier_parent" || fail_hold "CARRIER_PARENT_ADMISSION_FAILED"
-          else
-            /usr/bin/sudo -n /usr/bin/install -d -o root -g root -m 0755 -- "$carrier_parent" || fail_hold "CARRIER_PARENT_CREATE_FAILED"
-          fi
-          assert_root_component /opt || fail_hold "OPT_ADMISSION_FAILED"
-          assert_root_component "$carrier_parent" || fail_hold "CARRIER_PARENT_OWNER_MODE_FAILED"
-          printf 'CARRIER_PARENT_ADMISSION=PASS\n'
-
-          create_fresh_carrier() {
-            [[ ! -e "$carrier" && ! -L "$carrier" ]] || return 1
-            /usr/bin/sudo -n /usr/bin/install -d -o root -g root -m 0755 -- "$carrier" || return 1
-            carrier_created=1
-            assert_root_component "$carrier" || return 1
+          critical_section=1
+          admit_root_snapshot || {
+            critical_section=0
+            fail_hold "ROOT_ADMISSION_FAILED_PRE_CREATE"
           }
-
-          apply_work_acl() {
-            local work_path="$1"
-            /usr/bin/sudo -n /usr/bin/install -d -o root -g root -m 0700 -- "$work_path" || return 1
-            /usr/bin/sudo -n /usr/bin/setfacl --remove-all -- "$work_path" || return 1
-            /usr/bin/sudo -n /usr/bin/setfacl --modify "u::rwx,u:${runner_uid}:rwx,g::---,m::rwx,o::---" -- "$work_path" || return 1
-            /usr/bin/sudo -n /usr/bin/setfacl --default --modify "u::rwx,u:${runner_uid}:rwx,g::---,m::rwx,o::---" -- "$work_path" || return 1
-            work_acl="$(/usr/bin/sudo -n /usr/bin/getfacl -cp -- "$work_path")" || return 1
-            grep -Fx 'user::rwx' <<< "$work_acl" >/dev/null || return 1
-            grep -Fx "user:${runner_uid}:rwx" <<< "$work_acl" >/dev/null || return 1
-            grep -Fx 'group::---' <<< "$work_acl" >/dev/null || return 1
-            grep -Fx 'other::---' <<< "$work_acl" >/dev/null || return 1
-            grep -Fx 'default:user::rwx' <<< "$work_acl" >/dev/null || return 1
-            grep -Fx "default:user:${runner_uid}:rwx" <<< "$work_acl" >/dev/null || return 1
-            grep -Fx 'default:group::---' <<< "$work_acl" >/dev/null || return 1
-            grep -Fx 'default:other::---' <<< "$work_acl" >/dev/null || return 1
-            [[ "$(stat -c '%u:%g' -- "$work_path")" == "0:0" ]] || return 1
-            printf 'WORK_ACL_RESULT=PASS\nWORK_HOST_OWNER_MODE_RESULT=PASS\n'
+          run_live_mount_reader_admission || {
+            critical_section=0
+            fail_hold "MOUNT_ADMISSION_PRE_CREATE_FAILED"
           }
+          mount_table_admission "$carrier" || {
+            critical_section=0
+            fail_hold "CARRIER_MOUNT_ADMISSION_PRE_CREATE_FAILED"
+          }
+          require_enoent_only "$carrier" || {
+            critical_section=0
+            fail_hold "CARRIER_PREEXISTENCE_NOT_ABSENT"
+          }
+          printf 'CARRIER_PREEXISTENCE=ABSENT\nMOUNT_CHECKPOINT=PRE_CREATE\n'
+          admit_root_snapshot || {
+            critical_section=0
+            fail_hold "ROOT_IDENTITY_CHANGED_BEFORE_CREATE"
+          }
+          set +e
+          /usr/bin/sudo -n /usr/bin/mkdir -m 0755 -- "$carrier"
+          carrier_mkdir_status=$?
+          set -e
+          printf 'CARRIER_MKDIR_STATUS=%s\n' "$carrier_mkdir_status"
+          if (( carrier_mkdir_status != 0 )); then
+            critical_section=0
+            fail_hold "CARRIER_MKDIR_FAILED"
+          fi
+          carrier_created_by_attempt=1
+          carrier_lifecycle=CREATED_UNRECORDED
+          if ! admit_carrier_snapshot; then
+            critical_section=0
+            fail_hold "CARRIER_IDENTITY_RECORD_FAILED"
+          fi
+          carrier_identity_recorded=1
+          carrier_lifecycle=RECORDED
+          critical_section=0
+          flush_pending_signal
+          printf 'CARRIER_CREATION=PASS\nCARRIER_LIFECYCLE=RECORDED\n'
+          printf 'CARRIER_IDENTITY_RECORDED=PASS\nCARRIER_LIFECYCLE=RECORDED\n'
+          admit_root_and_carrier || fail_hold "POST_CREATE_IDENTITY_ADMISSION_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_POST_CREATE_FAILED"
+          printf 'MOUNT_CHECKPOINT=POST_CREATE\n'
+
+          work="$carrier/work"
+          immutable_work_path="$work"
+          admit_root_and_carrier || fail_hold "BEFORE_WORK_ROOT_CARRIER_ADMISSION_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_BEFORE_WORK_OPERATIONS_FAILED"
+          require_enoent_only "$work" || fail_hold "WORK_PREEXISTENCE_NOT_ABSENT"
+          set +e
+          /usr/bin/sudo -n /usr/bin/mkdir -m 0700 -- "$work"
+          work_mkdir_status=$?
+          set -e
+          printf 'WORK_MKDIR_STATUS=%s\n' "$work_mkdir_status"
+          (( work_mkdir_status == 0 )) || fail_hold "WORK_MKDIR_FAILED"
+          work_identity="$(work_identity_admission 0700 ordinary)" || fail_hold "WORK_INITIAL_ADMISSION_FAILED"
+          work_device_inode="$(printf '%s\n' "$work_identity" | /usr/bin/awk -F: '{ print $1 ":" $2 }')"
+          printf 'WORK_CREATION=PASS\nWORK_INITIAL_MODE=0700\nWORK_IDENTITY=%s\nWORK_DEVICE_INODE=%s\n' "$work_identity" "$work_device_inode"
+          apply_work_acl_once "$work" || fail_hold "WORK_ACL_MUTATION_FAILED"
+          printf 'MOUNT_CHECKPOINT=BEFORE_WORK_OPERATIONS\n'
+          carrier_lifecycle=ACTIVE
+          printf 'CARRIER_LIFECYCLE=ACTIVE\n'
+          bwrap_info_version="$archive_root/bwrap-version.stdout"
+          bwrap_info_help="$archive_root/bwrap-help.stdout"
+          validate_bwrap_info_after_carrier "$bwrap_info_version" "$bwrap_info_help" || fail_hold "BWRAP_INFO_ADMISSION_FAILED"
 
           validate_bwrap_destination_order() {
             local context="$1"
@@ -2605,23 +3461,27 @@ jobs:
             if ! validate_bwrap_destination_order "$mode" /usr/bin/sh "${args[@]}"; then
               fail_hold "BWRAP_DESTINATION_ORDER_ADMISSION_FAILED"
             fi
-            /usr/bin/sudo -n /usr/bin/bwrap "${args[@]}"
+            admit_before_bwrap "$mode" || fail_hold "BWRAP_IDENTITY_ADMISSION_FAILED"
+            run_tracked_command /usr/bin/sudo -n /usr/bin/bwrap "${args[@]}"
           }
 
-          create_fresh_carrier || fail_hold "PROBE_CARRIER_CREATE_FAILED"
-          assert_root_component "$carrier" || fail_hold "PROBE_CARRIER_OWNER_MODE_FAILED"
+          admit_root_and_carrier || fail_hold "PROBE_CARRIER_OWNER_MODE_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_BEFORE_PROBE_FAILED"
           /usr/bin/sudo -n /usr/bin/install -d -o root -g root -m 0555 -- "$carrier/probe" || fail_hold "PROBE_DIRECTORY_CREATE_FAILED"
           /usr/bin/sudo -n /usr/bin/tee "$carrier/probe/input.txt" >/dev/null <<< 's8-benign-probe' || fail_hold "PROBE_INPUT_CREATE_FAILED"
           /usr/bin/sudo -n /usr/bin/chown root:root -- "$carrier/probe/input.txt" || fail_hold "PROBE_INPUT_OWNER_FAILED"
           /usr/bin/sudo -n /usr/bin/chmod 0444 -- "$carrier/probe/input.txt" || fail_hold "PROBE_INPUT_MODE_FAILED"
-          apply_work_acl "$carrier/work" || fail_hold "WORK_ACL_PROBE_SETUP_FAILED"
+          admit_root_and_carrier || fail_hold "PROBE_POST_SETUP_IDENTITY_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_POST_PROBE_SETUP_FAILED"
+          admit_work_for_use || fail_hold "WORK_POST_SETUP_ADMISSION_FAILED"
           build_common_bwrap_args
           if ! run_capability_probe initial; then
             fail_hold "CAPABILITY_PROBE_FAILED"
           fi
           printf 'CAPABILITY_PROBE=PASS\nINITIAL_CAPABILITY_PROBE=PASS\n'
-          remove_carrier_exact || fail_hold "PROBE_CARRIER_CLEANUP_FAILED"
-          carrier_created=0
+          admit_root_and_carrier || fail_hold "POST_INITIAL_PROBE_IDENTITY_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_POST_INITIAL_PROBE_FAILED"
+          admit_work_for_use || fail_hold "WORK_POST_INITIAL_PROBE_ADMISSION_FAILED"
 
           temp_parent_resolved="$runner_temp_resolved"
           [[ -d "$temp_parent_resolved" && ! -L "$temp_parent_resolved" ]] || fail_hold "RUNNER_TEMP_INVALID"
@@ -2699,25 +3559,29 @@ jobs:
           validator_pre_stage_sha="$(sha256sum -- "$temp_root/s8-validator/s8-fbx-validator" | awk '{print $1}')"
           printf 'SOURCE_MANIFEST_SHA=%s\nBLENDER_PRE_STAGE_SHA=%s\nRUNNER_PRE_STAGE_SHA=%s\nVALIDATOR_PRE_STAGE_SHA=%s\n' "$source_manifest_sha" "$blender_pre_stage_sha" "$runner_pre_stage_sha" "$validator_pre_stage_sha"
 
-          create_fresh_carrier || fail_hold "STAGED_CARRIER_CREATE_FAILED"
+          admit_root_and_carrier || fail_hold "BEFORE_STAGING_IDENTITY_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_BEFORE_STAGING_FAILED"
+          admit_work_for_use || fail_hold "WORK_BEFORE_STAGING_ADMISSION_FAILED"
           /usr/bin/sudo -n /usr/bin/cp -a --no-dereference -- "$source_layout/runtime" "$carrier/"
           /usr/bin/sudo -n /usr/bin/cp -a --no-dereference -- "$source_layout/native" "$carrier/"
           /usr/bin/sudo -n /usr/bin/cp -a --no-dereference -- "$source_layout/writer" "$carrier/"
           /usr/bin/sudo -n /usr/bin/cp -a --no-dereference -- "$source_layout/support" "$carrier/"
-          /usr/bin/sudo -n /usr/bin/chown -R --no-dereference root:root -- "$carrier" || fail_hold "ROOT_STAGE_OWNERSHIP_FAILED"
+          /usr/bin/sudo -n /usr/bin/chown -R --no-dereference root:root -- "$carrier/runtime" "$carrier/native" "$carrier/writer" "$carrier/support" || fail_hold "ROOT_STAGE_OWNERSHIP_FAILED"
           /usr/bin/sudo -n /usr/bin/find -P "$carrier/runtime" "$carrier/native" "$carrier/writer" "$carrier/support" -type d -exec /usr/bin/chmod 0555 {} +
           /usr/bin/sudo -n /usr/bin/find -P "$carrier/runtime" "$carrier/native" "$carrier/writer" "$carrier/support" -type f -perm /111 -exec /usr/bin/chmod 0555 {} +
           /usr/bin/sudo -n /usr/bin/find -P "$carrier/runtime" "$carrier/native" "$carrier/writer" "$carrier/support" -type f ! -perm /111 -exec /usr/bin/chmod 0444 {} +
-          /usr/bin/sudo -n /usr/bin/chmod 0555 -- "$carrier"
-          apply_work_acl "$carrier/work" || fail_hold "WORK_ACL_STAGED_SETUP_FAILED"
+          admit_root_and_carrier || fail_hold "AFTER_STAGING_IDENTITY_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_AFTER_STAGING_FAILED"
+          admit_work_for_use || fail_hold "WORK_AFTER_STAGING_ADMISSION_FAILED"
 
-          for direct_surface in runtime native writer support work; do
+          for direct_surface in native probe runtime support work writer; do
             [[ -e "$carrier/$direct_surface" && ! -L "$carrier/$direct_surface" ]] || fail_hold "STAGED_SURFACE_INVALID_$direct_surface"
           done
           actual_surfaces="$(/usr/bin/find -P "$carrier" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C /usr/bin/sort)"
-          expected_surfaces=$'native\nruntime\nsupport\nwork\nwriter'
+          expected_surfaces=$'native\nprobe\nruntime\nsupport\nwork\nwriter'
           [[ "$actual_surfaces" == "$expected_surfaces" ]] || fail_hold "STAGED_SURFACE_SET_MISMATCH"
-          assert_root_component "$carrier" || fail_hold "STAGED_CARRIER_OWNER_MODE_FAILED"
+          printf 'DIRECT_SURFACE_SET=native,probe,runtime,support,work,writer\nRETAINED_PROBE=YES\nPROBE_BOUND_IN_INITIAL_ONLY=YES\n'
+          admit_root_and_carrier || fail_hold "STAGED_CARRIER_OWNER_MODE_FAILED"
           if /usr/bin/find -P "$carrier/runtime" "$carrier/native" "$carrier/writer" "$carrier/support" -type d -perm /022 -print -quit | grep -q .; then
             fail_hold "RUNTIME_CODE_DIRECTORY_WRITABLE"
           fi
@@ -2748,8 +3612,28 @@ jobs:
             printf '%s\n' '#!/usr/bin/bash'
             printf '%s\n' 'set -Eeuo pipefail'
             printf 'carrier_root=%q\n' "$carrier"
+            printf 'carrier=%q\n' "$carrier"
+            printf 'root_baseline_identity=%q\n' "$root_baseline_identity"
+            printf 'carrier_baseline_identity=%q\n' "$carrier_baseline_identity"
+            printf 'work=%q\n' "$work"
+            printf 'immutable_work_path=%q\n' "$immutable_work_path"
+            printf 'work_device_inode=%q\n' "$work_device_inode"
+            printf 'runner_uid=%q\n' "$runner_uid"
+            printf '%s\n' 'mount_table_output_file=""' 'mount_table_error_file=""'
             printf 'tmpfs_bytes=%q\n' "$tmpfs_bytes"
             printf 'destination_validator=%q\n' "$destination_validator"
+            declare -f stable_identity
+            declare -f acl_perm_for_mode
+            declare -f ordinary_acl_is_exact
+            declare -f work_acl_is_exact
+            declare -f verify_mountinfo
+            declare -f raw_mount_target_filter
+            declare -f mount_target_admission
+            declare -f read_mount_table
+            declare -f mount_table_admission
+            declare -f admit_root_owned_directory
+            declare -f work_identity_admission
+            declare -f admit_embedded_carrier_state
             cat <<'SH'
           source "$destination_validator"
           args=("$@")
@@ -2866,9 +3750,11 @@ jobs:
             "${args[@]:$((separator + 1))}"
           )
           validate_bwrap_destination_order candidate /runtime/process-runner "${final_args[@]}" || { echo "BWRAP_DESTINATION_ORDER_ADMISSION_FAILED" >&2; exit 78; }
+          admit_embedded_carrier_state || { echo "BWRAP_CARRIER_ADMISSION_FAILED" >&2; exit 79; }
           if (( admission_only == 1 )); then
             exit 0
           fi
+          admit_embedded_carrier_state || { echo "BWRAP_PRE_EXEC_ADMISSION_FAILED" >&2; exit 80; }
           exec /usr/bin/sudo -n /usr/bin/bwrap "${final_args[@]}"
           SH
           } > "$launcher"
@@ -2928,8 +3814,10 @@ jobs:
           target_path.write_text(source, encoding="utf-8")
           PY
 
+          (( stop_new_launches == 0 )) || exit "$(signal_exit_status "${received_signal:-TERM}")"
+          admit_before_bwrap candidate || fail_hold "BWRAP_IDENTITY_ADMISSION_BEFORE_CANDIDATE_FAILED"
           set +e
-          /usr/bin/python3 "$qualified_helper" \
+          run_tracked_command /usr/bin/python3 "$qualified_helper" \
             --blender "$carrier/runtime/blender-5.2.2-linux-x64/blender" \
             --writer "$carrier/writer/writer.py" \
             --runner "$carrier/native/s8-process-runner" \
@@ -2947,8 +3835,14 @@ jobs:
             failure_reported=1
           fi
           (( qualification_status == 0 )) || exit "$qualification_status"
+          admit_root_and_carrier || fail_hold "POST_CANDIDATE_IDENTITY_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_POST_CANDIDATE_FAILED"
+          admit_work_for_use || fail_hold "WORK_POST_CANDIDATE_ADMISSION_FAILED"
           printf 'NATIVE_RUNNER_ADMISSION_RESULT=PASS\nPINNED_BLENDER_RESULT=PASS\nPRIVATE_EXPORTER_RESULT=PASS\nNATIVE_VALIDATOR_RESULT=PASS\nBLENDER_SEMANTIC_QUALIFICATION=PASS\n'
 
+          admit_root_and_carrier || fail_hold "BEFORE_SEMANTIC_READBACK_IDENTITY_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_BEFORE_SEMANTIC_READBACK_FAILED"
+          admit_work_for_use || fail_hold "WORK_BEFORE_SEMANTIC_READBACK_FAILED"
           if ! /usr/bin/python3 - "$carrier/work/input.json" "$carrier/work/validator-readback.json" <<'PY'
           import json
           import pathlib
@@ -2981,6 +3875,9 @@ jobs:
           [[ -e "$candidate_marker_file" && ! -L "$candidate_marker_file" ]] || fail_amendment "CANDIDATE_MARKER_NOT_REACHED"
           printf 'CANDIDATE_MARKER_REACHED=YES\nBLENDER_VALIDATION=PASS\nNATIVE_VALIDATION=PASS\nSEMANTIC_VALIDATION=PASS\n'
 
+          admit_root_and_carrier || fail_hold "BEFORE_POST_RUN_MANIFEST_IDENTITY_FAILED"
+          mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_BEFORE_POST_RUN_MANIFEST_FAILED"
+          admit_work_for_use || fail_hold "WORK_BEFORE_POST_RUN_MANIFEST_FAILED"
           manifest_surfaces "$carrier" runtime native writer support > "$post_run_manifest" || fail_amendment "POST_RUN_MANIFEST_FAILED"
           post_run_manifest_sha="$(sha256sum -- "$post_run_manifest" | awk '{print $1}')"
           cmp --silent "$staged_manifest" "$post_run_manifest" || fail_amendment "POST_RUN_MANIFEST_MISMATCH"
