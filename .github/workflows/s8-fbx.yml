@@ -172,10 +172,17 @@ jobs:
             echo 'decimal privilege mask used in live workflow arithmetic' >&2
             exit 1
           fi
+          legacy_trigger_reader="$(printf 'man_db_%s_lines' trigger)"
+          if grep -nF -- "$legacy_trigger_reader" "$workflow"; then
+            echo 'legacy semantic man-db trigger reader detected' >&2
+            exit 1
+          fi
           octal_privilege_mask='& 0'6000
           grep -F "$octal_privilege_mask" "$workflow" >/dev/null
+          grep -F 'TRIGGER_SHA256' "$workflow" >/dev/null
+          grep -F 'O_NOFOLLOW' "$workflow" >/dev/null
           test "$(grep -Fc '/usr/bin/sudo -n /usr/bin/bwrap' "$workflow")" -ge 2
-          printf 'STATIC_BOUNDARY_PROOF=PASS\nDECIMAL_PRIVILEGE_MASK_6000=ABSENT\nOCTAL_PRIVILEGE_MASK_06000=PRESENT\nGLOBAL_APPARMOR_CHANGES=ABSENT\nSYSCTL_CHANGES=ABSENT\nTRIGGER_DEFERRAL_SUPPRESSION=ABSENT\nSTAGED_ALTERNATE_BWRAP_PATH=ABSENT\nSETUID_EXECUTION_ACCEPTANCE=ABSENT\n'
+          printf 'STATIC_BOUNDARY_PROOF=PASS\nDECIMAL_PRIVILEGE_MASK_6000=ABSENT\nOCTAL_PRIVILEGE_MASK_06000=PRESENT\nGLOBAL_APPARMOR_CHANGES=ABSENT\nSYSCTL_CHANGES=ABSENT\nTRIGGER_DEFERRAL_SUPPRESSION=ABSENT\nLEGACY_TRIGGER_SEMANTIC_READER=ABSENT\nTRIGGER_RAW_BYTE_CHECKER=PRESENT\nTRIGGER_SAFE_OPEN_FLAGS=PRESENT\nSTAGED_ALTERNATE_BWRAP_PATH=ABSENT\nSETUID_EXECUTION_ACCEPTANCE=ABSENT\n'
       - name: Typecheck
         run: pnpm exec tsc --noEmit --pretty false
       - name: Full repository tests
@@ -560,7 +567,6 @@ jobs:
           man_cache_manifest_after="$archive_root/man-cache-after.manifest"
           man_db_cache='/var/cache/man'
           man_db_auto_update_sentinel='/var/lib/man-db/auto-update'
-          man_db_trigger_file='/var/lib/dpkg/info/man-db.triggers'
 
           [[ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg && ! -L /usr/share/keyrings/ubuntu-archive-keyring.gpg ]] || fail_hold "UBUNTU_ARCHIVE_KEYRING_INVALID"
           apt_source_line='deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main'
@@ -1446,15 +1452,63 @@ jobs:
           PY
           }
 
-          run_package_trigger_regression() {
-            /usr/bin/python3 - <<'PY'
+          trigger_identity_checker() {
+            /usr/bin/python3 - "$1" <<'PY'
+          import base64
           import copy
+          import hashlib
+          import os
           import re
+          import stat
+          import subprocess
+          import sys
 
-          EXPECTED_TRIGGER = "interest-noawait /usr/share/man"
-          EXPECTED_SKIP = "Not building database; man-db/auto-update is not 'true'."
-          EXPECTED_EPISODE = "Processing triggers for man-db (2.12.0-4build2) ..."
-          BASE_LOG = f"{EXPECTED_EPISODE}\n{EXPECTED_SKIP}\n"
+          TRIGGER_FIXTURE_B64 = (
+              'IyBTZXZlcmFsIG9mIHRoZXNlIGRpcmVjdG9yaWVzIGFyZSBub3QgZXhwZWN0ZWQgdG8gYmUgdXNlZCBpbgojIHBvbGljeS1jb21wbGlhbnQgcGFja2FnZXMsIGJ1dCB0',
+              'aGV5J3JlIGxpc3RlZCBpbiBvdXIgZGVmYXVsdAojIC9ldGMvbWFucGF0aC5jb25maWcgc28gd2UgcmVnaXN0ZXIgaW50ZXJlc3QgaW4gdGhlbSBmb3IgY29tcGxldGVu',
+              'ZXNzLgppbnRlcmVzdC1ub2F3YWl0IC91c3IvbWFuCmludGVyZXN0LW5vYXdhaXQgL3Vzci9zaGFyZS9tYW4KaW50ZXJlc3Qtbm9hd2FpdCAvdXNyL2xvY2FsL21hbgpp',
+              'bnRlcmVzdC1ub2F3YWl0IC91c3IvbG9jYWwvc2hhcmUvbWFuCmludGVyZXN0LW5vYXdhaXQgL3Vzci9YMTFSNi9tYW4KaW50ZXJlc3Qtbm9hd2FpdCAvb3B0L21hbgo=',
+          )
+          TRIGGER_FIXTURE = base64.b64decode("".join(TRIGGER_FIXTURE_B64), validate=True)
+          TRIGGER_LENGTH = 383
+          TRIGGER_MAX_READ = 384
+          TRIGGER_SHA256 = "0a0a9141e038168b0a6d0978584b1d74c1805d5004b5be2b07f1be1ddb886c44"
+          TRIGGER_FIXTURE_DEB_SIZE = 1236636
+          TRIGGER_FIXTURE_DEB_SHA256 = "d7ce31173a73bd3a93b7216a837a2e8641fff3fd7ae2dfc0ca705dbabe03e92b"
+          PACKAGE_RECORD = b"man-db\tinstall ok installed\t2.12.0-4build2\tamd64\n"
+          CONTROL_PATH = b"/var/lib/dpkg/info/man-db.triggers\n"
+          PACKAGE_QUERY = (
+              "/usr/bin/dpkg-query",
+              "-W",
+              "-f=${Package}\t${Status}\t${Version}\t${Architecture}\n",
+              "man-db",
+          )
+          CONTROL_QUERY = (
+              "/usr/bin/dpkg-query",
+              "--control-path",
+              "man-db",
+              "triggers",
+          )
+          TRIGGER_BASENAME = "man-db.triggers"
+          IDENTITY_FIELDS = (
+              "st_dev",
+              "st_ino",
+              "st_mode",
+              "st_uid",
+              "st_gid",
+              "st_nlink",
+              "st_size",
+              "st_mtime_ns",
+              "st_ctime_ns",
+          )
+          ACTIVE_TRIGGER_LINES = (
+              b"interest-noawait /usr/man\n",
+              b"interest-noawait /usr/share/man\n",
+              b"interest-noawait /usr/local/man\n",
+              b"interest-noawait /usr/local/share/man\n",
+              b"interest-noawait /usr/X11R6/man\n",
+              b"interest-noawait /opt/man\n",
+          )
 
           class Reject(Exception):
               pass
@@ -1462,80 +1516,527 @@ jobs:
           def reject(code):
               raise Reject(code)
 
-          def check(snapshot):
-              if not snapshot["dpkg_success"]:
-                  reject("DPKG_FAILURE")
-              if snapshot["man_db_version"] != "2.12.0-4build2":
-                  reject("WRONG_MAN_DB_VERSION")
-              if snapshot["trigger_lines"] != [EXPECTED_TRIGGER]:
-                  reject("TRIGGER_IDENTITY_INVALID")
-              if snapshot["auto_update_sentinel_present"]:
-                  reject("AUTO_UPDATE_SENTINEL_PRESENT")
-              if not snapshot["cache_exists"]:
-                  reject("CACHE_DIRECTORY_MISSING")
-              if not snapshot["cache_safe"]:
-                  reject("CACHE_DIRECTORY_UNSAFE")
-              if snapshot["cache_before"] != snapshot["cache_after"]:
-                  reject("CACHE_MANIFEST_CHANGE")
-              episodes = [line for line in snapshot["install_log"].splitlines() if line.startswith("Processing triggers for ")]
-              if episodes != [EXPECTED_EPISODE]:
-                  reject("TRIGGER_EPISODE_INVALID")
-              if snapshot["install_log"].splitlines().count(EXPECTED_SKIP) != 1:
-                  reject("SKIP_RESULT_INVALID")
-              if re.search(r"^(Building|Updating) database of manual pages", snapshot["install_log"], re.MULTILINE):
-                  reject("DATABASE_BUILD_OUTPUT")
-              if snapshot["pending"] or snapshot["awaited"]:
-                  reject("PENDING_OR_AWAITED_TRIGGER_STATE")
-              if snapshot["other_trigger_count"] != 0:
-                  reject("OTHER_TRIGGER")
-              if snapshot["man_db_status"] != "install ok installed":
-                  reject("MAN_DB_STATUS_INVALID")
-              return True
+          def require(condition, code):
+              if not condition:
+                  reject(code)
 
-          BASE = {
-              "dpkg_success": True,
-              "man_db_version": "2.12.0-4build2",
-              "man_db_status": "install ok installed",
-              "trigger_lines": [EXPECTED_TRIGGER],
-              "auto_update_sentinel_present": False,
-              "cache_exists": True,
-              "cache_safe": True,
-              "cache_before": "manifest-v1",
-              "cache_after": "manifest-v1",
-              "install_log": BASE_LOG,
-              "pending": False,
-              "awaited": False,
-              "other_trigger_count": 0,
-          }
+          def trigger_bytes_valid(data):
+              return (
+                  isinstance(data, bytes)
+                  and len(data) == TRIGGER_LENGTH
+                  and hashlib.sha256(data).hexdigest() == TRIGGER_SHA256
+              )
 
-          if not check(BASE):
-              raise AssertionError("exact man-db skip case rejected")
-          print("EXACT_MAN_DB_SKIP_CASE=ACCEPT")
+          def exact_query_accepts(returncode, stdout, expected):
+              return returncode == 0 and stdout == expected
 
-          cases = [
-              ("MISSING_TRIGGER", lambda s: s.update(trigger_lines=[])),
-              ("EXTRA_TRIGGER", lambda s: s.update(install_log=BASE_LOG + "Processing triggers for libc-bin (2.39-0ubuntu8.6) ...\n", other_trigger_count=1)),
-              ("WRONG_MAN_DB_VERSION", lambda s: s.update(man_db_version="2.12.0-4build1")),
-              ("AUTO_UPDATE_SENTINEL_PRESENT", lambda s: s.update(auto_update_sentinel_present=True)),
-              ("CACHE_DIRECTORY_MISSING", lambda s: s.update(cache_exists=False)),
-              ("CACHE_DIRECTORY_UNSAFE", lambda s: s.update(cache_safe=False)),
-              ("CACHE_MANIFEST_CHANGE", lambda s: s.update(cache_after="manifest-v2")),
-              ("DATABASE_BUILD_OUTPUT", lambda s: s.update(install_log=BASE_LOG + "Building database of manual pages ...\n")),
-              ("PENDING_TRIGGER_STATE", lambda s: s.update(pending=True)),
-              ("AWAITED_TRIGGER_STATE", lambda s: s.update(awaited=True)),
-              ("DPKG_FAILURE", lambda s: s.update(dpkg_success=False)),
-          ]
-          for name, mutate in cases:
-              snapshot = copy.deepcopy(BASE)
-              mutate(snapshot)
+          def run_exact_query(argv, expected, code):
               try:
-                  check(snapshot)
+                  result = subprocess.run(
+                      argv,
+                      stdin=subprocess.DEVNULL,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      check=False,
+                  )
+              except OSError:
+                  reject(f"{code}_EXECUTION")
+              if result.returncode != 0:
+                  reject(f"{code}_FAILURE")
+              if result.stdout != expected:
+                  reject(f"{code}_IDENTITY")
+              return result.stdout
+
+          def identity_value(value, field):
+              if isinstance(value, dict):
+                  return value[field]
+              return getattr(value, field)
+
+          def stat_identity(value):
+              return tuple(identity_value(value, field) for field in IDENTITY_FIELDS)
+
+          def metadata_stable(before, after):
+              return stat_identity(before) == stat_identity(after)
+
+          def safe_directory(value):
+              return (
+                  stat.S_ISDIR(value.st_mode)
+                  and value.st_uid == 0
+                  and value.st_gid == 0
+                  and (value.st_mode & 0o022) == 0
+              )
+
+          def safe_file(value):
+              return (
+                  stat.S_ISREG(value.st_mode)
+                  and value.st_uid == 0
+                  and value.st_gid == 0
+                  and (value.st_mode & 0o022) == 0
+                  and value.st_nlink == 1
+              )
+
+          def close_quietly(fd):
+              if fd >= 0:
+                  try:
+                      os.close(fd)
+                  except OSError:
+                      pass
+
+          def open_protected_info_directory():
+              try:
+                  flags = (
+                      os.O_RDONLY
+                      | os.O_DIRECTORY
+                      | os.O_NOFOLLOW
+                      | getattr(os, "O_CLOEXEC", 0)
+                  )
+              except AttributeError:
+                  reject("ANCESTOR_OPEN_FLAGS_UNAVAILABLE")
+              current_fd = -1
+              next_fd = -1
+              success = False
+              try:
+                  try:
+                      current_fd = os.open("/", flags)
+                      root_stat = os.fstat(current_fd)
+                  except OSError:
+                      reject("ANCESTOR_STAT_FAILURE")
+                  require(safe_directory(root_stat), "UNSAFE_ANCESTOR")
+                  for component in ("var", "lib", "dpkg", "info"):
+                      try:
+                          component_stat = os.stat(
+                              component,
+                              dir_fd=current_fd,
+                              follow_symlinks=False,
+                          )
+                      except OSError:
+                          reject("ANCESTOR_STAT_FAILURE")
+                      require(safe_directory(component_stat), "UNSAFE_ANCESTOR")
+                      try:
+                          next_fd = os.open(component, flags, dir_fd=current_fd)
+                          opened_stat = os.fstat(next_fd)
+                      except OSError:
+                          reject("ANCESTOR_OPEN_FAILURE")
+                      require(safe_directory(opened_stat), "UNSAFE_ANCESTOR")
+                      require(
+                          stat_identity(component_stat) == stat_identity(opened_stat),
+                          "ANCESTOR_IDENTITY_CHANGED",
+                      )
+                      close_quietly(current_fd)
+                      current_fd = next_fd
+                      next_fd = -1
+                  success = True
+                  return current_fd
+              finally:
+                  if not success:
+                      close_quietly(current_fd)
+                      close_quietly(next_fd)
+
+          def read_and_validate_trigger(info_fd):
+              trigger_fd = -1
+              try:
+                  try:
+                      flags = (
+                          os.O_RDONLY
+                          | os.O_NONBLOCK
+                          | os.O_NOFOLLOW
+                          | getattr(os, "O_CLOEXEC", 0)
+                      )
+                      trigger_fd = os.open(
+                          TRIGGER_BASENAME,
+                          flags,
+                          dir_fd=info_fd,
+                      )
+                  except OSError:
+                      reject("OPEN_FAILURE")
+                  try:
+                      before = os.fstat(trigger_fd)
+                  except OSError:
+                      reject("STAT_FAILURE")
+                  require(safe_file(before), "UNSAFE_FILE_IDENTITY")
+                  try:
+                      data = os.read(trigger_fd, TRIGGER_MAX_READ)
+                  except OSError:
+                      reject("READ_FAILURE")
+                  try:
+                      after = os.fstat(trigger_fd)
+                  except OSError:
+                      reject("STAT_FAILURE")
+                  require(safe_file(after), "UNSAFE_FILE_IDENTITY")
+                  require(
+                      metadata_stable(before, after),
+                      "CONCURRENT_METADATA_CHANGE",
+                  )
+                  require(trigger_bytes_valid(data), "RAW_BYTES_INVALID")
+                  return before, after, data
+              finally:
+                  close_quietly(trigger_fd)
+
+          def run_production_check():
+              run_exact_query(PACKAGE_QUERY, PACKAGE_RECORD, "PACKAGE_RECORD")
+              run_exact_query(CONTROL_QUERY, CONTROL_PATH, "CONTROL_PATH")
+              info_fd = open_protected_info_directory()
+              try:
+                  before, after, data = read_and_validate_trigger(info_fd)
+                  run_exact_query(PACKAGE_QUERY, PACKAGE_RECORD, "PACKAGE_RECORD_RECHECK")
+                  run_exact_query(CONTROL_QUERY, CONTROL_PATH, "CONTROL_PATH_RECHECK")
+                  try:
+                      final_path = os.stat(
+                          TRIGGER_BASENAME,
+                          dir_fd=info_fd,
+                          follow_symlinks=False,
+                      )
+                  except OSError:
+                      reject("FINAL_PATH_STAT_FAILURE")
+                  require(safe_file(final_path), "UNSAFE_FILE_IDENTITY")
+                  require(
+                      metadata_stable(after, final_path)
+                      and metadata_stable(before, final_path),
+                      "CONCURRENT_METADATA_CHANGE",
+                  )
+              finally:
+                  close_quietly(info_fd)
+              print("MAN_DB_PACKAGE_RECORD=PASS")
+              print("MAN_DB_CONTROL_PATH_BINDING=PASS")
+              print("MAN_DB_TRIGGER_SAFE_FILE_IDENTITY=PASS")
+              print(f"MAN_DB_TRIGGER_BYTE_LENGTH={len(data)}")
+              print(f"MAN_DB_TRIGGER_SHA256={hashlib.sha256(data).hexdigest()}")
+              print("MAN_DB_TRIGGER_IDENTITY_STABLE=PASS")
+
+          def expect_raw_reject(name, data):
+              if trigger_bytes_valid(data):
+                  raise AssertionError(f"{name} unexpectedly accepted")
+              print(f"{name}=REJECT")
+
+          def expect_reject(name, callback):
+              try:
+                  callback()
               except Reject:
                   print(f"{name}=REJECT")
-              else:
+                  return
+              raise AssertionError(f"{name} unexpectedly accepted")
+
+          def expect_query_reject(name, returncode, stdout, expected):
+              if exact_query_accepts(returncode, stdout, expected):
                   raise AssertionError(f"{name} unexpectedly accepted")
-          print("PACKAGE_TRIGGER_REGRESSION=PASS")
+              print(f"{name}=REJECT")
+
+          def expect_file_reject(name, snapshot):
+              if (
+                  snapshot["open_failure"]
+                  or snapshot["stat_failure"]
+                  or not snapshot["exists"]
+                  or snapshot["symlink"]
+                  or snapshot["kind"] != "regular"
+                  or snapshot["uid"] != 0
+                  or snapshot["gid"] != 0
+                  or snapshot["writable"]
+                  or snapshot["link_count"] != 1
+              ):
+                  print(f"{name}=REJECT")
+                  return
+              raise AssertionError(f"{name} unexpectedly accepted")
+
+          def expect_ancestor_reject(name, snapshot):
+              if (
+                  not snapshot["actual_directory"]
+                  or snapshot["symlink"]
+                  or snapshot["owner"] != "root"
+                  or snapshot["group_or_other_writable"]
+              ):
+                  print(f"{name}=REJECT")
+                  return
+              raise AssertionError(f"{name} unexpectedly accepted")
+
+          def run_raw_identity_regression():
+              require(len(TRIGGER_FIXTURE) == TRIGGER_LENGTH, "FIXTURE_LENGTH")
+              require(trigger_bytes_valid(TRIGGER_FIXTURE), "FIXTURE_HASH")
+              print("TRIGGER_FIXTURE_SOURCE=exact Ubuntu man-db binary control.tar.zst/./triggers")
+              print(f"TRIGGER_FIXTURE_DEB_SIZE={TRIGGER_FIXTURE_DEB_SIZE}")
+              print(f"TRIGGER_FIXTURE_DEB_SHA256={TRIGGER_FIXTURE_DEB_SHA256}")
+              print(f"TRIGGER_FIXTURE_LENGTH={len(TRIGGER_FIXTURE)}")
+              print(f"TRIGGER_FIXTURE_SHA256={hashlib.sha256(TRIGGER_FIXTURE).hexdigest()}")
+              print("RAW_BYTE_POSITIVE_FIXTURE=PASS")
+
+              fixture_lines = TRIGGER_FIXTURE.splitlines(keepends=True)
+              active_indices = [
+                  index
+                  for index, line in enumerate(fixture_lines)
+                  if line in ACTIVE_TRIGGER_LINES
+              ]
+              require(len(active_indices) == len(ACTIVE_TRIGGER_LINES), "FIXTURE_DIRECTIVE_SET")
+              for line in ACTIVE_TRIGGER_LINES:
+                  label = line.decode("ascii").strip().replace(" ", "_").replace("/", "_")
+                  expect_raw_reject(
+                      "MISSING_ACTIVE_DIRECTIVE_" + label,
+                      b"".join(item for item in fixture_lines if item != line),
+                  )
+                  expect_raw_reject(
+                      "DUPLICATED_ACTIVE_DIRECTIVE_" + label,
+                      TRIGGER_FIXTURE + line,
+                  )
+              expect_raw_reject("OLD_ONE_LINE_FIXTURE", b"interest-noawait /usr/share/man\n")
+              expect_raw_reject("EXTRA_DIRECTIVE", TRIGGER_FIXTURE + b"interest-noawait /srv/man\n")
+              expect_raw_reject(
+                  "SUBSTITUTED_DIRECTIVE",
+                  TRIGGER_FIXTURE.replace(b"/usr/man\n", b"/usr/xxx\n", 1),
+              )
+              expect_raw_reject(
+                  "MALFORMED_DIRECTIVE",
+                  TRIGGER_FIXTURE.replace(b"interest-noawait", b"interest-await", 1),
+              )
+              reordered_lines = list(fixture_lines)
+              first_index, second_index = active_indices[0], active_indices[1]
+              reordered_lines[first_index], reordered_lines[second_index] = (
+                  reordered_lines[second_index],
+                  reordered_lines[first_index],
+              )
+              expect_raw_reject("CHANGED_DIRECTIVE_ORDER", b"".join(reordered_lines))
+              expect_raw_reject("WRONG_LENGTH_REMOVE_FINAL_BYTE", TRIGGER_FIXTURE[:-1])
+              expect_raw_reject("WRONG_LENGTH_APPEND_LF", TRIGGER_FIXTURE + b"\n")
+              same_length_wrong_hash = bytearray(TRIGGER_FIXTURE)
+              same_length_wrong_hash[0] ^= 1
+              expect_raw_reject("SAME_LENGTH_WRONG_HASH", bytes(same_length_wrong_hash))
+              expect_raw_reject("CRLF_CONVERSION", TRIGGER_FIXTURE.replace(b"\n", b"\r\n"))
+              expect_raw_reject("COMMENT_CHANGE", TRIGGER_FIXTURE.replace(b"Several", b"General", 1))
+              expect_raw_reject("WHITESPACE_CHANGE", TRIGGER_FIXTURE.replace(b"interest-noawait /usr/man", b"interest-noawait\t/usr/man", 1))
+              print("RAW_FIXTURE_REGRESSION=PASS")
+
+          def run_package_binding_regression():
+              for name, value in (
+                  ("WRONG_PACKAGE", PACKAGE_RECORD.replace(b"man-db", b"other", 1)),
+                  ("WRONG_STATUS", PACKAGE_RECORD.replace(b"install ok installed", b"deinstall ok config-files", 1)),
+                  ("WRONG_VERSION", PACKAGE_RECORD.replace(b"2.12.0-4build2", b"2.12.0-4build1", 1)),
+                  ("WRONG_ARCHITECTURE", PACKAGE_RECORD.replace(b"amd64", b"arm64", 1)),
+              ):
+                  expect_query_reject(name, 0, value, PACKAGE_RECORD)
+              expect_query_reject("CONTROL_QUERY_FAILURE", 1, CONTROL_PATH, CONTROL_PATH)
+              expect_query_reject("MISSING_CONTROL_PATH", 0, b"", CONTROL_PATH)
+              expect_query_reject(
+                  "MULTIPLE_CONTROL_PATH",
+                  0,
+                  CONTROL_PATH + b"/var/lib/dpkg/info/other.triggers\n",
+                  CONTROL_PATH,
+              )
+              expect_query_reject(
+                  "WRONG_CONTROL_PATH",
+                  0,
+                  b"/var/lib/dpkg/info/other.triggers\n",
+                  CONTROL_PATH,
+              )
+              print("PACKAGE_BINDING_REGRESSION=PASS")
+
+          def run_path_identity_regression():
+              good_ancestor = {
+                  "actual_directory": True,
+                  "symlink": False,
+                  "owner": "root",
+                  "group_or_other_writable": False,
+              }
+              for name, field, value in (
+                  ("UNSAFE_ANCESTOR_NOT_DIRECTORY", "actual_directory", False),
+                  ("UNSAFE_ANCESTOR_SYMLINK", "symlink", True),
+                  ("UNSAFE_ANCESTOR_OWNER", "owner", "user"),
+                  ("UNSAFE_ANCESTOR_MODE", "group_or_other_writable", True),
+              ):
+                  mutated = copy.deepcopy(good_ancestor)
+                  mutated[field] = value
+                  expect_ancestor_reject(name, mutated)
+              print("ANCESTOR_REGRESSION=PASS")
+
+              good_file = {
+                  "exists": True,
+                  "open_failure": False,
+                  "stat_failure": False,
+                  "symlink": False,
+                  "kind": "regular",
+                  "uid": 0,
+                  "gid": 0,
+                  "writable": False,
+                  "link_count": 1,
+              }
+              for name, field, value in (
+                  ("MISSING_FILE", "exists", False),
+                  ("SYMLINK_FILE", "symlink", True),
+                  ("HARD_LINK_FILE", "link_count", 2),
+                  ("DIRECTORY_INSTEAD_OF_FILE", "kind", "directory"),
+                  ("SPECIAL_FILE", "kind", "fifo"),
+                  ("UNSAFE_OWNER", "uid", 1000),
+                  ("UNSAFE_FILE_MODE", "writable", True),
+                  ("OPEN_FAILURE", "open_failure", True),
+                  ("STAT_FAILURE", "stat_failure", True),
+              ):
+                  mutated = copy.deepcopy(good_file)
+                  mutated[field] = value
+                  expect_file_reject(name, mutated)
+              print("PATH_FILE_IDENTITY_REGRESSION=PASS")
+
+          def bounded_read_model(data, fail=False):
+              if fail:
+                  reject("READ_FAILURE")
+              return data[:TRIGGER_MAX_READ]
+
+          def run_read_and_stability_regression():
+              expect_reject(
+                  "READ_FAILURE",
+                  lambda: bounded_read_model(TRIGGER_FIXTURE, fail=True),
+              )
+              bounded = bounded_read_model(TRIGGER_FIXTURE + b"x")
+              require(len(bounded) == TRIGGER_MAX_READ, "BOUNDED_READ")
+              require(not trigger_bytes_valid(bounded), "BOUNDED_READ_ACCEPTED")
+              print("READ_FAILURE_REGRESSION=PASS")
+
+              metadata = {
+                  "st_dev": 1,
+                  "st_ino": 2,
+                  "st_mode": 0o100644,
+                  "st_uid": 0,
+                  "st_gid": 0,
+                  "st_nlink": 1,
+                  "st_size": TRIGGER_LENGTH,
+                  "st_mtime_ns": 3,
+                  "st_ctime_ns": 4,
+              }
+              for field in IDENTITY_FIELDS:
+                  changed = dict(metadata)
+                  changed[field] = changed[field] + 1
+                  if metadata_stable(metadata, changed):
+                      raise AssertionError(f"{field} metadata change accepted")
+                  print(f"CONCURRENT_METADATA_CHANGE_{field}=REJECT")
+              print("CONCURRENT_IDENTITY_CHANGE_REGRESSION=PASS")
+
+          def run_single_byte_exhaustive_regression():
+              for position, original in enumerate(TRIGGER_FIXTURE):
+                  for replacement in range(256):
+                      if replacement == original:
+                          continue
+                      mutated = bytearray(TRIGGER_FIXTURE)
+                      mutated[position] = replacement
+                      if trigger_bytes_valid(bytes(mutated)):
+                          raise AssertionError(
+                              f"single-byte substitution accepted at {position}:{replacement}"
+                          )
+              print("SINGLE_BYTE_EXHAUSTIVE_REGRESSION=PASS")
+
+          EXPECTED_TRIGGER_LINES = [
+              line.decode("ascii").rstrip("\n")
+              for line in ACTIVE_TRIGGER_LINES
+          ]
+          EXPECTED_SKIP = "Not building database; man-db/auto-update is not 'true'."
+          EXPECTED_EPISODE = "Processing triggers for man-db (2.12.0-4build2) ..."
+          BASE_LOG = f"{EXPECTED_EPISODE}\n{EXPECTED_SKIP}\n"
+
+          def run_runtime_regression():
+              def check(snapshot):
+                  if not snapshot["dpkg_success"]:
+                      reject("DPKG_FAILURE")
+                  if snapshot["man_db_version"] != "2.12.0-4build2":
+                      reject("WRONG_MAN_DB_VERSION")
+                  if snapshot["trigger_lines"] != EXPECTED_TRIGGER_LINES:
+                      reject("TRIGGER_IDENTITY_INVALID")
+                  if snapshot["auto_update_sentinel_present"]:
+                      reject("AUTO_UPDATE_SENTINEL_PRESENT")
+                  if not snapshot["cache_exists"]:
+                      reject("CACHE_DIRECTORY_MISSING")
+                  if not snapshot["cache_safe"]:
+                      reject("CACHE_DIRECTORY_UNSAFE")
+                  if snapshot["cache_before"] != snapshot["cache_after"]:
+                      reject("CACHE_MANIFEST_CHANGE")
+                  episodes = [
+                      line
+                      for line in snapshot["install_log"].splitlines()
+                      if line.startswith("Processing triggers for ")
+                  ]
+                  if episodes != [EXPECTED_EPISODE]:
+                      reject("TRIGGER_EPISODE_INVALID")
+                  if snapshot["install_log"].splitlines().count(EXPECTED_SKIP) != 1:
+                      reject("SKIP_RESULT_INVALID")
+                  if re.search(
+                      r"^(Building|Updating) database of manual pages",
+                      snapshot["install_log"],
+                      re.MULTILINE,
+                  ):
+                      reject("DATABASE_BUILD_OUTPUT")
+                  if snapshot["pending"] or snapshot["awaited"]:
+                      reject("PENDING_OR_AWAITED_TRIGGER_STATE")
+                  if snapshot["other_trigger_count"] != 0:
+                      reject("OTHER_TRIGGER")
+                  if snapshot["man_db_status"] != "install ok installed":
+                      reject("MAN_DB_STATUS_INVALID")
+                  return True
+
+              base = {
+                  "dpkg_success": True,
+                  "man_db_version": "2.12.0-4build2",
+                  "man_db_status": "install ok installed",
+                  "trigger_lines": list(EXPECTED_TRIGGER_LINES),
+                  "auto_update_sentinel_present": False,
+                  "cache_exists": True,
+                  "cache_safe": True,
+                  "cache_before": "manifest-v1",
+                  "cache_after": "manifest-v1",
+                  "install_log": BASE_LOG,
+                  "pending": False,
+                  "awaited": False,
+                  "other_trigger_count": 0,
+              }
+              require(check(base), "RUNTIME_BASE_REJECTED")
+              print("EXACT_MAN_DB_SKIP_CASE=ACCEPT")
+              cases = [
+                  ("MISSING_TRIGGER", lambda value: value.update(trigger_lines=[])),
+                  (
+                      "EXTRA_TRIGGER",
+                      lambda value: value.update(
+                          install_log=BASE_LOG
+                          + "Processing triggers for libc-bin (2.39-0ubuntu8.6) ...\n",
+                          other_trigger_count=1,
+                      ),
+                  ),
+                  ("WRONG_MAN_DB_VERSION", lambda value: value.update(man_db_version="2.12.0-4build1")),
+                  ("AUTO_UPDATE_SENTINEL_PRESENT", lambda value: value.update(auto_update_sentinel_present=True)),
+                  ("CACHE_DIRECTORY_MISSING", lambda value: value.update(cache_exists=False)),
+                  ("CACHE_DIRECTORY_UNSAFE", lambda value: value.update(cache_safe=False)),
+                  ("CACHE_MANIFEST_CHANGE", lambda value: value.update(cache_after="manifest-v2")),
+                  ("DATABASE_BUILD_OUTPUT", lambda value: value.update(install_log=BASE_LOG + "Building database of manual pages ...\n")),
+                  ("PENDING_TRIGGER_STATE", lambda value: value.update(pending=True)),
+                  ("AWAITED_TRIGGER_STATE", lambda value: value.update(awaited=True)),
+                  ("DPKG_FAILURE", lambda value: value.update(dpkg_success=False)),
+              ]
+              for name, mutate in cases:
+                  snapshot = copy.deepcopy(base)
+                  mutate(snapshot)
+                  try:
+                      check(snapshot)
+                  except Reject:
+                      print(f"{name}=REJECT")
+                  else:
+                      raise AssertionError(f"{name} unexpectedly accepted")
+              print("RUNTIME_TRIGGER_REGRESSION=PASS")
+              print("PACKAGE_TRIGGER_REGRESSION=PASS")
+
+          try:
+              if sys.argv[1] == "production":
+                  run_production_check()
+              elif sys.argv[1] == "regression":
+                  run_raw_identity_regression()
+                  run_package_binding_regression()
+                  run_path_identity_regression()
+                  run_read_and_stability_regression()
+                  run_single_byte_exhaustive_regression()
+                  run_runtime_regression()
+              else:
+                  reject("MODE_INVALID")
+          except Reject as error:
+              print(f"MAN_DB_TRIGGER_CHECK_REJECT={error}", file=sys.stderr)
+              raise SystemExit(1)
+          except Exception as error:
+              print(f"MAN_DB_TRIGGER_CHECK_INTERNAL_FAILURE={type(error).__name__}", file=sys.stderr)
+              raise SystemExit(1)
           PY
+          }
+
+          run_package_trigger_regression() {
+            trigger_identity_checker regression
           }
 
           run_bwrap_mode_regression || fail_hold "PRIVILEGE_MODE_REGRESSION_FAILED"
@@ -1605,13 +2106,9 @@ jobs:
           grep -F "Inst bubblewrap ($expected_bwrap_version" "$package_plan" >/dev/null || fail_hold "BUBBLEWRAP_INSTALL_PLAN_VERSION_INVALID"
           printf 'ONE_NEW_PACKAGE=bubblewrap:amd64=0.9.0-1ubuntu0.3\nNO_VERSION_SUBSTITUTION=PASS\nPACKAGE_INSTALL_PLAN=PASS\n'
 
-          man_db_status="$(/usr/bin/dpkg-query -W -f='${Status}' man-db 2>/dev/null)" || fail_hold "MAN_DB_STATUS_UNAVAILABLE"
-          man_db_version="$(/usr/bin/dpkg-query -W -f='${Version}' man-db 2>/dev/null)" || fail_hold "MAN_DB_VERSION_UNAVAILABLE"
-          [[ "$man_db_status" == 'install ok installed' ]] || fail_hold "MAN_DB_STATUS_INVALID"
-          [[ "$man_db_version" == "$expected_man_db_version" ]] || fail_hold "MAN_DB_VERSION_INVALID"
-          [[ -f "$man_db_trigger_file" && ! -L "$man_db_trigger_file" ]] || fail_hold "MAN_DB_TRIGGER_FILE_INVALID"
-          mapfile -t man_db_trigger_lines < <(/usr/bin/awk 'NF && $1 !~ /^#/ { print }' "$man_db_trigger_file") || fail_hold "MAN_DB_TRIGGER_READ_FAILED"
-          [[ "${#man_db_trigger_lines[@]}" == 1 && "${man_db_trigger_lines[0]}" == 'interest-noawait /usr/share/man' ]] || fail_hold "MAN_DB_TRIGGER_IDENTITY_INVALID"
+          if ! trigger_identity_checker production; then
+            fail_hold "MAN_DB_TRIGGER_IDENTITY_INVALID"
+          fi
           [[ ! -e "$man_db_auto_update_sentinel" && ! -L "$man_db_auto_update_sentinel" ]] || fail_hold "AUTO_UPDATE_SENTINEL_PRESENT_PREINSTALL"
           assert_root_component /var || fail_hold "VAR_PROTECTED_ANCESTOR_INVALID"
           assert_root_component /var/cache || fail_hold "VAR_CACHE_PROTECTED_ANCESTOR_INVALID"
@@ -1620,8 +2117,8 @@ jobs:
           [[ -s "$man_cache_manifest_before" ]] || fail_hold "MAN_CACHE_MANIFEST_PREINSTALL_EMPTY"
           pre_trigger_state="$(dpkg_trigger_state)"
           [[ -z "$pre_trigger_state" ]] || fail_hold "DPKG_PREINSTALL_TRIGGER_STATE_NOT_CLEAN"
-          printf 'MAN_DB_STATUS=%s\nMAN_DB_VERSION=%s\nTRIGGER_INTEREST=%s\nAUTO_UPDATE_SENTINEL=ABSENT\nMAN_CACHE_PATH=%s\nMAN_CACHE_PREINSTALL_MANIFEST=%s\nDPKG_PREINSTALL_TRIGGER_STATE=CLEAN\n' \
-            "$man_db_status" "$man_db_version" "${man_db_trigger_lines[0]}" "$man_db_cache" "$man_cache_manifest_before"
+          printf 'MAN_DB_STATUS=install ok installed\nMAN_DB_VERSION=%s\nTRIGGER_REGISTERED_INTEREST_COUNT=6\nTRIGGER_REGISTERED_INTERESTS=PROVEN_BY_RAW_BYTE_IDENTITY\nAUTO_UPDATE_SENTINEL=ABSENT\nMAN_CACHE_PATH=%s\nMAN_CACHE_PREINSTALL_MANIFEST=%s\nDPKG_PREINSTALL_TRIGGER_STATE=CLEAN\n' \
+            "$expected_man_db_version" "$man_db_cache" "$man_cache_manifest_before"
 
           install_status=0
           /usr/bin/sudo -n /usr/bin/dpkg --install "$bubblewrap_deb" > "$bubblewrap_install_log" 2>&1 || install_status=$?
@@ -1651,8 +2148,8 @@ jobs:
           man_db_version_post="$(/usr/bin/dpkg-query -W -f='${Version}' man-db 2>/dev/null)" || fail_hold "MAN_DB_POST_VERSION_UNAVAILABLE"
           [[ "$man_db_status_post" == 'install ok installed' ]] || fail_hold "MAN_DB_POST_STATUS_INVALID"
           [[ "$man_db_version_post" == "$expected_man_db_version" ]] || fail_hold "MAN_DB_POST_VERSION_INVALID"
-          printf 'MAN_DB_TRIGGER_IDENTITY=%s\nMAN_DB_TRIGGER_COUNT=1\nMAN_DB_SKIP_RESULT=PASS\nMAN_DB_CACHE_MANIFEST_UNCHANGED=PASS\nOTHER_TRIGGER_COUNT=0\nDATABASE_BUILD_OR_UPDATE=NONE\nTRIGGER_PENDING_STATE=CLEAN\nTRIGGER_AWAITED_STATE=CLEAN\nMAN_DB_STATUS_AND_VERSION=UNCHANGED\n' \
-            "$expected_man_db_trigger_episode"
+          printf 'MAN_DB_TRIGGER_IDENTITY=%s\nMAN_DB_TRIGGER_COUNT=1\nMAN_DB_TRIGGER_EPISODE_COUNT=1\nMAN_DB_SKIP_RESULT=PASS\nMAN_DB_SKIP_COUNT=%s\nMAN_DB_CACHE_MANIFEST_UNCHANGED=PASS\nMAN_CACHE_MANIFEST_UNCHANGED=YES\nOTHER_TRIGGER_COUNT=0\nOTHER_TRIGGER_EPISODES=0\nDATABASE_BUILD_OR_UPDATE=NONE\nDATABASE_BUILD_OR_UPDATE_OUTPUT=NONE\nTRIGGER_PENDING_STATE=CLEAN\nTRIGGER_AWAITED_STATE=CLEAN\nPOST_PENDING_TRIGGER_STATE=EMPTY\nPOST_AWAITED_TRIGGER_STATE=EMPTY\nMAN_DB_STATUS_AND_VERSION=UNCHANGED\n' \
+            "$expected_man_db_trigger_episode" "$skip_count"
 
           installed_status="$(/usr/bin/dpkg-query -W -f='${Status}' bubblewrap 2>/dev/null)" || fail_hold "BUBBLEWRAP_INSTALLED_STATUS_UNAVAILABLE"
           installed_version="$(/usr/bin/dpkg-query -W -f='${Version}' bubblewrap 2>/dev/null)" || fail_hold "BUBBLEWRAP_INSTALLED_VERSION_UNAVAILABLE"
@@ -1707,6 +2204,8 @@ jobs:
           esac
           printf 'PACKAGE=bubblewrap\nVERSION=%s\nARCHITECTURE=%s\nSTATUS=%s\nPATH=%s\nREALPATH=%s\nTYPE=regular_file\nSYMLINK=NO\nOWNER=root:root\nBWRAP_OWNER=root:root\nDPKG_OWNER=bubblewrap\nBWRAP_DPKG_OWNER=bubblewrap\nINSTALLED_SHA256=%s\nBWRAP_PRE_SHA256=%s\nAUTHENTICATED_PAYLOAD_SHA256=%s\nBWRAP_PRE_MODE_RAW=%s\nBWRAP_PRE_MODE=%s\nBWRAP_PRIVILEGE_BITS=%s\nGETCAP_PRE_EXIT=%s\nGETCAP_PRE_EMPTY=PASS\n' \
             "$installed_version" "$installed_architecture" "$installed_status" "$bwrap_path" "$bwrap_realpath" "$bwrap_pre_sha256" "$bwrap_pre_sha256" "$verified_bwrap_sha256" "$bwrap_mode_raw" "$bwrap_pre_mode" "$bwrap_privilege_bits_display" "$getcap_pre_exit"
+          printf 'BUBBLEWRAP_PRE_MODE=%s\nBUBBLEWRAP_PRE_HASH=%s\nGETCAP_QUERY_SUCCESS=YES\nGETCAP_EMPTY=YES\n' \
+            "$bwrap_pre_mode" "$bwrap_pre_sha256"
 
           bwrap_transformation=NOOP
           if [[ "$bwrap_pre_mode" != 0755 ]]; then
@@ -1747,6 +2246,8 @@ jobs:
           [[ "$bwrap_post_sha256" == "$verified_bwrap_sha256" ]] || fail_hold "BWRAP_POST_AUTHENTICATED_HASH_MISMATCH"
           printf 'PATH=%s\nREALPATH=%s\nTYPE=regular_file\nSYMLINK=NO\nOWNER=root:root\nBWRAP_OWNER=root:root\nMODE=%s\nNO_SUID=PASS\nNO_SGID=PASS\nGETCAP_EXIT=%s\nGETCAP_POST_EXIT=%s\nFILE_CAPABILITIES=NONE\nGETCAP_POST_EMPTY=PASS\nDPKG_OWNER=bubblewrap\nBWRAP_DPKG_OWNER=bubblewrap\nPACKAGE_STATUS=%s\nBWRAP_PACKAGE_STATUS=%s\nPACKAGE_VERSION=%s\nBWRAP_PACKAGE_VERSION=%s\nPACKAGE_ARCHITECTURE=%s\nBWRAP_PACKAGE_ARCHITECTURE=%s\nPOST_SHA256=%s\nBWRAP_POST_SHA256=%s\nAUTHENTICATED_PAYLOAD_SHA256=%s\nPOST_SHA256_EQUALS_PRE_SHA256=YES\nPOST_SHA256_EQUALS_AUTHENTICATED_PAYLOAD=YES\nBWRAP_HASH_EQUALITY=PASS\nBWRAP_TRANSFORMATION=%s\nBWRAP_POST_MODE=%s\nBWRAP_ADMISSION=PASS\n' \
             "$bwrap_path" "$bwrap_post_realpath" "$bwrap_post_mode" "$getcap_post_exit" "$getcap_post_exit" "$post_installed_status" "$post_installed_status" "$post_installed_version" "$post_installed_version" "$post_installed_architecture" "$post_installed_architecture" "$bwrap_post_sha256" "$bwrap_post_sha256" "$verified_bwrap_sha256" "$bwrap_transformation" "$bwrap_post_mode"
+          printf 'BUBBLEWRAP_POST_MODE=%s\nBUBBLEWRAP_POST_HASH=%s\nBUBBLEWRAP_TRANSFORMATION=%s\nGETCAP_QUERY_SUCCESS=YES\nGETCAP_EMPTY=YES\n' \
+            "$bwrap_post_mode" "$bwrap_post_sha256" "$bwrap_transformation"
           bwrap_version="$(/usr/bin/sudo -n "$bwrap_path" --version)" || fail_hold "BWRAP_VERSION_FAILED"
           bwrap_help="$(/usr/bin/sudo -n "$bwrap_path" --help)" || fail_hold "BWRAP_HELP_FAILED"
           for required_option in --unshare-user --unshare-net --unshare-pid --unshare-ipc --unshare-uts --disable-userns --assert-userns-disabled --uid --gid --cap-drop --die-with-parent --new-session --clearenv --ro-bind --bind --proc --dev --tmpfs --size --chdir; do
@@ -2004,7 +2505,7 @@ jobs:
           test "$(readlink /proc/self/ns/ipc)" != "$EXPECTED_HOST_IPC_NS"
           test "$(readlink /proc/self/ns/uts)" != "$EXPECTED_HOST_UTS_NS"
           printf 'USER_NAMESPACE_RESULT=PASS\nPID_NAMESPACE_RESULT=PASS\nNETWORK_NAMESPACE_RESULT=PASS\nIPC_NAMESPACE_RESULT=PASS\nUTS_NAMESPACE_RESULT=PASS\n'
-          printf 'NAMESPACE_PROOF=PASS\n'
+          printf 'NAMESPACE_PROOF=PASS\nNAMESPACE_BOUNDARY=PASS\n'
           for capability_name in CapInh CapPrm CapEff CapBnd CapAmb; do
             capability_value="$(awk -v key="${capability_name}:" '$1 == key { print $2 }' "$status_file")"
             [[ "$capability_value" =~ ^0+$ ]] || exit 41
