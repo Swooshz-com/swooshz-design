@@ -8,6 +8,112 @@ permissions:
   contents: read
 
 jobs:
+  s8-actionlint:
+    name: S8 pinned actionlint ${{ matrix.platform }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            asset: actionlint_1.7.12_linux_amd64.tar.gz
+            sha256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          - platform: windows/amd64
+            runner: windows-2025
+            asset: actionlint_1.7.12_windows_amd64.zip
+            sha256: 6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Verify exact PR head
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Download verify and run pinned actionlint on Linux
+        if: matrix.platform == 'linux/amd64'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTIONLINT_ASSET: ${{ matrix.asset }}
+          ACTIONLINT_SHA256: ${{ matrix.sha256 }}
+        run: |
+          set -Eeuo pipefail
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          status_before="$(git status --porcelain=v1 --untracked-files=all)"
+          actionlint_root="$RUNNER_TEMP/s8-actionlint-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT-linux"
+          [[ ! -e "$actionlint_root" && ! -L "$actionlint_root" ]]
+          /usr/bin/install -d -m 0700 -- "$actionlint_root"
+          gh release download v1.7.12 --repo rhysd/actionlint --pattern "$ACTIONLINT_ASSET" --dir "$actionlint_root" --clobber
+          archive="$actionlint_root/$ACTIONLINT_ASSET"
+          [[ -f "$archive" && ! -L "$archive" ]]
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check --status
+          extract_root="$actionlint_root/extracted"
+          /usr/bin/install -d -m 0700 -- "$extract_root"
+          tar -tzf "$archive" | awk '/^\// || /(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }'
+          tar -xzf "$archive" --directory "$extract_root" --no-same-owner --no-same-permissions
+          mapfile -t actionlint_bins < <(find -P "$extract_root" -type f -name actionlint -print)
+          [[ "${#actionlint_bins[@]}" == 1 && "${actionlint_bins[0]}" == "$extract_root/actionlint" ]]
+          actionlint_bin="${actionlint_bins[0]}"
+          /usr/bin/chmod 0555 -- "$actionlint_bin"
+          actionlint_version="$($actionlint_bin -version 2>&1)"
+          grep -F '1.7.12' <<< "$actionlint_version" >/dev/null
+          "$actionlint_bin" .github/workflows/s8-fbx.yml
+          status_after="$(git status --porcelain=v1 --untracked-files=all)"
+          [[ "$status_before" == "$status_after" ]]
+          printf 'ACTIONLINT_PLATFORM=linux/amd64\nACTIONLINT_VERSION=1.7.12\nACTIONLINT=PASS\nREPOSITORY_STATUS_PRESERVED=YES\n'
+      - name: Download verify and run pinned actionlint on Windows
+        if: matrix.platform == 'windows/amd64'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTIONLINT_ASSET: ${{ matrix.asset }}
+          ACTIONLINT_SHA256: ${{ matrix.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'ACTIONLINT_PLATFORM_NOT_ADMITTED' }
+          $statusBefore = (@(git status --porcelain=v1 --untracked-files=all) -join "`n")
+          $actionlintRoot = Join-Path $env:RUNNER_TEMP ("s8-actionlint-{0}.{1}-windows" -f $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $actionlintRoot) { throw 'ACTIONLINT_TEMP_NOT_FRESH' }
+          New-Item -ItemType Directory -Path $actionlintRoot -Force | Out-Null
+          & gh release download v1.7.12 --repo rhysd/actionlint --pattern $env:ACTIONLINT_ASSET --dir $actionlintRoot --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'ACTIONLINT_RELEASE_DOWNLOAD_FAILED' }
+          $archive = Join-Path $actionlintRoot $env:ACTIONLINT_ASSET
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:ACTIONLINT_SHA256.ToLowerInvariant()) { throw 'ACTIONLINT_ARCHIVE_SHA256_MISMATCH' }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            foreach ($entry in $zip.Entries) {
+              $entryName = $entry.FullName.Replace('\', '/')
+              if ([System.IO.Path]::IsPathRooted($entryName) -or $entryName -match '(^|/)\.\.(\/|$)') { throw 'ACTIONLINT_ARCHIVE_PATH_TRAVERSAL' }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          $extractRoot = Join-Path $actionlintRoot 'extracted'
+          New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractRoot)
+          $candidates = @(Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter actionlint.exe)
+          if ($candidates.Count -ne 1 -or $candidates[0].FullName -ne (Join-Path $extractRoot 'actionlint.exe')) { throw 'ACTIONLINT_BINARY_PATH_INVALID' }
+          if (($candidates[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'ACTIONLINT_BINARY_LINK_INVALID' }
+          $actionlintBin = $candidates[0].FullName
+          $version = (& $actionlintBin -version 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '1\.7\.12') { throw 'ACTIONLINT_VERSION_INVALID' }
+          & $actionlintBin (Join-Path (Get-Location) '.github/workflows/s8-fbx.yml')
+          if ($LASTEXITCODE -ne 0) { throw 'ACTIONLINT_FAILED' }
+          $statusAfter = (@(git status --porcelain=v1 --untracked-files=all) -join "`n")
+          if ($statusBefore -cne $statusAfter) { throw 'REPOSITORY_STATUS_CHANGED' }
+          Write-Output 'ACTIONLINT_PLATFORM=windows/amd64'
+          Write-Output 'ACTIONLINT_VERSION=1.7.12'
+          Write-Output 'ACTIONLINT=PASS'
+          Write-Output 'REPOSITORY_STATUS_PRESERVED=YES'
+
   s8-static:
     name: S8 static and TypeScript floor
     runs-on: ubuntu-latest
@@ -38,6 +144,38 @@ jobs:
             echo "credential-like material detected in tracked files" >&2
             exit 1
           fi
+      - name: Static boundary proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow=.github/workflows/s8-fbx.yml
+          if grep -nE '(^|[[:space:]])(sysctl|apparmor_parser|aa-enforce|aa-disable)([[:space:]]|$)' "$workflow"; then
+            echo 'global policy mutation detected' >&2
+            exit 1
+          fi
+          trigger_deferral='--no-'triggers
+          trigger_unpack='dpkg[[:space:]]+--'unpack
+          trigger_config='dpkg[[:space:]]+--'configure'[[:space:]]+--no'
+          if grep -nE -- "$trigger_deferral|$trigger_unpack|$trigger_config" "$workflow"; then
+            echo 'trigger deferral or suppression detected' >&2
+            exit 1
+          fi
+          if grep -nE '(^|[[:space:]])(cp|install|mv|ln)[[:space:]].*(/usr/bin/bwrap|bwrap-staged)' "$workflow"; then
+            echo 'staged alternate bwrap path detected' >&2
+            exit 1
+          fi
+          if grep -nE '(^|[;&|])[[:space:]]*(exec[[:space:]]+)?/usr/bin/bwrap([[:space:]]|$)' "$workflow"; then
+            echo 'non-root bwrap execution accepted' >&2
+            exit 1
+          fi
+          if grep -nE '&[[:space:]]+6000([^0-9]|$)' "$workflow"; then
+            echo 'decimal privilege mask used in live workflow arithmetic' >&2
+            exit 1
+          fi
+          octal_privilege_mask='& 0'6000
+          grep -F "$octal_privilege_mask" "$workflow" >/dev/null
+          test "$(grep -Fc '/usr/bin/sudo -n /usr/bin/bwrap' "$workflow")" -ge 2
+          printf 'STATIC_BOUNDARY_PROOF=PASS\nDECIMAL_PRIVILEGE_MASK_6000=ABSENT\nOCTAL_PRIVILEGE_MASK_06000=PRESENT\nGLOBAL_APPARMOR_CHANGES=ABSENT\nSYSCTL_CHANGES=ABSENT\nTRIGGER_DEFERRAL_SUPPRESSION=ABSENT\nSTAGED_ALTERNATE_BWRAP_PATH=ABSENT\nSETUID_EXECUTION_ACCEPTANCE=ABSENT\n'
       - name: Typecheck
         run: pnpm exec tsc --noEmit --pretty false
       - name: Full repository tests
@@ -353,6 +491,9 @@ jobs:
             elif (( status != 0 && failure_reported == 0 && candidate_started == 1 )); then
               printf 'CANDIDATE_FAILURE_PROVEN=YES\nFAILURE_CLASS=CANDIDATE_FAILURE_UNCLASSIFIED\n' >&2
             fi
+            if (( cleanup_failed == 0 )); then
+              printf 'CLEANUP=PASS\n'
+            fi
             exit "$status"
           }
           trap cleanup EXIT
@@ -396,6 +537,7 @@ jobs:
 
           expected_bwrap_version='0.9.0-1ubuntu0.3'
           expected_bwrap_deb='bubblewrap_0.9.0-1ubuntu0.3_amd64.deb'
+          expected_man_db_version='2.12.0-4build2'
           archive_base_url='https://security.ubuntu.com/ubuntu'
           apt_root="$provision_root/apt"
           apt_lists="$apt_root/lists"
@@ -413,6 +555,12 @@ jobs:
           packages_plain="$archive_root/Packages"
           bubblewrap_deb="$archive_root/$expected_bwrap_deb"
           package_plan="$archive_root/package-plan.txt"
+          bubblewrap_install_log="$archive_root/bubblewrap-install.log"
+          man_cache_manifest_before="$archive_root/man-cache-before.manifest"
+          man_cache_manifest_after="$archive_root/man-cache-after.manifest"
+          man_db_cache='/var/cache/man'
+          man_db_auto_update_sentinel='/var/lib/man-db/auto-update'
+          man_db_trigger_file='/var/lib/dpkg/info/man-db.triggers'
 
           [[ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg && ! -L /usr/share/keyrings/ubuntu-archive-keyring.gpg ]] || fail_hold "UBUNTU_ARCHIVE_KEYRING_INVALID"
           apt_source_line='deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main'
@@ -433,6 +581,66 @@ jobs:
             local destination="$1"
             local url="$2"
             /usr/bin/curl --config /dev/null --fail --silent --show-error --proto '=https' --tlsv1.2 --location --max-redirs 0 --retry 3 --output "$destination" "$url"
+          }
+
+          protected_host_path_is_safe() {
+            local path="$1"
+            local resolved
+            local mode
+            [[ -d "$path" && ! -L "$path" ]] || return 1
+            resolved="$(realpath -e -- "$path")" || return 1
+            [[ "$resolved" == "$path" ]] || return 1
+            mode="$(stat -c '%a' -- "$path")"
+            [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+            (( (8#$mode & 022) == 0 )) || return 1
+          }
+
+          man_cache_manifest() {
+            local root="$1"
+            local path
+            local relative_path
+            local file_type
+            local mode
+            local owner
+            local size
+            local mtime
+            local content
+            [[ -d "$root" && ! -L "$root" ]] || return 1
+            {
+              while IFS= read -r -d '' path; do
+                if [[ "$path" == "$root" ]]; then
+                  relative_path='.'
+                else
+                  relative_path="${path#"$root"/}"
+                fi
+                file_type="$(stat -c '%F' -- "$path")"
+                mode="$(stat -c '%a' -- "$path")"
+                owner="$(stat -c '%u:%g' -- "$path")"
+                size="$(stat -c '%s' -- "$path")"
+                mtime="$(stat -c '%Y' -- "$path")"
+                case "$file_type" in
+                  'regular file')
+                    content="$(sha256sum -- "$path" | awk '{print $1}')"
+                    ;;
+                  'symbolic link')
+                    content="SYMLINK->$(readlink -- "$path")"
+                    ;;
+                  directory)
+                    content=DIRECTORY
+                    ;;
+                  *)
+                    content="TYPE:$file_type"
+                    ;;
+                esac
+                printf 'TYPE=%s\tPATH=%s\tMODE=%s\tOWNER=%s\tSIZE=%s\tMTIME=%s\tCONTENT=%s\n' \
+                  "$file_type" "$relative_path" "$mode" "$owner" "$size" "$mtime" "$content"
+              done < <(/usr/bin/find -P "$root" -print0)
+            } | LC_ALL=C /usr/bin/sort
+          }
+
+          dpkg_trigger_state() {
+            /usr/bin/dpkg-query -W -f='${Package}\t${Triggers-Pending}\t${Triggers-Awaited}\n' |
+              /usr/bin/awk -F '\t' 'NF >= 3 && ($2 != "" || $3 != "") { print }'
           }
 
           fetch_exact_archive "$inrelease" "$archive_base_url/dists/noble-security/InRelease" || fail_hold "UBUNTU_INRELEASE_DOWNLOAD_FAILED"
@@ -1068,6 +1276,271 @@ jobs:
           }
 
           ubuntu_packages_parser --regression || fail_hold "UBUNTU_PACKAGES_PARSER_REGRESSION_FAILED"
+
+          run_bwrap_mode_regression() {
+            /usr/bin/python3 - <<'PY'
+          import copy
+          import re
+
+          EXPECTED = {
+              "path": "/usr/bin/bwrap",
+              "realpath": "/usr/bin/bwrap",
+              "regular": True,
+              "symlink": False,
+              "owner": "root:root",
+              "dpkg_owner": "bubblewrap",
+              "package": "bubblewrap",
+              "status": "install ok installed",
+              "version": "0.9.0-1ubuntu0.3",
+              "architecture": "amd64",
+              "auth_hash": "a" * 64,
+              "pre_hash": "a" * 64,
+              "post_hash": "a" * 64,
+              "getcap_exit": 0,
+              "getcap_output": "",
+              "pre_mode": "0755",
+              "post_mode": "0755",
+              "chmod_ok": True,
+          }
+
+          class Reject(Exception):
+              pass
+
+          def reject(code):
+              raise Reject(code)
+
+          def parse_mode(raw):
+              if not isinstance(raw, str) or re.fullmatch(r"[0-7]{3,4}", raw) is None:
+                  reject("BWRAP_MODE_MALFORMED")
+              value = int(raw, 8)
+              if value & 0o777 != 0o755:
+                  reject("BWRAP_ORDINARY_MODE_INVALID")
+              if value & 0o1000:
+                  reject("BWRAP_UNRELATED_SPECIAL_BIT_PRESENT")
+              privilege_bits = value & 0o6000
+              if privilege_bits not in (0, 0o2000, 0o4000, 0o6000):
+                  reject("BWRAP_PRIVILEGE_BITS_INVALID")
+              return value, privilege_bits
+
+          def precheck(snapshot):
+              for field, expected in (
+                  ("path", "/usr/bin/bwrap"),
+                  ("realpath", "/usr/bin/bwrap"),
+                  ("owner", "root:root"),
+                  ("dpkg_owner", "bubblewrap"),
+                  ("package", "bubblewrap"),
+                  ("status", "install ok installed"),
+                  ("version", "0.9.0-1ubuntu0.3"),
+                  ("architecture", "amd64"),
+              ):
+                  if snapshot[field] != expected:
+                      reject(f"{field.upper()}_INVALID")
+              if not snapshot["regular"] or snapshot["symlink"]:
+                  reject("BWRAP_PATH_INVALID")
+              if snapshot["getcap_exit"] != 0:
+                  reject("GETCAP_QUERY_FAILURE")
+              if snapshot["getcap_output"] != "":
+                  reject("BWRAP_FILE_CAPABILITIES_PRESENT")
+              if snapshot["pre_hash"] != snapshot["auth_hash"]:
+                  reject("BWRAP_PRE_HASH_MISMATCH")
+              value, privilege_bits = parse_mode(snapshot["pre_mode"])
+              return {
+                  "value": value,
+                  "privilege_bits": privilege_bits,
+                  "transformation": "NOOP" if privilege_bits == 0 else "CLEARED_SUID_SGID",
+              }
+
+          def transform(snapshot, precheck_result):
+              transformed = copy.deepcopy(snapshot)
+              if precheck_result["privilege_bits"] != 0:
+                  if not transformed["chmod_ok"]:
+                      reject("CHMOD_FAILURE")
+                  transformed["post_mode"] = "0755"
+              else:
+                  transformed["post_mode"] = transformed["pre_mode"]
+              return transformed
+
+          def postcheck(snapshot, pre_hash):
+              if snapshot["path"] != "/usr/bin/bwrap" or snapshot["realpath"] != "/usr/bin/bwrap":
+                  reject("BWRAP_POST_PATH_INVALID")
+              if not snapshot["regular"] or snapshot["symlink"] or snapshot["owner"] != "root:root":
+                  reject("BWRAP_POST_IDENTITY_INVALID")
+              post_value, _ = parse_mode(snapshot["post_mode"])
+              if post_value != 0o755 or post_value & 0o6000 != 0:
+                  reject("POST_MODE_NOT_0755")
+              if snapshot["getcap_exit"] != 0:
+                  reject("GETCAP_POST_QUERY_FAILURE")
+              if snapshot["getcap_output"] != "":
+                  reject("BWRAP_POST_FILE_CAPABILITIES_PRESENT")
+              if snapshot["dpkg_owner"] != "bubblewrap" or snapshot["status"] != "install ok installed":
+                  reject("BWRAP_POST_PACKAGE_IDENTITY_INVALID")
+              if snapshot["version"] != "0.9.0-1ubuntu0.3" or snapshot["architecture"] != "amd64":
+                  reject("BWRAP_POST_PACKAGE_VERSION_INVALID")
+              if snapshot["post_hash"] != pre_hash or snapshot["post_hash"] != snapshot["auth_hash"]:
+                  reject("POST_HASH_MISMATCH")
+              return True
+
+          def accepted_mode_case(raw, expected_transformation):
+              snapshot = copy.deepcopy(EXPECTED)
+              snapshot["pre_mode"] = raw
+              precheck_result = precheck(snapshot)
+              if precheck_result["transformation"] != expected_transformation:
+                  raise AssertionError((raw, precheck_result))
+              transformed = transform(snapshot, precheck_result)
+              postcheck(transformed, snapshot["pre_hash"])
+
+          accepted_mode_case("0755", "NOOP")
+          print("0755=ACCEPT_NO_TRANSFORMATION")
+          for raw, label in (("4755", "04755"), ("2755", "02755"), ("6755", "06755")):
+              accepted_mode_case(raw, "CLEARED_SUID_SGID")
+              print(f"{label}=ACCEPT_PRECHECK__TRANSFORM__FINAL_0755")
+
+          def expect_reject(name, mutate, stage="pre"):
+              snapshot = copy.deepcopy(EXPECTED)
+              mutate(snapshot)
+              try:
+                  if stage == "pre":
+                      precheck(snapshot)
+                  elif stage == "transform":
+                      transform(snapshot, precheck(snapshot))
+                  else:
+                      postcheck(snapshot, snapshot["pre_hash"])
+              except Reject:
+                  print(f"{name}=REJECT")
+                  return
+              raise AssertionError(f"{name} unexpectedly accepted")
+
+          expect_reject("0775", lambda s: s.update(pre_mode="0775"))
+          expect_reject("0757", lambda s: s.update(pre_mode="0757"))
+          expect_reject("WRONG_EXECUTE_BITS", lambda s: s.update(pre_mode="0745"))
+          expect_reject("01755", lambda s: s.update(pre_mode="1755"))
+          expect_reject("MALFORMED_MODE", lambda s: s.update(pre_mode="07x5"))
+          expect_reject("WRONG_OWNER", lambda s: s.update(owner="root:wheel"))
+          expect_reject("SYMLINK", lambda s: s.update(symlink=True))
+          expect_reject("WRONG_REALPATH", lambda s: s.update(realpath="/opt/bwrap"))
+          expect_reject("WRONG_PACKAGE", lambda s: s.update(package="other"))
+          expect_reject("WRONG_VERSION", lambda s: s.update(version="0.9.0-1"))
+          expect_reject("WRONG_ARCHITECTURE", lambda s: s.update(architecture="arm64"))
+          expect_reject("HASH_MISMATCH", lambda s: s.update(pre_hash="b" * 64))
+          expect_reject("FILE_CAPABILITY_PRESENT", lambda s: s.update(getcap_output="/usr/bin/bwrap cap_net_raw=ep"))
+          expect_reject("GETCAP_QUERY_FAILURE", lambda s: s.update(getcap_exit=1))
+          expect_reject("CHMOD_FAILURE", lambda s: s.update(pre_mode="04755", chmod_ok=False), stage="transform")
+          expect_reject("POST_MODE_NOT_0755", lambda s: s.update(post_mode="0754"), stage="post")
+          expect_reject("POST_HASH_MISMATCH", lambda s: s.update(post_hash="b" * 64), stage="post")
+          print("PRIVILEGE_MODE_REGRESSION=PASS")
+          PY
+          }
+
+          run_old_decimal_mask_regression() {
+            /usr/bin/python3 - <<'PY'
+          decimal_mask = 6000
+          decimal_result = 0o755 & decimal_mask
+          octal_result = 0o755 & 0o6000
+          if decimal_result != 352:
+              raise SystemExit("old decimal mask result changed")
+          if octal_result != 0:
+              raise SystemExit("octal privilege mask result changed")
+          print("OLD_EXPRESSION=8#755 & decimal 6000 == 352")
+          print("CORRECT_EXPRESSION=8#755 & octal 06000 == 0")
+          print("OLD_DECIMAL_MASK_REGRESSION=PASS")
+          PY
+          }
+
+          run_package_trigger_regression() {
+            /usr/bin/python3 - <<'PY'
+          import copy
+          import re
+
+          EXPECTED_TRIGGER = "interest-noawait /usr/share/man"
+          EXPECTED_SKIP = "Not building database; man-db/auto-update is not 'true'."
+          EXPECTED_EPISODE = "Processing triggers for man-db (2.12.0-4build2) ..."
+          BASE_LOG = f"{EXPECTED_EPISODE}\n{EXPECTED_SKIP}\n"
+
+          class Reject(Exception):
+              pass
+
+          def reject(code):
+              raise Reject(code)
+
+          def check(snapshot):
+              if not snapshot["dpkg_success"]:
+                  reject("DPKG_FAILURE")
+              if snapshot["man_db_version"] != "2.12.0-4build2":
+                  reject("WRONG_MAN_DB_VERSION")
+              if snapshot["trigger_lines"] != [EXPECTED_TRIGGER]:
+                  reject("TRIGGER_IDENTITY_INVALID")
+              if snapshot["auto_update_sentinel_present"]:
+                  reject("AUTO_UPDATE_SENTINEL_PRESENT")
+              if not snapshot["cache_exists"]:
+                  reject("CACHE_DIRECTORY_MISSING")
+              if not snapshot["cache_safe"]:
+                  reject("CACHE_DIRECTORY_UNSAFE")
+              if snapshot["cache_before"] != snapshot["cache_after"]:
+                  reject("CACHE_MANIFEST_CHANGE")
+              episodes = [line for line in snapshot["install_log"].splitlines() if line.startswith("Processing triggers for ")]
+              if episodes != [EXPECTED_EPISODE]:
+                  reject("TRIGGER_EPISODE_INVALID")
+              if snapshot["install_log"].splitlines().count(EXPECTED_SKIP) != 1:
+                  reject("SKIP_RESULT_INVALID")
+              if re.search(r"^(Building|Updating) database of manual pages", snapshot["install_log"], re.MULTILINE):
+                  reject("DATABASE_BUILD_OUTPUT")
+              if snapshot["pending"] or snapshot["awaited"]:
+                  reject("PENDING_OR_AWAITED_TRIGGER_STATE")
+              if snapshot["other_trigger_count"] != 0:
+                  reject("OTHER_TRIGGER")
+              if snapshot["man_db_status"] != "install ok installed":
+                  reject("MAN_DB_STATUS_INVALID")
+              return True
+
+          BASE = {
+              "dpkg_success": True,
+              "man_db_version": "2.12.0-4build2",
+              "man_db_status": "install ok installed",
+              "trigger_lines": [EXPECTED_TRIGGER],
+              "auto_update_sentinel_present": False,
+              "cache_exists": True,
+              "cache_safe": True,
+              "cache_before": "manifest-v1",
+              "cache_after": "manifest-v1",
+              "install_log": BASE_LOG,
+              "pending": False,
+              "awaited": False,
+              "other_trigger_count": 0,
+          }
+
+          if not check(BASE):
+              raise AssertionError("exact man-db skip case rejected")
+          print("EXACT_MAN_DB_SKIP_CASE=ACCEPT")
+
+          cases = [
+              ("MISSING_TRIGGER", lambda s: s.update(trigger_lines=[])),
+              ("EXTRA_TRIGGER", lambda s: s.update(install_log=BASE_LOG + "Processing triggers for libc-bin (2.39-0ubuntu8.6) ...\n", other_trigger_count=1)),
+              ("WRONG_MAN_DB_VERSION", lambda s: s.update(man_db_version="2.12.0-4build1")),
+              ("AUTO_UPDATE_SENTINEL_PRESENT", lambda s: s.update(auto_update_sentinel_present=True)),
+              ("CACHE_DIRECTORY_MISSING", lambda s: s.update(cache_exists=False)),
+              ("CACHE_DIRECTORY_UNSAFE", lambda s: s.update(cache_safe=False)),
+              ("CACHE_MANIFEST_CHANGE", lambda s: s.update(cache_after="manifest-v2")),
+              ("DATABASE_BUILD_OUTPUT", lambda s: s.update(install_log=BASE_LOG + "Building database of manual pages ...\n")),
+              ("PENDING_TRIGGER_STATE", lambda s: s.update(pending=True)),
+              ("AWAITED_TRIGGER_STATE", lambda s: s.update(awaited=True)),
+              ("DPKG_FAILURE", lambda s: s.update(dpkg_success=False)),
+          ]
+          for name, mutate in cases:
+              snapshot = copy.deepcopy(BASE)
+              mutate(snapshot)
+              try:
+                  check(snapshot)
+              except Reject:
+                  print(f"{name}=REJECT")
+              else:
+                  raise AssertionError(f"{name} unexpectedly accepted")
+          print("PACKAGE_TRIGGER_REGRESSION=PASS")
+          PY
+          }
+
+          run_bwrap_mode_regression || fail_hold "PRIVILEGE_MODE_REGRESSION_FAILED"
+          run_old_decimal_mask_regression || fail_hold "OLD_DECIMAL_MASK_REGRESSION_FAILED"
+          run_package_trigger_regression || fail_hold "PACKAGE_TRIGGER_REGRESSION_FAILED"
           metadata_file="$archive_root/bubblewrap.metadata"
           [[ ! -e "$metadata_file" && ! -L "$metadata_file" ]] || fail_hold "UBUNTU_PACKAGES_METADATA_PATH_NOT_FRESH"
           if ! ubuntu_packages_parser --select "$packages_plain" > "$metadata_file"; then
@@ -1132,7 +1605,55 @@ jobs:
           grep -F "Inst bubblewrap ($expected_bwrap_version" "$package_plan" >/dev/null || fail_hold "BUBBLEWRAP_INSTALL_PLAN_VERSION_INVALID"
           printf 'ONE_NEW_PACKAGE=bubblewrap:amd64=0.9.0-1ubuntu0.3\nNO_VERSION_SUBSTITUTION=PASS\nPACKAGE_INSTALL_PLAN=PASS\n'
 
-          /usr/bin/sudo -n /usr/bin/dpkg --install "$bubblewrap_deb" || fail_hold "BUBBLEWRAP_INSTALL_FAILED"
+          man_db_status="$(/usr/bin/dpkg-query -W -f='${Status}' man-db 2>/dev/null)" || fail_hold "MAN_DB_STATUS_UNAVAILABLE"
+          man_db_version="$(/usr/bin/dpkg-query -W -f='${Version}' man-db 2>/dev/null)" || fail_hold "MAN_DB_VERSION_UNAVAILABLE"
+          [[ "$man_db_status" == 'install ok installed' ]] || fail_hold "MAN_DB_STATUS_INVALID"
+          [[ "$man_db_version" == "$expected_man_db_version" ]] || fail_hold "MAN_DB_VERSION_INVALID"
+          [[ -f "$man_db_trigger_file" && ! -L "$man_db_trigger_file" ]] || fail_hold "MAN_DB_TRIGGER_FILE_INVALID"
+          mapfile -t man_db_trigger_lines < <(/usr/bin/awk 'NF && $1 !~ /^#/ { print }' "$man_db_trigger_file") || fail_hold "MAN_DB_TRIGGER_READ_FAILED"
+          [[ "${#man_db_trigger_lines[@]}" == 1 && "${man_db_trigger_lines[0]}" == 'interest-noawait /usr/share/man' ]] || fail_hold "MAN_DB_TRIGGER_IDENTITY_INVALID"
+          [[ ! -e "$man_db_auto_update_sentinel" && ! -L "$man_db_auto_update_sentinel" ]] || fail_hold "AUTO_UPDATE_SENTINEL_PRESENT_PREINSTALL"
+          assert_root_component /var || fail_hold "VAR_PROTECTED_ANCESTOR_INVALID"
+          assert_root_component /var/cache || fail_hold "VAR_CACHE_PROTECTED_ANCESTOR_INVALID"
+          protected_host_path_is_safe "$man_db_cache" || fail_hold "MAN_CACHE_DIRECTORY_UNSAFE"
+          man_cache_manifest "$man_db_cache" > "$man_cache_manifest_before" || fail_hold "MAN_CACHE_MANIFEST_PREINSTALL_FAILED"
+          [[ -s "$man_cache_manifest_before" ]] || fail_hold "MAN_CACHE_MANIFEST_PREINSTALL_EMPTY"
+          pre_trigger_state="$(dpkg_trigger_state)"
+          [[ -z "$pre_trigger_state" ]] || fail_hold "DPKG_PREINSTALL_TRIGGER_STATE_NOT_CLEAN"
+          printf 'MAN_DB_STATUS=%s\nMAN_DB_VERSION=%s\nTRIGGER_INTEREST=%s\nAUTO_UPDATE_SENTINEL=ABSENT\nMAN_CACHE_PATH=%s\nMAN_CACHE_PREINSTALL_MANIFEST=%s\nDPKG_PREINSTALL_TRIGGER_STATE=CLEAN\n' \
+            "$man_db_status" "$man_db_version" "${man_db_trigger_lines[0]}" "$man_db_cache" "$man_cache_manifest_before"
+
+          install_status=0
+          /usr/bin/sudo -n /usr/bin/dpkg --install "$bubblewrap_deb" > "$bubblewrap_install_log" 2>&1 || install_status=$?
+          [[ "$install_status" == 0 ]] || fail_hold "BUBBLEWRAP_INSTALL_FAILED"
+          [[ -s "$bubblewrap_install_log" ]] || fail_hold "BUBBLEWRAP_INSTALL_LOG_EMPTY"
+          expected_man_db_trigger_episode="Processing triggers for man-db ($expected_man_db_version) ..."
+          expected_man_db_skip="Not building database; man-db/auto-update is not 'true'."
+          mapfile -t trigger_episodes < <(/usr/bin/grep -E '^Processing triggers for [^ ]+ \([^)]*\) \.\.\.$' "$bubblewrap_install_log" || true)
+          [[ "${#trigger_episodes[@]}" == 1 && "${trigger_episodes[0]}" == "$expected_man_db_trigger_episode" ]] || fail_hold "MAN_DB_TRIGGER_EPISODE_INVALID"
+          skip_count="$(/usr/bin/grep -Fxc -- "$expected_man_db_skip" "$bubblewrap_install_log" || true)"
+          [[ "$skip_count" == 1 ]] || fail_hold "MAN_DB_SKIP_RESULT_INVALID"
+          other_trigger_count=0
+          while IFS= read -r trigger_episode; do
+            [[ -z "$trigger_episode" ]] && continue
+            [[ "$trigger_episode" == "$expected_man_db_trigger_episode" ]] || other_trigger_count=$((other_trigger_count + 1))
+          done < <(/usr/bin/grep -E '^Processing triggers for [^ ]+ \([^)]*\) \.\.\.$' "$bubblewrap_install_log" || true)
+          [[ "$other_trigger_count" == 0 ]] || fail_hold "OTHER_TRIGGER_PRESENT"
+          if /usr/bin/grep -Eiq '^(Building|Updating) database of manual pages' "$bubblewrap_install_log"; then
+            fail_hold "DATABASE_BUILD_OR_UPDATE_OUTPUT_PRESENT"
+          fi
+          [[ ! -e "$man_db_auto_update_sentinel" && ! -L "$man_db_auto_update_sentinel" ]] || fail_hold "AUTO_UPDATE_SENTINEL_PRESENT_POSTINSTALL"
+          man_cache_manifest "$man_db_cache" > "$man_cache_manifest_after" || fail_hold "MAN_CACHE_MANIFEST_POSTINSTALL_FAILED"
+          /usr/bin/cmp --silent "$man_cache_manifest_before" "$man_cache_manifest_after" || fail_hold "MAN_CACHE_MANIFEST_CHANGED"
+          post_trigger_state="$(dpkg_trigger_state)"
+          [[ -z "$post_trigger_state" ]] || fail_hold "DPKG_POSTINSTALL_TRIGGER_STATE_NOT_CLEAN"
+          man_db_status_post="$(/usr/bin/dpkg-query -W -f='${Status}' man-db 2>/dev/null)" || fail_hold "MAN_DB_POST_STATUS_UNAVAILABLE"
+          man_db_version_post="$(/usr/bin/dpkg-query -W -f='${Version}' man-db 2>/dev/null)" || fail_hold "MAN_DB_POST_VERSION_UNAVAILABLE"
+          [[ "$man_db_status_post" == 'install ok installed' ]] || fail_hold "MAN_DB_POST_STATUS_INVALID"
+          [[ "$man_db_version_post" == "$expected_man_db_version" ]] || fail_hold "MAN_DB_POST_VERSION_INVALID"
+          printf 'MAN_DB_TRIGGER_IDENTITY=%s\nMAN_DB_TRIGGER_COUNT=1\nMAN_DB_SKIP_RESULT=PASS\nMAN_DB_CACHE_MANIFEST_UNCHANGED=PASS\nOTHER_TRIGGER_COUNT=0\nDATABASE_BUILD_OR_UPDATE=NONE\nTRIGGER_PENDING_STATE=CLEAN\nTRIGGER_AWAITED_STATE=CLEAN\nMAN_DB_STATUS_AND_VERSION=UNCHANGED\n' \
+            "$expected_man_db_trigger_episode"
+
           installed_status="$(/usr/bin/dpkg-query -W -f='${Status}' bubblewrap 2>/dev/null)" || fail_hold "BUBBLEWRAP_INSTALLED_STATUS_UNAVAILABLE"
           installed_version="$(/usr/bin/dpkg-query -W -f='${Version}' bubblewrap 2>/dev/null)" || fail_hold "BUBBLEWRAP_INSTALLED_VERSION_UNAVAILABLE"
           installed_architecture="$(/usr/bin/dpkg-query -W -f='${Architecture}' bubblewrap 2>/dev/null)" || fail_hold "BUBBLEWRAP_INSTALLED_ARCHITECTURE_UNAVAILABLE"
@@ -1144,21 +1665,94 @@ jobs:
           bwrap_realpath="$(realpath -e -- "$bwrap_path")" || fail_hold "BWRAP_REALPATH_FAILED"
           [[ "$bwrap_realpath" == "$bwrap_path" ]] || fail_hold "BWRAP_REALPATH_UNEXPECTED"
           [[ -f "$bwrap_path" && ! -L "$bwrap_path" ]] || fail_hold "BWRAP_PATH_INVALID"
+          assert_root_component /usr || fail_hold "USR_PROTECTED_ANCESTOR_INVALID"
+          assert_root_component /usr/bin || fail_hold "USR_BIN_PROTECTED_ANCESTOR_INVALID"
           [[ "$(stat -c '%u:%g' -- "$bwrap_path")" == '0:0' ]] || fail_hold "BWRAP_OWNER_INVALID"
-          bwrap_mode="$(stat -c '%a' -- "$bwrap_path")"
-          (( (8#$bwrap_mode & 6000) == 0 )) || fail_hold "BWRAP_SUID_SGID_PRESENT"
-          command -v /usr/sbin/getcap >/dev/null 2>&1 || fail_hold "GETCAP_UNAVAILABLE"
-          [[ -z "$(/usr/sbin/getcap -n "$bwrap_path" 2>/dev/null)" ]] || fail_hold "BWRAP_FILE_CAPABILITIES_PRESENT"
           bwrap_owner_record="$(/usr/bin/dpkg-query -S "$bwrap_path" 2>/dev/null)" || fail_hold "BWRAP_DPKG_OWNER_UNAVAILABLE"
           [[ "${bwrap_owner_record%%:*}" == bubblewrap ]] || fail_hold "BWRAP_DPKG_OWNER_INVALID"
-          bwrap_sha256="$(sha256sum -- "$bwrap_path" | awk '{print $1}')" || fail_hold "BWRAP_HASH_FAILED"
-          [[ "$bwrap_sha256" == "$verified_bwrap_sha256" ]] || fail_hold "BWRAP_INSTALLED_HASH_MISMATCH"
+          bwrap_pre_sha256="$(sha256sum -- "$bwrap_path" | awk '{print $1}')" || fail_hold "BWRAP_PRE_HASH_FAILED"
+          [[ "$bwrap_pre_sha256" =~ ^[A-Fa-f0-9]{64}$ ]] || fail_hold "BWRAP_PRE_HASH_INVALID"
+          [[ "$bwrap_pre_sha256" == "$verified_bwrap_sha256" ]] || fail_hold "BWRAP_PRE_HASH_MISMATCH"
+          command -v /usr/sbin/getcap >/dev/null 2>&1 || fail_hold "GETCAP_UNAVAILABLE"
+          bwrap_getcap_pre_output="$archive_root/bwrap-getcap-pre.stdout"
+          bwrap_getcap_pre_error="$archive_root/bwrap-getcap-pre.stderr"
+          set +e
+          /usr/sbin/getcap -n -- "$bwrap_path" > "$bwrap_getcap_pre_output" 2> "$bwrap_getcap_pre_error"
+          getcap_pre_exit=$?
+          set -e
+          [[ "$getcap_pre_exit" == 0 ]] || fail_hold "GETCAP_PRE_QUERY_FAILED"
+          [[ ! -s "$bwrap_getcap_pre_output" ]] || fail_hold "BWRAP_FILE_CAPABILITIES_PRESENT"
+          bwrap_mode_raw="$(stat -c '%a' -- "$bwrap_path")"
+          [[ "$bwrap_mode_raw" =~ ^[0-7]{3,4}$ ]] || fail_hold "BWRAP_MODE_MALFORMED"
+          bwrap_mode_value=$((8#$bwrap_mode_raw))
+          (( (bwrap_mode_value & 0777) == 0755 )) || fail_hold "BWRAP_ORDINARY_MODE_INVALID"
+          (( (bwrap_mode_value & 01000) == 0 )) || fail_hold "BWRAP_UNRELATED_SPECIAL_BIT_PRESENT"
+          bwrap_privilege_bits=$((bwrap_mode_value & 06000))
+          if ! (( bwrap_privilege_bits == 0 || bwrap_privilege_bits == 02000 || bwrap_privilege_bits == 04000 || bwrap_privilege_bits == 06000 )); then
+            fail_hold "BWRAP_PRIVILEGE_BITS_INVALID"
+          fi
+          if (( bwrap_mode_value < 01000 )); then
+            printf -v bwrap_pre_mode '0%03o' "$bwrap_mode_value"
+          else
+            printf -v bwrap_pre_mode '0%04o' "$bwrap_mode_value"
+          fi
+          if (( bwrap_privilege_bits == 0 )); then
+            bwrap_privilege_bits_display=0000
+          else
+            printf -v bwrap_privilege_bits_display '0%04o' "$bwrap_privilege_bits"
+          fi
+          case "$bwrap_pre_mode" in
+            0755|02755|04755|06755) ;;
+            *) fail_hold "BWRAP_MODE_COMBINATION_INVALID" ;;
+          esac
+          printf 'PACKAGE=bubblewrap\nVERSION=%s\nARCHITECTURE=%s\nSTATUS=%s\nPATH=%s\nREALPATH=%s\nTYPE=regular_file\nSYMLINK=NO\nOWNER=root:root\nBWRAP_OWNER=root:root\nDPKG_OWNER=bubblewrap\nBWRAP_DPKG_OWNER=bubblewrap\nINSTALLED_SHA256=%s\nBWRAP_PRE_SHA256=%s\nAUTHENTICATED_PAYLOAD_SHA256=%s\nBWRAP_PRE_MODE_RAW=%s\nBWRAP_PRE_MODE=%s\nBWRAP_PRIVILEGE_BITS=%s\nGETCAP_PRE_EXIT=%s\nGETCAP_PRE_EMPTY=PASS\n' \
+            "$installed_version" "$installed_architecture" "$installed_status" "$bwrap_path" "$bwrap_realpath" "$bwrap_pre_sha256" "$bwrap_pre_sha256" "$verified_bwrap_sha256" "$bwrap_mode_raw" "$bwrap_pre_mode" "$bwrap_privilege_bits_display" "$getcap_pre_exit"
+
+          bwrap_transformation=NOOP
+          if [[ "$bwrap_pre_mode" != 0755 ]]; then
+            /usr/bin/sudo -n /usr/bin/chmod u-s,g-s -- "$bwrap_path" || fail_hold "BWRAP_CHMOD_PRIVILEGE_CLEAR_FAILED"
+            bwrap_transformation=CLEARED_SUID_SGID
+          fi
+
+          bwrap_post_realpath="$(realpath -e -- "$bwrap_path")" || fail_hold "BWRAP_POST_REALPATH_FAILED"
+          [[ "$bwrap_post_realpath" == "$bwrap_path" ]] || fail_hold "BWRAP_POST_REALPATH_UNEXPECTED"
+          [[ -f "$bwrap_path" && ! -L "$bwrap_path" ]] || fail_hold "BWRAP_POST_PATH_INVALID"
+          [[ "$(stat -c '%u:%g' -- "$bwrap_path")" == '0:0' ]] || fail_hold "BWRAP_POST_OWNER_INVALID"
+          bwrap_post_mode_raw="$(stat -c '%a' -- "$bwrap_path")"
+          [[ "$bwrap_post_mode_raw" =~ ^[0-7]{3,4}$ ]] || fail_hold "BWRAP_POST_MODE_MALFORMED"
+          bwrap_post_mode_value=$((8#$bwrap_post_mode_raw))
+          (( (bwrap_post_mode_value & 0777) == 0755 )) || fail_hold "BWRAP_POST_ORDINARY_MODE_INVALID"
+          (( (bwrap_post_mode_value & 06000) == 0 )) || fail_hold "BWRAP_POST_SUID_SGID_PRESENT"
+          printf -v bwrap_post_mode '%04o' "$bwrap_post_mode_value"
+          [[ "$bwrap_post_mode" == 0755 ]] || fail_hold "BWRAP_POST_MODE_NOT_0755"
+          bwrap_getcap_post_output="$archive_root/bwrap-getcap-post.stdout"
+          bwrap_getcap_post_error="$archive_root/bwrap-getcap-post.stderr"
+          set +e
+          /usr/sbin/getcap -n -- "$bwrap_path" > "$bwrap_getcap_post_output" 2> "$bwrap_getcap_post_error"
+          getcap_post_exit=$?
+          set -e
+          [[ "$getcap_post_exit" == 0 ]] || fail_hold "GETCAP_POST_QUERY_FAILED"
+          [[ ! -s "$bwrap_getcap_post_output" ]] || fail_hold "BWRAP_POST_FILE_CAPABILITIES_PRESENT"
+          post_installed_status="$(/usr/bin/dpkg-query -W -f='${Status}' bubblewrap 2>/dev/null)" || fail_hold "BWRAP_POST_STATUS_UNAVAILABLE"
+          post_installed_version="$(/usr/bin/dpkg-query -W -f='${Version}' bubblewrap 2>/dev/null)" || fail_hold "BWRAP_POST_VERSION_UNAVAILABLE"
+          post_installed_architecture="$(/usr/bin/dpkg-query -W -f='${Architecture}' bubblewrap 2>/dev/null)" || fail_hold "BWRAP_POST_ARCHITECTURE_UNAVAILABLE"
+          [[ "$post_installed_status" == 'install ok installed' ]] || fail_hold "BWRAP_POST_STATUS_INVALID"
+          [[ "$post_installed_version" == "$expected_bwrap_version" ]] || fail_hold "BWRAP_POST_VERSION_INVALID"
+          [[ "$post_installed_architecture" == amd64 ]] || fail_hold "BWRAP_POST_ARCHITECTURE_INVALID"
+          bwrap_post_owner_record="$(/usr/bin/dpkg-query -S "$bwrap_path" 2>/dev/null)" || fail_hold "BWRAP_POST_DPKG_OWNER_UNAVAILABLE"
+          [[ "${bwrap_post_owner_record%%:*}" == bubblewrap ]] || fail_hold "BWRAP_POST_DPKG_OWNER_INVALID"
+          bwrap_post_sha256="$(sha256sum -- "$bwrap_path" | awk '{print $1}')" || fail_hold "BWRAP_POST_HASH_FAILED"
+          [[ "$bwrap_post_sha256" =~ ^[A-Fa-f0-9]{64}$ ]] || fail_hold "BWRAP_POST_HASH_INVALID"
+          [[ "$bwrap_post_sha256" == "$bwrap_pre_sha256" ]] || fail_hold "BWRAP_POST_HASH_MISMATCH"
+          [[ "$bwrap_post_sha256" == "$verified_bwrap_sha256" ]] || fail_hold "BWRAP_POST_AUTHENTICATED_HASH_MISMATCH"
+          printf 'PATH=%s\nREALPATH=%s\nTYPE=regular_file\nSYMLINK=NO\nOWNER=root:root\nBWRAP_OWNER=root:root\nMODE=%s\nNO_SUID=PASS\nNO_SGID=PASS\nGETCAP_EXIT=%s\nGETCAP_POST_EXIT=%s\nFILE_CAPABILITIES=NONE\nGETCAP_POST_EMPTY=PASS\nDPKG_OWNER=bubblewrap\nBWRAP_DPKG_OWNER=bubblewrap\nPACKAGE_STATUS=%s\nBWRAP_PACKAGE_STATUS=%s\nPACKAGE_VERSION=%s\nBWRAP_PACKAGE_VERSION=%s\nPACKAGE_ARCHITECTURE=%s\nBWRAP_PACKAGE_ARCHITECTURE=%s\nPOST_SHA256=%s\nBWRAP_POST_SHA256=%s\nAUTHENTICATED_PAYLOAD_SHA256=%s\nPOST_SHA256_EQUALS_PRE_SHA256=YES\nPOST_SHA256_EQUALS_AUTHENTICATED_PAYLOAD=YES\nBWRAP_HASH_EQUALITY=PASS\nBWRAP_TRANSFORMATION=%s\nBWRAP_POST_MODE=%s\nBWRAP_ADMISSION=PASS\n' \
+            "$bwrap_path" "$bwrap_post_realpath" "$bwrap_post_mode" "$getcap_post_exit" "$getcap_post_exit" "$post_installed_status" "$post_installed_status" "$post_installed_version" "$post_installed_version" "$post_installed_architecture" "$post_installed_architecture" "$bwrap_post_sha256" "$bwrap_post_sha256" "$verified_bwrap_sha256" "$bwrap_transformation" "$bwrap_post_mode"
           bwrap_version="$(/usr/bin/sudo -n "$bwrap_path" --version)" || fail_hold "BWRAP_VERSION_FAILED"
           bwrap_help="$(/usr/bin/sudo -n "$bwrap_path" --help)" || fail_hold "BWRAP_HELP_FAILED"
           for required_option in --unshare-user --unshare-net --unshare-pid --unshare-ipc --unshare-uts --disable-userns --assert-userns-disabled --uid --gid --cap-drop --die-with-parent --new-session --clearenv --ro-bind --bind --proc --dev --tmpfs --size --chdir; do
             grep -F -- "$required_option" <<< "$bwrap_help" >/dev/null || fail_hold "BWRAP_OPTION_UNAVAILABLE_${required_option#--}"
           done
-          printf 'PATH=%s\nREALPATH=%s\nTYPE=regular_file\nOWNER=root:root\nNO_SYMLINK=PASS\nNO_SUID=PASS\nNO_SGID=PASS\nNO_FILE_CAPABILITIES=PASS\nDPKG_OWNER=bubblewrap\nDPKG_VERSION=%s\nINSTALLED_HASH=%s\nBWRAP_PATH=%s\nBWRAP_VERSION=%s\nBWRAP_ADMISSION=PASS\n' "$bwrap_path" "$bwrap_realpath" "$installed_version" "$bwrap_sha256" "$bwrap_path" "$bwrap_version"
+          printf 'BWRAP_VERSION=%s\nBWRAP_POST_PROOF=PASS\n' "$bwrap_version"
 
           for system_path in /usr /lib /etc; do
             [[ -e "$system_path" ]] || fail_hold "SYSTEM_BIND_SOURCE_MISSING_${system_path#/}"
@@ -1397,6 +1991,7 @@ jobs:
           printf 'SANDBOX_UID=%s\nSANDBOX_GID=%s\n' "$(id -u)" "$(id -g)"
           test "$(id -u)" = 65534
           test "$(id -g)" = 65534
+          printf 'SANDBOX_UID_GID=65534:65534\n'
           printf 'UID_MAP='
           tr '\n' ';' < /proc/self/uid_map
           printf 'GID_MAP='
@@ -1409,13 +2004,16 @@ jobs:
           test "$(readlink /proc/self/ns/ipc)" != "$EXPECTED_HOST_IPC_NS"
           test "$(readlink /proc/self/ns/uts)" != "$EXPECTED_HOST_UTS_NS"
           printf 'USER_NAMESPACE_RESULT=PASS\nPID_NAMESPACE_RESULT=PASS\nNETWORK_NAMESPACE_RESULT=PASS\nIPC_NAMESPACE_RESULT=PASS\nUTS_NAMESPACE_RESULT=PASS\n'
+          printf 'NAMESPACE_PROOF=PASS\n'
           for capability_name in CapInh CapPrm CapEff CapBnd CapAmb; do
             capability_value="$(awk -v key="${capability_name}:" '$1 == key { print $2 }' "$status_file")"
             [[ "$capability_value" =~ ^0+$ ]] || exit 41
           done
           printf 'CAPABILITY_SET_RESULT=PASS\n'
+          printf 'CAPABILITY_SETS_ZERO=PASS\n'
           test "$(awk '$1 == "NoNewPrivs:" { print $2 }' "$status_file")" = 1
           printf 'NO_NEW_PRIVS_RESULT=PASS\n'
+          printf 'NO_NEW_PRIVS=PASS\n'
           for proc_field in Name Pid PPid Uid Gid CapInh CapPrm CapEff CapBnd CapAmb NoNewPrivs Seccomp; do
             grep -q "^${proc_field}:" "$status_file"
           done
@@ -1432,6 +2030,7 @@ jobs:
             exit 42
           fi
           printf 'NESTED_USERNS_RESULT=PASS\n'
+          printf 'NESTED_USERNS_REJECTION=PASS\n'
           test -x /usr/bin/unshare
           if { /usr/sbin/ip -4 route show; /usr/sbin/ip -6 route show; } | awk '/^unreachable |^prohibit |^blackhole |^throw / { next } NF && $0 !~ /(^| )dev lo( |$)/ && ($0 ~ /(^| )dev / || $0 ~ /^default /) { bad = 1 } END { exit bad }'; then
             :
@@ -1519,7 +2118,7 @@ jobs:
           if ! run_capability_probe initial; then
             fail_hold "CAPABILITY_PROBE_FAILED"
           fi
-          printf 'CAPABILITY_PROBE=PASS\n'
+          printf 'CAPABILITY_PROBE=PASS\nINITIAL_CAPABILITY_PROBE=PASS\n'
           remove_carrier_exact || fail_hold "PROBE_CARRIER_CLEANUP_FAILED"
           carrier_created=0
 
@@ -1640,7 +2239,7 @@ jobs:
           if ! run_capability_probe staged; then
             fail_hold "ACTUAL_STAGED_PATH_ADMISSION_FAILED"
           fi
-          printf 'ACTUAL_STAGED_PATH_ADMISSION=PASS\n'
+          printf 'ACTUAL_STAGED_PATH_ADMISSION=PASS\nSTAGED_CAPABILITY_PROBE=PASS\n'
 
           candidate_marker_file="$temp_root/candidate-started"
           launcher="$temp_root/s8-bwrap-launcher"
@@ -1878,6 +2477,8 @@ jobs:
             printf 'CANDIDATE_FAILURE_PROVEN=YES\nFAILURE_CLASS=CANDIDATE_DEFECT__SEMANTIC_READBACK\n' >&2
             exit 1
           fi
+          [[ -e "$candidate_marker_file" && ! -L "$candidate_marker_file" ]] || fail_amendment "CANDIDATE_MARKER_NOT_REACHED"
+          printf 'CANDIDATE_MARKER_REACHED=YES\nBLENDER_VALIDATION=PASS\nNATIVE_VALIDATION=PASS\nSEMANTIC_VALIDATION=PASS\n'
 
           manifest_surfaces "$carrier" runtime native writer support > "$post_run_manifest" || fail_amendment "POST_RUN_MANIFEST_FAILED"
           post_run_manifest_sha="$(sha256sum -- "$post_run_manifest" | awk '{print $1}')"
@@ -1888,5 +2489,5 @@ jobs:
           [[ "$blender_staged_sha" == "$blender_post_run_sha" ]] || fail_amendment "BLENDER_POST_RUN_HASH_MISMATCH"
           [[ "$runner_staged_sha" == "$runner_post_run_sha" ]] || fail_amendment "RUNNER_POST_RUN_HASH_MISMATCH"
           [[ "$validator_staged_sha" == "$validator_post_run_sha" ]] || fail_amendment "VALIDATOR_POST_RUN_HASH_MISMATCH"
-          printf 'POST_RUN_MANIFEST_SHA=%s\nBLENDER_POST_RUN_SHA=%s\nRUNNER_POST_RUN_SHA=%s\nVALIDATOR_POST_RUN_SHA=%s\nPOST_RUN_IDENTITY_RESULT=PASS\n' "$post_run_manifest_sha" "$blender_post_run_sha" "$runner_post_run_sha" "$validator_post_run_sha"
+          printf 'POST_RUN_MANIFEST_SHA=%s\nBLENDER_POST_RUN_SHA=%s\nRUNNER_POST_RUN_SHA=%s\nVALIDATOR_POST_RUN_SHA=%s\nPOST_RUN_IDENTITY_RESULT=PASS\nMANIFEST_EQUALITY=PASS\n' "$post_run_manifest_sha" "$blender_post_run_sha" "$runner_post_run_sha" "$validator_post_run_sha"
           printf 'S8_PINNED_BLENDER_CHECK=PASS\nEXACT_HEAD_HOSTED_CI_RESULT=PASS\nAMENDMENT_RESULT=PASS\nCANDIDATE_FAILURE_PROVEN=NO\nNON_CONVERGENCE_DECISION_REQUIRED=NO\nG3_RESULT=HOSTED_CI_PASS__REMAINING_G3_EVIDENCE_PENDING\nG4_AUTHORISED=NO\nRETURN_TO_WEB=YES\n'
