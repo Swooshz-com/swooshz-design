@@ -1166,14 +1166,98 @@ jobs:
             local child_status
             tracked_children=("$child_pid")
             all_launched_children_reaped=0
-            set +e
-            wait "$child_pid"
-            child_status=$?
-            set -e
+            if wait "$child_pid"; then
+              child_status=0
+            else
+              child_status=$?
+            fi
             tracked_children=()
             all_launched_children_reaped=1
             return "$child_status"
           }
+
+          run_tracked_command_regression() {
+            local regression_root matrix_script unguarded_script matrix_status unguarded_status
+            regression_root="$(/usr/bin/mktemp -d)" || return 1
+            matrix_script="$regression_root/run-tracked-command-matrix.sh"
+            unguarded_script="$regression_root/run-tracked-command-unguarded.sh"
+
+            declare -f run_tracked_command > "$matrix_script"
+            /usr/bin/cat >> "$matrix_script" <<'SH'
+          set -Eeuo pipefail
+          tracked_children=()
+          all_launched_children_reaped=1
+
+          assert_errexit_state() {
+            local expected="$1"
+            if [[ "$expected" == ON ]]; then
+              [[ "$-" == *e* ]]
+            else
+              [[ "$-" != *e* ]]
+            fi
+          }
+
+          assert_child_bookkeeping() {
+            [[ "${#tracked_children[@]}" == 0 ]]
+            [[ "$all_launched_children_reaped" == 1 ]]
+          }
+
+          run_matrix_case() {
+            local caller_errexit="$1"
+            local child_status="$2"
+            local actual_status
+            if [[ "$caller_errexit" == ON ]]; then
+              set -e
+            else
+              set +e
+            fi
+            assert_errexit_state "$caller_errexit"
+            if [[ "$caller_errexit" == ON ]]; then
+              if run_tracked_command /usr/bin/sh -c "exit $child_status"; then
+                actual_status=0
+              else
+                actual_status=$?
+              fi
+            else
+              run_tracked_command /usr/bin/sh -c "exit $child_status"
+              actual_status=$?
+            fi
+            [[ "$actual_status" == "$child_status" ]]
+            assert_errexit_state "$caller_errexit"
+            assert_child_bookkeeping
+            printf 'ERREXIT_MATRIX_CASE=%s_STATUS_%s=PASS\n' "$caller_errexit" "$child_status"
+          }
+
+          for caller_errexit in ON OFF; do
+            for child_status in 0 1 42; do
+              run_matrix_case "$caller_errexit" "$child_status"
+            done
+          done
+          printf 'CALLER_ERREXIT_OWNERSHIP=PASS\nEXACT_STATUS_PROPAGATION=PASS\nBOOKKEEPING_REGRESSION=PASS\nERREXIT_MATRIX=PASS\n'
+          SH
+
+            declare -f run_tracked_command > "$unguarded_script"
+            /usr/bin/cat >> "$unguarded_script" <<'SH'
+          set -Eeuo pipefail
+          tracked_children=()
+          all_launched_children_reaped=1
+          run_tracked_command /usr/bin/sh -c 'exit 42'
+          printf 'UNGUARDED_POST_CALL_SENTINEL=FAIL\n'
+          SH
+
+            /usr/bin/chmod 0700 -- "$matrix_script" "$unguarded_script"
+            set +e
+            /usr/bin/bash "$matrix_script"
+            matrix_status=$?
+            /usr/bin/bash "$unguarded_script"
+            unguarded_status=$?
+            set -e
+            /usr/bin/rm -rf -- "$regression_root"
+            [[ "$matrix_status" == 0 && "$unguarded_status" == 42 ]] || return 1
+            printf 'UNGUARDED_STATUS_42_REGRESSION=PASS\nRUN_TRACKED_COMMAND_REGRESSION=PASS\n'
+          }
+
+          run_tracked_command_regression || fail_amendment "RUN_TRACKED_COMMAND_REGRESSION_FAILED"
 
           apply_work_acl_once() {
             local supplied_path="$1"
@@ -3638,19 +3722,20 @@ jobs:
             [[ "$proof_status" == "$expected_status" ]] || fail_hold "BWRAP_GRAMMAR_PROOF_EXIT_STATUS_${context}"
             if [[ "$context" == bwrap_bad_grammar ]]; then
               grep -F -- '--size must be followed by --tmpfs' "$stderr_path" >/dev/null || fail_hold "BWRAP_BAD_GRAMMAR_DIAGNOSTIC_MISSING"
-              printf 'EXPECTED_SIZE_FOLLOWING_DIAGNOSTIC=YES\nBWRAP_BAD_GRAMMAR_PROOF=PASS\n'
+              printf 'BAD_GRAMMAR_STATUS=%s\nEXPECTED_SIZE_FOLLOWING_DIAGNOSTIC=YES\nBWRAP_BAD_GRAMMAR_PROOF=PASS\n' "$proof_status"
             else
               grep -F -- 'Usage:' "$stdout_path" >/dev/null || fail_hold "BWRAP_GOOD_GRAMMAR_HELP_OUTPUT_MISSING"
               if grep -F -- '--size must be followed by --tmpfs' "$stdout_path" "$stderr_path" >/dev/null 2>&1; then
                 fail_hold "BWRAP_GOOD_GRAMMAR_DIAGNOSTIC_PRESENT"
               fi
-              printf 'EXPECTED_HELP_OUTPUT=YES\nSIZE_FOLLOWING_DIAGNOSTIC=NO\nBWRAP_GOOD_GRAMMAR_PROOF=PASS\n'
+              printf 'GOOD_GRAMMAR_STATUS=%s\nEXPECTED_HELP_OUTPUT=YES\nSIZE_FOLLOWING_DIAGNOSTIC=NO\nBWRAP_GOOD_GRAMMAR_PROOF=PASS\n' "$proof_status"
             fi
             printf 'CANDIDATE_MARKER_CREATED=NO\nAPPARMOR_MUTATION=NO\nSYSCTL_MUTATION=NO\nPAYLOAD_EXECUTION=NO\n'
           }
 
           run_bwrap_parser_proof bwrap_bad_grammar 1 "$archive_root/bwrap-bad-grammar.stdout" "$archive_root/bwrap-bad-grammar.stderr"
           run_bwrap_parser_proof bwrap_good_grammar 0 "$archive_root/bwrap-good-grammar.stdout" "$archive_root/bwrap-good-grammar.stderr"
+          printf 'GOOD_GRAMMAR_CONTROL=CAPABILITY_PROBE_NEXT\n'
 
           read -r -d '' capability_script <<'SH' || true
           set -Eeuo pipefail
@@ -3777,6 +3862,250 @@ jobs:
             run_tracked_command /usr/bin/sudo -n /usr/bin/bwrap "${args[@]}"
           }
 
+          run_guarded_caller_regressions() {
+            local regression_root caller_script negative_script regression_status negative_status negative_case
+            regression_root="$(/usr/bin/mktemp -d)" || return 1
+            caller_script="$regression_root/guarded-caller-regressions.sh"
+            {
+              declare -f run_tracked_command
+              declare -f validate_bwrap_info_after_carrier
+              declare -f run_capability_probe
+              /usr/bin/cat <<'SH'
+          set -Eeuo pipefail
+          regression_root="$1"
+          candidate_marker_file=""
+          tmpfs_bytes=1073741824
+          bwrap_path=/usr/bin/bwrap
+          carrier=/carrier
+          common_bwrap_args=(--unshare-user)
+          host_user_ns=user:[host]
+          host_pid_ns=pid:[host]
+          host_net_ns=net:[host]
+          host_ipc_ns=ipc:[host]
+          host_uts_ns=uts:[host]
+          capability_script=':'
+          actual_helper_definition="$(declare -f run_tracked_command)"
+          eval "${actual_helper_definition/run_tracked_command/run_tracked_command_actual}"
+
+          fail_hold() {
+            hold_reason="$1"
+          }
+
+          fail_amendment() {
+            amendment_reason="$1"
+            return 1
+          }
+
+          admit_before_bwrap() {
+            return 0
+          }
+
+          admit_root_and_carrier() {
+            return 0
+          }
+
+          mount_table_admission() {
+            return 0
+          }
+
+          admit_work_for_use() {
+            return 0
+          }
+
+          run_bwrap_argv_grammar_regression() {
+            return 0
+          }
+
+          validate_bwrap_destination_order() {
+            return 0
+          }
+
+          injected_call=0
+          injected_at=0
+          run_tracked_command() {
+            injected_call=$((injected_call + 1))
+            printf 'injected informational output\n'
+            if [[ "$injected_call" == "$injected_at" ]]; then
+              return 42
+            fi
+            return 0
+          }
+
+          run_informational_case() {
+            local label="$1"
+            local inject_at="$2"
+            local version_output="$regression_root/info-$label.version"
+            local help_output="$regression_root/info-$label.help"
+            local info_success=0
+            injected_call=0
+            injected_at="$inject_at"
+            hold_reason=""
+            if ! validate_bwrap_info_after_carrier "$version_output" "$help_output"; then
+              fail_hold "BWRAP_INFO_ADMISSION_FAILED"
+            else
+              info_success=1
+            fi
+            [[ "$hold_reason" == BWRAP_INFO_ADMISSION_FAILED ]]
+            [[ "$info_success" == 0 ]]
+            [[ "$injected_call" == "$inject_at" ]]
+            [[ ! -e "$candidate_marker_file" && ! -L "$candidate_marker_file" ]]
+            printf 'GUARDED_INFORMATIONAL_%s=PASS\n' "$label"
+          }
+
+          run_informational_case VERSION 1
+          run_informational_case HELP 2
+
+          run_capability_case() {
+            local mode="$1"
+            local capability_success=0
+            injected_call=0
+            injected_at=1
+            hold_reason=""
+            if ! run_capability_probe "$mode"; then
+              fail_hold "CAPABILITY_PROBE_FAILED"
+            else
+              capability_success=1
+            fi
+            [[ "$hold_reason" == CAPABILITY_PROBE_FAILED ]]
+            [[ "$capability_success" == 0 ]]
+            [[ "$injected_call" == 1 ]]
+            [[ ! -e "$candidate_marker_file" && ! -L "$candidate_marker_file" ]]
+            printf 'GUARDED_CAPABILITY_%s=PASS\n' "$mode"
+          }
+
+          run_capability_case initial
+          run_capability_case staged
+
+          run_qualification_case() {
+            local label="$1"
+            local create_marker="$2"
+            local marker="$regression_root/$label.marker"
+            local qualification_status=0
+            local candidate_started=0
+            local failure_reported=0
+            local qualification_pass=0
+            local -a qualification_command
+            /usr/bin/rm -f -- "$marker"
+            if [[ "$create_marker" == 1 ]]; then
+              qualification_command=(/usr/bin/sh -c 'printf "1\n" > "$1"; exit 42' qualification "$marker")
+            else
+              qualification_command=(/usr/bin/sh -c 'exit 42')
+            fi
+            set +e
+            run_tracked_command_actual "${qualification_command[@]}"
+            qualification_status=$?
+            set -e
+            if [[ -e "$marker" ]]; then
+              candidate_started=1
+            fi
+            if (( qualification_status != 0 && candidate_started == 1 )); then
+              failure_reported=1
+            fi
+            if (( qualification_status == 0 )); then
+              qualification_pass=1
+            fi
+            [[ "$qualification_status" == 42 ]]
+            [[ "$qualification_pass" == 0 ]]
+            if [[ "$create_marker" == 0 ]]; then
+              [[ "$candidate_started" == 0 && "$failure_reported" == 0 ]]
+            else
+              [[ "$candidate_started" == 1 && "$failure_reported" == 1 ]]
+            fi
+            printf 'QUALIFICATION_CAPTURE_%s=PASS\n' "$label"
+          }
+
+          run_qualification_case BEFORE_MARKER 0
+          run_qualification_case AFTER_MARKER 1
+          printf 'QUALIFICATION_CAPTURE_REGRESSIONS=PASS\n'
+          printf 'GUARDED_CALLER_REGRESSIONS=PASS\n'
+          SH
+            } > "$caller_script"
+            /usr/bin/chmod 0700 -- "$caller_script"
+            set +e
+            /usr/bin/bash "$caller_script" "$regression_root"
+            regression_status=$?
+            set -e
+            if [[ "$regression_status" != 0 ]]; then
+              /usr/bin/rm -rf -- "$regression_root"
+              return 1
+            fi
+
+            negative_script="$regression_root/negative-proof-controls.sh"
+            {
+              declare -f run_tracked_command
+              declare -f run_bwrap_parser_proof
+              /usr/bin/cat <<'SH'
+          set -Eeuo pipefail
+          regression_root="$1"
+          negative_case="$2"
+          candidate_marker_file="$regression_root/$negative_case.marker"
+          tmpfs_bytes=1073741824
+          /usr/bin/rm -f -- "$candidate_marker_file"
+
+          fail_hold() {
+            printf 'NEGATIVE_CONTROL_HOLD=%s\n' "$1" >&2
+            exit 1
+          }
+
+          admit_before_bwrap() {
+            return 0
+          }
+
+          run_tracked_command() {
+            case "$negative_case" in
+              WRONG_BAD_GRAMMAR_STATUS)
+                printf 'wrong status diagnostic fixture\n'
+                return 2
+                ;;
+              MISSING_BAD_GRAMMAR_DIAGNOSTIC)
+                printf 'different diagnostic fixture\n'
+                return 1
+                ;;
+              FAILED_GOOD_GRAMMAR)
+                printf 'Usage: fixture\n'
+                return 1
+                ;;
+              *)
+                return 99
+                ;;
+            esac
+          }
+
+          stdout_path="$regression_root/$negative_case.stdout"
+          stderr_path="$regression_root/$negative_case.stderr"
+          if [[ "$negative_case" == FAILED_GOOD_GRAMMAR ]]; then
+            run_bwrap_parser_proof bwrap_good_grammar 0 "$stdout_path" "$stderr_path"
+          else
+            run_bwrap_parser_proof bwrap_bad_grammar 1 "$stdout_path" "$stderr_path"
+          fi
+          printf 'CANDIDATE_EXECUTION_START=SHOULD_NOT_REACH\n' > "$candidate_marker_file"
+          SH
+            } > "$negative_script"
+            /usr/bin/chmod 0700 -- "$negative_script"
+            for negative_case in WRONG_BAD_GRAMMAR_STATUS MISSING_BAD_GRAMMAR_DIAGNOSTIC FAILED_GOOD_GRAMMAR; do
+              set +e
+              /usr/bin/bash "$negative_script" "$regression_root" "$negative_case" > "$regression_root/$negative_case.log" 2>&1
+              negative_status=$?
+              set -e
+              [[ "$negative_status" != 0 ]] || {
+                /usr/bin/rm -rf -- "$regression_root"
+                return 1
+              }
+              [[ ! -e "$regression_root/$negative_case.marker" && ! -L "$regression_root/$negative_case.marker" ]] || {
+                /usr/bin/rm -rf -- "$regression_root"
+                return 1
+              }
+              if /usr/bin/grep -F 'CANDIDATE_EXECUTION_START=SHOULD_NOT_REACH' "$regression_root/$negative_case.log" >/dev/null 2>&1; then
+                /usr/bin/rm -rf -- "$regression_root"
+                return 1
+              fi
+              printf 'NEGATIVE_PROOF_CONTROL_%s=PASS\n' "$negative_case"
+            done
+            /usr/bin/rm -rf -- "$regression_root"
+            printf 'NEGATIVE_CONTROL_REGRESSIONS=PASS\n'
+          }
+
+          run_guarded_caller_regressions || fail_amendment "GUARDED_CALLER_REGRESSION_FAILED"
           admit_root_and_carrier || fail_hold "PROBE_CARRIER_OWNER_MODE_FAILED"
           mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_BEFORE_PROBE_FAILED"
           /usr/bin/sudo -n /usr/bin/install -d -o root -g root -m 0555 -- "$carrier/probe" || fail_hold "PROBE_DIRECTORY_CREATE_FAILED"
