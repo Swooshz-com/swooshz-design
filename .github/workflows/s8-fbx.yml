@@ -505,15 +505,12 @@ jobs:
               records = raw[:-1].split(b"\n")
               if not records or any(record == b"" for record in records):
                   reject("MALFORMED_RECORD")
-              decoded_records = []
+              decoded_targets = []
               for record in records:
-                  decoded = decode_record(record)
-                  if decoded in decoded_records:
-                      reject("AMBIGUOUS_DUPLICATE")
-                  decoded_records.append(decoded)
-              if "/" not in decoded_records:
+                  decoded_targets.append(decode_record(record))
+              if "/" not in decoded_targets:
                   reject("ROOT_MOUNT_TARGET_MISSING")
-              if target in decoded_records or any(item.startswith(target + "/") for item in decoded_records):
+              if target in decoded_targets or any(item.startswith(target + "/") for item in decoded_targets):
                   reject("EXACT_OR_DESCENDANT_MOUNT_PRESENT")
               print("MOUNT_TABLE_ADMISSION=NO_EXACT_OR_DESCENDANT_MOUNT")
           except (OSError, Reject):
@@ -709,7 +706,7 @@ jobs:
           }
 
           run_mount_admission_regression() {
-            local fixture_dir fixture_file fixture_root='/run/s8-mount-admission-regression'
+            local fixture_dir fixture_file fixture_root='/run/s8-mount-admission-regression' encoded_carrier='/run/s8\carrier'
             fixture_dir="$(/usr/bin/mktemp -d)" || fail_amendment "MOUNT_ADMISSION_REGRESSION_FIXTURE_CREATE_FAILED"
             fixture_file="$fixture_dir/ordinary"
             printf '/\n/proc\n/dev\n' > "$fixture_file"
@@ -718,6 +715,60 @@ jobs:
               fail_amendment "MOUNT_ADMISSION_REGRESSION_FRESH_REJECTED"
             }
             printf 'SYNTHETIC_SAFE_CASE=PASS\n'
+            printf '%s\n' '/' '/proc' '/proc' '/dev' > "$fixture_file"
+            if ! mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_DUPLICATE_SAFE_REJECTED"
+            fi
+            printf 'DUPLICATE_SAFE_NONCARRIER_TARGETS=ACCEPT\n'
+            printf '%s\n' '/' '/' '/proc' '/dev' > "$fixture_file"
+            if ! mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_DUPLICATE_ROOT_REJECTED"
+            fi
+            printf 'DUPLICATE_ROOT_TARGETS=ACCEPT\n'
+            printf '%s\n' '/' '/proc' '/proc' "$fixture_root" "$fixture_root" '/dev' '/proc' > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_DUPLICATE_EXACT_ACCEPTED"
+            fi
+            printf 'DUPLICATE_EXACT_CARRIER_TARGET=REJECT\n'
+            printf '%s\n' '/' '/proc' '/proc' "$fixture_root/work" "$fixture_root/work" '/dev' '/proc' > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_DUPLICATE_DESCENDANT_ACCEPTED"
+            fi
+            printf 'DUPLICATE_DESCENDANT_CARRIER_TARGET=REJECT\n'
+            printf '%s\n' '/' '/proc' '/run/s8\\mount' '/run/s8\134mount' > "$fixture_file"
+            if ! mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_DUPLICATE_ENCODING_SAFE_REJECTED"
+            fi
+            printf 'SAFE_DUPLICATE_TARGET_WITH_VALID_ALTERNATE_RAW_ENCODING=ACCEPT\n'
+            printf '%s\n' '/' '/proc' '/proc' '/run/s8\\carrier' '/run/s8\134carrier' '/dev' '/proc' > "$fixture_file"
+            if mount_target_admission "$encoded_carrier" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_DUPLICATE_ENCODING_CARRIER_ACCEPTED"
+            fi
+            printf 'CARRIER_TARGET_WITH_VALID_ALTERNATE_RAW_ENCODING=REJECT\n'
+            printf '%s\n' '/' '/proc' '/proc' '' '' > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_MALFORMED_DUPLICATE_ACCEPTED"
+            fi
+            printf 'MALFORMED_DUPLICATE_RECORD=REJECT\n'
+            printf '%s\n' '/' '/proc' '/proc' '/run/s8\qmount' '/run/s8\qmount' > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_INVALID_ESCAPE_DUPLICATE_ACCEPTED"
+            fi
+            printf 'INVALID_ESCAPE_IN_DUPLICATE=REJECT\n'
+            printf '%s\n' '/' '/proc' '/proc' 'relative' 'relative' > "$fixture_file"
+            if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
+              /usr/bin/rm -rf -- "$fixture_dir"
+              fail_amendment "MOUNT_ADMISSION_REGRESSION_NONABSOLUTE_DUPLICATE_ACCEPTED"
+            fi
+            printf 'NONABSOLUTE_DUPLICATE=REJECT\nDUPLICATE_MOUNT_TARGET_REGRESSION=PASS\n'
             printf '/\n/proc\n/dev\n%s\n' "$fixture_root" > "$fixture_file"
             if mount_target_admission "$fixture_root" "$fixture_file" >/dev/null 2>&1; then
               /usr/bin/rm -rf -- "$fixture_dir"
