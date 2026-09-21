@@ -3235,8 +3235,10 @@ jobs:
             local work_chdir_seen=0
             local proc_seen=0
             local dev_seen=0
-            local tmpfs_seen=0
-            local size_seen=0
+            local tmpfs_count=0
+            local size_count=0
+            local pair_count=0
+            local size_applies_to=""
             local probe_seen=0
             local runtime_seen=0
             local runner_seen=0
@@ -3279,13 +3281,12 @@ jobs:
                   destinations+=("$destination")
                   index=$((index + 3))
                   ;;
-                --proc|--dev|--tmpfs)
+                --proc|--dev)
                   (( index + 1 < array_length )) || return 1
                   destination="${setup_args[index + 1]}"
                   case "$option:$destination" in
                     --proc:/proc) [[ "$proc_seen" == 0 ]] || return 1; proc_seen=1 ;;
                     --dev:/dev) [[ "$dev_seen" == 0 ]] || return 1; dev_seen=1 ;;
-                    --tmpfs:/tmp) [[ "$tmpfs_seen" == 0 ]] || return 1; tmpfs_seen=1 ;;
                     *) return 1 ;;
                   esac
                   for prior in "${destinations[@]}"; do
@@ -3301,10 +3302,23 @@ jobs:
                   index=$((index + 2))
                   ;;
                 --size)
-                  (( index + 1 < array_length )) || return 1
-                  [[ "${setup_args[index + 1]}" == "$tmpfs_bytes" && "$size_seen" == 0 ]] || return 1
-                  size_seen=1
-                  index=$((index + 2))
+                  (( index + 3 < array_length )) || return 1
+                  [[ "${setup_args[index + 1]}" == "$tmpfs_bytes" &&
+                     "${setup_args[index + 2]}" == --tmpfs &&
+                     "${setup_args[index + 3]}" == /tmp &&
+                     "$size_count" == 0 &&
+                     "$tmpfs_count" == 0 ]] || return 1
+                  destination=/tmp
+                  for prior in "${destinations[@]}"; do
+                    [[ "$destination" != "$prior" &&
+                       "$destination" != "$prior"/* ]] || return 1
+                  done
+                  destinations+=("$destination")
+                  size_count=1
+                  tmpfs_count=1
+                  pair_count=1
+                  size_applies_to=/tmp
+                  index=$((index + 4))
                   ;;
                 --setenv)
                   (( index + 2 < array_length )) || return 1
@@ -3339,7 +3353,15 @@ jobs:
                   ;;
               esac
             done
-            [[ "$separator_seen" == 1 && "$work_bind_seen" == 1 && "$work_chdir_seen" == 1 && "$proc_seen" == 1 && "$dev_seen" == 1 && "$tmpfs_seen" == 1 && "$size_seen" == 1 ]] || return 1
+            [[ "$separator_seen" == 1 &&
+               "$work_bind_seen" == 1 &&
+               "$work_chdir_seen" == 1 &&
+               "$proc_seen" == 1 &&
+               "$dev_seen" == 1 &&
+               "$size_count" == 1 &&
+               "$tmpfs_count" == 1 &&
+               "$pair_count" == 1 &&
+               "$size_applies_to" == /tmp ]] || return 1
             if [[ "$context" == initial ]]; then
               [[ "$probe_seen" == 1 && "$runtime_seen" == 0 && "$runner_seen" == 0 && "$validator_seen" == 0 && "$writer_seen" == 0 && "$support_seen" == 0 ]] || return 1
             elif [[ "$context" == staged ]]; then
@@ -3351,6 +3373,7 @@ jobs:
               return 1
             fi
             printf 'BWRAP_DESTINATION_ORDER_ADMISSION=%s\n' "$context"
+            printf 'SIZE_COUNT=%s\nTMPFS_/tmp_COUNT=%s\nPAIR_COUNT=%s\nSIZE_APPLIES_TO=%s\n' "$size_count" "$tmpfs_count" "$pair_count" "$size_applies_to"
             printf 'BWRAP_SETUP_DESTINATION_INVARIANT=fresh_bwrap_owned_root+fixed_top_level_destinations_only+no_bind_destination_root+writable_/work_mounted_only_at_/work+no_bwrap_file_dir_symlink_creation_beneath_/work+no_destination_beneath_any_prior_candidate_controlled_or_writable_bind+destination_order_mechanically_validated_before_bwrap_execution\n'
           }
 
@@ -3385,13 +3408,249 @@ jobs:
               common_bwrap_args+=(--ro-bind "$lib64_source" /lib64)
             fi
             common_bwrap_args+=(
-              --size "$tmpfs_bytes"
               --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
               --setenv LANG C.UTF-8
               --setenv LC_ALL C.UTF-8
               --setenv HOME /tmp
             )
           }
+
+          bwrap_validator_expect() {
+            local label="$1"
+            local expected="$2"
+            local context="$3"
+            local expected_payload="$4"
+            shift 4
+            local status=0
+            if validate_bwrap_destination_order "$context" "$expected_payload" "$@"; then
+              status=0
+            else
+              status=$?
+            fi
+            if [[ "$expected" == ACCEPT ]]; then
+              [[ "$status" == 0 ]] || return 1
+            else
+              [[ "$status" != 0 ]] || return 1
+            fi
+            printf 'BWRAP_GRAMMAR_CASE=%s RESULT=PASS EXPECTED=%s\n' "$label" "$expected"
+          }
+
+          bwrap_mutate_pair() {
+            local mutation="$1"
+            shift
+            local -a original=( "$@" )
+            local -a replacement=()
+            local pair_index=-1
+            local index
+            for ((index = 0; index < ${#original[@]}; index++)); do
+              if [[ "${original[index]}" == --size ]]; then
+                pair_index=$index
+                break
+              fi
+            done
+            [[ "$pair_index" -ge 0 ]] || return 1
+            case "$mutation" in
+              SIZE_THEN_SETENV_THEN_TMPFS)
+                replacement=(--size "$tmpfs_bytes" --setenv LANG C.UTF-8 --tmpfs /tmp)
+                ;;
+              SIZE_THEN_BIND_THEN_TMPFS)
+                replacement=(--size "$tmpfs_bytes" --ro-bind /carrier/probe /probe --tmpfs /tmp)
+                ;;
+              SIZE_THEN_PROC_THEN_TMPFS)
+                replacement=(--size "$tmpfs_bytes" --proc /proc --tmpfs /tmp)
+                ;;
+              SIZE_THEN_DEV_THEN_TMPFS)
+                replacement=(--size "$tmpfs_bytes" --dev /dev --tmpfs /tmp)
+                ;;
+              SIZE_THEN_CHDIR_THEN_TMPFS)
+                replacement=(--size "$tmpfs_bytes" --chdir /work --tmpfs /tmp)
+                ;;
+              MISSING_SIZE)
+                replacement=(--tmpfs /tmp)
+                ;;
+              MISSING_TMPFS)
+                replacement=(--size "$tmpfs_bytes")
+                ;;
+              DUPLICATE_SIZE)
+                replacement=(--size "$tmpfs_bytes" --tmpfs /tmp --size "$tmpfs_bytes" --tmpfs /tmp)
+                ;;
+              DUPLICATE_TMPFS)
+                replacement=(--size "$tmpfs_bytes" --tmpfs /tmp --tmpfs /tmp)
+                ;;
+              SIZE_WITHOUT_VALUE)
+                replacement=(--size --tmpfs /tmp)
+                ;;
+              TMPFS_WITHOUT_DESTINATION)
+                replacement=(--size "$tmpfs_bytes" --tmpfs)
+                ;;
+              WRONG_TMPFS_DESTINATION)
+                replacement=(--size "$tmpfs_bytes" --tmpfs /var/tmp)
+                ;;
+              WRONG_SIZE_VALUE)
+                replacement=(--size 1073741825 --tmpfs /tmp)
+                ;;
+              SIZE_AFTER_TMPFS)
+                replacement=(--tmpfs /tmp --size "$tmpfs_bytes")
+                ;;
+              DUPLICATED_COMPLETE_PAIR)
+                replacement=(--size "$tmpfs_bytes" --tmpfs /tmp --size "$tmpfs_bytes" --tmpfs /tmp)
+                ;;
+              TRUNCATED_PAIR)
+                replacement=(--size "$tmpfs_bytes" --tmpfs)
+                ;;
+              EMPTY_SIZE_OPERAND)
+                replacement=(--size "" --tmpfs /tmp)
+                ;;
+              EMPTY_TMPFS_DESTINATION)
+                replacement=(--size "$tmpfs_bytes" --tmpfs "")
+                ;;
+              INTERVENING_SEPARATOR)
+                replacement=(--size "$tmpfs_bytes" -- /usr/bin/sh --tmpfs /tmp)
+                ;;
+              INTERVENING_PERMS)
+                replacement=(--size "$tmpfs_bytes" --perms 1777 --tmpfs /tmp)
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+            BWRAP_MUTATED_ARGS=(
+              "${original[@]:0:$pair_index}"
+              "${replacement[@]}"
+              "${original[@]:$((pair_index + 4))}"
+            )
+          }
+
+          bwrap_run_029_regression() {
+            local context="$1"
+            local expected_payload="$2"
+            shift 2
+            local -a original=( "$@" )
+            local -a without_size=()
+            local -a mutated=()
+            local size_index=-1
+            local path_index=-1
+            local index
+            for ((index = 0; index < ${#original[@]}; index++)); do
+              if [[ "${original[index]}" == --size && "$size_index" == -1 ]]; then
+                size_index=$index
+              fi
+              if [[ "${original[index]}" == --setenv && "${original[index + 1]:-}" == PATH && "$path_index" == -1 ]]; then
+                path_index=$index
+              fi
+            done
+            [[ "$size_index" -ge 0 && "$path_index" -ge 0 && "$path_index" -lt "$size_index" ]] || return 1
+            without_size=(
+              "${original[@]:0:$size_index}"
+              "${original[@]:$((size_index + 2))}"
+            )
+            mutated=(
+              "${without_size[@]:0:$path_index}"
+              --size "$tmpfs_bytes"
+              "${without_size[@]:$path_index}"
+            )
+            bwrap_validator_expect RUN_029_BAD_ARGV REJECT "$context" "$expected_payload" "${mutated[@]}" || return 1
+            printf 'RUN_029_%s_BAD_ARGV_REGRESSION=PASS\nRUN_029_BAD_ARGV_REGRESSION=PASS\n' "${context^^}"
+          }
+
+          run_bwrap_argv_grammar_regression() {
+            local context="$1"
+            local expected_payload="$2"
+            shift 2
+            local -a actual=( "$@" )
+            local -a rejection_cases=(
+              SIZE_THEN_SETENV_THEN_TMPFS
+              SIZE_THEN_BIND_THEN_TMPFS
+              SIZE_THEN_PROC_THEN_TMPFS
+              SIZE_THEN_DEV_THEN_TMPFS
+              SIZE_THEN_CHDIR_THEN_TMPFS
+              MISSING_SIZE
+              MISSING_TMPFS
+              DUPLICATE_SIZE
+              DUPLICATE_TMPFS
+              SIZE_WITHOUT_VALUE
+              TMPFS_WITHOUT_DESTINATION
+              WRONG_TMPFS_DESTINATION
+              WRONG_SIZE_VALUE
+              SIZE_AFTER_TMPFS
+              DUPLICATED_COMPLETE_PAIR
+              TRUNCATED_PAIR
+              EMPTY_SIZE_OPERAND
+              EMPTY_TMPFS_DESTINATION
+              INTERVENING_SEPARATOR
+              INTERVENING_PERMS
+            )
+            local mutation
+            bwrap_validator_expect "VALID_${context^^}_ARGV" ACCEPT "$context" "$expected_payload" "${actual[@]}" || return 1
+            bwrap_validator_expect SIZE_IMMEDIATELY_BEFORE_TMPFS ACCEPT "$context" "$expected_payload" "${actual[@]}" || return 1
+            bwrap_validator_expect VALID_PAIR_WITH_SYSTEM_BINDS_BEFORE_IT ACCEPT "$context" "$expected_payload" "${actual[@]}" || return 1
+            bwrap_validator_expect VALID_PAIR_WITH_SETENV_AFTER_IT ACCEPT "$context" "$expected_payload" "${actual[@]}" || return 1
+            if [[ "$context" == initial || "$context" == staged ]]; then
+              bwrap_run_029_regression "$context" "$expected_payload" "${actual[@]}" || return 1
+            fi
+            for mutation in "${rejection_cases[@]}"; do
+              bwrap_mutate_pair "$mutation" "${actual[@]}" || return 1
+              bwrap_validator_expect "$mutation" REJECT "$context" "$expected_payload" "${BWRAP_MUTATED_ARGS[@]}" || return 1
+            done
+            case "$context" in
+              initial)
+                printf 'VALID_INITIAL_ARGV=PASS\nINITIAL_ARGV_REGRESSION=PASS\n'
+                ;;
+              staged)
+                printf 'VALID_STAGED_ARGV=PASS\nSTAGED_ARGV_REGRESSION=PASS\n'
+                ;;
+              candidate)
+                printf 'VALID_CANDIDATE_ARGV=PASS\nCANDIDATE_ARGV_REGRESSION=PASS\n'
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+            printf 'BWRAP_ARGV_GRAMMAR_REGRESSION=PASS\n'
+          }
+
+          run_bwrap_parser_proof() {
+            local context="$1"
+            local expected_status="$2"
+            local stdout_path="$3"
+            local stderr_path="$4"
+            local proof_status=0
+            [[ ! -e "$stdout_path" && ! -L "$stdout_path" && ! -e "$stderr_path" && ! -L "$stderr_path" ]] || fail_hold "BWRAP_GRAMMAR_PROOF_OUTPUT_PATH_NOT_FRESH"
+            [[ -z "$candidate_marker_file" ]] || fail_hold "CANDIDATE_MARKER_PREEXISTS_BEFORE_GRAMMAR_PROOF"
+            admit_before_bwrap "$context" || fail_hold "BWRAP_GRAMMAR_PROOF_ADMISSION_FAILED_${context}"
+            set +e
+            if [[ "$context" == bwrap_bad_grammar ]]; then
+              run_tracked_command /usr/bin/sudo -n /usr/bin/bwrap \
+                --size "$tmpfs_bytes" \
+                --setenv LANG C.UTF-8 \
+                --tmpfs /tmp \
+                --help >"$stdout_path" 2>"$stderr_path"
+            else
+              run_tracked_command /usr/bin/sudo -n /usr/bin/bwrap \
+                --size "$tmpfs_bytes" \
+                --tmpfs /tmp \
+                --setenv LANG C.UTF-8 \
+                --help >"$stdout_path" 2>"$stderr_path"
+            fi
+            proof_status=$?
+            set -e
+            printf 'BWRAP_GRAMMAR_PROOF_CONTEXT=%s\nEXIT_STATUS=%s\n' "$context" "$proof_status"
+            [[ "$proof_status" == "$expected_status" ]] || fail_hold "BWRAP_GRAMMAR_PROOF_EXIT_STATUS_${context}"
+            if [[ "$context" == bwrap_bad_grammar ]]; then
+              grep -F -- '--size must be followed by --tmpfs' "$stderr_path" >/dev/null || fail_hold "BWRAP_BAD_GRAMMAR_DIAGNOSTIC_MISSING"
+              printf 'EXPECTED_SIZE_FOLLOWING_DIAGNOSTIC=YES\nBWRAP_BAD_GRAMMAR_PROOF=PASS\n'
+            else
+              grep -F -- 'Usage:' "$stdout_path" >/dev/null || fail_hold "BWRAP_GOOD_GRAMMAR_HELP_OUTPUT_MISSING"
+              if grep -F -- '--size must be followed by --tmpfs' "$stdout_path" "$stderr_path" >/dev/null 2>&1; then
+                fail_hold "BWRAP_GOOD_GRAMMAR_DIAGNOSTIC_PRESENT"
+              fi
+              printf 'EXPECTED_HELP_OUTPUT=YES\nSIZE_FOLLOWING_DIAGNOSTIC=NO\nBWRAP_GOOD_GRAMMAR_PROOF=PASS\n'
+            fi
+            printf 'CANDIDATE_MARKER_CREATED=NO\nAPPARMOR_MUTATION=NO\nSYSCTL_MUTATION=NO\nPAYLOAD_EXECUTION=NO\n'
+          }
+
+          run_bwrap_parser_proof bwrap_bad_grammar 1 "$archive_root/bwrap-bad-grammar.stdout" "$archive_root/bwrap-bad-grammar.stderr"
+          run_bwrap_parser_proof bwrap_good_grammar 0 "$archive_root/bwrap-good-grammar.stdout" "$archive_root/bwrap-good-grammar.stderr"
 
           read -r -d '' capability_script <<'SH' || true
           set -Eeuo pipefail
@@ -3496,6 +3755,7 @@ jobs:
               --bind "$carrier/work" /work
               --proc /proc
               --dev /dev
+              --size "$tmpfs_bytes"
               --tmpfs /tmp
               --chdir /work
             )
@@ -3509,6 +3769,7 @@ jobs:
               --
               /usr/bin/sh -ceu "$capability_script"
             )
+            run_bwrap_argv_grammar_regression "$mode" /usr/bin/sh "${args[@]}" || fail_amendment "BWRAP_ARGV_GRAMMAR_REGRESSION_FAILED_${mode}"
             if ! validate_bwrap_destination_order "$mode" /usr/bin/sh "${args[@]}"; then
               fail_hold "BWRAP_DESTINATION_ORDER_ADMISSION_FAILED"
             fi
@@ -3685,6 +3946,10 @@ jobs:
             declare -f admit_root_owned_directory
             declare -f work_identity_admission
             declare -f admit_embedded_carrier_state
+            declare -f bwrap_validator_expect
+            declare -f bwrap_mutate_pair
+            declare -f bwrap_run_029_regression
+            declare -f run_bwrap_argv_grammar_regression
             cat <<'SH'
           source "$destination_validator"
           args=("$@")
@@ -3731,6 +3996,8 @@ jobs:
           writer_seen=0
           support_seen=0
           work_seen=0
+          input_tmpfs_count=0
+          input_tmpfs_destination=""
           for ((index = 0; index < separator;)); do
             option="${args[$index]}"
             case "$option" in
@@ -3766,12 +4033,19 @@ jobs:
                 fi
                 index=$((index + 3))
                 ;;
-              --proc|--dev|--tmpfs|--chdir)
+              --proc|--dev|--chdir)
                 expected="${args[$((index + 1))]:-}"
                 case "$option:$expected" in
-                  --proc:/proc|--dev:/dev|--tmpfs:/tmp|--chdir:/work) ;;
+                  --proc:/proc|--dev:/dev|--chdir:/work) ;;
                   *) echo "unexpected sandbox mount option" >&2; exit 73 ;;
                 esac
+                index=$((index + 2))
+                ;;
+              --tmpfs)
+                expected="${args[$((index + 1))]:-}"
+                [[ "$expected" == /tmp && "$input_tmpfs_count" == 0 ]] || { echo "candidate tmpfs request invalid" >&2; exit 78; }
+                input_tmpfs_count=1
+                input_tmpfs_destination="$expected"
                 index=$((index + 2))
                 ;;
               --unshare-user|--unshare-net|--unshare-pid|--unshare-ipc|--unshare-uts|--die-with-parent|--new-session)
@@ -3784,6 +4058,8 @@ jobs:
             esac
           done
 
+          [[ "$input_tmpfs_count" == 1 && "$input_tmpfs_destination" == /tmp ]] || { echo "candidate tmpfs request missing" >&2; exit 78; }
+          printf 'INPUT_TMPFS_COUNT=%s\nINPUT_TMPFS_DESTINATION=%s\nCANDIDATE_INPUT_TMPFS_COUNT_CHECK=PASS\n' "$input_tmpfs_count" "$input_tmpfs_destination"
           (( runtime_seen == 1 && runner_seen == 1 && writer_seen == 1 && work_seen == 1 )) || { echo "required runtime bind missing" >&2; exit 75; }
           (( separator + 1 < ${#args[@]} )) || { echo "sandbox payload missing" >&2; exit 76; }
           [[ "${args[$((separator + 1))]}" == "/runtime/process-runner" ]] || { echo "native runner is not the first sandbox process" >&2; exit 77; }
@@ -3800,6 +4076,7 @@ jobs:
             --
             "${args[@]:$((separator + 1))}"
           )
+          run_bwrap_argv_grammar_regression candidate /runtime/process-runner "${final_args[@]}" || { echo "BWRAP_ARGV_GRAMMAR_REGRESSION_FAILED_CANDIDATE" >&2; exit 82; }
           validate_bwrap_destination_order candidate /runtime/process-runner "${final_args[@]}" || { echo "BWRAP_DESTINATION_ORDER_ADMISSION_FAILED" >&2; exit 78; }
           admit_embedded_carrier_state || { echo "BWRAP_CARRIER_ADMISSION_FAILED" >&2; exit 79; }
           if (( admission_only == 1 )); then
@@ -3811,6 +4088,150 @@ jobs:
           } > "$launcher"
           /usr/bin/chmod 0700 -- "$launcher"
           /usr/bin/bash -n "$launcher" || fail_amendment "SANDBOX_LAUNCHER_SYNTAX"
+
+          run_candidate_input_case() {
+            local label="$1"
+            local expected="$2"
+            shift 2
+            local stdout_path="$temp_root/candidate-input-$label.stdout"
+            local stderr_path="$temp_root/candidate-input-$label.stderr"
+            local status=0
+            set +e
+            "$launcher" --s8-destination-admission-only "$@" >"$stdout_path" 2>"$stderr_path"
+            status=$?
+            set -e
+            if [[ "$expected" == ACCEPT ]]; then
+              [[ "$status" == 0 ]] || fail_amendment "CANDIDATE_INPUT_${label}_REJECTED"
+            else
+              [[ "$status" != 0 ]] || fail_amendment "CANDIDATE_INPUT_${label}_ACCEPTED"
+            fi
+            [[ ! -e "$candidate_marker_file" && ! -L "$candidate_marker_file" ]] || fail_amendment "CANDIDATE_MARKER_CREATED_DURING_INPUT_REGRESSION"
+            printf 'CANDIDATE_INPUT_%s=PASS\n' "$label"
+          }
+
+          candidate_common_prefix=(
+            --unshare-user
+            --unshare-net
+            --die-with-parent
+            --new-session
+            --ro-bind /carrier/runtime/blender-5.2.2-linux-x64 /runtime/blender-root
+            --ro-bind /carrier/writer /runtime/writer
+            --ro-bind /carrier/native/s8-process-runner /runtime/process-runner
+            --bind /carrier/work /work
+            --chdir /work
+            --proc /proc
+            --dev /dev
+            --tmpfs /tmp
+          )
+          candidate_runner_prefix=(
+            -- /runtime/process-runner
+            --address-space-bytes 4294967296
+            --file-bytes 134217728
+            --timeout-ms 300000
+            --stdout-bytes 1048576
+            --stderr-bytes 1048576
+            --max-children 0
+            --
+          )
+          candidate_writer_payload=(
+            "${candidate_runner_prefix[@]}"
+            /runtime/blender-root/blender
+            --background
+            --factory-startup
+            --disable-autoexec
+            --offline-mode
+            --python-exit-code 50
+            --python /runtime/writer/writer.py
+            --
+          )
+          candidate_validator_payload=(
+            "${candidate_runner_prefix[@]}"
+            /runtime/validator
+            /work/artifact.fbx
+          )
+          candidate_import_payload=(
+            "${candidate_runner_prefix[@]}"
+            /runtime/blender-root/blender
+            --background
+            --factory-startup
+            --disable-autoexec
+            --offline-mode
+            --python-exit-code 50
+            --python /runtime/support/blender_validate.py
+            --
+          )
+          candidate_reopen_payload=(
+            "${candidate_runner_prefix[@]}"
+            /runtime/blender-root/blender
+            --background
+            --factory-startup
+            --disable-autoexec
+            --offline-mode
+            --python-exit-code 50
+            --python /runtime/support/blender_reopen_validate.py
+            --
+            --phase reopen
+          )
+          candidate_writer_input=( "${candidate_common_prefix[@]}" "${candidate_writer_payload[@]}" )
+          candidate_validator_input=(
+            "${candidate_common_prefix[@]}"
+            --ro-bind /carrier/native/s8-fbx-validator /runtime/validator
+            "${candidate_validator_payload[@]}"
+          )
+          candidate_import_input=(
+            "${candidate_common_prefix[@]}"
+            --ro-bind /carrier/support/blender_validate.py /runtime/support/blender_validate.py
+            "${candidate_import_payload[@]}"
+          )
+          candidate_reopen_input=(
+            "${candidate_common_prefix[@]}"
+            --ro-bind /carrier/support/blender_reopen_validate.py /runtime/support/blender_reopen_validate.py
+            "${candidate_reopen_payload[@]}"
+          )
+          candidate_tmpfs_index=-1
+          for ((index = 0; index < ${#candidate_writer_input[@]}; index++)); do
+            if [[ "${candidate_writer_input[index]}" == --tmpfs ]]; then
+              candidate_tmpfs_index=$index
+              break
+            fi
+          done
+          [[ "$candidate_tmpfs_index" -ge 0 ]] || fail_amendment "CANDIDATE_INPUT_REGRESSION_FIXTURE_MISSING_TMPFS"
+          candidate_missing_tmpfs=(
+            "${candidate_writer_input[@]:0:$candidate_tmpfs_index}"
+            "${candidate_writer_input[@]:$((candidate_tmpfs_index + 2))}"
+          )
+          candidate_duplicate_tmpfs=(
+            "${candidate_writer_input[@]:0:$candidate_tmpfs_index}"
+            --tmpfs /tmp
+            --tmpfs /tmp
+            "${candidate_writer_input[@]:$((candidate_tmpfs_index + 2))}"
+          )
+          candidate_tmpfs_without_destination=(
+            "${candidate_writer_input[@]:0:$candidate_tmpfs_index}"
+            --tmpfs
+            "${candidate_writer_input[@]:$((candidate_tmpfs_index + 2))}"
+          )
+          candidate_wrong_tmpfs_destination=(
+            "${candidate_writer_input[@]:0:$candidate_tmpfs_index}"
+            --tmpfs /var/tmp
+            "${candidate_writer_input[@]:$((candidate_tmpfs_index + 2))}"
+          )
+          candidate_caller_supplied_size=(
+            "${candidate_writer_input[@]:0:$candidate_tmpfs_index}"
+            --size "$tmpfs_bytes"
+            "${candidate_writer_input[@]:$candidate_tmpfs_index}"
+          )
+          run_candidate_input_case VALID_WRITER ACCEPT "${candidate_writer_input[@]}"
+          run_candidate_input_case VALID_VALIDATOR ACCEPT "${candidate_validator_input[@]}"
+          run_candidate_input_case VALID_IMPORT ACCEPT "${candidate_import_input[@]}"
+          run_candidate_input_case VALID_REOPEN ACCEPT "${candidate_reopen_input[@]}"
+          run_candidate_input_case MISSING_TMPFS REJECT "${candidate_missing_tmpfs[@]}"
+          run_candidate_input_case DUPLICATE_TMPFS REJECT "${candidate_duplicate_tmpfs[@]}"
+          run_candidate_input_case TMPFS_WITHOUT_DESTINATION REJECT "${candidate_tmpfs_without_destination[@]}"
+          run_candidate_input_case WRONG_TMPFS_DESTINATION REJECT "${candidate_wrong_tmpfs_destination[@]}"
+          run_candidate_input_case CALLER_SUPPLIED_SIZE REJECT "${candidate_caller_supplied_size[@]}"
+          printf 'CANDIDATE_INPUT_SIZE_REJECTION=PASS\nCANDIDATE_INPUT_REGRESSION=PASS\n'
+
           qualified_helper="$temp_root/s8-runtime-sensitivity-hosted.py"
           /usr/bin/python3 - "$GITHUB_WORKSPACE/scripts/s8/s8_runtime_sensitivity.py" "$qualified_helper" "$candidate_marker_file" <<'PY'
           from pathlib import Path
