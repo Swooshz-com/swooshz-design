@@ -411,7 +411,6 @@ jobs:
           inrelease_stderr="$archive_root/InRelease.gpg-stderr"
           packages_index="$archive_root/Packages.xz"
           packages_plain="$archive_root/Packages"
-          bubblewrap_stanza="$archive_root/bubblewrap.stanza"
           bubblewrap_deb="$archive_root/$expected_bwrap_deb"
           package_plan="$archive_root/package-plan.txt"
 
@@ -780,41 +779,311 @@ jobs:
           printf 'UBUNTU_PACKAGES_INDEX_PATH=%s\nUBUNTU_PACKAGES_INDEX_SIZE=%s\nUBUNTU_PACKAGES_INDEX_SHA256=%s\n' "$packages_signed_path" "$packages_expected_size" "$packages_expected_sha"
           /usr/bin/xz --decompress --stdout -- "$packages_index" > "$packages_plain" || fail_hold "UBUNTU_PACKAGES_INDEX_DECOMPRESSION_FAILED"
 
-          package_match_count="$(awk -v expected_version="$expected_bwrap_version" '
-            BEGIN { RS = ""; FS = "\n" }
-            {
-              package = version = architecture = ""
-              for (index = 1; index <= NF; index += 1) {
-                if ($index == "Package: bubblewrap") package = "bubblewrap"
-                else if ($index == "Version: " expected_version) version = expected_version
-                else if ($index == "Architecture: amd64") architecture = "amd64"
-              }
-              if (package == "bubblewrap" && version == expected_version && architecture == "amd64") count += 1
-            }
-            END { print count + 0 }
-          ' "$packages_plain")"
-          [[ "$package_match_count" == 1 ]] || fail_hold "UBUNTU_BUBBLEWRAP_STANZA_COUNT_INVALID"
-          awk -v expected_version="$expected_bwrap_version" '
-            BEGIN { RS = ""; FS = "\n" }
-            {
-              package = version = architecture = ""
-              for (index = 1; index <= NF; index += 1) {
-                if ($index == "Package: bubblewrap") package = "bubblewrap"
-                else if ($index == "Version: " expected_version) version = expected_version
-                else if ($index == "Architecture: amd64") architecture = "amd64"
-              }
-              if (package == "bubblewrap" && version == expected_version && architecture == "amd64") print
-            }
-          ' "$packages_plain" > "$bubblewrap_stanza"
-          stanza_filename="$(awk -F': ' '$1 == "Filename" { print $2 }' "$bubblewrap_stanza")"
-          stanza_size="$(awk -F': ' '$1 == "Size" { print $2 }' "$bubblewrap_stanza")"
-          stanza_sha="$(awk -F': ' '$1 == "SHA256" { print $2 }' "$bubblewrap_stanza")"
-          [[ "$(grep -c '^Filename: ' "$bubblewrap_stanza")" == 1 ]] || fail_hold "UBUNTU_BUBBLEWRAP_FILENAME_FIELD_INVALID"
-          [[ "$(grep -c '^Size: ' "$bubblewrap_stanza")" == 1 ]] || fail_hold "UBUNTU_BUBBLEWRAP_SIZE_FIELD_INVALID"
-          [[ "$(grep -c '^SHA256: ' "$bubblewrap_stanza")" == 1 ]] || fail_hold "UBUNTU_BUBBLEWRAP_SHA_FIELD_INVALID"
-          [[ "$stanza_filename" == "pool/main/b/bubblewrap/$expected_bwrap_deb" ]] || fail_hold "UBUNTU_BUBBLEWRAP_FILENAME_INVALID"
-          [[ "$stanza_size" =~ ^[0-9]+$ ]] || fail_hold "UBUNTU_BUBBLEWRAP_SIZE_INVALID"
-          [[ "$stanza_sha" =~ ^[A-Fa-f0-9]{64}$ ]] || fail_hold "UBUNTU_BUBBLEWRAP_SHA_INVALID"
+          ubuntu_packages_parser() {
+            /usr/bin/python3 - "$@" <<'PY'
+          import re
+          import sys
+
+          EXPECTED_PACKAGE = "bubblewrap"
+          EXPECTED_VERSION = "0.9.0-1ubuntu0.3"
+          EXPECTED_ARCHITECTURE = "amd64"
+          EXPECTED_FILENAME = "pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb"
+          REQUIRED_FIELD_NAMES = frozenset({
+              "package",
+              "version",
+              "architecture",
+              "filename",
+              "size",
+              "sha256",
+          })
+          REQUIRED_OUTPUT_FIELDS = (
+              ("filename", "REQUIRED_FIELD_MISSING", "REQUIRED_FIELD_EMPTY", "FILENAME_INVALID"),
+              ("size", "REQUIRED_FIELD_MISSING", "REQUIRED_FIELD_EMPTY", "SIZE_INVALID"),
+              ("sha256", "REQUIRED_FIELD_MISSING", "REQUIRED_FIELD_EMPTY", "SHA256_INVALID"),
+          )
+
+          class Reject(Exception):
+              def __init__(self, code):
+                  self.code = code
+                  super().__init__(code)
+
+          class RegressionFailure(Exception):
+              pass
+
+          def reject(code):
+              raise Reject(code)
+
+          def parse_deb822_records(raw_bytes):
+              if not isinstance(raw_bytes, bytes):
+                  reject("INTERNAL_PARSER_FAILURE")
+              if b"\x00" in raw_bytes:
+                  reject("MALFORMED_FIELD_LINE")
+              normalized = raw_bytes.replace(b"\r\n", b"\n")
+              if b"\r" in normalized:
+                  reject("MALFORMED_FIELD_LINE")
+
+              records = []
+              fields = {}
+              current_field = None
+
+              def flush_record():
+                  nonlocal current_field, fields
+                  if fields:
+                      records.append(fields)
+                  fields = {}
+                  current_field = None
+
+              for line in normalized.split(b"\n"):
+                  if line == b"":
+                      flush_record()
+                      continue
+                  if line.startswith((b" ", b"\t")):
+                      if current_field is None:
+                          reject("ORPHAN_CONTINUATION")
+                      if current_field in REQUIRED_FIELD_NAMES:
+                          reject("REQUIRED_FIELD_CONTINUATION")
+                      fields[current_field] += b"\n" + line[1:]
+                      continue
+                  colon_index = line.find(b":")
+                  if colon_index <= 0:
+                      reject("MALFORMED_FIELD_LINE")
+                  field_name = line[:colon_index]
+                  if not all(
+                      0x21 <= character <= 0x7E and character != 0x3A
+                      for character in field_name
+                  ):
+                      reject("MALFORMED_FIELD_LINE")
+                  normalized_name = field_name.lower().decode("ascii")
+                  if normalized_name in fields:
+                      reject("DUPLICATE_FIELD")
+                  fields[normalized_name] = line[colon_index + 1:]
+                  current_field = normalized_name
+              flush_record()
+              return records
+
+          def _trim_ascii_space(value):
+              return value.strip(b" \t")
+
+          def _identity_value(record, field_name):
+              raw_value = record.get(field_name)
+              if raw_value is None:
+                  return None
+              try:
+                  return _trim_ascii_space(raw_value).decode("ascii")
+              except UnicodeDecodeError:
+                  return None
+
+          def select_bubblewrap_metadata(records):
+              matches = []
+              for record in records:
+                  if (
+                      _identity_value(record, "package") == EXPECTED_PACKAGE
+                      and _identity_value(record, "version") == EXPECTED_VERSION
+                      and _identity_value(record, "architecture") == EXPECTED_ARCHITECTURE
+                  ):
+                      matches.append(record)
+              if len(matches) != 1:
+                  reject("MATCH_COUNT_INVALID")
+
+              record = matches[0]
+              values = {}
+              for field_name, missing_code, empty_code, invalid_code in REQUIRED_OUTPUT_FIELDS:
+                  if field_name not in record:
+                      reject(missing_code)
+                  raw_value = _trim_ascii_space(record[field_name])
+                  if raw_value == b"":
+                      reject(empty_code)
+                  try:
+                      value = raw_value.decode("ascii")
+                  except UnicodeDecodeError:
+                      reject(invalid_code)
+                  values[field_name] = value
+
+              if values["filename"] != EXPECTED_FILENAME:
+                  reject("FILENAME_INVALID")
+              if re.fullmatch(r"[0-9]+", values["size"]) is None:
+                  reject("SIZE_INVALID")
+              if re.fullmatch(r"[0-9A-Fa-f]{64}", values["sha256"]) is None:
+                  reject("SHA256_INVALID")
+              return values
+
+          def format_success(metadata):
+              return (
+                  f"FILENAME={metadata['filename']}\n"
+                  f"SIZE={metadata['size']}\n"
+                  f"SHA256={metadata['sha256']}\n"
+              )
+
+          def _paragraph(fields, final_lf=True):
+              lines = []
+              for field_name, value in fields:
+                  lines.append(f"{field_name}: {value}")
+              result = "\n".join(lines)
+              if final_lf:
+                  result += "\n"
+              return result.encode("ascii")
+
+          def _base_fields():
+              return [
+                  ("Package", EXPECTED_PACKAGE),
+                  ("Version", EXPECTED_VERSION),
+                  ("Architecture", EXPECTED_ARCHITECTURE),
+                  ("Filename", EXPECTED_FILENAME),
+                  ("Size", "123"),
+                  ("SHA256", "a" * 64),
+              ]
+
+          def _exact(overrides=None, omit=(), order=None, final_lf=True, extra_fields=()):
+              overrides = overrides or {}
+              fields = [
+                  (field_name, overrides.get(field_name, value))
+                  for field_name, value in _base_fields()
+                  if field_name not in omit
+              ]
+              if order is not None:
+                  by_name = {field_name: (field_name, value) for field_name, value in fields}
+                  fields = [by_name[field_name] for field_name in order]
+              fields.extend(extra_fields)
+              return _paragraph(fields, final_lf=final_lf)
+
+          def _duplicate(field_name, duplicate_name=None):
+              duplicate_name = duplicate_name or field_name
+              fields = _base_fields()
+              for index, (name, value) in enumerate(fields):
+                  if name == field_name:
+                      fields.insert(index + 1, (duplicate_name, value))
+                      break
+              return _paragraph(fields)
+
+          def _required_continuation(field_name):
+              lines = []
+              for name, value in _base_fields():
+                  lines.append(f"{name}: {value}")
+                  if name == field_name:
+                      lines.append(" continuation text")
+              return ("\n".join(lines) + "\n").encode("ascii")
+
+          def _join_paragraphs(*paragraphs, final_lf=True):
+              raw = b"\n\n".join(paragraph.rstrip(b"\n") for paragraph in paragraphs)
+              if final_lf:
+                  raw += b"\n"
+              return raw
+
+          def _expect_fixture(name, raw_bytes, expected_code=None, expected_output=None):
+              try:
+                  records = parse_deb822_records(raw_bytes)
+                  output = format_success(select_bubblewrap_metadata(records))
+              except Reject as error:
+                  if expected_code is None or error.code != expected_code:
+                      raise RegressionFailure(f"{name}: expected {expected_code or 'PASS'}, got {error.code}")
+                  return
+              except Exception:
+                  raise RegressionFailure(f"{name}: unexpected internal exception")
+              if expected_code is not None:
+                  raise RegressionFailure(f"{name}: expected {expected_code}, got PASS")
+              if output != expected_output:
+                  raise RegressionFailure(f"{name}: exact output mismatch")
+
+          def run_regression():
+              exact = _exact()
+              expected_output = (
+                  f"FILENAME={EXPECTED_FILENAME}\n"
+                  "SIZE=123\n"
+                  f"SHA256={'a' * 64}\n"
+              )
+              unrelated = (
+                  b"Package: unrelated\n"
+                  b"Version: 1\n"
+                  b"Description: first line\n"
+                  b" second line\n"
+              )
+              cases = [
+                  ("ONE_EXACT_MATCH", exact, None),
+                  ("NO_MATCH", _exact({"Package": "other"}), "MATCH_COUNT_INVALID"),
+                  ("TWO_MATCHING_STANZAS", _join_paragraphs(exact, exact), "MATCH_COUNT_INVALID"),
+                  ("WRONG_PACKAGE", _exact({"Package": "other"}), "MATCH_COUNT_INVALID"),
+                  ("WRONG_VERSION", _exact({"Version": "0.9.0-1"}), "MATCH_COUNT_INVALID"),
+                  ("WRONG_ARCHITECTURE", _exact({"Architecture": "arm64"}), "MATCH_COUNT_INVALID"),
+                  ("MISSING_FILENAME", _exact(omit=("Filename",)), "REQUIRED_FIELD_MISSING"),
+                  ("MISSING_SIZE", _exact(omit=("Size",)), "REQUIRED_FIELD_MISSING"),
+                  ("MISSING_SHA256", _exact(omit=("SHA256",)), "REQUIRED_FIELD_MISSING"),
+                  ("DUPLICATE_FILENAME", _duplicate("Filename"), "DUPLICATE_FIELD"),
+                  ("DUPLICATE_SIZE", _duplicate("Size"), "DUPLICATE_FIELD"),
+                  ("DUPLICATE_SHA256", _duplicate("SHA256"), "DUPLICATE_FIELD"),
+                  ("EMPTY_FILENAME", _exact({"Filename": ""}), "REQUIRED_FIELD_EMPTY"),
+                  ("EMPTY_SIZE", _exact({"Size": ""}), "REQUIRED_FIELD_EMPTY"),
+                  ("EMPTY_SHA256", _exact({"SHA256": ""}), "REQUIRED_FIELD_EMPTY"),
+                  ("MALFORMED_SIZE", _exact({"Size": "12x"}), "SIZE_INVALID"),
+                  ("MALFORMED_SHA256", _exact({"SHA256": "g" * 64}), "SHA256_INVALID"),
+                  ("WRONG_FILENAME", _exact({"Filename": "pool/main/b/bubblewrap/wrong.deb"}), "FILENAME_INVALID"),
+                  ("UNRELATED_STANZAS_PRESENT", _join_paragraphs(unrelated, exact), None),
+                  ("FIELD_ORDER_CHANGED", _exact(order=("SHA256", "Architecture", "Filename", "Package", "Size", "Version")), None),
+                  ("DUPLICATE_IDENTITY_FIELD", _duplicate("Package"), "DUPLICATE_FIELD"),
+                  ("CASE_VARIANT_DUPLICATE_FIELD", _duplicate("Filename", "FILENAME"), "DUPLICATE_FIELD"),
+                  ("REQUIRED_FIELD_CONTINUATION_PACKAGE", _required_continuation("Package"), "REQUIRED_FIELD_CONTINUATION"),
+                  ("REQUIRED_FIELD_CONTINUATION_VERSION", _required_continuation("Version"), "REQUIRED_FIELD_CONTINUATION"),
+                  ("REQUIRED_FIELD_CONTINUATION_ARCHITECTURE", _required_continuation("Architecture"), "REQUIRED_FIELD_CONTINUATION"),
+                  ("REQUIRED_FIELD_CONTINUATION_FILENAME", _required_continuation("Filename"), "REQUIRED_FIELD_CONTINUATION"),
+                  ("REQUIRED_FIELD_CONTINUATION_SIZE", _required_continuation("Size"), "REQUIRED_FIELD_CONTINUATION"),
+                  ("REQUIRED_FIELD_CONTINUATION_SHA256", _required_continuation("SHA256"), "REQUIRED_FIELD_CONTINUATION"),
+                  ("ORPHAN_CONTINUATION", b" continuation text\n" + exact, "ORPHAN_CONTINUATION"),
+                  ("MALFORMED_FIELD_LINE", b"Package bubblewrap\n" + exact, "MALFORMED_FIELD_LINE"),
+                  ("VALID_MULTILINE_UNRELATED_FIELD", _exact(extra_fields=(("Description", "first line"), ("Details", "one\n two"))), None),
+                  ("EOF_WITHOUT_FINAL_NEWLINE", _exact(final_lf=False), None),
+                  ("SECOND_MATCH_NEAR_EOF", _join_paragraphs(exact, _exact(final_lf=False), final_lf=False), "MATCH_COUNT_INVALID"),
+              ]
+              for name, raw_bytes, expected_code in cases:
+                  _expect_fixture(name, raw_bytes, expected_code, expected_output)
+
+          def main(arguments):
+              if arguments == ["--regression"]:
+                  run_regression()
+                  sys.stdout.buffer.write(b"UBUNTU_PACKAGES_PARSER_REGRESSION=PASS\n")
+                  return 0
+              if len(arguments) == 2 and arguments[0] == "--select":
+                  try:
+                      with open(arguments[1], "rb") as packages_file:
+                          raw_bytes = packages_file.read()
+                  except (OSError, ValueError):
+                      reject("INPUT_READ_FAILED")
+                  records = parse_deb822_records(raw_bytes)
+                  metadata = select_bubblewrap_metadata(records)
+                  sys.stdout.buffer.write(format_success(metadata).encode("ascii"))
+                  return 0
+              reject("ARGUMENTS_INVALID")
+
+          try:
+              raise SystemExit(main(sys.argv[1:]))
+          except Reject as error:
+              print(f"UBUNTU_PACKAGES_PARSER_REJECT={error.code}", file=sys.stderr)
+              raise SystemExit(1)
+          except RegressionFailure as error:
+              print(f"UBUNTU_PACKAGES_PARSER_REGRESSION_FAILED={error}", file=sys.stderr)
+              raise SystemExit(1)
+          except Exception:
+              print("UBUNTU_PACKAGES_PARSER_REJECT=INTERNAL_PARSER_FAILURE", file=sys.stderr)
+              raise SystemExit(1)
+
+          PY
+          }
+
+          ubuntu_packages_parser --regression || fail_hold "UBUNTU_PACKAGES_PARSER_REGRESSION_FAILED"
+          metadata_file="$archive_root/bubblewrap.metadata"
+          [[ ! -e "$metadata_file" && ! -L "$metadata_file" ]] || fail_hold "UBUNTU_PACKAGES_METADATA_PATH_NOT_FRESH"
+          if ! ubuntu_packages_parser --select "$packages_plain" > "$metadata_file"; then
+            /usr/bin/rm -f -- "$metadata_file"
+            fail_hold "UBUNTU_PACKAGES_PARSER_REJECTED"
+          fi
+          metadata_line_count="$(wc -l < "$metadata_file")"
+          [[ "$metadata_line_count" == 3 ]] || fail_hold "UBUNTU_PACKAGES_METADATA_LINE_COUNT_INVALID"
+          mapfile -t metadata_lines < "$metadata_file" || fail_hold "UBUNTU_PACKAGES_METADATA_READ_FAILED"
+          [[ "${#metadata_lines[@]}" == 3 ]] || fail_hold "UBUNTU_PACKAGES_METADATA_CARDINALITY_INVALID"
+          [[ "${metadata_lines[0]}" == "FILENAME=pool/main/b/bubblewrap/$expected_bwrap_deb" ]] || fail_hold "UBUNTU_BUBBLEWRAP_FILENAME_FIELD_INVALID"
+          [[ "${metadata_lines[1]}" =~ ^SIZE=[0-9]+$ ]] || fail_hold "UBUNTU_BUBBLEWRAP_SIZE_FIELD_INVALID"
+          [[ "${metadata_lines[2]}" =~ ^SHA256=[A-Fa-f0-9]{64}$ ]] || fail_hold "UBUNTU_BUBBLEWRAP_SHA_FIELD_INVALID"
+          stanza_filename="${metadata_lines[0]#FILENAME=}"
+          stanza_size="${metadata_lines[1]#SIZE=}"
+          stanza_sha="${metadata_lines[2]#SHA256=}"
           fetch_exact_archive "$bubblewrap_deb" "$archive_base_url/$stanza_filename" || fail_hold "UBUNTU_BUBBLEWRAP_DOWNLOAD_FAILED"
           [[ "$(stat -c '%s' -- "$bubblewrap_deb")" == "$stanza_size" ]] || fail_hold "UBUNTU_BUBBLEWRAP_SIZE_MISMATCH"
           printf '%s  %s\n' "$stanza_sha" "$bubblewrap_deb" | /usr/bin/sha256sum --check --status || fail_hold "UBUNTU_BUBBLEWRAP_SHA256_MISMATCH"
