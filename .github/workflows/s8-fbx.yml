@@ -3724,7 +3724,7 @@ jobs:
               grep -F -- '--size must be followed by --tmpfs' "$stderr_path" >/dev/null || fail_hold "BWRAP_BAD_GRAMMAR_DIAGNOSTIC_MISSING"
               printf 'BAD_GRAMMAR_STATUS=%s\nEXPECTED_SIZE_FOLLOWING_DIAGNOSTIC=YES\nBWRAP_BAD_GRAMMAR_PROOF=PASS\n' "$proof_status"
             else
-              grep -F -- 'Usage:' "$stdout_path" >/dev/null || fail_hold "BWRAP_GOOD_GRAMMAR_HELP_OUTPUT_MISSING"
+              grep -F -- 'usage:' "$stdout_path" >/dev/null || fail_hold "BWRAP_GOOD_GRAMMAR_HELP_OUTPUT_MISSING"
               if grep -F -- '--size must be followed by --tmpfs' "$stdout_path" "$stderr_path" >/dev/null 2>&1; then
                 fail_hold "BWRAP_GOOD_GRAMMAR_DIAGNOSTIC_PRESENT"
               fi
