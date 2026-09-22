@@ -1613,9 +1613,102 @@ jobs:
           }
 
           remove_temp_exact() {
+            [[ "$all_launched_children_reaped" == 1 && ${#tracked_children[@]} == 0 ]] || return 1
             temp_path_is_safe || return 1
+            restore_temp_owner_permissions || return 1
+            local remove_status
+            set +e
             /usr/bin/rm -rf -- "$temp_root"
+            remove_status=$?
+            set -e
+            (( remove_status == 0 )) || return 1
             [[ ! -e "$temp_root" && ! -L "$temp_root" ]]
+          }
+
+          restore_temp_owner_permissions() {
+            /usr/bin/find -P "$temp_root" -xdev -type d -exec /usr/bin/chmod u+wx -- {} +
+          }
+
+          temp_cleanup_regression() {
+            local regression_root regression_script status
+            regression_root="$(/usr/bin/mktemp -d)" || return 1
+            regression_script="$regression_root/temp-cleanup-regression.sh"
+            {
+              declare -f restore_temp_owner_permissions
+              declare -f remove_temp_exact
+              /usr/bin/cat <<'SH'
+          set -Eeuo pipefail
+          regression_root="$(/usr/bin/mktemp -d)"
+          cleanup_regression() {
+            /usr/bin/find -P "$regression_root" -xdev -type d -exec /usr/bin/chmod u+wx -- {} + 2>/dev/null || true
+            /usr/bin/rm -rf -- "$regression_root" 2>/dev/null || true
+          }
+          trap cleanup_regression EXIT
+          fixture_root="$regression_root/fixture"
+          old_temp_root="$fixture_root/old-temp-root"
+          corrected_temp_root="$fixture_root/temp-root"
+          sibling_root="$regression_root/sibling"
+          outside_root="$regression_root/outside"
+          /usr/bin/install -d -m 0700 -- "$old_temp_root/dir" "$corrected_temp_root/dir" "$sibling_root" "$outside_root/target"
+          printf 'old-file\n' > "$old_temp_root/dir/file"
+          printf 'old-executable\n' > "$old_temp_root/executable"
+          printf 'corrected-file\n' > "$corrected_temp_root/dir/file"
+          printf 'corrected-executable\n' > "$corrected_temp_root/executable"
+          printf 'sibling-sentinel\n' > "$sibling_root/sentinel"
+          printf 'outside-sentinel\n' > "$outside_root/target/payload"
+          /usr/bin/ln -s -- "$outside_root/target" "$corrected_temp_root/outside-link"
+          /usr/bin/chmod 0555 -- "$old_temp_root" "$old_temp_root/dir" "$old_temp_root/executable" "$corrected_temp_root" "$corrected_temp_root/dir" "$corrected_temp_root/executable" "$outside_root/target"
+          /usr/bin/chmod 0444 -- "$old_temp_root/dir/file" "$corrected_temp_root/dir/file"
+          sibling_before="$(/usr/bin/sha256sum -- "$sibling_root/sentinel" | /usr/bin/awk '{print $1}')"
+          outside_mode_before="$(/usr/bin/stat -c '%a' -- "$outside_root/target")"
+          outside_before="$(/usr/bin/sha256sum -- "$outside_root/target/payload" | /usr/bin/awk '{print $1}')"
+
+          old_status=0
+          /usr/bin/rm -rf -- "$old_temp_root" >/dev/null 2>"$regression_root/old-rm.stderr" || old_status=$?
+          [[ "$old_status" != 0 || -e "$old_temp_root" || -L "$old_temp_root" ]] || exit 1
+          printf 'OLD_SHAPE_PLAIN_RM_FAILS_OR_IS_INSUFFICIENT=YES\n'
+          if [[ -e "$old_temp_root" || -L "$old_temp_root" ]]; then
+            /usr/bin/find -P "$old_temp_root" -xdev -type d -exec /usr/bin/chmod u+wx -- {} +
+            /usr/bin/rm -rf -- "$old_temp_root"
+          fi
+
+          temp_root="$corrected_temp_root"
+          temp_path_is_safe() {
+            [[ "$temp_root" == "$corrected_temp_root" && -d "$temp_root" && ! -L "$temp_root" ]]
+          }
+          tracked_children=(424242)
+          all_launched_children_reaped=0
+          blocked_mode="$(/usr/bin/stat -c '%a' -- "$temp_root")"
+          if remove_temp_exact; then exit 1; fi
+          [[ -d "$temp_root" && "$(/usr/bin/stat -c '%a' -- "$temp_root")" == "$blocked_mode" ]]
+          printf 'TEMP_CLEANUP_REAP_GATE=PASS\n'
+
+          tracked_children=()
+          all_launched_children_reaped=1
+          temp_path_is_safe
+          restore_temp_owner_permissions
+          [[ "$(/usr/bin/stat -c '%a' -- "$temp_root")" == 755 ]]
+          [[ "$(/usr/bin/stat -c '%a' -- "$temp_root/dir")" == 755 ]]
+          [[ "$(/usr/bin/stat -c '%a' -- "$temp_root/dir/file")" == 444 ]]
+          [[ "$(/usr/bin/stat -c '%a' -- "$outside_root/target")" == "$outside_mode_before" ]]
+          printf 'BOUNDED_OWNER_PERMISSION_RESTORE=PASS\n'
+          remove_temp_exact
+          [[ ! -e "$temp_root" && ! -L "$temp_root" ]]
+          printf 'TEMP_ROOT_REMOVAL=PASS\nTEMP_ROOT_ABSENT=YES\n'
+          [[ "$(/usr/bin/sha256sum -- "$sibling_root/sentinel" | /usr/bin/awk '{print $1}')" == "$sibling_before" ]]
+          printf 'SIBLING_UNCHANGED=YES\n'
+          [[ -d "$outside_root/target" && "$(/usr/bin/stat -c '%a' -- "$outside_root/target")" == "$outside_mode_before" ]]
+          [[ "$(/usr/bin/sha256sum -- "$outside_root/target/payload" | /usr/bin/awk '{print $1}')" == "$outside_before" ]]
+          printf 'SYMLINK_NOT_FOLLOWED=YES\nTEMP_CLEANUP_SYMLINK_NONFOLLOW=PASS\nTEMP_CLEANUP_SIBLING_CONFINEMENT=PASS\nTEMP_CLEANUP_CONFINEMENT=PASS\nTEMP_CLEANUP_PERMISSION_RESTORE=PASS\nTEMP_CLEANUP_HARDENED_TREE_REGRESSION=PASS\nTEMP_CLEANUP_REGRESSION=PASS\n'
+          SH
+            } > "$regression_script"
+            /usr/bin/chmod 0700 -- "$regression_script"
+            set +e
+            /usr/bin/bash "$regression_script"
+            status=$?
+            set -e
+            /usr/bin/rm -rf -- "$regression_root"
+            [[ "$status" == 0 ]]
           }
 
           remove_provision_exact() {
@@ -1707,6 +1800,7 @@ jobs:
           trap 'handle_signal HUP' HUP
           trap 'handle_signal INT' INT
           trap 'handle_signal TERM' TERM
+          temp_cleanup_regression || fail_amendment "TEMP_CLEANUP_REGRESSION_FAILED"
           run_top_level_carrier_regression || fail_hold "TOP_LEVEL_CARRIER_REGRESSION_FAILED"
           run_mount_admission_regression
 
@@ -5098,9 +5192,14 @@ jobs:
 
           qualified_helper="$temp_root/s8-runtime-sensitivity-hosted.py"
           /usr/bin/python3 - "$GITHUB_WORKSPACE/scripts/s8/s8_runtime_sensitivity.py" "$qualified_helper" "$candidate_marker_file" <<'PY'
+          import builtins
+          import contextlib
+          import io
           from pathlib import Path
           import json
+          import tempfile
           import sys
+          from types import SimpleNamespace
 
           source_path = Path(sys.argv[1])
           target_path = Path(sys.argv[2])
@@ -5132,6 +5231,12 @@ jobs:
               "        print(\"CANDIDATE_EXECUTION_START=S8_PINNED_BLENDER_PRIVATE_EXPORTER\", flush=True)\n"
           )
           source = source.replace(admission_anchor, admission_block + admission_anchor, 1)
+          marker_binding_literal = json.dumps(str(marker_path), ensure_ascii=True)
+          marker_binding = f"marker_path = pathlib.Path({marker_binding_literal})\n\n"
+          run_sandbox_anchor = "def run_sandbox(\n"
+          if source.count(run_sandbox_anchor) != 1:
+              raise SystemExit("run_sandbox anchor is not unique")
+          source = source.replace(run_sandbox_anchor, marker_binding + run_sandbox_anchor, 1)
           broad_bind_anchor = (
               "        " + chr(34) + "--ro-bind" + chr(34) + ", str(carrier_root), "
               + chr(34) + "/carrier" + chr(34) + ",\n"
@@ -5148,6 +5253,142 @@ jobs:
           readback_line = '    (work / "validator-readback.json").write_text(json.dumps(readback, sort_keys=True, separators=(",", ":")), encoding="ascii")\n'
           source = source.replace(readback_anchor, readback_anchor + readback_line, 1)
           target_path.write_text(source, encoding="utf-8")
+          compile(source, str(target_path), "exec")
+          binding_text = f"marker_path = pathlib.Path({marker_binding_literal})"
+          binding_index = source.find(binding_text)
+          first_marker_use = source.find("if not marker_path.exists():")
+          if source.count(binding_text) != 1:
+              raise SystemExit("generated marker binding is not unique")
+          if binding_index < 0 or first_marker_use < 0 or binding_index >= first_marker_use:
+              raise SystemExit("generated marker binding is not before first use")
+          print("GENERATED_HELPER_PYTHON_SYNTAX=PASS")
+          print("GENERATED_HOSTED_PYTHON_SYNTAX=PASS")
+          print("GENERATED_MARKER_BINDING_PRESENT=PASS")
+          print("MARKER_BINDING_DEFINED_BEFORE_USE=PASS")
+
+          with tempfile.TemporaryDirectory(prefix="s8-marker-binding-regression-") as regression_dir:
+              regression_root = Path(regression_dir)
+              carrier_root = regression_root / "carrier"
+              work = carrier_root / "work"
+              runtime_root = carrier_root / "runtime"
+              writer_root = carrier_root / "writer"
+              runner = carrier_root / "runner"
+              sandbox = regression_root / "bwrap"
+              work.mkdir(parents=True)
+              runtime_root.mkdir()
+              writer_root.mkdir()
+              runner.write_text("runner\n", encoding="ascii")
+              sandbox.write_text("sandbox\n", encoding="ascii")
+              module_globals = {"__name__": "s8_generated_marker_regression"}
+              exec(compile(source, str(target_path), "exec"), module_globals)
+              generated_marker = module_globals["marker_path"]
+              if generated_marker != marker_path:
+                  raise SystemExit("generated marker path differs from outer marker path")
+              original_run = module_globals["subprocess"].run
+              calls: list[list[str]] = []
+              admission_status = 1
+
+              def fake_run(command, **kwargs):
+                  calls.append(command)
+                  if len(calls) == 1:
+                      return SimpleNamespace(returncode=admission_status, stdout=b"", stderr=b"")
+                  return SimpleNamespace(returncode=0, stdout=b"candidate\n", stderr=b"")
+
+              run_args = (
+                  sandbox,
+                  runner,
+                  work,
+                  runtime_root,
+                  writer_root,
+                  "/runtime/writer/export_fbx_bin.py",
+                  [],
+                  1,
+              )
+              missing_binding_source = source.replace(marker_binding, "", 1)
+              missing_globals = {"__name__": "s8_missing_marker_binding_regression"}
+              exec(compile(missing_binding_source, str(target_path), "exec"), missing_globals)
+              missing_calls: list[list[str]] = []
+
+              def missing_fake_run(command, **kwargs):
+                  missing_calls.append(command)
+                  return SimpleNamespace(returncode=0, stdout=b"candidate\n", stderr=b"")
+
+              missing_globals["subprocess"].run = missing_fake_run
+              try:
+                  missing_globals["run_sandbox"](*run_args)
+              except NameError as error:
+                  if "marker_path" not in str(error):
+                      raise
+              else:
+                  raise SystemExit("missing marker binding unexpectedly executed")
+              print("MISSING_MARKER_BINDING_NEGATIVE_CONTROL=PASS")
+              module_globals["subprocess"].run = fake_run
+              if marker_path.exists():
+                  marker_path.unlink()
+              try:
+                  with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                      module_globals["run_sandbox"](*run_args)
+              except SystemExit as error:
+                  if error.code != 1:
+                      raise
+              else:
+                  raise SystemExit("destination admission failure unexpectedly succeeded")
+              if marker_path.exists():
+                  raise SystemExit("destination admission failure created marker")
+              print("MARKER_DESTINATION_FAILURE_REGRESSION=PASS")
+
+              events: list[str] = []
+              original_print = builtins.print
+              original_write_text = Path.write_text
+
+              def observed_print(*args, **kwargs):
+                  line = " ".join(str(arg) for arg in args)
+                  if line.startswith("BWRAP_DESTINATION_ORDER_ADMISSION="):
+                      events.append("BWRAP_DESTINATION_ORDER_ADMISSION")
+                  elif line.startswith("CANDIDATE_EXECUTION_START="):
+                      events.append("CANDIDATE_EXECUTION_START")
+                  return original_print(*args, **kwargs)
+
+              def observed_write_text(path, *args, **kwargs):
+                  if path == marker_path:
+                      events.append("MARKER_WRITE")
+                  return original_write_text(path, *args, **kwargs)
+
+              admission_status = 0
+              calls.clear()
+              captured_stdout = io.StringIO()
+              captured_stderr = io.StringIO()
+              builtins.print = observed_print
+              Path.write_text = observed_write_text
+              try:
+                  with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
+                      first_result = module_globals["run_sandbox"](*run_args)
+                      first_marker_bytes = marker_path.read_bytes()
+                      first_marker_text = marker_path.read_text(encoding="ascii")
+                      first_events = list(events)
+                      events.clear()
+                      calls.clear()
+                      second_result = module_globals["run_sandbox"](*run_args)
+                      second_marker_bytes = marker_path.read_bytes()
+                      second_events = list(events)
+              finally:
+                  Path.write_text = original_write_text
+                  builtins.print = original_print
+                  module_globals["subprocess"].run = original_run
+              if first_result != b"candidate\n" or second_result != b"candidate\n":
+                  raise SystemExit("generated helper candidate result mismatch")
+              if first_marker_text != "1\n" or second_marker_bytes != first_marker_bytes:
+                  raise SystemExit("generated marker was not created idempotently")
+              if first_events != ["MARKER_WRITE", "BWRAP_DESTINATION_ORDER_ADMISSION", "CANDIDATE_EXECUTION_START"]:
+                  raise SystemExit(f"generated marker ordering mismatch: {first_events}")
+              if second_events:
+                  raise SystemExit(f"repeated admission emitted marker events: {second_events}")
+              if generated_marker != marker_path or not marker_path.exists():
+                  raise SystemExit("outer marker classification path mismatch")
+          print("MARKER_ORDERING_REGRESSION=PASS")
+          print("MARKER_BINDING_REGRESSION=PASS")
+          print("MARKER_IDEMPOTENCE_REGRESSION=PASS")
+          print("OUTER_MARKER_CLASSIFICATION=PASS")
           PY
 
           (( stop_new_launches == 0 )) || exit "$(signal_exit_status "${received_signal:-TERM}")"
