@@ -4053,6 +4053,93 @@ jobs:
             [[ "$script" != *'/usr/sbin/ip '* && "$script" != *' /bin/ip '* && "$script" != *'command -v'* ]] || return 1
           }
 
+          emit_route_evidence_diagnostic() {
+            local mode="$1"
+            local v4="$work/.s8-${mode}-route-v4.json" v6="$work/.s8-${mode}-route-v6.json"
+            local family path sha bytes
+            [[ "$mode" == initial ]] || return 0
+            [[ -f "$v4" && ! -L "$v4" && -f "$v6" && ! -L "$v6" ]] || {
+              printf 'ROUTE_EVIDENCE_DIAGNOSTIC=FILES_MISSING\n'
+              return 1
+            }
+            if /usr/bin/grep -aE -q '(BEGIN (OPENSSH|RSA|EC|DSA|PGP|PRIVATE) KEY|gh[pous]_|github_pat_|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-|AKIA[0-9A-Z]{16})' "$v4" || /usr/bin/grep -aE -q '(BEGIN (OPENSSH|RSA|EC|DSA|PGP|PRIVATE) KEY|gh[pous]_|github_pat_|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-|AKIA[0-9A-Z]{16})' "$v6"; then
+              printf 'ROUTE_EVIDENCE_SECRET_CHECK=FAIL\n'
+              return 1
+            fi
+            printf 'ROUTE_EVIDENCE_SECRET_CHECK=PASS\n'
+            for family in V4 V6; do
+              if [[ "$family" == V4 ]]; then path="$v4"; else path="$v6"; fi
+              sha="$(/usr/bin/sha256sum -- "$path" | /usr/bin/awk '{print $1}')"
+              bytes="$(/usr/bin/wc -c < "$path" | /usr/bin/tr -d '[:space:]')"
+              printf 'ROUTE_EVIDENCE_%s_SHA256=%s\n' "$family" "$sha"
+              printf 'ROUTE_EVIDENCE_%s_BYTES=%s\n' "$family" "$bytes"
+              printf '%s\n' "--- ROUTE_EVIDENCE_${family}_RAW_BEGIN ---"
+              /usr/bin/cat -- "$path"
+              printf '\n%s\n' "--- ROUTE_EVIDENCE_${family}_RAW_END ---"
+            done
+            printf '%s\n' 'ROUTE_STRUCTURAL_SUMMARY_BEGIN'
+            /usr/bin/python3 - "$v4" "$v6" <<'PY'
+          import json, pathlib, sys
+
+          def hook(pairs):
+              out={}
+              for key,value in pairs:
+                  if key in out: raise ValueError("duplicate key")
+                  out[key]=value
+              return out
+
+          def json_type(value, missing=False):
+              if missing: return "missing"
+              if value is None: return "null"
+              if isinstance(value, bool): return "boolean"
+              if isinstance(value, str): return "string"
+              if isinstance(value, (int, float)): return "number"
+              if isinstance(value, list): return "array"
+              if isinstance(value, dict): return "object"
+              return type(value).__name__
+
+          def value_text(value, missing=False):
+              if missing: return "<MISSING>"
+              if isinstance(value, str): return value
+              return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+          def type_token(route):
+              if "type" not in route: return json.dumps("<MISSING>")
+              return json.dumps(route["type"], ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+          distinct={"IPv4": set(), "IPv6": set()}
+          for family,path in (("IPv4", sys.argv[1]), ("IPv6", sys.argv[2])):
+              routes=json.loads(pathlib.Path(path).read_bytes().decode("utf-8"), object_pairs_hook=hook)
+              if not isinstance(routes, list): raise SystemExit(f"{family} route top level")
+              for index,route in enumerate(routes):
+                  if not isinstance(route, dict): raise SystemExit(f"{family} route {index} is not an object")
+                  distinct[family].add(type_token(route))
+                  has_type="type" in route
+                  has_table="table" in route
+                  print("ROUTE_STRUCTURAL_RECORD_BEGIN")
+                  print(f"FAMILY={family}")
+                  print(f"INDEX={index}")
+                  print(f"TYPE_JSON_TYPE={json_type(route.get('type'), not has_type)}")
+                  print(f"TYPE_VALUE={value_text(route.get('type'), not has_type)}")
+                  print(f"TABLE_JSON_TYPE={json_type(route.get('table'), not has_table)}")
+                  print(f"TABLE_VALUE={value_text(route.get('table'), not has_table)}")
+                  print(f"DEV={value_text(route.get('dev'), 'dev' not in route)}")
+                  print(f"PROTOCOL={value_text(route.get('protocol'), 'protocol' not in route)}")
+                  print(f"SCOPE={value_text(route.get('scope'), 'scope' not in route)}")
+                  print(f"FLAGS={value_text(route.get('flags'), 'flags' not in route)}")
+                  print(f"SORTED_KEYS={','.join(sorted(route))}")
+                  for key in ("dst", "src", "gateway", "via", "nexthops", "error"):
+                      print(f"HAS_{key.upper()}={'YES' if key in route else 'NO'}")
+                  print("ROUTE_STRUCTURAL_RECORD_END")
+
+          all_types=distinct["IPv4"] | distinct["IPv6"]
+          print("IPV4_DISTINCT_ROUTE_TYPES=[" + ",".join(sorted(distinct["IPv4"])) + "]")
+          print("IPV6_DISTINCT_ROUTE_TYPES=[" + ",".join(sorted(distinct["IPv6"])) + "]")
+          print("ALL_DISTINCT_ROUTE_TYPES=[" + ",".join(sorted(all_types)) + "]")
+          PY
+            printf '%s\n' 'ROUTE_STRUCTURAL_SUMMARY_END'
+          }
+
           validate_route_evidence() {
             local mode="$1"
             local v4="$work/.s8-${mode}-route-v4.json" v6="$work/.s8-${mode}-route-v6.json"
@@ -4217,6 +4304,9 @@ jobs:
             (( probe_status == 0 )) || return "$probe_status"
             [[ "$all_launched_children_reaped" == 1 && ${#tracked_children[@]} == 0 ]] || return 1
             admit_iproute2_snapshot "${mode}_post_reap" || fail_hold "IPROUTE2_ADMISSION_FAILED_${mode}_POST_REAP"
+            if [[ "$mode" == initial && "${diagnostic_route_evidence_enabled:-0}" == 1 ]]; then
+              emit_route_evidence_diagnostic "$mode" || printf 'ROUTE_EVIDENCE_DIAGNOSTIC=EMIT_FAILED\n'
+            fi
             validate_route_evidence "$mode" || fail_hold "NETWORK_ROUTE_EVIDENCE_INVALID_${mode}"
             return 0
           }
@@ -4264,6 +4354,7 @@ jobs:
           pending_signal=""
           received_signal=""
           iproute2_admission_baseline=""
+          diagnostic_route_evidence_enabled=0
           admit_iproute2_snapshot() { return 0; }
           validate_capability_ip_paths() { return 0; }
           validate_route_evidence() { return 0; }
@@ -4535,6 +4626,7 @@ jobs:
           mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_POST_PROBE_SETUP_FAILED"
           admit_work_for_use || fail_hold "WORK_POST_SETUP_ADMISSION_FAILED"
           build_common_bwrap_args
+          diagnostic_route_evidence_enabled=1
           if ! run_capability_probe initial; then
             fail_hold "CAPABILITY_PROBE_FAILED"
           fi
