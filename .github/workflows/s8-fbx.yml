@@ -284,6 +284,7 @@ jobs:
           provision_root=""
           candidate_marker_file=""
           tmpfs_bytes=1073741824
+          iproute2_admission_baseline=""
 
           fail_hold() {
             failure_reported=1
@@ -1160,20 +1161,96 @@ jobs:
             mount_table_admission "$provision_resolved"
           }
 
-          run_tracked_command() {
-            "$@" &
-            local child_pid=$!
-            local child_status
-            tracked_children=("$child_pid")
-            all_launched_children_reaped=0
-            if wait "$child_pid"; then
-              child_status=0
+          tracked_pid_is_registered() {
+            local wanted="$1"
+            local pid
+            [[ "$wanted" =~ ^[1-9][0-9]*$ ]] || return 1
+            for pid in "${tracked_children[@]}"; do
+              [[ "$pid" == "$wanted" ]] && return 0
+            done
+            return 1
+          }
+
+          remove_tracked_pid_exact() {
+            local wanted="$1"
+            local pid removed=0
+            local -a remaining=()
+            tracked_pid_is_registered "$wanted" || return 1
+            for pid in "${tracked_children[@]}"; do
+              if (( removed == 0 )) && [[ "$pid" == "$wanted" ]]; then
+                removed=1
+              else
+                remaining+=("$pid")
+              fi
+            done
+            (( removed == 1 )) || return 1
+            tracked_children=("${remaining[@]}")
+            if (( ${#tracked_children[@]} == 0 )); then
+              all_launched_children_reaped=1
             else
-              child_status=$?
+              all_launched_children_reaped=0
             fi
-            tracked_children=()
-            all_launched_children_reaped=1
-            return "$child_status"
+          }
+
+          wait_for_tracked_pid() {
+            local pid="$1"
+            local status_name="$2"
+            local -n out_status="$status_name"
+            local wait_witness wait_status interruption_count=0
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { out_status=127; return 1; }
+            tracked_pid_is_registered "$pid" || { out_status=127; return 1; }
+            while :; do
+              unset -v wait_witness
+              if wait -p wait_witness "$pid"; then
+                wait_status=0
+              else
+                wait_status=$?
+              fi
+              out_status="$wait_status"
+              if [[ ${wait_witness+x} == x && "$wait_witness" == "$pid" ]]; then
+                return 0
+              fi
+              case "$wait_status" in
+                129|130|143)
+                  interruption_count=$((interruption_count + 1))
+                  (( interruption_count <= 32 )) || return 1
+                  ;;
+                *)
+                  return 1
+                  ;;
+              esac
+            done
+          }
+
+          run_tracked_command() {
+            (( stop_new_launches == 0 )) || return "$(signal_exit_status "${received_signal:-TERM}")"
+            (( ${#tracked_children[@]} == 0 )) || return 1
+            local child_pid child_status deferred_signal
+            critical_section=1
+            "$@" &
+            child_pid=$!
+            [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] || {
+              critical_section=0
+              return 1
+            }
+            tracked_children+=("$child_pid")
+            all_launched_children_reaped=0
+            critical_section=0
+            if [[ -n "${pending_signal:-}" ]]; then
+              deferred_signal="$pending_signal"
+              pending_signal=""
+              received_signal="$deferred_signal"
+              stop_new_launches=1
+              /usr/bin/kill -s "$deferred_signal" "$child_pid" 2>/dev/null || true
+            fi
+            if wait_for_tracked_pid "$child_pid" child_status; then
+              remove_tracked_pid_exact "$child_pid" || return 1
+              if [[ -n "${received_signal:-}" && "$child_status" == 0 ]]; then
+                return "$(signal_exit_status "$received_signal")"
+              fi
+              return "$child_status"
+            fi
+            return 1
           }
 
           run_tracked_command_regression() {
@@ -1181,45 +1258,39 @@ jobs:
             regression_root="$(/usr/bin/mktemp -d)" || return 1
             matrix_script="$regression_root/run-tracked-command-matrix.sh"
             unguarded_script="$regression_root/run-tracked-command-unguarded.sh"
-
-            declare -f run_tracked_command > "$matrix_script"
+            declare -f tracked_pid_is_registered remove_tracked_pid_exact wait_for_tracked_pid run_tracked_command > "$matrix_script"
             /usr/bin/cat >> "$matrix_script" <<'SH'
           set -Eeuo pipefail
           tracked_children=()
           all_launched_children_reaped=1
-
+          critical_section=0
+          pending_signal=""
+          received_signal=""
+          stop_new_launches=0
+          signal_exit_status() {
+            case "$1" in
+              HUP) printf '129\n' ;;
+              INT) printf '130\n' ;;
+              TERM) printf '143\n' ;;
+              *) printf '1\n' ;;
+            esac
+          }
           assert_errexit_state() {
             local expected="$1"
-            if [[ "$expected" == ON ]]; then
-              [[ "$-" == *e* ]]
-            else
-              [[ "$-" != *e* ]]
-            fi
+            if [[ "$expected" == ON ]]; then [[ "$-" == *e* ]]; else [[ "$-" != *e* ]]; fi
           }
-
           assert_child_bookkeeping() {
             [[ "${#tracked_children[@]}" == 0 ]]
             [[ "$all_launched_children_reaped" == 1 ]]
           }
-
           run_matrix_case() {
-            local caller_errexit="$1"
-            local child_status="$2"
-            local actual_status
-            if [[ "$caller_errexit" == ON ]]; then
-              set -e
-            else
-              set +e
-            fi
+            local caller_errexit="$1" child_status="$2" actual_status
+            if [[ "$caller_errexit" == ON ]]; then set -e; else set +e; fi
             assert_errexit_state "$caller_errexit"
             if [[ "$caller_errexit" == ON ]]; then
-              if run_tracked_command /usr/bin/sh -c "exit $child_status"; then
-                actual_status=0
-              else
-                actual_status=$?
-              fi
+              if run_tracked_command /usr/bin/bash -c "exit $child_status"; then actual_status=0; else actual_status=$?; fi
             else
-              run_tracked_command /usr/bin/sh -c "exit $child_status"
+              run_tracked_command /usr/bin/bash -c "exit $child_status"
               actual_status=$?
             fi
             [[ "$actual_status" == "$child_status" ]]
@@ -1227,24 +1298,30 @@ jobs:
             assert_child_bookkeeping
             printf 'ERREXIT_MATRIX_CASE=%s_STATUS_%s=PASS\n' "$caller_errexit" "$child_status"
           }
-
           for caller_errexit in ON OFF; do
-            for child_status in 0 1 42; do
-              run_matrix_case "$caller_errexit" "$child_status"
-            done
+            for child_status in 0 1 42 127 143; do run_matrix_case "$caller_errexit" "$child_status"; done
           done
-          printf 'CALLER_ERREXIT_OWNERSHIP=PASS\nEXACT_STATUS_PROPAGATION=PASS\nBOOKKEEPING_REGRESSION=PASS\nERREXIT_MATRIX=PASS\n'
+          set +e
+          run_tracked_command /usr/bin/bash -c 'kill -TERM "$$"'
+          actual_signal_status=$?
+          set -e
+          [[ "$actual_signal_status" == 143 ]]
+          assert_child_bookkeeping
+          printf 'ACTUAL_SIGTERM_STATUS_143=PASS\nCALLER_ERREXIT_OWNERSHIP=PASS\nEXACT_STATUS_PROPAGATION=PASS\n'
           SH
-
-            declare -f run_tracked_command > "$unguarded_script"
+            declare -f tracked_pid_is_registered remove_tracked_pid_exact wait_for_tracked_pid run_tracked_command > "$unguarded_script"
             /usr/bin/cat >> "$unguarded_script" <<'SH'
           set -Eeuo pipefail
           tracked_children=()
           all_launched_children_reaped=1
-          run_tracked_command /usr/bin/sh -c 'exit 42'
+          critical_section=0
+          pending_signal=""
+          received_signal=""
+          stop_new_launches=0
+          signal_exit_status() { case "$1" in HUP) printf '129\n' ;; INT) printf '130\n' ;; TERM) printf '143\n' ;; *) printf '1\n' ;; esac; }
+          run_tracked_command /usr/bin/bash -c 'exit 42'
           printf 'UNGUARDED_POST_CALL_SENTINEL=FAIL\n'
           SH
-
             /usr/bin/chmod 0700 -- "$matrix_script" "$unguarded_script"
             set +e
             /usr/bin/bash "$matrix_script"
@@ -1259,6 +1336,7 @@ jobs:
 
           run_tracked_command_regression || fail_amendment "RUN_TRACKED_COMMAND_REGRESSION_FAILED"
 
+          apply_work_acl_once() {
           apply_work_acl_once() {
             local supplied_path="$1"
             local first_status second_status acl_text post_identity post_device_inode
@@ -1296,7 +1374,7 @@ jobs:
             bwrap_version_value="$(<"$version_output")"
             bwrap_help_value="$(<"$help_output")"
             [[ -n "$bwrap_version_value" && -n "$bwrap_help_value" ]] || return 1
-            for required_option in --unshare-user --unshare-net --unshare-pid --unshare-ipc --unshare-uts --disable-userns --assert-userns-disabled --uid --gid --cap-drop --die-with-parent --new-session --clearenv --ro-bind --bind --proc --dev --tmpfs --size --chdir; do
+            for required_option in --unshare-user --unshare-net --unshare-pid --unshare-ipc --unshare-uts --disable-userns --assert-userns-disabled --as-pid-1 --uid --gid --cap-drop --die-with-parent --new-session --clearenv --ro-bind --bind --proc --dev --tmpfs --size --chdir; do
               grep -F -- "$required_option" <<< "$bwrap_help_value" >/dev/null || return 1
             done
             bwrap_version="$bwrap_version_value"
@@ -1322,16 +1400,17 @@ jobs:
           }
 
           reap_tracked_children() {
-            local pid wait_status all_reaped=1
-            for pid in "${tracked_children[@]}"; do
-              set +e
-              wait "$pid"
-              wait_status=$?
-              set -e
-              (( wait_status == 127 )) && all_reaped=0
+            local pid wait_status unresolved=0
+            local -a snapshot=("${tracked_children[@]}")
+            for pid in "${snapshot[@]}"; do
+              tracked_pid_is_registered "$pid" || continue
+              if wait_for_tracked_pid "$pid" wait_status; then
+                remove_tracked_pid_exact "$pid" || unresolved=1
+              else
+                unresolved=1
+              fi
             done
-            tracked_children=()
-            if (( all_reaped == 1 )); then
+            if (( ${#tracked_children[@]} == 0 && unresolved == 0 )); then
               all_launched_children_reaped=1
               return 0
             fi
@@ -1339,6 +1418,7 @@ jobs:
             return 1
           }
 
+          handle_signal() {
           handle_signal() {
             local signal="$1"
             stop_new_launches=1
@@ -1363,6 +1443,160 @@ jobs:
             forward_tracked_children "$signal"
             exit "$(signal_exit_status "$signal")"
           }
+
+          wait_reap_regression() {
+            local regression_root script status
+            regression_root="$(/usr/bin/mktemp -d)" || return 1
+            script="$regression_root/wait-reap-regression.sh"
+            declare -f tracked_pid_is_registered remove_tracked_pid_exact wait_for_tracked_pid run_tracked_command reap_tracked_children signal_exit_status forward_tracked_children handle_signal > "$script"
+            /usr/bin/cat >> "$script" <<'SH'
+          set -Eeuo pipefail
+          reset_state() { tracked_children=(); all_launched_children_reaped=1; critical_section=0; pending_signal=""; received_signal=""; stop_new_launches=0; }
+          assert_empty() { [[ "${#tracked_children[@]}" == 0 && "$all_launched_children_reaped" == 1 ]]; }
+          interrupt_case() {
+            local sig="$1" root parent child notifier status
+            root="$(/usr/bin/mktemp -d)"
+            /usr/bin/mkfifo "$root/ready" "$root/release" "$root/ack"
+            reset_state
+            parent="$BASHPID"
+            trap "handle_signal $sig; printf 'ack\\n' > '$root/ack'" "$sig"
+            /usr/bin/bash -c 'sig="$1"; ready="$2"; release="$3"; trap "" "$sig"; printf "ready\\n" > "$ready"; read -r _ < "$release"; exit 42' _ "$sig" "$root/ready" "$root/release" &
+            child=$!
+            tracked_children=("$child")
+            all_launched_children_reaped=0
+            read -r _ < "$root/ready"
+            ( /usr/bin/kill -s "$sig" "$parent"; read -r _ < "$root/ack"; printf 'go\n' > "$root/release" ) &
+            notifier=$!
+            if wait_for_tracked_pid "$child" status; then remove_tracked_pid_exact "$child"; else exit 1; fi
+            wait "$notifier"
+            trap - "$sig"
+            [[ "$status" == 42 ]]
+            assert_empty
+            /usr/bin/rm -rf -- "$root"
+            reset_state
+            printf 'WAIT_INTERRUPT_%s_RETRY=PASS\n' "$sig"
+          }
+          for sig in HUP INT TERM; do interrupt_case "$sig"; done
+          printf 'SIGNAL_COMPLETION_RACE=PASS\n'
+
+          reset_state
+          root="$(/usr/bin/mktemp -d)"
+          /usr/bin/mkfifo "$root/ack"
+          parent="$BASHPID"
+          trap "handle_signal TERM; printf 'ack\\n' > '$root/ack'" TERM
+          set +e
+          run_tracked_command /usr/bin/bash -c 'parent="$1"; ack="$2"; trap "" TERM; /usr/bin/kill -TERM "$parent"; read -r _ < "$ack"; exit 0' _ "$parent" "$root/ack"
+          signal_zero_status=$?
+          set -e
+          trap - TERM
+          /usr/bin/rm -rf -- "$root"
+          [[ "$signal_zero_status" == 143 ]]
+          assert_empty
+          printf 'SIGNAL_ABORTED_ZERO_CHILD_BLOCKED=PASS\n'
+
+          reset_state
+          /usr/bin/bash -c 'exit 42' & already_pid=$!
+          tracked_children=("$already_pid")
+          all_launched_children_reaped=0
+          while /usr/bin/kill -0 "$already_pid" 2>/dev/null; do :; done
+          if wait_for_tracked_pid "$already_pid" already_status; then remove_tracked_pid_exact "$already_pid"; else exit 1; fi
+          [[ "$already_status" == 42 ]]
+          assert_empty
+          printf 'ALREADY_COMPLETED_CHILD=PASS\n'
+
+          reset_state
+          tracked_children=(999999)
+          all_launched_children_reaped=0
+          if reap_tracked_children; then exit 1; fi
+          [[ "${tracked_children[*]}" == 999999 && "$all_launched_children_reaped" == 0 ]]
+          printf 'UNKNOWN_PID_FAIL_CLOSED=PASS\n'
+
+          reset_state
+          /usr/bin/bash -c 'exit 0' & p0=$!
+          /usr/bin/bash -c 'exit 42' & p42=$!
+          /usr/bin/bash -c 'exit 143' & p143=$!
+          tracked_children=("$p0" "$p42" "$p143")
+          all_launched_children_reaped=0
+          reap_tracked_children
+          assert_empty
+          printf 'MULTI_CHILD_MIXED_STATUS_REAP=PASS\n'
+
+          reset_state
+          /usr/bin/bash -c 'exit 0' & good=$!
+          tracked_children=(999999 "$good")
+          all_launched_children_reaped=0
+          if reap_tracked_children; then exit 1; fi
+          [[ "${#tracked_children[@]}" == 1 && "${tracked_children[0]}" == 999999 && "$all_launched_children_reaped" == 0 ]]
+          printf 'UNRESOLVED_ENTRY_RETAINED_OTHER_CHILD_REAPED=PASS\n'
+          SH
+            /usr/bin/chmod 0700 -- "$script"
+            set +e
+            /usr/bin/bash "$script"
+            status=$?
+            set -e
+            /usr/bin/rm -rf -- "$regression_root"
+            [[ "$status" == 0 ]]
+          }
+
+          wait_reap_positive_controls() {
+            local regression_root source_file status
+            regression_root="$(/usr/bin/mktemp -d)" || return 1
+            source_file="$regression_root/source.txt"
+            {
+              declare -f wait_for_tracked_pid
+              declare -f run_tracked_command
+              declare -f reap_tracked_children
+            } > "$source_file"
+            /usr/bin/python3 - "$source_file" <<'PY'
+          from pathlib import Path
+          import re, sys
+          source=Path(sys.argv[1]).read_text(encoding="utf-8")
+          def valid(t):
+              required=[
+                  'unset -v wait_witness',
+                  'wait -p wait_witness "$pid"',
+                  'wait_status=$?',
+                  '[[ ${wait_witness+x} == x && "$wait_witness" == "$pid" ]]',
+                  'tracked_children+=("$child_pid")',
+                  'remove_tracked_pid_exact "$child_pid"',
+                  'remove_tracked_pid_exact "$pid"',
+              ]
+              if any(x not in t for x in required): return False
+              if any(x in t for x in ['! wait -p','wait "$pid"','tracked_children=("$child_pid")','[[ "$wait_status" == 127 ]]','[[ "$wait_status" == 143 ]]']): return False
+              if not re.search(r'if wait -p wait_witness "\$pid"; then\s+wait_status=0;\s+else\s+wait_status=\$\?;',t): return False
+              if re.search(r'reap_tracked_children \(\).*?tracked_children=\(\)',t,re.S): return False
+              run=t[t.index('run_tracked_command ()'):t.index('reap_tracked_children ()')]
+              pos=-1
+              for token in ['critical_section=1','"$@" &','child_pid=$!','tracked_children+=("$child_pid")','all_launched_children_reaped=0','critical_section=0']:
+                  pos=run.find(token,pos+1)
+                  if pos<0:return False
+              return True
+          if not valid(source): raise SystemExit("correct source rejected")
+          variants={
+              "PLAIN_WAIT":source.replace('wait -p wait_witness "$pid"','wait "$pid"',1),
+              "WITNESS_NOT_RESET":source.replace('unset -v wait_witness','wait_witness=stale',1),
+              "MISMATCHED_WITNESS":source.replace('"$wait_witness" == "$pid"','"$wait_witness" != "$pid"',1),
+              "STATUS_OVERWRITTEN":re.sub(r'else\n(\s*)wait_status=\$\?',r'else\n\1:\n\1wait_status=$?',source,count=1),
+              "BANG_WAIT":source.replace('if wait -p wait_witness "$pid"; then','if ! wait -p wait_witness "$pid"; then',1),
+              "RAW_WAIT":re.sub(r'if wait -p wait_witness "\$pid"; then\s+wait_status=0;\s+else\s+wait_status=\$\?;\s+fi;', 'wait -p wait_witness "$pid"; wait_status=$?;', source, count=1),
+              "EXIT127_UNKNOWN":source.replace('out_status="$wait_status";','out_status="$wait_status"; [[ "$wait_status" == 127 ]] && return 1;',1),
+              "EXIT143_INTERRUPTED":source.replace('out_status="$wait_status";','out_status="$wait_status"; [[ "$wait_status" == 143 ]] && continue;',1),
+              "BLANKET_CLEAR":source.replace('if (( ${#tracked_children[@]} == 0 && unresolved == 0 )); then','tracked_children=(); if (( ${#tracked_children[@]} == 0 && unresolved == 0 )); then',1),
+          }
+          for label,mutated in variants.items():
+              if mutated==source: raise SystemExit("mutation did not apply:"+label)
+              if valid(mutated): raise SystemExit("defective variant accepted:"+label)
+              print("WAIT_POSITIVE_CONTROL_"+label+"=PASS")
+          print("REGISTRATION_CRITICAL_SECTION=PASS")
+          print("WAIT_REAP_POSITIVE_CONTROLS=PASS")
+          PY
+            status=$?
+            /usr/bin/rm -rf -- "$regression_root"
+            [[ "$status" == 0 ]]
+          }
+
+          wait_reap_regression || fail_amendment "WAIT_REAP_REGRESSION_FAILED"
+          wait_reap_positive_controls || fail_amendment "WAIT_REAP_POSITIVE_CONTROLS_FAILED"
 
           delete_carrier_exact() {
             carrier_path_is_safe || return 1
@@ -1423,19 +1657,29 @@ jobs:
               fi
             fi
             if (( provision_created == 1 )); then
-              if remove_provision_exact; then
-                printf 'PROVISIONING_CLEANUP_RESULT=PASS\n'
-                provision_created=0
+              if (( all_launched_children_reaped == 1 )); then
+                if remove_provision_exact; then
+                  printf 'PROVISIONING_CLEANUP_RESULT=PASS\n'
+                  provision_created=0
+                else
+                  printf 'PROVISIONING_CLEANUP_RESULT=FAIL\n' >&2
+                  cleanup_failed=1
+                fi
               else
-                printf 'PROVISIONING_CLEANUP_RESULT=FAIL\n' >&2
+                printf 'PROVISIONING_CLEANUP_RESULT=DEFERRED_UNRESOLVED_CHILD\n' >&2
                 cleanup_failed=1
               fi
             fi
             if (( temp_created == 1 )); then
-              if remove_temp_exact; then
-                temp_created=0
+              if (( all_launched_children_reaped == 1 )); then
+                if remove_temp_exact; then
+                  temp_created=0
+                else
+                  printf 'TEMP_CLEANUP_RESULT=FAIL\n' >&2
+                  cleanup_failed=1
+                fi
               else
-                printf 'TEMP_CLEANUP_RESULT=FAIL\n' >&2
+                printf 'TEMP_CLEANUP_RESULT=DEFERRED_UNRESOLVED_CHILD\n' >&2
                 cleanup_failed=1
               fi
             fi
@@ -3329,6 +3573,7 @@ jobs:
             local validator_seen=0
             local writer_seen=0
             local support_seen=0
+            local as_pid_1_seen=0
             local array_length="${#setup_args[@]}"
             while (( index < array_length )); do
               option="${setup_args[index]}"
@@ -3415,6 +3660,11 @@ jobs:
                   esac
                   index=$((index + 3))
                   ;;
+                --as-pid-1)
+                  [[ "$as_pid_1_seen" == 0 ]] || return 1
+                  as_pid_1_seen=1
+                  index=$((index + 1))
+                  ;;
                 --unshare-user|--unshare-net|--unshare-pid|--unshare-ipc|--unshare-uts|--disable-userns|--assert-userns-disabled|--die-with-parent|--new-session|--clearenv)
                   index=$((index + 1))
                   ;;
@@ -3447,11 +3697,11 @@ jobs:
                "$pair_count" == 1 &&
                "$size_applies_to" == /tmp ]] || return 1
             if [[ "$context" == initial ]]; then
-              [[ "$probe_seen" == 1 && "$runtime_seen" == 0 && "$runner_seen" == 0 && "$validator_seen" == 0 && "$writer_seen" == 0 && "$support_seen" == 0 ]] || return 1
+              [[ "$as_pid_1_seen" == 1 && "$probe_seen" == 1 && "$runtime_seen" == 0 && "$runner_seen" == 0 && "$validator_seen" == 0 && "$writer_seen" == 0 && "$support_seen" == 0 ]] || return 1
             elif [[ "$context" == staged ]]; then
-              [[ "$probe_seen" == 0 && "$runtime_seen" == 1 && "$runner_seen" == 1 && "$validator_seen" == 1 && "$writer_seen" == 1 && "$support_seen" == 1 ]] || return 1
+              [[ "$as_pid_1_seen" == 1 && "$probe_seen" == 0 && "$runtime_seen" == 1 && "$runner_seen" == 1 && "$validator_seen" == 1 && "$writer_seen" == 1 && "$support_seen" == 1 ]] || return 1
             elif [[ "$context" == candidate ]]; then
-              [[ "$probe_seen" == 0 && "$runtime_seen" == 1 && "$runner_seen" == 1 && "$writer_seen" == 1 ]] || return 1
+              [[ "$as_pid_1_seen" == 0 && "$probe_seen" == 0 && "$runtime_seen" == 1 && "$runner_seen" == 1 && "$writer_seen" == 1 ]] || return 1
               (( validator_seen + support_seen <= 1 )) || return 1
             else
               return 1
@@ -3737,6 +3987,133 @@ jobs:
           run_bwrap_parser_proof bwrap_good_grammar 0 "$archive_root/bwrap-good-grammar.stdout" "$archive_root/bwrap-good-grammar.stderr"
           printf 'GOOD_GRAMMAR_CONTROL=CAPABILITY_PROBE_NEXT\n'
 
+          iproute2_contract_values_valid() {
+            local rl="$1" iv="$2" ios="$3" ps="$4" pv="$5" pa="$6" dm="$7" fm="$8" cm="$9"
+            local cc="${10}" th="${11}" acl="${12}" alias="${13}" dq="${14}" dqe="${15}" ver="${16}" vere="${17}"
+            [[ "$rl" == ubuntu-24.04 && "$iv" == 20260907.300.1 && "$ios" == ubuntu24 ]] || return 1
+            [[ "$ps" == 'install ok installed' && "$pv" == 6.1.0-1ubuntu6.4 && "$pa" == amd64 ]] || return 1
+            [[ "$dm" == 'directory|755|0:0' && "$fm" == 'regular file|644|0:0' && "$cm" == 'directory|755|0:0' ]] || return 1
+            [[ "$cc" == 0 && "$th" == 08c418b8469951cd5c59da91e4b116cd62cb125478dfac12e5f5067d4d07ad3f ]] || return 1
+            [[ "$acl" == 1 && "$alias" == 1 && "$dq" == 1 && "$dqe" == 1 && "$ver" == 1 && "$vere" == 1 ]] || return 1
+          }
+
+          admit_iproute2_snapshot() {
+            local phase="$1"
+            local ps pv pa dm fm cm cc th acl=1 alias=0 dq=0 dqe=0 ver=0 vere=0 br ur bd ud
+            local dout derr vout verr ds vs fp
+            [[ "${S8_RUNNER_LABEL:-}" == ubuntu-24.04 && "${ImageVersion:-}" == 20260907.300.1 && "${ImageOS:-}" == ubuntu24 ]] || return 1
+            ps="$(/usr/bin/dpkg-query -W -f='${Status}' iproute2 2>/dev/null)" || return 1
+            pv="$(/usr/bin/dpkg-query -W -f='${Version}' iproute2 2>/dev/null)" || return 1
+            pa="$(/usr/bin/dpkg-query -W -f='${Architecture}' iproute2 2>/dev/null)" || return 1
+            [[ -d /etc/iproute2 && ! -L /etc/iproute2 && -f /etc/iproute2/rt_tables && ! -L /etc/iproute2/rt_tables && -d /etc/iproute2/rt_tables.d && ! -L /etc/iproute2/rt_tables.d ]] || return 1
+            dm="directory|$(/usr/bin/stat -c '%a|%u:%g' -- /etc/iproute2)"
+            fm="regular file|$(/usr/bin/stat -c '%a|%u:%g' -- /etc/iproute2/rt_tables)"
+            cm="directory|$(/usr/bin/stat -c '%a|%u:%g' -- /etc/iproute2/rt_tables.d)"
+            ordinary_acl_is_exact /etc/iproute2 0755 || acl=0
+            ordinary_acl_is_exact /etc/iproute2/rt_tables 0644 || acl=0
+            ordinary_acl_is_exact /etc/iproute2/rt_tables.d 0755 || acl=0
+            cc="$(/usr/bin/find -P /etc/iproute2/rt_tables.d -mindepth 1 -maxdepth 1 -name '*.conf' -printf '.' | /usr/bin/wc -c)" || return 1
+            th="$(/usr/bin/sha256sum -- /etc/iproute2/rt_tables | /usr/bin/awk '{print $1}')" || return 1
+            [[ -x /usr/bin/ip && -f /usr/bin/ip ]] || return 1
+            br="$(/usr/bin/readlink -e -- /bin/ip)" || return 1
+            ur="$(/usr/bin/readlink -e -- /usr/bin/ip)" || return 1
+            [[ "$br" == "$ur" && "$ur" == /usr/bin/ip ]] || return 1
+            bd="$(/usr/bin/stat -Lc '%d:%i' -- /bin/ip)" || return 1
+            ud="$(/usr/bin/stat -Lc '%d:%i' -- /usr/bin/ip)" || return 1
+            [[ "$bd" == "$ud" ]] && alias=1
+            dout="$archive_root/ip-${phase}.dpkg.stdout"
+            derr="$archive_root/ip-${phase}.dpkg.stderr"
+            vout="$archive_root/ip-${phase}.version.stdout"
+            verr="$archive_root/ip-${phase}.version.stderr"
+            /usr/bin/rm -f -- "$dout" "$derr" "$vout" "$verr"
+            set +e
+            /usr/bin/dpkg-query -S -- /bin/ip >"$dout" 2>"$derr"
+            ds=$?
+            /usr/bin/ip -Version >"$vout" 2>"$verr"
+            vs=$?
+            set -e
+            [[ "$ds" == 0 && "$vs" == 0 ]] || return 1
+            [[ ! -s "$derr" ]] && dqe=1
+            [[ ! -s "$verr" ]] && vere=1
+            if printf 'iproute2: /bin/ip\n' | /usr/bin/cmp --silent - "$dout"; then dq=1; fi
+            if printf 'ip utility, iproute2-6.1.0, libbpf 1.3.0\n' | /usr/bin/cmp --silent - "$vout"; then ver=1; fi
+            iproute2_contract_values_valid "${S8_RUNNER_LABEL:-}" "${ImageVersion:-}" "${ImageOS:-}" "$ps" "$pv" "$pa" "$dm" "$fm" "$cm" "$cc" "$th" "$acl" "$alias" "$dq" "$dqe" "$ver" "$vere" || return 1
+            fp="$(printf '%s\n' "${S8_RUNNER_LABEL:-}" "${ImageVersion:-}" "${ImageOS:-}" "$ps" "$pv" "$pa" "$dm" "$fm" "$cm" "$cc" "$th" "$br" "$ur" "$bd" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')"
+            if [[ -z "${iproute2_admission_baseline:-}" ]]; then
+              iproute2_admission_baseline="$fp"
+            else
+              [[ "$fp" == "$iproute2_admission_baseline" ]] || return 1
+            fi
+            /usr/bin/rm -f -- "$dout" "$derr" "$vout" "$verr"
+            printf 'IPROUTE2_ADMISSION_%s=PASS\n' "$phase"
+          }
+
+          validate_capability_ip_paths() {
+            local script="$1"
+            [[ "$script" == *'/usr/bin/ip -j -Numeric -details -4 route show table all'* ]] || return 1
+            [[ "$script" == *'/usr/bin/ip -j -Numeric -details -6 route show table all'* ]] || return 1
+            [[ "$script" != *'/usr/sbin/ip '* && "$script" != *' /bin/ip '* && "$script" != *'command -v'* ]] || return 1
+          }
+
+          validate_route_evidence() {
+            local mode="$1"
+            local v4="$work/.s8-${mode}-route-v4.json" v6="$work/.s8-${mode}-route-v6.json"
+            local e4="$work/.s8-${mode}-route-v4.stderr" e6="$work/.s8-${mode}-route-v6.stderr"
+            [[ -f "$v4" && ! -L "$v4" && -f "$v6" && ! -L "$v6" && -f "$e4" && ! -L "$e4" && -f "$e6" && ! -L "$e6" && ! -s "$e4" && ! -s "$e6" ]] || return 1
+            /usr/bin/python3 - "$v4" "$v6" <<'PY'
+          import json, pathlib, re, sys
+          allowed={"type","dst","src","gateway","via","dev","protocol","scope","prefsrc","metric","table","flags","mtu","advmss","hoplimit","pref","expires","features","nhid","uid","error","cacheinfo","newdst","encap","weight","nexthops","tos","realm","quickack","congctl","rto_min","initcwnd","initrwnd","fastopen_no_cookie"}
+          types={"unicast","local","broadcast","multicast","unreachable","prohibit","blackhole","throw","anycast"}
+          blocked={"unreachable","prohibit","blackhole","throw"}
+          numeric=re.compile(r"^[1-9][0-9]*$")
+          def hook(pairs):
+              out={}
+              for k,v in pairs:
+                  if k in out: raise ValueError("duplicate key")
+                  out[k]=v
+              return out
+          for path in sys.argv[1:]:
+              try: routes=json.loads(pathlib.Path(path).read_bytes().decode("utf-8"),object_pairs_hook=hook)
+              except Exception as exc: raise SystemExit(f"invalid route json: {exc}")
+              if not isinstance(routes,list): raise SystemExit("route top level")
+              for route in routes:
+                  if not isinstance(route,dict) or set(route)-allowed: raise SystemExit("unsupported route structure")
+                  table=route.get("table")
+                  if not isinstance(table,str) or not numeric.fullmatch(table): raise SystemExit("route table identity")
+                  route_type=route.get("type","unicast")
+                  dev=route.get("dev")
+                  if route_type not in types: raise SystemExit("unsupported route type")
+                  if dev is not None and (not isinstance(dev,str) or not dev): raise SystemExit("invalid route device")
+                  flags=route.get("flags",[])
+                  if not isinstance(flags,list) or any(not isinstance(flag,str) for flag in flags): raise SystemExit("invalid flags")
+                  if route_type not in blocked and dev!="lo": raise SystemExit("non-loopback routable path admitted")
+          print("NETWORK_ROUTE_RESULT=PASS")
+          PY
+            local route_status=$?
+            (( route_status == 0 )) || return 1
+            /usr/bin/rm -f -- "$v4" "$v6" "$e4" "$e6"
+            printf 'ROUTE_EVIDENCE_%s=PASS\n' "$mode"
+          }
+
+          iproute2_positive_controls() {
+            local -a good=(ubuntu-24.04 20260907.300.1 ubuntu24 'install ok installed' 6.1.0-1ubuntu6.4 amd64 'directory|755|0:0' 'regular file|644|0:0' 'directory|755|0:0' 0 08c418b8469951cd5c59da91e4b116cd62cb125478dfac12e5f5067d4d07ad3f 1 1 1 1 1 1)
+            iproute2_contract_values_valid "${good[@]}" || return 1
+            local label
+            for label in WRONG_VERSION_BYTES NON_EMPTY_STDERR WRONG_CONFIG_HASH WRONG_ACL ALIAS_MISMATCH EXTRA_CONF; do
+              local -a bad=("${good[@]}")
+              case "$label" in
+                WRONG_VERSION_BYTES) bad[15]=0 ;;
+                NON_EMPTY_STDERR) bad[16]=0 ;;
+                WRONG_CONFIG_HASH) bad[10]=deadbeef ;;
+                WRONG_ACL) bad[11]=0 ;;
+                ALIAS_MISMATCH) bad[12]=0 ;;
+                EXTRA_CONF) bad[9]=1 ;;
+              esac
+              if iproute2_contract_values_valid "${bad[@]}"; then return 1; fi
+            done
+            printf 'IPROUTE2_POSITIVE_CONTROLS=PASS\n'
+          }
+
           read -r -d '' capability_script <<'SH' || true
           set -Eeuo pipefail
           status_file=/proc/self/status
@@ -3784,12 +4161,13 @@ jobs:
           printf 'NESTED_USERNS_RESULT=PASS\n'
           printf 'NESTED_USERNS_REJECTION=PASS\n'
           test -x /usr/bin/unshare
-          if { /usr/sbin/ip -4 route show; /usr/sbin/ip -6 route show; } | awk '/^unreachable |^prohibit |^blackhole |^throw / { next } NF && $0 !~ /(^| )dev lo( |$)/ && ($0 ~ /(^| )dev / || $0 ~ /^default /) { bad = 1 } END { exit bad }'; then
-            :
-          else
-            exit 43
-          fi
-          printf 'NETWORK_ROUTE_RESULT=PASS\n'
+          route_prefix="/work/.s8-${S8_ADMISSION_MODE}-route"
+          test ! -e "${route_prefix}-v4.json" && test ! -e "${route_prefix}-v4.stderr" && test ! -e "${route_prefix}-v6.json" && test ! -e "${route_prefix}-v6.stderr"
+          if /usr/bin/ip -j -Numeric -details -4 route show table all >"${route_prefix}-v4.json" 2>"${route_prefix}-v4.stderr"; then :; else exit 43; fi
+          test ! -s "${route_prefix}-v4.stderr"
+          if /usr/bin/ip -j -Numeric -details -6 route show table all >"${route_prefix}-v6.json" 2>"${route_prefix}-v6.stderr"; then :; else exit 43; fi
+          test ! -s "${route_prefix}-v6.stderr"
+          printf 'NETWORK_ROUTE_EVIDENCE_READY=YES\n'
           test "$(stat -c '%u:%g' /work)" = 65534:65534
           printf 'WORK_SANDBOX_OWNER_RESULT=PASS\n'
           printf 'probe-data\n' > /work/.s8-work-probe
@@ -3822,46 +4200,38 @@ jobs:
           SH
 
           run_capability_probe() {
-            local mode="$1"
+            local mode="$1" probe_status
             local -a args
-            args=( "${common_bwrap_args[@]}" )
+            admit_iproute2_snapshot "${mode}_pre_probe" || fail_hold "IPROUTE2_ADMISSION_FAILED_${mode}_PRE"
+            validate_capability_ip_paths "$capability_script" || fail_amendment "IPROUTE2_EXECUTION_PATH_CONTRACT_FAILED"
+            args=( "${common_bwrap_args[@]}" --as-pid-1 )
             if [[ "$mode" == initial ]]; then
               args+=(--ro-bind "$carrier/probe" /probe)
             else
-              args+=(
-                --ro-bind "$carrier/runtime/blender-5.2.2-linux-x64" /runtime/blender-root
-                --ro-bind "$carrier/native/s8-process-runner" /runtime/process-runner
-                --ro-bind "$carrier/native/s8-fbx-validator" /runtime/validator
-                --ro-bind "$carrier/writer" /runtime/writer
-                --ro-bind "$carrier/support" /runtime/support
-              )
+              args+=(--ro-bind "$carrier/runtime/blender-5.2.2-linux-x64" /runtime/blender-root --ro-bind "$carrier/native/s8-process-runner" /runtime/process-runner --ro-bind "$carrier/native/s8-fbx-validator" /runtime/validator --ro-bind "$carrier/writer" /runtime/writer --ro-bind "$carrier/support" /runtime/support)
             fi
-            args+=(
-              --bind "$carrier/work" /work
-              --proc /proc
-              --dev /dev
-              --size "$tmpfs_bytes"
-              --tmpfs /tmp
-              --chdir /work
-            )
-            args+=(
-              --setenv EXPECTED_HOST_USER_NS "$host_user_ns"
-              --setenv EXPECTED_HOST_PID_NS "$host_pid_ns"
-              --setenv EXPECTED_HOST_NET_NS "$host_net_ns"
-              --setenv EXPECTED_HOST_IPC_NS "$host_ipc_ns"
-              --setenv EXPECTED_HOST_UTS_NS "$host_uts_ns"
-              --setenv S8_ADMISSION_MODE "$mode"
-              --
-              /usr/bin/bash -ceu "$capability_script"
-            )
+            args+=(--bind "$carrier/work" /work --proc /proc --dev /dev --size "$tmpfs_bytes" --tmpfs /tmp --chdir /work)
+            args+=(--setenv EXPECTED_HOST_USER_NS "$host_user_ns" --setenv EXPECTED_HOST_PID_NS "$host_pid_ns" --setenv EXPECTED_HOST_NET_NS "$host_net_ns" --setenv EXPECTED_HOST_IPC_NS "$host_ipc_ns" --setenv EXPECTED_HOST_UTS_NS "$host_uts_ns" --setenv S8_ADMISSION_MODE "$mode" -- /usr/bin/bash -ceu "$capability_script")
             run_bwrap_argv_grammar_regression "$mode" /usr/bin/bash "${args[@]}" || fail_amendment "BWRAP_ARGV_GRAMMAR_REGRESSION_FAILED_${mode}"
-            if ! validate_bwrap_destination_order "$mode" /usr/bin/bash "${args[@]}"; then
-              fail_hold "BWRAP_DESTINATION_ORDER_ADMISSION_FAILED"
-            fi
+            validate_bwrap_destination_order "$mode" /usr/bin/bash "${args[@]}" || fail_hold "BWRAP_DESTINATION_ORDER_ADMISSION_FAILED"
             admit_before_bwrap "$mode" || fail_hold "BWRAP_IDENTITY_ADMISSION_FAILED"
-            run_tracked_command /usr/bin/sudo -n /usr/bin/bwrap "${args[@]}"
+            if run_tracked_command /usr/bin/sudo -n /usr/bin/bwrap "${args[@]}"; then probe_status=0; else probe_status=$?; fi
+            (( probe_status == 0 )) || return "$probe_status"
+            [[ "$all_launched_children_reaped" == 1 && ${#tracked_children[@]} == 0 ]] || return 1
+            admit_iproute2_snapshot "${mode}_post_reap" || fail_hold "IPROUTE2_ADMISSION_FAILED_${mode}_POST_REAP"
+            validate_route_evidence "$mode" || fail_hold "NETWORK_ROUTE_EVIDENCE_INVALID_${mode}"
+            return 0
           }
 
+          iproute2_positive_controls || fail_amendment "IPROUTE2_POSITIVE_CONTROLS_FAILED"
+          validate_capability_ip_paths "$capability_script" || fail_amendment "IPROUTE2_EXECUTION_PATH_CONTRACT_FAILED"
+          one_family_bad="${capability_script/\/usr\/bin\/ip -j -Numeric -details -6/\/usr\/sbin\/ip -j -Numeric -details -6}"
+          if validate_capability_ip_paths "$one_family_bad"; then fail_amendment "IPROUTE2_ONE_FAMILY_PATH_POSITIVE_CONTROL_FAILED"; fi
+          bin_fallback_bad="${capability_script/\/usr\/bin\/ip -j -Numeric -details -4/\/bin\/ip -j -Numeric -details -4}"
+          if validate_capability_ip_paths "$bin_fallback_bad"; then fail_amendment "IPROUTE2_BIN_FALLBACK_POSITIVE_CONTROL_FAILED"; fi
+          printf 'IPROUTE2_EXECUTION_PATH_POSITIVE_CONTROLS=PASS\n'
+
+          run_guarded_caller_regressions() {
           run_guarded_caller_regressions() {
             local regression_root caller_script negative_script regression_status negative_status negative_case
             regression_root="$(/usr/bin/mktemp -d)" || return 1
@@ -3884,6 +4254,12 @@ jobs:
           host_ipc_ns=ipc:[host]
           host_uts_ns=uts:[host]
           capability_script=':'
+          tracked_children=()
+          all_launched_children_reaped=1
+          iproute2_admission_baseline=""
+          admit_iproute2_snapshot() { return 0; }
+          validate_capability_ip_paths() { return 0; }
+          validate_route_evidence() { return 0; }
           actual_helper_definition="$(declare -f run_tracked_command)"
           eval "${actual_helper_definition/run_tracked_command/run_tracked_command_actual}"
 
@@ -4641,6 +5017,8 @@ jobs:
           admit_work_for_use || fail_hold "WORK_POST_CANDIDATE_ADMISSION_FAILED"
           printf 'NATIVE_RUNNER_ADMISSION_RESULT=PASS\nPINNED_BLENDER_RESULT=PASS\nPRIVATE_EXPORTER_RESULT=PASS\nNATIVE_VALIDATOR_RESULT=PASS\nBLENDER_SEMANTIC_QUALIFICATION=PASS\n'
 
+          [[ "$all_launched_children_reaped" == 1 && ${#tracked_children[@]} == 0 ]] || fail_hold "CANDIDATE_CHILD_REAP_WITNESS_MISSING"
+          admit_iproute2_snapshot post_candidate_reap || fail_hold "IPROUTE2_ADMISSION_FAILED_POST_CANDIDATE_REAP"
           admit_root_and_carrier || fail_hold "BEFORE_SEMANTIC_READBACK_IDENTITY_FAILED"
           mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_BEFORE_SEMANTIC_READBACK_FAILED"
           admit_work_for_use || fail_hold "WORK_BEFORE_SEMANTIC_READBACK_FAILED"
