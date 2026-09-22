@@ -1337,7 +1337,6 @@ jobs:
           run_tracked_command_regression || fail_amendment "RUN_TRACKED_COMMAND_REGRESSION_FAILED"
 
           apply_work_acl_once() {
-          apply_work_acl_once() {
             local supplied_path="$1"
             local first_status second_status acl_text post_identity post_device_inode
             [[ "$supplied_path" == "$immutable_work_path" && "$supplied_path" == "$work" ]] || return 1
@@ -1418,7 +1417,6 @@ jobs:
             return 1
           }
 
-          handle_signal() {
           handle_signal() {
             local signal="$1"
             stop_new_launches=1
@@ -4231,7 +4229,6 @@ jobs:
           if validate_capability_ip_paths "$bin_fallback_bad"; then fail_amendment "IPROUTE2_BIN_FALLBACK_POSITIVE_CONTROL_FAILED"; fi
           printf 'IPROUTE2_EXECUTION_PATH_POSITIVE_CONTROLS=PASS\n'
 
-          run_guarded_caller_regressions() {
           run_guarded_caller_regressions() {
             local regression_root caller_script negative_script regression_status negative_status negative_case
             regression_root="$(/usr/bin/mktemp -d)" || return 1
