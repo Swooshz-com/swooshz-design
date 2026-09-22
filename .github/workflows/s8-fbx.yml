@@ -8,6 +8,94 @@ permissions:
   contents: read
 
 jobs:
+  s8-hosted-image-admission-diagnostic:
+    name: S8 hosted image admission diagnostic
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Establish exact image identity and collect read-only evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          required_image_version='20260907.300.1'
+          observed_image_version="${ImageVersion:-}"
+          if [[ -z "$observed_image_version" || "$observed_image_version" == unknown ]]; then
+            printf 'HOLD=RUNNER_IMAGE_IDENTITY_UNVERIFIABLE\n'
+            exit 1
+          fi
+          if [[ "$observed_image_version" != "$required_image_version" ]]; then
+            printf 'HOLD=EXACT_IMAGE_UNAVAILABLE\nOBSERVED_IMAGE_VERSION=%s\n' "$observed_image_version"
+            exit 1
+          fi
+          printf 'RUNNER_IMAGE_VERSION=%s\n' "$observed_image_version"
+          printf 'RUNNER_IMAGE_OS=%s\n' "${ImageOS:-unknown}"
+
+          shopt -s nullglob
+          conf=(/etc/iproute2/rt_tables.d/*.conf)
+          targets=(
+            /etc/iproute2
+            /etc/iproute2/rt_tables
+            /etc/iproute2/rt_tables.d
+            "${conf[@]}"
+          )
+
+          printf 'RT_TABLES_D_CONF_COUNT=%s\n' "${#conf[@]}"
+          printf '%s\n' '--- RT_TABLES_STAT_BEGIN ---'
+          /usr/bin/stat \
+            -c '%n|%F|%a|%u:%g|%d:%i' \
+            -- "${targets[@]}"
+          printf '%s\n' '--- RT_TABLES_STAT_END ---'
+
+          printf '%s\n' '--- RT_TABLES_SHA256_BEGIN ---'
+          /usr/bin/sha256sum -- /etc/iproute2/rt_tables
+          printf '%s\n' '--- RT_TABLES_SHA256_END ---'
+
+          printf '%s\n' '--- IP_RESOLVED_PATHS_BEGIN ---'
+          /usr/bin/readlink -e -- /bin/ip /usr/bin/ip
+          printf '%s\n' '--- IP_RESOLVED_PATHS_END ---'
+
+          printf '%s\n' '--- IP_RESOLVED_STAT_BEGIN ---'
+          /usr/bin/stat \
+            -Lc '%n|%F|%a|%u:%g|%d:%i' \
+            -- /bin/ip /usr/bin/ip
+          printf '%s\n' '--- IP_RESOLVED_STAT_END ---'
+
+          if [[ ! -x /usr/bin/getfacl ]]; then
+            printf 'HOLD=HOSTED_DIAGNOSTIC_TOOL_UNAVAILABLE\nMISSING_TOOL=/usr/bin/getfacl\n'
+            exit 1
+          fi
+          printf 'ACL_TOOL_AVAILABLE=YES\n'
+          printf '%s\n' '--- RT_TABLES_ACL_BEGIN ---'
+          /usr/bin/getfacl \
+            --numeric \
+            --absolute-names \
+            -- "${targets[@]}"
+          printf '%s\n' '--- RT_TABLES_ACL_END ---'
+
+          printf '%s\n' '--- DPKG_BIN_IP_BEGIN ---'
+          /usr/bin/dpkg-query -S -- /bin/ip || true
+          printf '%s\n' '--- DPKG_BIN_IP_END ---'
+          printf '%s\n' '--- DPKG_USR_BIN_IP_BEGIN ---'
+          /usr/bin/dpkg-query -S -- /usr/bin/ip || true
+          printf '%s\n' '--- DPKG_USR_BIN_IP_END ---'
+
+          set +e
+          ip_stdout="$(mktemp)"
+          ip_stderr="$(mktemp)"
+
+          /usr/bin/ip -Version >"$ip_stdout" 2>"$ip_stderr"
+          ip_status=$?
+
+          printf 'IP_VERSION_STATUS=%s\n' "$ip_status"
+          printf '%s\n' '--- IP_VERSION_STDOUT_BEGIN ---'
+          /usr/bin/cat "$ip_stdout"
+          printf '%s\n' '--- IP_VERSION_STDOUT_END ---'
+          printf '%s\n' '--- IP_VERSION_STDERR_BEGIN ---' >&2
+          /usr/bin/cat "$ip_stderr" >&2
+          printf '%s\n' '--- IP_VERSION_STDERR_END ---' >&2
+
+          /usr/bin/rm -f -- "$ip_stdout" "$ip_stderr"
+          set -e
+
   s8-actionlint:
     name: S8 pinned actionlint ${{ matrix.platform }}
     strategy:
