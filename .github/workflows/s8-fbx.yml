@@ -4234,6 +4234,12 @@ jobs:
             regression_root="$(/usr/bin/mktemp -d)" || return 1
             caller_script="$regression_root/guarded-caller-regressions.sh"
             {
+              declare -f tracked_pid_is_registered
+              declare -f remove_tracked_pid_exact
+              declare -f wait_for_tracked_pid
+              declare -f signal_exit_status
+              actual_helper_definition="$(declare -f run_tracked_command)"
+              printf '%s\n' "${actual_helper_definition/run_tracked_command/run_tracked_command_actual}"
               declare -f run_tracked_command
               declare -f validate_bwrap_info_after_carrier
               declare -f run_capability_probe
@@ -4253,12 +4259,14 @@ jobs:
           capability_script=':'
           tracked_children=()
           all_launched_children_reaped=1
+          stop_new_launches=0
+          critical_section=0
+          pending_signal=""
+          received_signal=""
           iproute2_admission_baseline=""
           admit_iproute2_snapshot() { return 0; }
           validate_capability_ip_paths() { return 0; }
           validate_route_evidence() { return 0; }
-          actual_helper_definition="$(declare -f run_tracked_command)"
-          eval "${actual_helper_definition/run_tracked_command/run_tracked_command_actual}"
 
           fail_hold() {
             hold_reason="$1"
@@ -4394,6 +4402,44 @@ jobs:
           SH
             } > "$caller_script"
             /usr/bin/chmod 0700 -- "$caller_script"
+            if ! /usr/bin/python3 - "$caller_script" <<'PY'
+          from pathlib import Path
+          import re, sys
+
+          source = Path(sys.argv[1]).read_text(encoding="utf-8")
+          required_functions = (
+              "run_tracked_command_actual",
+              "tracked_pid_is_registered",
+              "remove_tracked_pid_exact",
+              "wait_for_tracked_pid",
+              "signal_exit_status",
+          )
+          for name in required_functions:
+              if not re.search(rf"^{re.escape(name)}\s*\(\)\s*\{{", source, re.MULTILINE):
+                  raise SystemExit(f"missing generated function: {name}")
+          state_initialisers = (
+              "tracked_children=()",
+              "all_launched_children_reaped=1",
+              "stop_new_launches=0",
+              "critical_section=0",
+              'pending_signal=""',
+              'received_signal=""',
+          )
+          state_start = source.index("set -Eeuo pipefail")
+          qualification_start = source.index("run_qualification_case()")
+          state_section = source[state_start:qualification_start]
+          for assignment in state_initialisers:
+              if assignment not in state_section:
+                  raise SystemExit(f"missing generated state initializer: {assignment}")
+          if "run_tracked_command_actual" not in source[qualification_start:]:
+              raise SystemExit("generated qualification path does not invoke run_tracked_command_actual")
+          print("GUARDED_CALLER_FUNCTION_DEPENDENCY_CLOSURE=PASS")
+          print("GUARDED_CALLER_STATE_DEPENDENCY_CLOSURE=PASS")
+          PY
+            then
+              /usr/bin/rm -rf -- "$regression_root"
+              return 1
+            fi
             set +e
             /usr/bin/bash "$caller_script" "$regression_root"
             regression_status=$?
