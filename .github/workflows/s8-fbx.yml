@@ -5236,7 +5236,130 @@ jobs:
           run_sandbox_anchor = "def run_sandbox(\n"
           if source.count(run_sandbox_anchor) != 1:
               raise SystemExit("run_sandbox anchor is not unique")
-          source = source.replace(run_sandbox_anchor, marker_binding + run_sandbox_anchor, 1)
+          diagnostic_helpers = r'''
+          import hashlib
+          import re
+          import sys
+
+          diagnostic_phase = "UNKNOWN"
+
+          def _s8_diagnostic_scalar(value):
+              if value is None:
+                  return "null"
+              if isinstance(value, bool):
+                  return "true" if value else "false"
+              return str(value)
+
+          def _s8_diagnostic_payload(label, payload):
+              secret_pattern = re.compile(
+                  r"(?is)-----BEGIN (?:RSA|EC|OPENSSH|PRIVATE) KEY-----.*?-----END (?:RSA|EC|OPENSSH|PRIVATE) KEY-----|sk-[A-Za-z0-9_-]{20,}|gh[pous]_[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{20,}"
+              )
+              text = payload.decode("utf-8", errors="replace")
+              redacted = secret_pattern.search(text) is not None
+              if redacted:
+                  text = secret_pattern.sub("[REDACTED_SECRET]", text)
+              print(f"{label}_SECRET_SAFETY={'REDACTED' if redacted else 'PASS'}", flush=True)
+              sys.stdout.write(f"--- {label}_BEGIN ---\n")
+              sys.stdout.write(text)
+              if not text.endswith("\n"):
+                  sys.stdout.write("\n")
+              sys.stdout.write(f"--- {label}_END ---\n")
+
+          def _s8_emit_runner_diagnostic(result):
+              try:
+                  print(f"FAILING_RUNTIME_PHASE={diagnostic_phase}", flush=True)
+                  print(f"RUNNER_PROCESS_RETURN_CODE={result.returncode}", flush=True)
+                  receipt_prefix = b"S8_RUNNER_RECEIPT:"
+                  receipt_line = None
+                  receipt_start = -1
+                  offset = 0
+                  for line in result.stdout.splitlines(keepends=True):
+                      if line.startswith(receipt_prefix):
+                          receipt_line = line
+                          receipt_start = offset
+                          break
+                      offset += len(line)
+                  if receipt_line is None:
+                      print("DIAGNOSTIC_RECEIPT_PARSE=NOT_FOUND", flush=True)
+                      return
+                  receipt_text = receipt_line.rstrip(b"\r\n").decode("utf-8", errors="strict")
+                  receipt = json.loads(receipt_text[len(receipt_prefix):])
+                  parent_verification = receipt.get("runnerParentVerification") or {}
+                  result_data = receipt.get("result") or {}
+                  sys.stdout.write("--- S8_RUNNER_RECEIPT_RAW_BEGIN ---\n")
+                  sys.stdout.write(receipt_text)
+                  sys.stdout.write("\n--- S8_RUNNER_RECEIPT_RAW_END ---\n")
+                  for label, value in (
+                      ("RECEIPT_SCHEMA_VERSION", receipt.get("schemaVersion", "<MISSING>")),
+                      ("RECEIPT_PROTOCOL", receipt.get("protocol", "<MISSING>")),
+                      ("RECEIPT_POLICY_ID", receipt.get("policyId", "<MISSING>")),
+                      ("RUNNER_PARENT_VERIFICATION_STATUS", parent_verification.get("status", "<MISSING>")),
+                      ("RUNNER_PARENT_MISMATCH_CODE", parent_verification.get("mismatchCode", "<MISSING>")),
+                      ("RUNNER_RESULT_CODE", result_data.get("code", "<MISSING>")),
+                      ("RUNNER_RESULT_NAME", result_data.get("name", "<MISSING>")),
+                      ("RUNNER_TERMINATION_CLASS", result_data.get("terminationClass", "<MISSING>")),
+                      ("RUNNER_TARGET_EXIT", result_data.get("targetExit", "<MISSING>")),
+                      ("RUNNER_TARGET_SIGNAL", result_data.get("targetSignal", "<MISSING>")),
+                      ("RUNNER_ELAPSED_MS", result_data.get("elapsedMs", "<MISSING>")),
+                      ("RUNNER_STDOUT_BYTES", result_data.get("stdoutBytes", "<MISSING>")),
+                      ("RUNNER_STDERR_BYTES", result_data.get("stderrBytes", "<MISSING>")),
+                      ("RUNNER_SETUP_STAGE", result_data.get("setupStage", "<MISSING>")),
+                      ("RUNNER_EVIDENCE_CODE", result_data.get("evidenceCode", "<MISSING>")),
+                  ):
+                      print(f"{label}={_s8_diagnostic_scalar(value)}", flush=True)
+                  receipt_end = receipt_start + len(receipt_line)
+                  target_stdout = result.stdout[receipt_end:]
+                  print(f"TARGET_STDOUT_BYTES={len(target_stdout)}", flush=True)
+                  print(f"TARGET_STDOUT_SHA256={hashlib.sha256(target_stdout).hexdigest()}", flush=True)
+                  print(f"TARGET_STDERR_BYTES={len(result.stderr)}", flush=True)
+                  print(f"TARGET_STDERR_SHA256={hashlib.sha256(result.stderr).hexdigest()}", flush=True)
+                  _s8_diagnostic_payload("TARGET_STDOUT", target_stdout)
+                  _s8_diagnostic_payload("TARGET_STDERR", result.stderr)
+              except Exception as diagnostic_error:
+                  print(f"DIAGNOSTIC_EMISSION_ERROR={type(diagnostic_error).__name__}", file=sys.stderr, flush=True)
+
+          '''
+          source = source.replace(run_sandbox_anchor, diagnostic_helpers + "\n" + marker_binding + run_sandbox_anchor, 1)
+          phase_anchors = (
+              (
+                  '    writer_output = run_sandbox(\n',
+                  '    diagnostic_phase = "WRITER"\n    writer_output = run_sandbox(\n',
+              ),
+              (
+                  '    validator_output = run_sandbox(\n',
+                  '    diagnostic_phase = "VALIDATOR"\n    validator_output = run_sandbox(\n',
+              ),
+          )
+          for anchor, replacement in phase_anchors:
+              if source.count(anchor) != 1:
+                  raise SystemExit("runtime phase anchor is not unique")
+              source = source.replace(anchor, replacement, 1)
+          import_anchor = (
+              '    run_sandbox(\n'
+              '        sandbox, runner, work, runtime_root, writer_root,\n'
+              '        "/runtime/blender-root/blender",\n'
+              '        ["--background", "--factory-startup", "--disable-autoexec", "--offline-mode", "--python-exit-code", "50", "--python", f"/runtime/support/{import_script.name}", "--"],\n'
+          )
+          edit_anchor = (
+              '    run_sandbox(\n'
+              '        sandbox, runner, work, runtime_root, writer_root,\n'
+              '        "/runtime/blender-root/blender",\n'
+              '        ["--background", "--factory-startup", "--disable-autoexec", "--offline-mode", "--python-exit-code", "50", "--python", f"/runtime/support/{reopen_script.name}", "--", "--phase", "edit"],\n'
+          )
+          reopen_anchor = (
+              '    run_sandbox(\n'
+              '        sandbox, runner, work, runtime_root, writer_root,\n'
+              '        "/runtime/blender-root/blender",\n'
+              '        ["--background", "--factory-startup", "--disable-autoexec", "--offline-mode", "--python-exit-code", "50", "--python", f"/runtime/support/{reopen_script.name}", "--", "--phase", "reopen"],\n'
+          )
+          for phase, anchor in (("IMPORT", import_anchor), ("EDIT", edit_anchor), ("REOPEN", reopen_anchor)):
+              if source.count(anchor) != 1:
+                  raise SystemExit(f"{phase.lower()} runtime phase anchor is not unique")
+              source = source.replace(anchor, f'    diagnostic_phase = "{phase}"\n' + anchor, 1)
+          failure_anchor = '        fail("NATIVE_PROCESS_BOUNDARY_FAILED", "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY")\n'
+          if source.count(failure_anchor) != 1:
+              raise SystemExit("native process failure anchor is not unique")
+          source = source.replace(failure_anchor, '        _s8_emit_runner_diagnostic(result)\n' + failure_anchor, 1)
           broad_bind_anchor = (
               "        " + chr(34) + "--ro-bind" + chr(34) + ", str(carrier_root), "
               + chr(34) + "/carrier" + chr(34) + ",\n"
