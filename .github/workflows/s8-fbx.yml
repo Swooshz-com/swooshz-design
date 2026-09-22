@@ -4665,6 +4665,13 @@ jobs:
           post_run_manifest="$temp_root/post-run.manifest"
           /usr/bin/install -d -m 0700 -- "$source_layout/runtime" "$source_layout/native" "$source_layout/writer" "$source_layout/support" || fail_hold "SOURCE_LAYOUT_CREATE_FAILED"
 
+          test -x /usr/local/bin/cmake || fail_hold "HOSTED_CMAKE_PATH_INVALID"
+          cmake_version_stderr="$temp_root/cmake-version.stderr"
+          cmake_version="$(/usr/local/bin/cmake --version 2>"$cmake_version_stderr")" || fail_hold "HOSTED_CMAKE_VERSION_QUERY_FAILED"
+          [[ ! -s "$cmake_version_stderr" ]] || fail_hold "HOSTED_CMAKE_VERSION_STDERR"
+          /usr/bin/grep -Fx 'cmake version 3.31.6' <<< "$cmake_version" >/dev/null || fail_hold "HOSTED_CMAKE_VERSION_INVALID"
+          printf 'HOSTED_CMAKE_PATH_CONTRACT=PASS\nHOSTED_CMAKE_VERSION_CONTRACT=PASS\n'
+
           /usr/bin/curl --fail --location --retry 3 --output "$archive" \
             https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz || fail_hold "BLENDER_ARCHIVE_DOWNLOAD_FAILED"
           [[ -f "$archive" && ! -L "$archive" ]] || fail_hold "BLENDER_ARCHIVE_PATH_INVALID"
@@ -4676,10 +4683,10 @@ jobs:
           blender_source="$temp_root/extracted/blender-5.2.2-linux-x64"
           [[ -d "$blender_source" && ! -L "$blender_source" && -x "$blender_source/blender" ]] || fail_hold "BLENDER_SOURCE_INVALID"
 
-          /usr/bin/cmake -S native/s8-process-runner -B "$temp_root/s8-runner" -DCMAKE_BUILD_TYPE=Release
-          /usr/bin/cmake --build "$temp_root/s8-runner" --config Release --parallel
-          /usr/bin/cmake -S native/s8-fbx-validator -B "$temp_root/s8-validator" -DCMAKE_BUILD_TYPE=Release
-          /usr/bin/cmake --build "$temp_root/s8-validator" --config Release --parallel
+          /usr/local/bin/cmake -S native/s8-process-runner -B "$temp_root/s8-runner" -DCMAKE_BUILD_TYPE=Release
+          /usr/local/bin/cmake --build "$temp_root/s8-runner" --config Release --parallel
+          /usr/local/bin/cmake -S native/s8-fbx-validator -B "$temp_root/s8-validator" -DCMAKE_BUILD_TYPE=Release
+          /usr/local/bin/cmake --build "$temp_root/s8-validator" --config Release --parallel
           [[ -x "$temp_root/s8-runner/s8-process-runner" && -x "$temp_root/s8-validator/s8-fbx-validator" ]] || fail_hold "NATIVE_BUILD_OUTPUT_INVALID"
 
           /usr/bin/cp -a --no-dereference -- "$blender_source" "$source_layout/runtime/"
