@@ -4062,6 +4062,7 @@ jobs:
           import json, pathlib, re, sys
           allowed={"type","dst","src","gateway","via","dev","protocol","scope","prefsrc","metric","table","flags","mtu","advmss","hoplimit","pref","expires","features","nhid","uid","error","cacheinfo","newdst","encap","weight","nexthops","tos","realm","quickack","congctl","rto_min","initcwnd","initrwnd","fastopen_no_cookie"}
           types={"unicast","local","broadcast","multicast","unreachable","prohibit","blackhole","throw","anycast"}
+          numeric_types={"1":"unicast","2":"local","3":"broadcast","4":"anycast","5":"multicast","6":"blackhole","7":"unreachable","8":"prohibit","9":"throw"}
           blocked={"unreachable","prohibit","blackhole","throw"}
           numeric=re.compile(r"^[1-9][0-9]*$")
           def hook(pairs):
@@ -4070,6 +4071,11 @@ jobs:
                   if k in out: raise ValueError("duplicate key")
                   out[k]=v
               return out
+          def canonical_route_type(value):
+              if not isinstance(value,str): raise SystemExit("unsupported route type")
+              value=numeric_types.get(value,value)
+              if value not in types: raise SystemExit("unsupported route type")
+              return value
           for path in sys.argv[1:]:
               try: routes=json.loads(pathlib.Path(path).read_bytes().decode("utf-8"),object_pairs_hook=hook)
               except Exception as exc: raise SystemExit(f"invalid route json: {exc}")
@@ -4078,9 +4084,8 @@ jobs:
                   if not isinstance(route,dict) or set(route)-allowed: raise SystemExit("unsupported route structure")
                   table=route.get("table")
                   if not isinstance(table,str) or not numeric.fullmatch(table): raise SystemExit("route table identity")
-                  route_type=route.get("type","unicast")
+                  route_type=canonical_route_type(route.get("type","unicast"))
                   dev=route.get("dev")
-                  if route_type not in types: raise SystemExit("unsupported route type")
                   if dev is not None and (not isinstance(dev,str) or not dev): raise SystemExit("invalid route device")
                   flags=route.get("flags",[])
                   if not isinstance(flags,list) or any(not isinstance(flag,str) for flag in flags): raise SystemExit("invalid flags")
@@ -4091,6 +4096,105 @@ jobs:
             (( route_status == 0 )) || return 1
             /usr/bin/rm -f -- "$v4" "$v6" "$e4" "$e6"
             printf 'ROUTE_EVIDENCE_%s=PASS\n' "$mode"
+          }
+
+          run_route_parser_regressions() {
+            local regression_root route_type status
+            regression_root="$(/usr/bin/mktemp -d)" || return 1
+            set +e
+            (
+              set -Eeuo pipefail
+              work="$regression_root"
+              run049_v4='[{"type":"2","dst":"127.0.0.0/8","dev":"lo","table":"255","protocol":"2","scope":"254","prefsrc":"127.0.0.1","flags":[]},{"type":"2","dst":"127.0.0.1","dev":"lo","table":"255","protocol":"2","scope":"254","prefsrc":"127.0.0.1","flags":[]},{"type":"3","dst":"127.255.255.255","dev":"lo","table":"255","protocol":"2","scope":"253","prefsrc":"127.0.0.1","flags":[]}]'
+              run049_v6='[{"type":"2","dst":"::1","dev":"lo","table":"255","protocol":"2","scope":"0","metric":0,"flags":[],"pref":"medium"}]'
+              local_v4='[{"type":"2","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]'
+              local_v6='[{"type":"2","dst":"::1","dev":"lo","table":"255","flags":[]}]'
+
+              write_route_case() {
+                local case_mode="$1" v4_json="$2" v6_json="$3" stderr_text=""
+                if (( $# >= 4 )); then stderr_text="$4"; fi
+                printf '%s' "$v4_json" > "$work/.s8-$case_mode-route-v4.json"
+                printf '%s' "$v6_json" > "$work/.s8-$case_mode-route-v6.json"
+                printf '%s' "$stderr_text" > "$work/.s8-$case_mode-route-v4.stderr"
+                : > "$work/.s8-$case_mode-route-v6.stderr"
+              }
+
+              clear_route_case() {
+                local case_mode="$1"
+                /usr/bin/rm -f -- "$work/.s8-$case_mode-route-v4.json" "$work/.s8-$case_mode-route-v6.json" "$work/.s8-$case_mode-route-v4.stderr" "$work/.s8-$case_mode-route-v6.stderr"
+              }
+
+              expect_route_accept() {
+                local case_mode="$1" v4_json="$2" v6_json="$3"
+                write_route_case "$case_mode" "$v4_json" "$v6_json"
+                if ! validate_route_evidence "$case_mode"; then
+                  clear_route_case "$case_mode"
+                  return 1
+                fi
+                clear_route_case "$case_mode"
+                printf 'ROUTE_ACCEPT_%s=PASS\n' "$case_mode"
+              }
+
+              expect_route_reject() {
+                local case_mode="$1" v4_json="$2" v6_json="$3" stderr_text=""
+                if (( $# >= 4 )); then stderr_text="$4"; fi
+                write_route_case "$case_mode" "$v4_json" "$v6_json" "$stderr_text"
+                if validate_route_evidence "$case_mode"; then
+                  clear_route_case "$case_mode"
+                  return 1
+                fi
+                clear_route_case "$case_mode"
+                printf 'ROUTE_REJECT_%s=PASS\n' "$case_mode"
+              }
+
+              expect_route_accept RUN049_EXACT "$run049_v4" "$run049_v6"
+              printf 'RUN049_EXACT_ROUTE_EVIDENCE_REGRESSION=PASS\n'
+              expect_route_accept NUMERIC_LOCAL "$local_v4" "$local_v6"
+              broadcast_v4='[{"type":"3","dst":"127.255.255.255","dev":"lo","table":"255","flags":[]}]'
+              broadcast_v6="$local_v6"
+              expect_route_accept NUMERIC_BROADCAST "$broadcast_v4" "$broadcast_v6"
+              for route_type in 1 4 5; do
+                loopback_route="$(printf '[{"type":"%s","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$route_type")"
+                expect_route_accept "NUMERIC_LOOPBACK_$route_type" "$loopback_route" "$local_v6"
+              done
+              expect_route_accept TEXTUAL_LOCAL '[{"type":"local","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$local_v6"
+              expect_route_accept TEXTUAL_UNICAST_LOOPBACK '[{"type":"unicast","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$local_v6"
+              printf 'NUMERIC_ROUTE_TYPE_POSITIVE_CONTROLS=PASS\n'
+              printf 'TEXTUAL_ROUTE_TYPE_COMPATIBILITY=PASS\n'
+
+              routable_unicast='[{"type":"1","dst":"192.0.2.0/24","dev":"eth0","table":"255","flags":[]}]'
+              expect_route_reject NUMERIC_UNICAST_NON_LOOPBACK "$routable_unicast" "$local_v6"
+              for route_type in 0 10 11 99; do
+                invalid_numeric="$(printf '[{"type":"%s","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$route_type")"
+                expect_route_reject "NUMERIC_UNSUPPORTED_$route_type" "$invalid_numeric" "$local_v6"
+              done
+              expect_route_reject INTEGER_TYPE '[{"type":2,"dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$local_v6"
+              expect_route_reject UNKNOWN_TEXT_TYPE '[{"type":"bogus","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$local_v6"
+              expect_route_reject EMPTY_TYPE '[{"type":"","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$local_v6"
+              expect_route_reject MALFORMED_TYPE '[{"type":[],"dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$local_v6"
+              for route_type in 6 7 8 9; do
+                blocked_route="$(printf '[{"type":"%s","dst":"192.0.2.1","dev":"eth0","table":"255","flags":[]}]' "$route_type")"
+                expect_route_accept "NUMERIC_BLOCKED_$route_type" "$blocked_route" "$blocked_route"
+              done
+              printf 'NUMERIC_ROUTE_TYPE_NEGATIVE_CONTROLS=PASS\n'
+
+              expect_route_reject TABLE_STRING_ZERO '[{"type":"2","dst":"127.0.0.1","dev":"lo","table":"0","flags":[]}]' "$local_v6"
+              expect_route_reject TABLE_INTEGER_ZERO '[{"type":"2","dst":"127.0.0.1","dev":"lo","table":0,"flags":[]}]' "$local_v6"
+              expect_route_reject TABLE_MAIN '[{"type":"2","dst":"127.0.0.1","dev":"lo","table":"main","flags":[]}]' "$local_v6"
+              expect_route_reject TABLE_LOCAL '[{"type":"2","dst":"127.0.0.1","dev":"lo","table":"local","flags":[]}]' "$local_v6"
+              expect_route_reject TABLE_NULL '[{"type":"2","dst":"127.0.0.1","dev":"lo","table":null,"flags":[]}]' "$local_v6"
+              expect_route_reject UNKNOWN_KEY '[{"type":"2","dst":"127.0.0.1","dev":"lo","table":"255","flags":[],"unexpected":true}]' "$local_v6"
+              expect_route_reject DUPLICATE_KEY '[{"type":"2","dst":"127.0.0.1","dev":"lo","table":"255","flags":[],"flags":[]}]' "$local_v6"
+              expect_route_reject MALFORMED_JSON 'not-json' "$local_v6"
+              expect_route_reject IPV4_VALID_V6_INVALID "$local_v4" '[{"type":"99","dst":"::1","dev":"lo","table":"255","flags":[]}]'
+              expect_route_reject IPV4_INVALID_V6_VALID '[{"type":"99","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$local_v6"
+              expect_route_reject NONEMPTY_STDERR "$local_v4" "$local_v6" 'route stderr is not accepted'
+              printf 'STRICT_ROUTE_POLICY_REVALIDATION=PASS\nNUMERIC_ROUTE_TYPE_CANONICALISATION=PASS\n'
+            )
+            status=$?
+            set -e
+            /usr/bin/rm -rf -- "$regression_root"
+            return "$status"
           }
 
           iproute2_positive_controls() {
@@ -4228,6 +4332,11 @@ jobs:
           bin_fallback_bad="${capability_script/\/usr\/bin\/ip -j -Numeric -details -4/\/bin\/ip -j -Numeric -details -4}"
           if validate_capability_ip_paths "$bin_fallback_bad"; then fail_amendment "IPROUTE2_BIN_FALLBACK_POSITIVE_CONTROL_FAILED"; fi
           printf 'IPROUTE2_EXECUTION_PATH_POSITIVE_CONTROLS=PASS\n'
+          set +e
+          run_route_parser_regressions
+          route_parser_status=$?
+          set -e
+          (( route_parser_status == 0 )) || fail_amendment "ROUTE_PARSER_REGRESSIONS_FAILED"
 
           run_guarded_caller_regressions() {
             local regression_root caller_script negative_script regression_status negative_status negative_case
