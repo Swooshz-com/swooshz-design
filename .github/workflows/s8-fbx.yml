@@ -23,6 +23,7 @@ jobs:
             asset: actionlint_1.7.12_windows_amd64.zip
             sha256: 6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 8
     steps:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -43,30 +44,171 @@ jobs:
           ACTIONLINT_SHA256: ${{ matrix.sha256 }}
         run: |
           set -Eeuo pipefail
-          test "$(uname -s)" = Linux
-          test "$(uname -m)" = x86_64
+          platform_identity="$(/usr/bin/uname -s)/$(/usr/bin/uname -m)"
+          if [[ "$platform_identity" == Linux/x86_64 ]]; then
+            printf 'PHASE=platform_admission\nSTATUS=0\nTIMED_OUT=NO\nTOOL_OR_ASSET=ubuntu-24.04 Linux amd64 runner\nSTDOUT=%s\nSTDERR=<empty>\n' "$platform_identity"
+          else
+            printf 'PHASE=platform_admission\nSTATUS=1\nTIMED_OUT=NO\nTOOL_OR_ASSET=ubuntu-24.04 Linux amd64 runner\nSTDOUT=%s\nSTDERR=<empty>\n' "$platform_identity"
+            printf 'CANDIDATE_FAILURE_PROVEN=NO\nFAILURE_CLASS=ENVIRONMENT_CHECK_SYSTEM_HOLD\nHOLD_REASON=ACTIONLINT_LINUX_RUNNER_UNAVAILABLE\n' >&2
+            exit 2
+          fi
+
           status_before="$(git status --porcelain=v1 --untracked-files=all)"
           actionlint_root="$RUNNER_TEMP/s8-actionlint-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT-linux"
-          [[ ! -e "$actionlint_root" && ! -L "$actionlint_root" ]]
+          if [[ -e "$actionlint_root" || -L "$actionlint_root" ]]; then
+            printf 'PHASE=runner_temp_preparation\nSTATUS=1\nTIMED_OUT=NO\nTOOL_OR_ASSET=actionlint temp root\nSTDOUT=<empty>\nSTDERR=ACTIONLINT_TEMP_NOT_FRESH\n' >&2
+            printf 'CANDIDATE_FAILURE_PROVEN=NO\nFAILURE_CLASS=ENVIRONMENT_CHECK_SYSTEM_HOLD\nHOLD_REASON=ACTIONLINT_TEMP_NOT_FRESH\n' >&2
+            exit 2
+          fi
           /usr/bin/install -d -m 0700 -- "$actionlint_root"
-          gh release download v1.7.12 --repo rhysd/actionlint --pattern "$ACTIONLINT_ASSET" --dir "$actionlint_root" --clobber
+
+          bounded_evidence_text() {
+            local value
+            value="$(/usr/bin/head -c 2048 -- "$1" | /usr/bin/sed -E 's/(Authorization:[[:space:]]*).*/\1[REDACTED]/Ig' | /usr/bin/tr '\r\n' '  ' | /usr/bin/tr -cd '\11\15\40-\176' | /usr/bin/sed -E 's/(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})/[REDACTED]/g')"
+            [[ -n "$value" ]] || value='<empty>'
+            printf '%s' "${value:0:512}"
+          }
+
+          emit_phase_evidence() {
+            local phase="$1" status="$2" timed_out="$3" tool="$4" stdout_file="$5" stderr_file="$6"
+            local stdout_text stderr_text
+            stdout_text="$(bounded_evidence_text "$stdout_file")"
+            stderr_text="$(bounded_evidence_text "$stderr_file")"
+            printf 'PHASE=%s\nSTATUS=%s\nTIMED_OUT=%s\nTOOL_OR_ASSET=%s\nSTDOUT=%s\nSTDERR=%s\n' "$phase" "$status" "$timed_out" "$tool" "$stdout_text" "$stderr_text"
+          }
+
+          phase_timed_out=NO
+          run_bounded_phase() {
+            local phase="$1" tool="$2" seconds="$3"
+            shift 3
+            local stdout_file="$actionlint_root/$phase.stdout"
+            local stderr_file="$actionlint_root/$phase.stderr"
+            local status
+            : > "$stdout_file"
+            : > "$stderr_file"
+            phase_timed_out=NO
+            if /usr/bin/timeout --signal=TERM --kill-after=5s "${seconds}s" "$@" >"$stdout_file" 2>"$stderr_file"; then
+              status=0
+            else
+              status=$?
+            fi
+            if [[ "$status" == 124 || "$status" == 137 ]]; then phase_timed_out=YES; fi
+            emit_phase_evidence "$phase" "$status" "$phase_timed_out" "$tool" "$stdout_file" "$stderr_file"
+            return "$status"
+          }
+
+          fail_hold() {
+            printf 'CANDIDATE_FAILURE_PROVEN=NO\nFAILURE_CLASS=ENVIRONMENT_CHECK_SYSTEM_HOLD\nHOLD_REASON=%s\n' "$1" >&2
+            exit 2
+          }
+          fail_candidate() {
+            printf 'CANDIDATE_FAILURE_PROVEN=YES\nFAILURE_CLASS=CANDIDATE_DEFECT\nCANDIDATE_DEFECT=%s\n' "$1" >&2
+            exit 1
+          }
+
+          if run_bounded_phase asset_acquisition "$ACTIONLINT_ASSET" 120 gh release download v1.7.12 --repo rhysd/actionlint --pattern "$ACTIONLINT_ASSET" --dir "$actionlint_root" --clobber; then
+            :
+          else
+            acquisition_status=$?
+            if [[ "$phase_timed_out" == YES || "$acquisition_status" == 126 || "$acquisition_status" == 127 ]]; then
+              fail_hold ACTIONLINT_ASSET_ACQUISITION_FAILED
+            elif [[ "$acquisition_status" == 125 ]]; then
+              fail_candidate ACTIONLINT_TIMEOUT_WRAPPER_FAILURE
+            else
+              fail_hold ACTIONLINT_ASSET_ACQUISITION_FAILED
+            fi
+          fi
           archive="$actionlint_root/$ACTIONLINT_ASSET"
-          [[ -f "$archive" && ! -L "$archive" ]]
-          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check --status
-          extract_root="$actionlint_root/extracted"
+          if [[ -f "$archive" && ! -L "$archive" ]]; then
+            printf 'PHASE=asset_presence\nSTATUS=0\nTIMED_OUT=NO\nTOOL_OR_ASSET=%s\nSTDOUT=PRESENT\nSTDERR=<empty>\n' "$ACTIONLINT_ASSET"
+          else
+            printf 'PHASE=asset_presence\nSTATUS=1\nTIMED_OUT=NO\nTOOL_OR_ASSET=%s\nSTDOUT=MISSING\nSTDERR=<empty>\n' "$ACTIONLINT_ASSET"
+            fail_candidate ACTIONLINT_ARCHIVE_MISSING_AFTER_ACQUISITION
+          fi
+
+          checksum_file="$actionlint_root/actionlint.sha256"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" > "$checksum_file"
+          if run_bounded_phase checksum_verification "$ACTIONLINT_ASSET" 15 sha256sum --check --status "$checksum_file"; then
+            :
+          else
+            checksum_status=$?
+            if [[ "$phase_timed_out" == YES || "$checksum_status" == 126 || "$checksum_status" == 127 ]]; then
+              fail_hold ACTIONLINT_CHECKSUM_TOOL_OR_TIMEOUT_FAILURE
+            elif [[ "$checksum_status" == 125 ]]; then
+              fail_candidate ACTIONLINT_TIMEOUT_WRAPPER_FAILURE
+            elif [[ "$checksum_status" == 1 ]]; then
+              fail_candidate ACTIONLINT_ARCHIVE_SHA256_MISMATCH
+            else
+              fail_hold ACTIONLINT_CHECKSUM_VERIFICATION_UNAVAILABLE
+            fi
+          fi
+
+          archive_script="$actionlint_root/archive-audit-extract.sh"
+          cat > "$archive_script" <<'SH'
+          set -Eeuo pipefail
+          archive="$1"
+          extract_root="$2"
+          LC_ALL=C /usr/bin/tar -tzf "$archive" | LC_ALL=C /usr/bin/awk '/^\/|(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }'
           /usr/bin/install -d -m 0700 -- "$extract_root"
-          tar -tzf "$archive" | awk '/^\// || /(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }'
-          tar -xzf "$archive" --directory "$extract_root" --no-same-owner --no-same-permissions
-          mapfile -t actionlint_bins < <(find -P "$extract_root" -type f -name actionlint -print)
+          /usr/bin/tar -xzf "$archive" --directory "$extract_root" --no-same-owner --no-same-permissions
+          /usr/bin/find -P "$extract_root" -type f -name actionlint -print > "$extract_root/actionlint-files.txt"
+          mapfile -t actionlint_bins < "$extract_root/actionlint-files.txt"
           [[ "${#actionlint_bins[@]}" == 1 && "${actionlint_bins[0]}" == "$extract_root/actionlint" ]]
-          actionlint_bin="${actionlint_bins[0]}"
-          /usr/bin/chmod 0555 -- "$actionlint_bin"
-          actionlint_version="$($actionlint_bin -version 2>&1)"
-          grep -F '1.7.12' <<< "$actionlint_version" >/dev/null
-          "$actionlint_bin" .github/workflows/s8-fbx.yml
+          [[ -f "$extract_root/actionlint" && ! -L "$extract_root/actionlint" ]]
+          /usr/bin/chmod 0555 -- "$extract_root/actionlint"
+          printf 'ARCHIVE_AUDIT=PASS\nACTIONLINT_BINARY=FOUND\n'
+          SH
+          extract_root="$actionlint_root/extracted"
+          if run_bounded_phase archive_audit_extraction "$ACTIONLINT_ASSET" 30 /usr/bin/bash "$archive_script" "$archive" "$extract_root"; then
+            :
+          else
+            archive_status=$?
+            if [[ "$phase_timed_out" == YES || "$archive_status" == 126 || "$archive_status" == 127 ]]; then
+              fail_hold ACTIONLINT_ARCHIVE_PHASE_TOOL_OR_TIMEOUT_FAILURE
+            elif [[ "$archive_status" == 125 ]]; then
+              fail_candidate ACTIONLINT_TIMEOUT_WRAPPER_FAILURE
+            else
+              fail_candidate ACTIONLINT_ARCHIVE_AUDIT_OR_EXTRACTION_FAILED
+            fi
+          fi
+          actionlint_bin="$extract_root/actionlint"
+
+          if run_bounded_phase version_invocation "$ACTIONLINT_ASSET actionlint -version" 15 "$actionlint_bin" -version; then
+            :
+          else
+            version_status=$?
+            if [[ "$phase_timed_out" == YES || "$version_status" == 126 || "$version_status" == 127 ]]; then
+              fail_hold ACTIONLINT_VERSION_TOOL_OR_TIMEOUT_FAILURE
+            elif [[ "$version_status" == 125 ]]; then
+              fail_candidate ACTIONLINT_TIMEOUT_WRAPPER_FAILURE
+            else
+              fail_candidate ACTIONLINT_VERSION_INVOCATION_FAILED
+            fi
+          fi
+          if ! /usr/bin/grep -F '1.7.12' "$actionlint_root/version_invocation.stdout" "$actionlint_root/version_invocation.stderr" >/dev/null; then
+            fail_candidate ACTIONLINT_VERSION_MISMATCH
+          fi
+
+          if run_bounded_phase actionlint_invocation "$ACTIONLINT_ASSET actionlint workflow" 120 "$actionlint_bin" -shellcheck= -pyflakes= .github/workflows/s8-fbx.yml; then
+            :
+          else
+            actionlint_status=$?
+            if [[ "$phase_timed_out" == YES || "$actionlint_status" == 126 || "$actionlint_status" == 127 ]]; then
+              fail_hold ACTIONLINT_INVOCATION_TOOL_OR_TIMEOUT_FAILURE
+            elif [[ "$actionlint_status" == 125 ]]; then
+              fail_candidate ACTIONLINT_TIMEOUT_WRAPPER_FAILURE
+            else
+              fail_candidate ACTIONLINT_DIAGNOSTICS
+            fi
+          fi
+
           status_after="$(git status --porcelain=v1 --untracked-files=all)"
-          [[ "$status_before" == "$status_after" ]]
-          printf 'ACTIONLINT_PLATFORM=linux/amd64\nACTIONLINT_VERSION=1.7.12\nACTIONLINT=PASS\nREPOSITORY_STATUS_PRESERVED=YES\n'
+          if [[ "$status_before" != "$status_after" ]]; then
+            printf 'PHASE=repository_state_check\nSTATUS=1\nTIMED_OUT=NO\nTOOL_OR_ASSET=git status --porcelain\nSTDOUT=CHANGED\nSTDERR=<empty>\n'
+            fail_candidate ACTIONLINT_REPOSITORY_STATE_MUTATION
+          fi
+          printf 'PHASE=repository_state_check\nSTATUS=0\nTIMED_OUT=NO\nTOOL_OR_ASSET=git status --porcelain\nSTDOUT=UNCHANGED\nSTDERR=<empty>\n'
+          printf 'ACTIONLINT_PLATFORM=linux/amd64\nACTIONLINT_VERSION=1.7.12\nACTIONLINT_EXTERNAL_AUTODISCOVERY_DISABLED=YES\nACTIONLINT=PASS\nREPOSITORY_STATUS_PRESERVED=YES\n'
       - name: Download verify and run pinned actionlint on Windows
         if: matrix.platform == 'windows/amd64'
         shell: pwsh
@@ -76,18 +218,197 @@ jobs:
           ACTIONLINT_SHA256: ${{ matrix.sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'ACTIONLINT_PLATFORM_NOT_ADMITTED' }
-          $statusBefore = (@(git status --porcelain=v1 --untracked-files=all) -join "`n")
+          $ProgressPreference = 'SilentlyContinue'
+
+          function ConvertTo-EvidenceText {
+            param([AllowNull()][string]$Text)
+            if ($null -eq $Text) { return '<empty>' }
+            $Text = $Text -replace '[\r\n]+', ' '
+            $Text = $Text -replace '[^\x20-\x7E]', ' '
+            $Text = $Text -replace '(?i)(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})', '[REDACTED]'
+            $Text = $Text -replace '(?i)(Authorization\s*:\s*).*$','$1[REDACTED]'
+            $Text = $Text -replace '(?i)((?:GH_TOKEN|GITHUB_TOKEN|token)\s*[=:]\s*)[^\s,;]+', '$1[REDACTED]'
+            if ($Text.Length -gt 512) { $Text = $Text.Substring(0, 512) + ' [TRUNCATED]' }
+            if ([string]::IsNullOrWhiteSpace($Text)) { return '<empty>' }
+            return $Text
+          }
+
+          function Read-BoundedFile {
+            param([string]$Path)
+            if (-not [System.IO.File]::Exists($Path)) { return '<unavailable>' }
+            $stream = [System.IO.File]::OpenRead($Path)
+            try {
+              $length = [int][Math]::Min([long]2048, $stream.Length)
+              $bytes = New-Object byte[] $length
+              $read = $stream.Read($bytes, 0, $bytes.Length)
+              $text = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $read)
+              if ($stream.Length -gt $read) { $text += ' [TRUNCATED]' }
+            } finally {
+              $stream.Dispose()
+            }
+            return ConvertTo-EvidenceText $text
+          }
+
+          function Write-PhaseEvidence {
+            param([string]$Phase, [string]$Status, [bool]$TimedOut, [string]$ToolOrAsset, [string]$Stdout, [string]$Stderr)
+            $timedOutText = 'NO'
+            if ($TimedOut) { $timedOutText = 'YES' }
+            [Console]::Out.WriteLine("PHASE=$Phase")
+            [Console]::Out.WriteLine("STATUS=$Status")
+            [Console]::Out.WriteLine("TIMED_OUT=$timedOutText")
+            [Console]::Out.WriteLine("TOOL_OR_ASSET=$(ConvertTo-EvidenceText $ToolOrAsset)")
+            [Console]::Out.WriteLine("STDOUT=$(ConvertTo-EvidenceText $Stdout)")
+            [Console]::Out.WriteLine("STDERR=$(ConvertTo-EvidenceText $Stderr)")
+          }
+
+          function Write-EnvironmentHold {
+            param([string]$Reason)
+            [Console]::Error.WriteLine('CANDIDATE_FAILURE_PROVEN=NO')
+            [Console]::Error.WriteLine('FAILURE_CLASS=ENVIRONMENT_CHECK_SYSTEM_HOLD')
+            [Console]::Error.WriteLine("HOLD_REASON=$Reason")
+          }
+
+          function Write-CandidateDefect {
+            param([string]$Reason)
+            [Console]::Error.WriteLine('CANDIDATE_FAILURE_PROVEN=YES')
+            [Console]::Error.WriteLine('FAILURE_CLASS=CANDIDATE_DEFECT')
+            [Console]::Error.WriteLine("CANDIDATE_DEFECT=$Reason")
+          }
+
+          function Quote-ProcessArgument {
+            param([string]$Value)
+            if ($Value -notmatch '[\s"]') { return $Value }
+            $escaped = [System.Text.RegularExpressions.Regex]::Replace($Value, '(\\*)"', '$1$1\"')
+            $escaped = [System.Text.RegularExpressions.Regex]::Replace($escaped, '(\\+)$', '$1$1')
+            return '"' + $escaped + '"'
+          }
+
+          function Invoke-BoundedProcess {
+            param([string]$Phase, [string]$ToolOrAsset, [string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds)
+            $stdoutPath = Join-Path $actionlintRoot "$Phase.stdout"
+            $stderrPath = Join-Path $actionlintRoot "$Phase.stderr"
+            [System.IO.File]::WriteAllText($stdoutPath, '')
+            [System.IO.File]::WriteAllText($stderrPath, '')
+            $argumentLine = (@($Arguments | ForEach-Object { Quote-ProcessArgument ([string]$_) }) -join ' ')
+            $process = $null
+            $status = 'START_FAILED'
+            $timedOut = $false
+            try {
+              $process = Start-Process -FilePath $FilePath -ArgumentList $argumentLine -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
+              if ($process.WaitForExit($TimeoutSeconds * 1000)) {
+                $status = [string]$process.ExitCode
+              } else {
+                $timedOut = $true
+                $status = 'TIMEOUT'
+                $taskkillPath = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                $terminateStdout = Join-Path $actionlintRoot "$Phase.terminate.stdout"
+                $terminateStderr = Join-Path $actionlintRoot "$Phase.terminate.stderr"
+                try {
+                  $terminator = Start-Process -FilePath $taskkillPath -ArgumentList "/PID $($process.Id) /T" -NoNewWindow -PassThru -RedirectStandardOutput $terminateStdout -RedirectStandardError $terminateStderr -ErrorAction Stop
+                  if (-not $terminator.WaitForExit(1000)) {
+                    try { $terminator.Kill($true); $null = $terminator.WaitForExit(1000) } catch {}
+                  }
+                } catch {
+                  [System.IO.File]::AppendAllText($stderrPath, [Environment]::NewLine + 'PROCESS_TREE_GRACEFUL_TERMINATION_REQUEST_FAILED')
+                }
+                $null = $process.WaitForExit(5000)
+                if (-not $process.HasExited) {
+                  try {
+                    $process.Kill($true)
+                    $null = $process.WaitForExit(5000)
+                  } catch {
+                    $status = 'TIMEOUT_KILL_FAILED'
+                    [System.IO.File]::AppendAllText($stderrPath, [Environment]::NewLine + 'PROCESS_TREE_FORCE_TERMINATION_FAILED')
+                  }
+                }
+                if (-not $process.HasExited) { $status = 'TIMEOUT_KILL_FAILED' }
+              }
+            } catch {
+              $status = 'WAIT_OR_START_FAILED'
+              [System.IO.File]::AppendAllText($stderrPath, [Environment]::NewLine + $_.Exception.Message)
+              if (($null -ne $process) -and -not $process.HasExited) {
+                try { $process.Kill($true); $null = $process.WaitForExit(5000) } catch {}
+              }
+            } finally {
+              if ($null -ne $process) { $process.Dispose() }
+            }
+            $stdoutText = Read-BoundedFile $stdoutPath
+            $stderrText = Read-BoundedFile $stderrPath
+            Write-PhaseEvidence -Phase $Phase -Status $status -TimedOut $timedOut -ToolOrAsset $ToolOrAsset -Stdout $stdoutText -Stderr $stderrText
+            return [pscustomobject]@{ Status = $status; TimedOut = $timedOut; Stdout = $stdoutText; Stderr = $stderrText }
+          }
+
+          $platformIdentity = "$env:OS/$env:PROCESSOR_ARCHITECTURE"
+          if ($env:OS -eq 'Windows_NT' -and $env:PROCESSOR_ARCHITECTURE -eq 'AMD64') {
+            Write-PhaseEvidence -Phase platform_admission -Status '0' -TimedOut $false -ToolOrAsset 'windows-2025 Windows amd64 runner' -Stdout $platformIdentity -Stderr '<empty>'
+          } else {
+            Write-PhaseEvidence -Phase platform_admission -Status '1' -TimedOut $false -ToolOrAsset 'windows-2025 Windows amd64 runner' -Stdout $platformIdentity -Stderr '<empty>'
+            Write-EnvironmentHold 'ACTIONLINT_WINDOWS_RUNNER_UNAVAILABLE'
+            exit 2
+          }
+
           $actionlintRoot = Join-Path $env:RUNNER_TEMP ("s8-actionlint-{0}.{1}-windows" -f $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT)
-          if (Test-Path -LiteralPath $actionlintRoot) { throw 'ACTIONLINT_TEMP_NOT_FRESH' }
-          New-Item -ItemType Directory -Path $actionlintRoot -Force | Out-Null
-          & gh release download v1.7.12 --repo rhysd/actionlint --pattern $env:ACTIONLINT_ASSET --dir $actionlintRoot --clobber
-          if ($LASTEXITCODE -ne 0) { throw 'ACTIONLINT_RELEASE_DOWNLOAD_FAILED' }
+          if (Test-Path -LiteralPath $actionlintRoot) {
+            Write-PhaseEvidence -Phase runner_temp_preparation -Status '1' -TimedOut $false -ToolOrAsset $actionlintRoot -Stdout '<empty>' -Stderr 'ACTIONLINT_TEMP_NOT_FRESH'
+            Write-EnvironmentHold 'ACTIONLINT_TEMP_NOT_FRESH'
+            exit 2
+          }
+          try {
+            New-Item -ItemType Directory -Path $actionlintRoot | Out-Null
+            Write-PhaseEvidence -Phase runner_temp_preparation -Status '0' -TimedOut $false -ToolOrAsset 'runner temporary directory' -Stdout 'CREATED' -Stderr '<empty>'
+          } catch {
+            Write-PhaseEvidence -Phase runner_temp_preparation -Status '1' -TimedOut $false -ToolOrAsset 'runner temporary directory' -Stdout '<empty>' -Stderr $_.Exception.Message
+            Write-EnvironmentHold 'ACTIONLINT_TEMP_PREPARATION_FAILED'
+            exit 2
+          }
+
+          $statusBefore = (@(git status --porcelain=v1 --untracked-files=all) -join [Environment]::NewLine)
+          $gh = Get-Command gh.exe -CommandType Application -ErrorAction SilentlyContinue
+          if ($null -eq $gh) {
+            Write-PhaseEvidence -Phase asset_acquisition -Status 'TOOL_UNAVAILABLE' -TimedOut $false -ToolOrAsset $env:ACTIONLINT_ASSET -Stdout '<empty>' -Stderr 'gh.exe is unavailable'
+            Write-EnvironmentHold 'ACTIONLINT_GH_TOOL_UNAVAILABLE'
+            exit 2
+          }
+          $download = Invoke-BoundedProcess -Phase asset_acquisition -ToolOrAsset $env:ACTIONLINT_ASSET -FilePath $gh.Source -Arguments @('release', 'download', 'v1.7.12', '--repo', 'rhysd/actionlint', '--pattern', $env:ACTIONLINT_ASSET, '--dir', $actionlintRoot, '--clobber') -TimeoutSeconds 120
+          if ($download.TimedOut -or $download.Status -ne '0') {
+            Write-EnvironmentHold 'ACTIONLINT_ASSET_ACQUISITION_FAILED'
+            exit 2
+          }
           $archive = Join-Path $actionlintRoot $env:ACTIONLINT_ASSET
-          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualHash -ne $env:ACTIONLINT_SHA256.ToLowerInvariant()) { throw 'ACTIONLINT_ARCHIVE_SHA256_MISMATCH' }
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            Write-PhaseEvidence -Phase asset_acquisition_artifact_check -Status '1' -TimedOut $false -ToolOrAsset $env:ACTIONLINT_ASSET -Stdout '<empty>' -Stderr 'ACTIONLINT_ARCHIVE_MISSING'
+            Write-CandidateDefect 'ACTIONLINT_ARCHIVE_MISSING_AFTER_ACQUISITION'
+            exit 1
+          }
+
+          $certutil = Get-Command certutil.exe -CommandType Application -ErrorAction SilentlyContinue
+          if ($null -eq $certutil) {
+            Write-PhaseEvidence -Phase checksum_verification -Status 'TOOL_UNAVAILABLE' -TimedOut $false -ToolOrAsset $env:ACTIONLINT_ASSET -Stdout '<empty>' -Stderr 'certutil.exe is unavailable'
+            Write-EnvironmentHold 'ACTIONLINT_CHECKSUM_TOOL_UNAVAILABLE'
+            exit 2
+          }
+          $checksum = Invoke-BoundedProcess -Phase checksum_verification -ToolOrAsset $env:ACTIONLINT_ASSET -FilePath $certutil.Source -Arguments @('-hashfile', $archive, 'SHA256') -TimeoutSeconds 15
+          if ($checksum.TimedOut -or $checksum.Status -ne '0') {
+            Write-EnvironmentHold 'ACTIONLINT_CHECKSUM_TOOL_OR_TIMEOUT_FAILURE'
+            exit 2
+          }
+          $hashMatches = [System.Text.RegularExpressions.Regex]::Matches($checksum.Stdout + ' ' + $checksum.Stderr, '(?i)\b[0-9a-f]{64}\b')
+          if ($hashMatches.Count -ne 1) {
+            Write-CandidateDefect 'ACTIONLINT_CHECKSUM_EVIDENCE_PARSE_FAILED'
+            exit 1
+          }
+          $actualHash = $hashMatches[0].Value.ToLowerInvariant()
+          if ($actualHash -ne $env:ACTIONLINT_SHA256.ToLowerInvariant()) {
+            Write-CandidateDefect 'ACTIONLINT_ARCHIVE_SHA256_MISMATCH'
+            exit 1
+          }
+
+          $archiveAuditScriptPath = Join-Path $actionlintRoot 'archive-audit-extract.ps1'
+          $archiveAuditScript = @'
+          param([string]$Archive, [string]$ExtractRoot)
+          $ErrorActionPreference = 'Stop'
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
           try {
             foreach ($entry in $zip.Entries) {
               $entryName = $entry.FullName.Replace('\', '/')
@@ -96,23 +417,76 @@ jobs:
           } finally {
             $zip.Dispose()
           }
-          $extractRoot = Join-Path $actionlintRoot 'extracted'
-          New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
-          [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractRoot)
-          $candidates = @(Get-ChildItem -LiteralPath $extractRoot -Recurse -File -Filter actionlint.exe)
-          if ($candidates.Count -ne 1 -or $candidates[0].FullName -ne (Join-Path $extractRoot 'actionlint.exe')) { throw 'ACTIONLINT_BINARY_PATH_INVALID' }
+          New-Item -ItemType Directory -Path $ExtractRoot | Out-Null
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($Archive, $ExtractRoot)
+          $candidates = @(Get-ChildItem -LiteralPath $ExtractRoot -Recurse -File -Filter actionlint.exe)
+          if ($candidates.Count -ne 1 -or $candidates[0].FullName -cne (Join-Path $ExtractRoot 'actionlint.exe')) { throw 'ACTIONLINT_BINARY_PATH_INVALID' }
           if (($candidates[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'ACTIONLINT_BINARY_LINK_INVALID' }
-          $actionlintBin = $candidates[0].FullName
-          $version = (& $actionlintBin -version 2>&1) -join "`n"
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch '1\.7\.12') { throw 'ACTIONLINT_VERSION_INVALID' }
-          & $actionlintBin (Join-Path (Get-Location) '.github/workflows/s8-fbx.yml')
-          if ($LASTEXITCODE -ne 0) { throw 'ACTIONLINT_FAILED' }
-          $statusAfter = (@(git status --porcelain=v1 --untracked-files=all) -join "`n")
-          if ($statusBefore -cne $statusAfter) { throw 'REPOSITORY_STATUS_CHANGED' }
-          Write-Output 'ACTIONLINT_PLATFORM=windows/amd64'
-          Write-Output 'ACTIONLINT_VERSION=1.7.12'
-          Write-Output 'ACTIONLINT=PASS'
-          Write-Output 'REPOSITORY_STATUS_PRESERVED=YES'
+          Write-Output 'ARCHIVE_AUDIT=PASS'
+          Write-Output 'ACTIONLINT_BINARY=FOUND'
+          '@
+          [System.IO.File]::WriteAllText($archiveAuditScriptPath, $archiveAuditScript, [System.Text.UTF8Encoding]::new($false))
+          $extractRoot = Join-Path $actionlintRoot 'extracted'
+          $powershellPath = Join-Path $PSHOME 'pwsh.exe'
+          $archivePhase = Invoke-BoundedProcess -Phase archive_audit_extraction -ToolOrAsset $env:ACTIONLINT_ASSET -FilePath $powershellPath -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $archiveAuditScriptPath, $archive, $extractRoot) -TimeoutSeconds 30
+          if ($archivePhase.TimedOut) {
+            Write-EnvironmentHold 'ACTIONLINT_ARCHIVE_PHASE_TIMEOUT'
+            exit 2
+          }
+          if ($archivePhase.Status -ne '0') {
+            if ($archivePhase.Status -in @('START_FAILED', 'WAIT_OR_START_FAILED')) {
+              Write-EnvironmentHold 'ACTIONLINT_ARCHIVE_PHASE_TOOL_UNAVAILABLE'
+              exit 2
+            }
+            Write-CandidateDefect 'ACTIONLINT_ARCHIVE_AUDIT_OR_EXTRACTION_FAILED'
+            exit 1
+          }
+          $actionlintBin = Join-Path $extractRoot 'actionlint.exe'
+
+          $version = Invoke-BoundedProcess -Phase version_invocation -ToolOrAsset "$env:ACTIONLINT_ASSET actionlint.exe -version" -FilePath $actionlintBin -Arguments @('-version') -TimeoutSeconds 15
+          if ($version.TimedOut) {
+            Write-EnvironmentHold 'ACTIONLINT_VERSION_TIMEOUT'
+            exit 2
+          }
+          if ($version.Status -ne '0') {
+            if ($version.Status -in @('START_FAILED', 'WAIT_OR_START_FAILED')) {
+              Write-EnvironmentHold 'ACTIONLINT_VERSION_TOOL_UNAVAILABLE'
+              exit 2
+            }
+            Write-CandidateDefect 'ACTIONLINT_VERSION_INVOCATION_FAILED'
+            exit 1
+          }
+          if (($version.Stdout + ' ' + $version.Stderr) -notmatch '(?<![0-9.])1\.7\.12(?![0-9.])') {
+            Write-CandidateDefect 'ACTIONLINT_VERSION_MISMATCH'
+            exit 1
+          }
+
+          $actionlint = Invoke-BoundedProcess -Phase actionlint_invocation -ToolOrAsset "$env:ACTIONLINT_ASSET actionlint.exe workflow" -FilePath $actionlintBin -Arguments @('-shellcheck=', '-pyflakes=', (Join-Path (Get-Location) '.github/workflows/s8-fbx.yml')) -TimeoutSeconds 120
+          if ($actionlint.TimedOut) {
+            Write-EnvironmentHold 'ACTIONLINT_INVOCATION_TIMEOUT'
+            exit 2
+          }
+          if ($actionlint.Status -ne '0') {
+            if ($actionlint.Status -in @('START_FAILED', 'WAIT_OR_START_FAILED')) {
+              Write-EnvironmentHold 'ACTIONLINT_INVOCATION_TOOL_UNAVAILABLE'
+              exit 2
+            }
+            Write-CandidateDefect 'ACTIONLINT_DIAGNOSTICS'
+            exit 1
+          }
+
+          $statusAfter = (@(git status --porcelain=v1 --untracked-files=all) -join [Environment]::NewLine)
+          if ($statusBefore -cne $statusAfter) {
+            Write-PhaseEvidence -Phase repository_state_check -Status '1' -TimedOut $false -ToolOrAsset 'git status --porcelain' -Stdout 'CHANGED' -Stderr '<empty>'
+            Write-CandidateDefect 'ACTIONLINT_REPOSITORY_STATE_MUTATION'
+            exit 1
+          }
+          Write-PhaseEvidence -Phase repository_state_check -Status '0' -TimedOut $false -ToolOrAsset 'git status --porcelain' -Stdout 'UNCHANGED' -Stderr '<empty>'
+          [Console]::Out.WriteLine('ACTIONLINT_PLATFORM=windows/amd64')
+          [Console]::Out.WriteLine('ACTIONLINT_VERSION=1.7.12')
+          [Console]::Out.WriteLine('ACTIONLINT_EXTERNAL_AUTODISCOVERY_DISABLED=YES')
+          [Console]::Out.WriteLine('ACTIONLINT=PASS')
+          [Console]::Out.WriteLine('REPOSITORY_STATUS_PRESERVED=YES')
 
   s8-static:
     name: S8 static and TypeScript floor
@@ -4100,7 +4474,7 @@ jobs:
           iproute2_contract_values_valid() {
             local rl="$1" iv="$2" ios="$3" ps="$4" pv="$5" pa="$6" dm="$7" fm="$8" cm="$9"
             local cc="${10}" th="${11}" acl="${12}" alias="${13}" dq="${14}" dqe="${15}" ver="${16}" vere="${17}"
-            [[ "$rl" == ubuntu-24.04 && "$iv" == 20260907.300.1 && "$ios" == ubuntu24 ]] || return 1
+            [[ "$rl" == ubuntu-24.04 && "$iv" == 20260920.314.1 && "$ios" == ubuntu24 ]] || return 1
             [[ "$ps" == 'install ok installed' && "$pv" == 6.1.0-1ubuntu6.4 && "$pa" == amd64 ]] || return 1
             [[ "$dm" == 'directory|755|0:0' && "$fm" == 'regular file|644|0:0' && "$cm" == 'directory|755|0:0' ]] || return 1
             [[ "$cc" == 0 && "$th" == 08c418b8469951cd5c59da91e4b116cd62cb125478dfac12e5f5067d4d07ad3f ]] || return 1
@@ -4111,7 +4485,7 @@ jobs:
             local phase="$1"
             local ps pv pa dm fm cm cc th acl=1 alias=0 dq=0 dqe=0 ver=0 vere=0 br ur bd ud
             local dout derr vout verr ds vs fp
-            [[ "${S8_RUNNER_LABEL:-}" == ubuntu-24.04 && "${ImageVersion:-}" == 20260907.300.1 && "${ImageOS:-}" == ubuntu24 ]] || return 1
+            [[ "${S8_RUNNER_LABEL:-}" == ubuntu-24.04 && "${ImageVersion:-}" == 20260920.314.1 && "${ImageOS:-}" == ubuntu24 ]] || return 1
             ps="$(/usr/bin/dpkg-query -W -f='${Status}' iproute2 2>/dev/null)" || return 1
             pv="$(/usr/bin/dpkg-query -W -f='${Version}' iproute2 2>/dev/null)" || return 1
             pa="$(/usr/bin/dpkg-query -W -f='${Architecture}' iproute2 2>/dev/null)" || return 1
@@ -4310,7 +4684,7 @@ jobs:
           }
 
           iproute2_positive_controls() {
-            local -a good=(ubuntu-24.04 20260907.300.1 ubuntu24 'install ok installed' 6.1.0-1ubuntu6.4 amd64 'directory|755|0:0' 'regular file|644|0:0' 'directory|755|0:0' 0 08c418b8469951cd5c59da91e4b116cd62cb125478dfac12e5f5067d4d07ad3f 1 1 1 1 1 1)
+            local -a good=(ubuntu-24.04 20260920.314.1 ubuntu24 'install ok installed' 6.1.0-1ubuntu6.4 amd64 'directory|755|0:0' 'regular file|644|0:0' 'directory|755|0:0' 0 08c418b8469951cd5c59da91e4b116cd62cb125478dfac12e5f5067d4d07ad3f 1 1 1 1 1 1)
             iproute2_contract_values_valid "${good[@]}" || return 1
             local label
             for label in WRONG_VERSION_BYTES NON_EMPTY_STDERR WRONG_CONFIG_HASH WRONG_ACL ALIAS_MISMATCH EXTRA_CONF; do
