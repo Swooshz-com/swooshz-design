@@ -5600,6 +5600,7 @@ jobs:
           import stat
           import subprocess
           import tempfile
+          import textwrap
           import sys
           from types import SimpleNamespace
           import zlib
@@ -6565,8 +6566,18 @@ jobs:
                   expected_uid=production_runner_uid, expected_gid=production_runner_gid, expected_mode="0660",
                   checkpoint="after-real-mapped-probe",
               )
-              assert_seed_admission_delta(input_seed_after_admission, input_seed_after_probe, "PRODUCTION_INPUT_POSTPROBE")
-              assert_seed_admission_delta(expected_seed_after_admission, expected_seed_after_probe, "PRODUCTION_EXPECTED_POSTPROBE")
+              if seed_evidence_signature(input_seed_after_admission) != \
+                 seed_evidence_signature(input_seed_after_probe):
+                  prove_seed_candidate_defect(
+                      "PRODUCTION_INPUT_POSTPROBE_CHANGED",
+                      "EVIDENCE",
+                  )
+              if seed_evidence_signature(expected_seed_after_admission) != \
+                 seed_evidence_signature(expected_seed_after_probe):
+                  prove_seed_candidate_defect(
+                      "PRODUCTION_EXPECTED_POSTPROBE_CHANGED",
+                      "EVIDENCE",
+                  )
               production_work_after_probe = emit_seed_acl_evidence(
                   work, "production", "post_probe", "work", include_default=True,
                   expected_access=expected_work_acl(production_runner_uid),
@@ -7098,6 +7109,449 @@ jobs:
               print("R30_BLANK_PRE_RECEIPT_PRESERVED=PASS")
               print("MAPPED_RECEIPT_FRAMING_REGRESSIONS=PASS")
 
+              if source.count(mapped_probe_block) != 1:
+                  raise SystemExit("generated post-probe call path is not unique")
+              postprobe_code = compile(
+                  textwrap.dedent(mapped_probe_block),
+                  f"{target_path}:postprobe-stability-regression",
+                  "exec",
+              )
+
+              def clone_seed_snapshot(snapshot):
+                  cloned = dict(snapshot)
+                  cloned["access"] = {
+                      key: dict(value) for key, value in snapshot["access"].items()
+                  }
+                  cloned["default"] = {
+                      key: dict(value) for key, value in snapshot["default"].items()
+                  }
+                  return cloned
+
+              admission_access = {
+                  "user::": {"raw": "rw-", "effective": "rw-"},
+                  "user:1001": {"raw": "rwx", "effective": "rw-"},
+                  "group::": {"raw": "---", "effective": "---"},
+                  "mask::": {"raw": "rw-", "effective": "rw-"},
+                  "other::": {"raw": "---", "effective": "---"},
+              }
+              admission_before = {
+                  "uid": 1001,
+                  "gid": 1001,
+                  "mode": "0660",
+                  "device": 2049,
+                  "inode": 15210918,
+                  "digest": "024ad6d5b002bebb42667a2eaff8ed474dd3894e56600bff6ff2e4e4cdf2b5b7",
+                  "access": admission_access,
+                  "default": {},
+              }
+              admission_after = clone_seed_snapshot(admission_before)
+              admission_after["access"]["user:0"] = {
+                  "raw": "r--",
+                  "effective": "r--",
+              }
+              module_globals["assert_seed_admission_delta"](
+                  admission_before,
+                  admission_after,
+                  "ADMISSION_VALID",
+                  "FIXTURE",
+              )
+
+              def expect_generated_rejection(marker_name, expected_code, operation):
+                  rejection_marker = regression_root / f"{marker_name}.marker"
+                  if rejection_marker.exists():
+                      rejection_marker.unlink()
+                  original_marker = module_globals["candidate_defect_marker_path"]
+                  module_globals["candidate_defect_marker_path"] = rejection_marker
+                  caught = None
+                  try:
+                      with contextlib.redirect_stdout(io.StringIO()):
+                          with contextlib.redirect_stderr(io.StringIO()):
+                              try:
+                                  operation()
+                              except SystemExit as error:
+                                  caught = error
+                      if caught is None or caught.code != 1:
+                          raise SystemExit(f"GENERATED_REJECTION_NOT_PROVEN_{marker_name}")
+                      if (
+                          not rejection_marker.exists()
+                          or rejection_marker.read_text(encoding="ascii") != expected_code + "\n"
+                      ):
+                          raise SystemExit(f"GENERATED_REJECTION_REASON_INVALID_{marker_name}")
+                  finally:
+                      module_globals["candidate_defect_marker_path"] = original_marker
+                      if rejection_marker.exists():
+                          rejection_marker.unlink()
+
+              preexisting_uid_zero = clone_seed_snapshot(admission_before)
+              preexisting_uid_zero["access"]["user:0"] = {
+                  "raw": "r--",
+                  "effective": "r--",
+              }
+              expect_generated_rejection(
+                  "admission-preexisting-uid-zero",
+                  "ADMISSION_PREEXISTING_UID0_ADMISSION_DELTA_INVALID",
+                  lambda: module_globals["assert_seed_admission_delta"](
+                      preexisting_uid_zero,
+                      clone_seed_snapshot(preexisting_uid_zero),
+                      "ADMISSION_PREEXISTING",
+                      "FIXTURE",
+                  ),
+              )
+              additional_acl_entry = clone_seed_snapshot(admission_after)
+              additional_acl_entry["access"]["user:1002"] = {
+                  "raw": "r--",
+                  "effective": "r--",
+              }
+              expect_generated_rejection(
+                  "admission-additional-acl-entry",
+                  "ADMISSION_ADDITIONAL_ENTRY_UID0_ADMISSION_DELTA_INVALID",
+                  lambda: module_globals["assert_seed_admission_delta"](
+                      admission_before,
+                      additional_acl_entry,
+                      "ADMISSION_ADDITIONAL_ENTRY",
+                      "FIXTURE",
+                  ),
+              )
+              changed_existing_acl_entry = clone_seed_snapshot(admission_after)
+              changed_existing_acl_entry["access"]["user:1001"] = {
+                  "raw": "r--",
+                  "effective": "r--",
+              }
+              expect_generated_rejection(
+                  "admission-existing-acl-entry-changed",
+                  "ADMISSION_EXISTING_ENTRY_EXISTING_ACL_ENTRY_CHANGED",
+                  lambda: module_globals["assert_seed_admission_delta"](
+                      admission_before,
+                      changed_existing_acl_entry,
+                      "ADMISSION_EXISTING_ENTRY",
+                      "FIXTURE",
+                  ),
+              )
+              changed_default_acl = clone_seed_snapshot(admission_after)
+              changed_default_acl["default"]["default:user::"] = {
+                  "raw": "rwx",
+                  "effective": "rwx",
+              }
+              expect_generated_rejection(
+                  "admission-default-acl-changed",
+                  "ADMISSION_DEFAULT_DEFAULT_ACL_CHANGED",
+                  lambda: module_globals["assert_seed_admission_delta"](
+                      admission_before,
+                      changed_default_acl,
+                      "ADMISSION_DEFAULT",
+                      "FIXTURE",
+                  ),
+              )
+              for field, changed_value in (
+                  ("uid", 1002),
+                  ("gid", 1002),
+                  ("mode", "0640"),
+                  ("device", 2050),
+                  ("inode", 15210920),
+                  ("digest", "f" * 64),
+              ):
+                  changed_metadata = clone_seed_snapshot(admission_after)
+                  changed_metadata[field] = changed_value
+                  label = f"ADMISSION_METADATA_{field.upper()}"
+                  expect_generated_rejection(
+                      f"admission-metadata-{field}",
+                      f"{label}_SEED_METADATA_CHANGED",
+                      lambda label=label, changed_metadata=changed_metadata:
+                          module_globals["assert_seed_admission_delta"](
+                              admission_before,
+                              changed_metadata,
+                              label,
+                              "FIXTURE",
+                          ),
+                  )
+              print("ADMISSION_DELTA_REGRESSIONS=PASS")
+
+              run062_access = {
+                  "user::": {"raw": "rw-", "effective": "rw-"},
+                  "user:0": {"raw": "r--", "effective": "r--"},
+                  "user:1001": {"raw": "rwx", "effective": "rw-"},
+                  "group::": {"raw": "---", "effective": "---"},
+                  "mask::": {"raw": "rw-", "effective": "rw-"},
+                  "other::": {"raw": "---", "effective": "---"},
+              }
+
+              def run062_seed_snapshot(object_name, inode, digest, phase):
+                  return {
+                      "context": "production",
+                      "phase": phase,
+                      "object": object_name,
+                      "path": f"/s8-ci-carrier-35860688359.1/work/{object_name}",
+                      "uid": 1001,
+                      "gid": 1001,
+                      "mode": "0660",
+                      "device": 2049,
+                      "inode": inode,
+                      "digest": digest,
+                      "access": {
+                          key: dict(value) for key, value in run062_access.items()
+                      },
+                      "default": {},
+                  }
+
+              run062_admitted = {
+                  "input.json": run062_seed_snapshot(
+                      "input.json",
+                      15210918,
+                      "024ad6d5b002bebb42667a2eaff8ed474dd3894e56600bff6ff2e4e4cdf2b5b7",
+                      "post_admission",
+                  ),
+                  "expected.json": run062_seed_snapshot(
+                      "expected.json",
+                      15210919,
+                      "2e64f809e43703aab6492ef031e147d71385e5141f973ca57a016e0e4013cc6b",
+                      "post_admission",
+                  ),
+              }
+              # Keep the captured post-probe records explicit; this is a replay, not a copy.
+              run062_after_probe = {
+                  "input.json": run062_seed_snapshot(
+                      "input.json",
+                      15210918,
+                      "024ad6d5b002bebb42667a2eaff8ed474dd3894e56600bff6ff2e4e4cdf2b5b7",
+                      "post_probe",
+                  ),
+                  "expected.json": run062_seed_snapshot(
+                      "expected.json",
+                      15210919,
+                      "2e64f809e43703aab6492ef031e147d71385e5141f973ca57a016e0e4013cc6b",
+                      "post_probe",
+                  ),
+              }
+              probe_work_snapshot = {
+                  "uid": 0,
+                  "gid": 0,
+                  "mode": "0770",
+                  "device": 2049,
+                  "inode": 15210917,
+                  "digest": None,
+                  "access": {
+                      "user::": {"raw": "rwx", "effective": "rwx"},
+                      "user:1001": {"raw": "rwx", "effective": "rwx"},
+                      "group::": {"raw": "---", "effective": "---"},
+                      "mask::": {"raw": "rwx", "effective": "rwx"},
+                      "other::": {"raw": "---", "effective": "---"},
+                  },
+                  "default": {
+                      "default:user::": {"raw": "rwx", "effective": "rwx"},
+                      "default:user:1001": {"raw": "rwx", "effective": "rwx"},
+                      "default:group::": {"raw": "---", "effective": "---"},
+                      "default:mask::": {"raw": "rwx", "effective": "rwx"},
+                      "default:other::": {"raw": "---", "effective": "---"},
+                  },
+              }
+
+              def invoke_postprobe_callsite(
+                  label,
+                  admitted_snapshots,
+                  postprobe_snapshots,
+                  expected_defect=None,
+              ):
+                  postprobe_marker = regression_root / f"postprobe-{label}.marker"
+                  if postprobe_marker.exists():
+                      postprobe_marker.unlink()
+                  original_marker = module_globals["candidate_defect_marker_path"]
+                  module_globals["candidate_defect_marker_path"] = postprobe_marker
+                  emitted = []
+                  mapped_probe_arguments = []
+                  captured_stdout = io.StringIO()
+                  captured_stderr = io.StringIO()
+                  expected_seed_paths = {
+                      "input.json": work / "input.json",
+                      "expected.json": work / "expected.json",
+                  }
+
+                  def fake_mapped_seed_probe(*args):
+                      if len(args) != 6:
+                          raise SystemExit("POSTPROBE_MAPPED_PROBE_ARGUMENTS_INVALID")
+                      snapshots = args[5]
+                      if set(snapshots) != {"input.json", "expected.json"}:
+                          raise SystemExit("POSTPROBE_MAPPED_PROBE_SEED_SET_INVALID")
+                      for seed_name, snapshot in admitted_snapshots.items():
+                          if (
+                              module_globals["seed_evidence_signature"](snapshots[seed_name])
+                              != module_globals["seed_evidence_signature"](snapshot)
+                          ):
+                              raise SystemExit("POSTPROBE_MAPPED_PROBE_ADMISSION_SNAPSHOT_CHANGED")
+                      mapped_probe_arguments.append(snapshots)
+                      return {"input.json": True, "expected.json": True}
+
+                  def fake_emit_seed_acl_evidence(
+                      path,
+                      context,
+                      phase,
+                      object_name,
+                      **kwargs,
+                  ):
+                      if context != "production" or phase != "post_probe":
+                          raise SystemExit("POSTPROBE_EVIDENCE_CONTEXT_INVALID")
+                      emitted.append(object_name)
+                      if object_name in expected_seed_paths:
+                          if Path(path) != expected_seed_paths[object_name]:
+                              raise SystemExit("POSTPROBE_SEED_PATH_INVALID")
+                          if (
+                              kwargs.get("expected_access")
+                              != module_globals["expected_seed_acl"](1001, uid_zero=True)
+                              or kwargs.get("include_default") is not True
+                              or kwargs.get("expected_default") != {}
+                              or kwargs.get("expected_uid") != 1001
+                              or kwargs.get("expected_gid") != 1001
+                              or kwargs.get("expected_mode") != "0660"
+                          ):
+                              raise SystemExit("POSTPROBE_SEED_EXPECTATIONS_INVALID")
+                          return clone_seed_snapshot(postprobe_snapshots[object_name])
+                      if object_name == "work":
+                          if (
+                              Path(path) != work
+                              or kwargs.get("expected_access")
+                              != module_globals["expected_work_acl"](1001)
+                              or kwargs.get("include_default") is not True
+                              or kwargs.get("expected_default")
+                              != module_globals["expected_work_acl"](1001, default=True)
+                              or kwargs.get("expected_uid") != 0
+                              or kwargs.get("expected_gid") != 0
+                              or kwargs.get("expected_mode") != "0770"
+                          ):
+                              raise SystemExit("POSTPROBE_WORK_EXPECTATIONS_INVALID")
+                          return clone_seed_snapshot(probe_work_snapshot)
+                      raise SystemExit("POSTPROBE_EVIDENCE_OBJECT_INVALID")
+
+                  call_globals = dict(module_globals)
+                  call_globals.update(
+                      {
+                          "sandbox": sandbox,
+                          "runner": runner,
+                          "work": work,
+                          "runtime_root": runtime_root,
+                          "writer_root": writer_root,
+                          "payload_path": expected_seed_paths["input.json"],
+                          "expected_path": expected_seed_paths["expected.json"],
+                          "production_runner_uid": 1001,
+                          "production_runner_gid": 1001,
+                          "production_work_configured": clone_seed_snapshot(
+                              probe_work_snapshot
+                          ),
+                          "input_seed_after_admission": clone_seed_snapshot(
+                              admitted_snapshots["input.json"]
+                          ),
+                          "expected_seed_after_admission": clone_seed_snapshot(
+                              admitted_snapshots["expected.json"]
+                          ),
+                          "run_mapped_seed_probe": fake_mapped_seed_probe,
+                          "emit_seed_acl_evidence": fake_emit_seed_acl_evidence,
+                      }
+                  )
+                  failure = None
+                  try:
+                      with contextlib.redirect_stdout(captured_stdout):
+                          with contextlib.redirect_stderr(captured_stderr):
+                              try:
+                                  exec(postprobe_code, call_globals)
+                              except SystemExit as error:
+                                  failure = error
+                      if len(mapped_probe_arguments) != 1:
+                          raise SystemExit(f"POSTPROBE_MAPPED_PROBE_NOT_EXERCISED_{label}")
+                      if emitted[:2] != ["input.json", "expected.json"]:
+                          raise SystemExit(f"POSTPROBE_SEED_PATHS_NOT_EXERCISED_{label}")
+                      if expected_defect is None:
+                          if failure is not None or postprobe_marker.exists():
+                              raise SystemExit(f"POSTPROBE_IDENTICAL_SNAPSHOT_REJECTED_{label}")
+                          if emitted != ["input.json", "expected.json", "work"]:
+                              raise SystemExit(f"POSTPROBE_SUCCESS_CALL_ORDER_INVALID_{label}")
+                          if "PRODUCTION_SEED_IDENTITY_CONTENT_STABLE=PASS" not in captured_stdout.getvalue():
+                              raise SystemExit(f"POSTPROBE_SUCCESS_EVIDENCE_MISSING_{label}")
+                      else:
+                          if failure is None or failure.code != 1:
+                              raise SystemExit(f"POSTPROBE_CHANGED_SNAPSHOT_ACCEPTED_{label}")
+                          if postprobe_marker.read_text(encoding="ascii") != expected_defect + "\n":
+                              raise SystemExit(f"POSTPROBE_CHANGED_SNAPSHOT_REASON_INVALID_{label}")
+                  finally:
+                      module_globals["candidate_defect_marker_path"] = original_marker
+                      if postprobe_marker.exists():
+                          postprobe_marker.unlink()
+
+              invoke_postprobe_callsite(
+                  "run062-captured-stability",
+                  run062_admitted,
+                  run062_after_probe,
+              )
+              print("RUN062_CAPTURED_STABILITY_REPLAY=PASS")
+              print("IDENTICAL_POST_ADMISSION_POSTPROBE_SNAPSHOT=PASS")
+
+              def reject_changed_postprobe_snapshot(seed_name, case_name, mutation):
+                  admitted = {
+                      name: clone_seed_snapshot(snapshot)
+                      for name, snapshot in run062_admitted.items()
+                  }
+                  after_probe = {
+                      name: clone_seed_snapshot(snapshot)
+                      for name, snapshot in run062_after_probe.items()
+                  }
+                  mutation(after_probe[seed_name])
+                  defect = (
+                      "PRODUCTION_INPUT_POSTPROBE_CHANGED"
+                      if seed_name == "input.json"
+                      else "PRODUCTION_EXPECTED_POSTPROBE_CHANGED"
+                  )
+                  invoke_postprobe_callsite(
+                      f"{seed_name}-{case_name}",
+                      admitted,
+                      after_probe,
+                      defect,
+                  )
+
+              def rename_other_acl_key(snapshot):
+                  snapshot["access"]["user:1002"] = snapshot["access"].pop("user:1001")
+
+              postprobe_mutations = [
+                  ("uid-zero-removed", lambda snapshot: snapshot["access"].pop("user:0")),
+                  (
+                      "uid-zero-raw-permission",
+                      lambda snapshot: snapshot["access"]["user:0"].__setitem__("raw", "rwx"),
+                  ),
+                  (
+                      "uid-zero-effective-permission",
+                      lambda snapshot: snapshot["access"]["user:0"].__setitem__("effective", "---"),
+                  ),
+                  (
+                      "other-acl-entry-changed",
+                      lambda snapshot: snapshot["access"]["user:1001"].__setitem__("effective", "r--"),
+                  ),
+                  ("other-acl-key-changed", rename_other_acl_key),
+                  (
+                      "default-acl-changed",
+                      lambda snapshot: snapshot["default"].__setitem__(
+                          "default:user::",
+                          {"raw": "rwx", "effective": "rwx"},
+                      ),
+                  ),
+              ]
+              for field, changed_value in (
+                  ("uid", 1002),
+                  ("gid", 1002),
+                  ("mode", "0640"),
+                  ("device", 2050),
+                  ("inode", 15210920),
+                  ("digest", "f" * 64),
+              ):
+                  postprobe_mutations.append(
+                      (
+                          f"{field}-changed",
+                          lambda snapshot, field=field, changed_value=changed_value:
+                              snapshot.__setitem__(field, changed_value),
+                      )
+                  )
+              for seed_name in ("input.json", "expected.json"):
+                  for case_name, mutation in postprobe_mutations:
+                      reject_changed_postprobe_snapshot(seed_name, case_name, mutation)
+              print("INPUT_POSTPROBE_STABILITY_REGRESSIONS=PASS")
+              print("EXPECTED_POSTPROBE_STABILITY_REGRESSIONS=PASS")
+              print("POSTPROBE_STABILITY_REGRESSIONS=PASS")
+
               parser = module_globals["parse_numeric_acl_evidence"]
               run058_path = "/tmp/s8-marker-binding-regression-_n6x3jrc/seed-acl/work"
               parser_path = Path(run058_path)
@@ -7435,7 +7889,38 @@ jobs:
                   module_globals["parse_numeric_acl_evidence"] = original_parser
                   module_globals["candidate_defect_marker_path"] = original_candidate_marker
               print("PARSER_R14_RUN058_CONFIGURED_SNAPSHOT_REPLAY=PASS")
+              parser_workflow_path = (
+                  Path(os.environ["GITHUB_WORKSPACE"])
+                  / ".github"
+                  / "workflows"
+                  / "s8-fbx.yml"
+              )
+              parser_workflow_lines = parser_workflow_path.read_text(
+                  encoding="utf-8"
+              ).splitlines()
+              parser_success_marker = 'print("PARSER_R1_R14=PASS")'
+              normalization_success_marker = (
+                  'print("DEFAULT_ACL_SCOPE_NORMALISATION=PASS")'
+              )
+              parser_success_lines = [
+                  index
+                  for index, line in enumerate(parser_workflow_lines)
+                  if line.strip() == parser_success_marker
+              ]
+              normalization_success_lines = [
+                  index
+                  for index, line in enumerate(parser_workflow_lines)
+                  if line.strip() == normalization_success_marker
+              ]
+              if (
+                  len(parser_success_lines) != 1
+                  or len(normalization_success_lines) != 1
+                  or normalization_success_lines[0] != parser_success_lines[0] + 1
+              ):
+                  raise SystemExit("DEFAULT_ACL_SCOPE_NORMALISATION_MARKER_NOT_BOUND")
+              print("DEFAULT_ACL_SCOPE_NORMALISATION_MARKER_BINDING=PASS")
               print("PARSER_R1_R14=PASS")
+              print("DEFAULT_ACL_SCOPE_NORMALISATION=PASS")
 
               runner_uid = os.getuid()
               runner_euid = os.geteuid()
