@@ -5757,9 +5757,9 @@ jobs:
                           raise ValueError("ACL_ANNOTATION_GRAMMAR")
                       annotation = annotation_match.group(1)
                   if scope == "default":
-                      if not entry.startswith("default:"):
-                          raise ValueError("ACL_ACCESS_ENTRY_IN_DEFAULT_QUERY")
-                      body = entry[len("default:"):]
+                      if entry.startswith("default:"):
+                          raise ValueError("ACL_DEFAULT_PREFIX_IN_DEFAULT_QUERY")
+                      body = entry
                   else:
                       if entry.startswith("default:"):
                           raise ValueError("ACL_DEFAULT_ENTRY_IN_ACCESS_QUERY")
@@ -6632,6 +6632,345 @@ jobs:
               sandbox.write_text("sandbox\n", encoding="ascii")
               module_globals = {"__name__": "s8_generated_marker_regression"}
               exec(compile(source, str(target_path), "exec"), module_globals)
+              parser = module_globals["parse_numeric_acl_evidence"]
+              run058_path = "/tmp/s8-marker-binding-regression-_n6x3jrc/seed-acl/work"
+              parser_path = Path(run058_path)
+              parser_observed = SimpleNamespace(st_uid=0, st_gid=0)
+
+              def acl_document(entries, *, path=parser_path, owner=0, group=0, extra_headers=""):
+                  return (
+                      f"# file: {os.path.abspath(os.fspath(path))}\n# owner: {owner}\n# group: {group}\n"
+                      f"{extra_headers}\n{entries}\n"
+                  )
+
+              def require_parser(condition, label):
+                  if not condition:
+                      raise SystemExit(f"ACL_PARSER_REGRESSION_FAILED_{label}")
+
+              def expect_parser_reject(label, text, scope, error=None):
+                  try:
+                      parser(text, parser_path, parser_observed, scope)
+                  except ValueError as caught:
+                      if error is not None and str(caught) != error:
+                          raise SystemExit(f"ACL_PARSER_WRONG_REJECTION_{label}_{caught}")
+                  else:
+                      raise SystemExit(f"ACL_PARSER_ACCEPTED_INVALID_{label}")
+
+              def raw_entries(parsed):
+                  return {key: value["raw"] for key, value in parsed.items()}
+
+              run058_access_snapshot = (
+                  f"# file: {os.path.abspath(run058_path)}\n"
+                  "# owner: 0\n"
+                  "# group: 0\n\n"
+                  "user::rwx\n"
+                  "user:1001:rwx\t#effective:rwx\n"
+                  "group::---\t#effective:---\n"
+                  "mask::rwx\n"
+                  "other::---\n"
+              )
+              run058_default_snapshot = (
+                  f"# file: {os.path.abspath(run058_path)}\n"
+                  "# owner: 0\n"
+                  "# group: 0\n\n"
+                  "user::rwx\n"
+                  "user:1001:rwx\t#effective:rwx\n"
+                  "group::---\t#effective:---\n"
+                  "mask::rwx\n"
+                  "other::---\n"
+              )
+              run058_expected_access = {
+                  "user::": "rwx", "user:1001": "rwx", "group::": "---",
+                  "mask::": "rwx", "other::": "---",
+              }
+              run058_expected_default = {
+                  "default:user::": "rwx", "default:user:1001": "rwx",
+                  "default:group::": "---", "default:mask::": "rwx",
+                  "default:other::": "---",
+              }
+              captured_access = parser(
+                  run058_access_snapshot, parser_path, parser_observed, "access"
+              )
+              captured_default = parser(
+                  run058_default_snapshot, parser_path, parser_observed, "default"
+              )
+              require_parser(
+                  raw_entries(captured_default) == run058_expected_default
+                  and all(key.startswith("default:") for key in captured_default),
+                  "R1_DEFAULT_NORMALISATION",
+              )
+              require_parser(
+                  raw_entries(captured_access) == run058_expected_access
+                  and all(not key.startswith("default:") for key in captured_access),
+                  "R2_ACCESS_CANONICAL_KEYS",
+              )
+              print("PARSER_R1_DEFAULT_SCOPE_NORMALISATION=PASS")
+              print("PARSER_R2_ACCESS_SCOPE_CANONICAL_KEYS=PASS")
+
+              masked_default = parser(
+                  acl_document(
+                      "user::rwx\nuser:1001:rwx\t#effective:rw-\n"
+                      "group::r-x  #effective:r--\n"
+                      "group:2002:r-x  #effective:r--\nmask::rw-\nother::---"
+                  ),
+                  parser_path, parser_observed, "default",
+              )
+              require_parser(
+                  masked_default["default:user:1001"]["effective"] == "rw-"
+                  and masked_default["default:group:2002"]["effective"] == "r--"
+                  and masked_default["default:group::"]["effective"] == "r--",
+                  "R3_MASK_DERIVED_EFFECTIVE_PERMISSIONS",
+              )
+              tab_annotation = parser(
+                  acl_document(
+                      "user::rwx\nuser:1001:rwx\t#effective:rwx\n"
+                      "group::---\nmask::rwx\nother::---"
+                  ),
+                  parser_path, parser_observed, "default",
+              )
+              space_annotation = parser(
+                  acl_document(
+                      "user::rwx\nuser:1001:rwx  #effective:rwx\n"
+                      "group::---\nmask::rwx\nother::---"
+                  ),
+                  parser_path, parser_observed, "default",
+              )
+              require_parser(
+                  tab_annotation["default:user:1001"]["effective"] == "rwx"
+                  and space_annotation["default:user:1001"]["effective"] == "rwx",
+                  "R4_R5_EFFECTIVE_ANNOTATIONS",
+              )
+              print("PARSER_R3_MASK_EFFECTIVE_PERMISSIONS=PASS")
+              print("PARSER_R4_TAB_EFFECTIVE_ANNOTATION=PASS")
+              print("PARSER_R5_SPACE_EFFECTIVE_ANNOTATION=PASS")
+
+              expect_parser_reject(
+                  "R6_DUPLICATE_ENTRY",
+                  acl_document("user::rwx\nuser::rwx\ngroup::---\nother::---"),
+                  "access", "ACL_ENTRY_DUPLICATE",
+              )
+              expect_parser_reject(
+                  "R7_INVALID_RAW_PERMISSION",
+                  acl_document("user::rwx+\ngroup::---\nother::---"),
+                  "access", "ACL_PERMISSION_GRAMMAR",
+              )
+              expect_parser_reject(
+                  "R7_MALFORMED_ANNOTATION_PERMISSION",
+                  acl_document("user::rwx\nuser:1001:rwx #effective:rw+\nmask::rwx\nother::---"),
+                  "access", "ACL_ANNOTATION_GRAMMAR",
+              )
+              expect_parser_reject(
+                  "R7_EFFECTIVE_ANNOTATION_MISMATCH",
+                  acl_document(
+                      "user::rwx\nuser:1001:rwx #effective:rwx\n"
+                      "group::---\nmask::rw-\nother::---"
+                  ),
+                  "access", "ACL_EFFECTIVE_ANNOTATION_MISMATCH",
+              )
+              print("PARSER_R6_R7_MALFORMED_ENTRIES_REJECTED=PASS")
+
+              for invalid_kind in ("user", "group"):
+                  for invalid_id in ("abc", "-1", "+1", "01001"):
+                      expect_parser_reject(
+                          f"R8_NAMED_{invalid_kind.upper()}_ID_{invalid_id}",
+                          acl_document(
+                              f"user::rwx\n{invalid_kind}:{invalid_id}:rwx\n"
+                              "group::---\nmask::rwx\nother::---"
+                          ),
+                          "access", "ACL_NUMERIC_QUALIFIER_INVALID",
+                      )
+              numeric_ids = parser(
+                  acl_document(
+                      "user::rwx\nuser:1001:rwx\ngroup::---\n"
+                      "group:2002:rwx\nmask::rwx\nother::---"
+                  ),
+                  parser_path, parser_observed, "access",
+              )
+              require_parser(
+                  "user:1001" in numeric_ids and "group:2002" in numeric_ids,
+                  "R8_VALID_NUMERIC_IDS",
+              )
+              for named_entry in ("user:1001:rwx", "group:2002:rwx"):
+                  expect_parser_reject(
+                      "R9_NAMED_ENTRY_WITHOUT_MASK",
+                      acl_document(
+                          f"user::rwx\ngroup::---\n{named_entry}\nother::---"
+                      ),
+                      "access", "ACL_MASK_MISSING",
+                  )
+              print("PARSER_R8_R9_NUMERIC_IDS_AND_REQUIRED_MASKS=PASS")
+
+              baseline_entries = "user::rwx\ngroup::---\nother::---"
+              header_cases = (
+                  ("WRONG_PATH", acl_document(baseline_entries, path="/tmp/wrong-acl-path"), "ACL_HEADER_PATH_MISMATCH"),
+                  ("WRONG_OWNER", acl_document(baseline_entries, owner=1), "ACL_HEADER_IDENTITY_MISMATCH"),
+                  ("WRONG_GROUP", acl_document(baseline_entries, group=1), "ACL_HEADER_IDENTITY_MISMATCH"),
+                  ("NONNUMERIC_OWNER", acl_document(baseline_entries, owner="alice"), "ACL_HEADER_OWNER_INVALID"),
+                  ("NONCANONICAL_GROUP", acl_document(baseline_entries, group="00"), "ACL_HEADER_GROUP_INVALID"),
+                  ("MALFORMED", f"# file {parser_path}\n# owner: 0\n# group: 0\n\n{baseline_entries}\n", "ACL_HEADER_GRAMMAR"),
+                  ("MISSING", f"# file: {parser_path}\n# owner: 0\n\n{baseline_entries}\n", "ACL_HEADERS_INCOMPLETE"),
+                  ("DUPLICATE", acl_document(baseline_entries, extra_headers="# group: 0"), "ACL_HEADER_DUPLICATE"),
+                  ("UNKNOWN", acl_document(baseline_entries, extra_headers="# creator: unknown"), "ACL_HEADER_GRAMMAR"),
+              )
+              for label, text, error in header_cases:
+                  expect_parser_reject(f"R10_{label}_HEADER", text, "access", error)
+              expect_parser_reject(
+                  "R11_DEFAULT_TEXT_IN_ACCESS",
+                  acl_document("default:user::rwx\nuser::rwx\ngroup::---\nother::---"),
+                  "access", "ACL_DEFAULT_ENTRY_IN_ACCESS_QUERY",
+              )
+              expect_parser_reject(
+                  "INVALID_SCOPE", acl_document(baseline_entries), "combined", "ACL_SCOPE_INVALID"
+              )
+              expect_parser_reject(
+                  "UNKNOWN_ENTRY_KIND",
+                  acl_document("acl::rwx\ngroup::---\nother::---"),
+                  "access", "ACL_KIND_INVALID",
+              )
+              for reserved in ("mask:1:rwx", "other:1:---"):
+                  expect_parser_reject(
+                      "RESERVED_QUALIFIER",
+                      acl_document(f"user::rwx\n{reserved}\nmask::rwx\nother::---"),
+                      "access", "ACL_RESERVED_QUALIFIER_INVALID",
+                  )
+              for malformed in ("user:rwx", "user:1001:rwx:extra"):
+                  expect_parser_reject(
+                      "WRONG_FIELD_COUNT",
+                      acl_document(f"{malformed}\ngroup::---\nother::---"),
+                      "access", "ACL_ENTRY_GRAMMAR",
+                  )
+              print("PARSER_R10_R11_AND_EXISTING_GUARDS=PASS")
+
+              expect_parser_reject(
+                  "R12_FULLY_PREFIXED_DEFAULT",
+                  acl_document("default:user::rwx\ndefault:group::---\ndefault:other::---"),
+                  "default", "ACL_DEFAULT_PREFIX_IN_DEFAULT_QUERY",
+              )
+              expect_parser_reject(
+                  "R12_MIXED_PREFIXED_DEFAULT",
+                  acl_document("user::rwx\ndefault:group::---\nother::---"),
+                  "default", "ACL_DEFAULT_PREFIX_IN_DEFAULT_QUERY",
+              )
+              require_parser(
+                  parser(acl_document(""), parser_path, parser_observed, "default") == {},
+                  "R13_EMPTY_DEFAULT_SCOPE",
+              )
+              expect_parser_reject(
+                  "R13_HEADERLESS_EMPTY", "", "default", "ACL_HEADERS_INCOMPLETE"
+              )
+              print("PARSER_R12_R13_PREFIX_AND_EMPTY_SCOPE=PASS")
+              print("RUN058_CAPTURED_FIXTURE_REPLAY=PASS")
+
+              binding_path = regression_root / "input.json"
+              binding_path.write_text("seed input\n", encoding="ascii")
+              os.chmod(binding_path, 0o660)
+              binding_stat = os.lstat(binding_path)
+              binding_access = {
+                  "user::": "rw-", "user:1001": "rwx", "group::": "---",
+                  "mask::": "rw-", "other::": "---",
+              }
+              binding_default = run058_expected_default
+
+              def binding_document(entries):
+                  return acl_document(
+                      entries, path=binding_path,
+                      owner=binding_stat.st_uid, group=binding_stat.st_gid,
+                  )
+
+              scoped_outputs = {
+                  "access": binding_document(
+                      "user::rw-\nuser:1001:rwx\t#effective:rw-\n"
+                      "group::---\nmask::rw-\nother::---"
+                  ),
+                  "default": binding_document(
+                      "user::rwx\nuser:1001:rwx\t#effective:rwx\n"
+                      "group::---\t#effective:---\nmask::rwx\nother::---"
+                  ),
+              }
+              calls = []
+              parser_scopes = []
+              original_run = module_globals["subprocess"].run
+              original_parser = module_globals["parse_numeric_acl_evidence"]
+              original_candidate_marker = module_globals["candidate_defect_marker_path"]
+
+              def recording_parser(output, path, observed, scope):
+                  parser_scopes.append(scope)
+                  return original_parser(output, path, observed, scope)
+
+              def scoped_getfacl(command, **kwargs):
+                  calls.append(list(command))
+                  scope = "access" if "--access" in command else "default" if "--default" in command else None
+                  if scope is None:
+                      raise SystemExit("ACL_CALLER_SCOPE_OPTION_MISSING")
+                  return SimpleNamespace(returncode=0, stdout=scoped_outputs[scope].encode("ascii"), stderr=b"")
+
+              module_globals["parse_numeric_acl_evidence"] = recording_parser
+              module_globals["subprocess"].run = scoped_getfacl
+              try:
+                  caller_snapshot = module_globals["emit_seed_acl_evidence"](
+                      binding_path, "fixture", "configured", "input.json",
+                      include_default=True,
+                      expected_access=binding_access,
+                      expected_default=binding_default,
+                      expected_uid=binding_stat.st_uid,
+                      expected_gid=binding_stat.st_gid,
+                      expected_mode=f"{stat.S_IMODE(binding_stat.st_mode):04o}",
+                  )
+                  require_parser(
+                      len(calls) == 2
+                      and "--access" in calls[0] and "--default" not in calls[0]
+                      and "--default" in calls[1] and "--access" not in calls[1]
+                      and parser_scopes == ["access", "default"]
+                      and set(caller_snapshot["default"]) == set(binding_default),
+                      "R11_CALLER_COMMAND_SCOPE_BINDING",
+                  )
+                  print("PARSER_R11_CALLER_COMMAND_SCOPE_BINDING=PASS")
+
+                  mismatch_marker = regression_root / "acl-caller-mismatch.marker"
+                  module_globals["candidate_defect_marker_path"] = mismatch_marker
+
+                  def expect_caller_map_mismatch(label, entries, expected):
+                      scoped_outputs["access"] = binding_document(entries)
+                      captured = io.StringIO()
+                      try:
+                          with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(captured):
+                              module_globals["emit_seed_acl_evidence"](
+                                  binding_path, "fixture", "configured", "input.json",
+                                  expected_access=expected,
+                                  expected_uid=binding_stat.st_uid,
+                                  expected_gid=binding_stat.st_gid,
+                                  expected_mode=f"{stat.S_IMODE(binding_stat.st_mode):04o}",
+                              )
+                      except SystemExit as error:
+                          if error.code != 1:
+                              raise SystemExit(f"CALLER_EXPECTED_MAP_WRONG_EXIT_{label}")
+                      else:
+                          raise SystemExit(f"CALLER_EXPECTED_MAP_MISMATCH_ACCEPTED_{label}")
+                      if (
+                          "SEED_ACL_EVIDENCE_ENTRIES_MISMATCH" not in captured.getvalue()
+                          or mismatch_marker.read_text(encoding="ascii") != "SEED_ACL_EVIDENCE_ENTRIES_MISMATCH\n"
+                      ):
+                          raise SystemExit(f"CALLER_EXPECTED_MAP_WRONG_FAILURE_{label}")
+                      mismatch_marker.unlink()
+
+                  expect_caller_map_mismatch(
+                      "UNEXPECTED_ENTRY",
+                      "user::rw-\ngroup::---\nmask::rw-\nother::---",
+                      {key: value for key, value in binding_access.items() if key != "other::"},
+                  )
+                  expect_caller_map_mismatch(
+                      "MISSING_ENTRY",
+                      "user::rw-\ngroup::---\nmask::rw-",
+                      binding_access,
+                  )
+                  print("CALLER_EXPECTED_MAP_EXACTNESS_REGRESSION=PASS")
+              finally:
+                  module_globals["subprocess"].run = original_run
+                  module_globals["parse_numeric_acl_evidence"] = original_parser
+                  module_globals["candidate_defect_marker_path"] = original_candidate_marker
+              print("PARSER_R14_RUN058_CONFIGURED_SNAPSHOT_REPLAY=PASS")
+              print("PARSER_R1_R14=PASS")
+
               runner_uid = os.getuid()
               runner_euid = os.geteuid()
               runner_gid = os.getgid()
