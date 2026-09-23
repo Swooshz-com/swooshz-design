@@ -283,6 +283,7 @@ jobs:
           temp_root=""
           provision_root=""
           candidate_marker_file=""
+          candidate_defect_marker_file=""
           tmpfs_bytes=1073741824
           iproute2_admission_baseline=""
 
@@ -1721,12 +1722,23 @@ jobs:
             local status=$?
             local cleanup_failed=0
             local signal_status
+            local candidate_defect_proven=0
+            local candidate_defect_reason=""
             if (( cleanup_running == 1 )); then
               exit "$status"
             fi
             cleanup_running=1
             trap - EXIT
             trap - HUP INT TERM
+            if [[ -n "$candidate_defect_marker_file" && ( -e "$candidate_defect_marker_file" || -L "$candidate_defect_marker_file" ) ]]; then
+              if [[ -f "$candidate_defect_marker_file" && ! -L "$candidate_defect_marker_file" ]]; then
+                IFS= read -r candidate_defect_reason < "$candidate_defect_marker_file" || candidate_defect_reason=""
+              fi
+              if [[ ! "$candidate_defect_reason" =~ ^[A-Z0-9_]{1,96}$ ]]; then
+                candidate_defect_reason=SEED_CANDIDATE_DEFECT_MARKER_INVALID
+              fi
+              candidate_defect_proven=1
+            fi
             if ! reap_tracked_children; then
               printf 'CHILDREN_REAPED=NO\n' >&2
               cleanup_failed=1
@@ -1784,8 +1796,14 @@ jobs:
             if (( cleanup_failed == 1 )); then
               status=1
               if (( failure_reported == 0 )); then
-                printf 'AMENDMENT_RESULT=NOT_GREEN\nCANDIDATE_FAILURE_PROVEN=NO\nNON_CONVERGENCE_DECISION_REQUIRED=NO\nRETURN_TO_WEB=YES\n' >&2
+                if (( candidate_defect_proven == 1 )); then
+                  printf 'AMENDMENT_RESULT=NOT_GREEN\nCANDIDATE_FAILURE_PROVEN=YES\nFAILURE_CLASS=CANDIDATE_DEFECT__SEED_ACL_BOUNDARY\nCANDIDATE_DEFECT=%s\nNON_CONVERGENCE_DECISION_REQUIRED=NO\nRETURN_TO_WEB=YES\n' "$candidate_defect_reason" >&2
+                else
+                  printf 'AMENDMENT_RESULT=NOT_GREEN\nCANDIDATE_FAILURE_PROVEN=NO\nNON_CONVERGENCE_DECISION_REQUIRED=NO\nRETURN_TO_WEB=YES\n' >&2
+                fi
               fi
+            elif (( status != 0 && candidate_defect_proven == 1 )); then
+              printf 'CANDIDATE_FAILURE_PROVEN=YES\nFAILURE_CLASS=CANDIDATE_DEFECT__SEED_ACL_BOUNDARY\nCANDIDATE_DEFECT=%s\nRETURN_TO_WEB=YES\n' "$candidate_defect_reason" >&2
             elif (( status != 0 && failure_reported == 0 && candidate_started == 0 )); then
               printf 'CANDIDATE_FAILURE_PROVEN=NO\nFAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD\n' >&2
             elif (( status != 0 && failure_reported == 0 && candidate_started == 1 )); then
@@ -4877,6 +4895,8 @@ jobs:
           printf 'ACTUAL_STAGED_PATH_ADMISSION=PASS\nSTAGED_CAPABILITY_PROBE=PASS\n'
 
           candidate_marker_file="$temp_root/candidate-started"
+          candidate_defect_marker_file="$temp_root/candidate-defect-proven"
+          [[ ! -e "$candidate_defect_marker_file" && ! -L "$candidate_defect_marker_file" ]] || fail_hold "CANDIDATE_DEFECT_MARKER_NOT_FRESH"
           launcher="$temp_root/s8-bwrap-launcher"
           {
             printf '%s\n' '#!/usr/bin/bash'
@@ -5191,9 +5211,12 @@ jobs:
           printf 'CANDIDATE_INPUT_SIZE_REJECTION=PASS\nCANDIDATE_INPUT_REGRESSION=PASS\n'
 
           qualified_helper="$temp_root/s8-runtime-sensitivity-hosted.py"
-          /usr/bin/python3 - "$GITHUB_WORKSPACE/scripts/s8/s8_runtime_sensitivity.py" "$qualified_helper" "$candidate_marker_file" <<'PY'
+          seed_generator_stderr="$temp_root/s8-seed-generator.stderr"
+          set +e
+          /usr/bin/python3 - "$GITHUB_WORKSPACE/scripts/s8/s8_runtime_sensitivity.py" "$qualified_helper" "$candidate_marker_file" "$candidate_defect_marker_file" 2>"$seed_generator_stderr" <<'PY'
           import builtins
           import contextlib
+          import errno
           import io
           from pathlib import Path
           import json
@@ -5207,6 +5230,7 @@ jobs:
           source_path = Path(sys.argv[1])
           target_path = Path(sys.argv[2])
           marker_path = Path(sys.argv[3])
+          candidate_defect_marker_path = Path(sys.argv[4])
           source = source_path.read_text(encoding="utf-8")
           admission_anchor = "    try:\n        result = subprocess.run(\n"
           if source.count(admission_anchor) != 1:
@@ -5239,98 +5263,784 @@ jobs:
               raise SystemExit("seed admission import anchor is not unique")
           source = source.replace(
               source_import_anchor,
-              "import hashlib\nimport json\nimport os\nimport stat\n",
+              "import contextlib\nimport hashlib\nimport io\nimport json\nimport os\nimport re\nimport stat\n",
               1,
           )
-          seed_admission_block = "\n".join([
-              'def read_numeric_acl(path: pathlib.Path) -> list[str]:',
-              '    try:',
-              '        result = subprocess.run(',
-              '            ["/usr/bin/getfacl", "--numeric", "--omit-header", "--absolute-names", "--", str(path)],',
-              '            stdout=subprocess.PIPE,',
-              '            stderr=subprocess.PIPE,',
-              '            timeout=30,',
-              '            check=False,',
-              '        )',
-              '    except (OSError, subprocess.TimeoutExpired):',
-              '        fail("SEED_ACL_READ_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")',
-              '    if result.returncode != 0:',
-              '        fail("SEED_ACL_READ_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")',
-              '    try:',
-              '        return [',
-              '            line',
-              '            for line in result.stdout.decode("ascii").splitlines()',
-              '            if line and not line.startswith("#")',
-              '        ]',
-              '    except UnicodeDecodeError:',
-              '        fail("SEED_ACL_FORMAT_INVALID", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")',
-              '',
-              '',
-              'def validate_seed_acl(',
-              '    work: pathlib.Path,',
-              '    seed: pathlib.Path,',
-              '    expected_name: str,',
-              '    require_uid_zero: bool,',
-              '    expected_identity: tuple[int, int] | None = None,',
-              ') -> tuple[int, int]:',
-              '    if expected_name not in {"input.json", "expected.json"}:',
-              '        fail("SEED_EXPECTED_NAME_INVALID")',
-              '    if work.name != "work" or work.is_symlink() or not work.is_dir():',
-              '        fail("SEED_PARENT_INVALID")',
-              '    expected_path = work / expected_name',
-              '    if seed != expected_path or seed.parent != work:',
-              '        fail("SEED_PATH_INVALID")',
-              '    if seed.is_symlink():',
-              '        fail("SEED_SYMLINK_REJECTED")',
-              '    try:',
-              '        seed_stat = seed.lstat()',
-              '    except OSError:',
-              '        fail("SEED_STAT_FAILED")',
-              '    if not stat.S_ISREG(seed_stat.st_mode):',
-              '        fail("SEED_NOT_REGULAR")',
-              '    if seed_stat.st_uid != os.getuid():',
-              '        fail("SEED_OWNER_INVALID")',
-              '    identity = (seed_stat.st_dev, seed_stat.st_ino)',
-              '    if expected_identity is not None and identity != expected_identity:',
-              '        fail("SEED_IDENTITY_CHANGED")',
-              '    acl_entries = read_numeric_acl(seed)',
-              '    group_entries = [entry for entry in acl_entries if entry.startswith("group::")]',
-              '    other_entries = [entry for entry in acl_entries if entry.startswith("other::")]',
-              '    if len(group_entries) != 1 or group_entries[0].split(" #effective:", 1)[0] != "group::---":',
-              '        fail("SEED_GROUP_ACCESS_INVALID")',
-              '    if len(other_entries) != 1 or other_entries[0].split(" #effective:", 1)[0] != "other::---":',
-              '        fail("SEED_OTHER_ACCESS_INVALID")',
-              '    if require_uid_zero:',
-              '        uid_zero_entries = [entry for entry in acl_entries if entry.startswith("user:0:")]',
-              '        if len(uid_zero_entries) != 1:',
-              '            fail("SEED_UID0_READ_ACL_MISSING")',
-              '        raw_entry, separator, effective_entry = uid_zero_entries[0].partition(" #effective:")',
-              '        raw_parts = raw_entry.split(":")',
-              '        effective_perm = effective_entry if separator else raw_parts[-1]',
-              '        if len(raw_parts) != 3 or raw_parts[:2] != ["user", "0"] or raw_parts[2] != "r--":',
-              '            fail("SEED_UID0_RAW_ACL_INVALID")',
-              '        if effective_perm != "r--" or "w" in effective_perm or "x" in effective_perm:',
-              '            fail("SEED_UID0_EFFECTIVE_ACL_INVALID")',
-              '    return identity',
-              '',
-              '',
-              'def admit_seed(work: pathlib.Path, seed: pathlib.Path, expected_name: str) -> tuple[int, int]:',
-              '    identity = validate_seed_acl(work, seed, expected_name, require_uid_zero=False)',
-              '    try:',
-              '        result = subprocess.run(',
-              '            ["/usr/bin/setfacl", "--no-mask", "-m", "u:0:r--", "--", str(seed)],',
-              '            stdout=subprocess.PIPE,',
-              '            stderr=subprocess.PIPE,',
-              '            timeout=30,',
-              '            check=False,',
-              '        )',
-              '    except (OSError, subprocess.TimeoutExpired):',
-              '        fail("SEED_ACL_MUTATION_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")',
-              '    if result.returncode != 0:',
-              '        fail("SEED_ACL_MUTATION_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")',
-              '    return validate_seed_acl(work, seed, expected_name, require_uid_zero=True, expected_identity=identity)',
-              '',
-          ]) + "\n"
+          seed_admission_block = r'''
+          def read_numeric_acl(path: pathlib.Path) -> list[str]:
+              try:
+                  result = subprocess.run(
+                      ["/usr/bin/getfacl", "--numeric", "--omit-header", "--absolute-names", "--", str(path)],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      timeout=30,
+                      check=False,
+                  )
+              except (OSError, subprocess.TimeoutExpired):
+                  fail("SEED_ACL_READ_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              if result.returncode != 0:
+                  fail("SEED_ACL_READ_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              try:
+                  return [
+                      line
+                      for line in result.stdout.decode("ascii").splitlines()
+                      if line and not line.startswith("#")
+                  ]
+              except UnicodeDecodeError:
+                  fail("SEED_ACL_FORMAT_INVALID", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+
+
+          def prove_seed_candidate_defect(code: str, category: str = "FIXTURE") -> None:
+              if re.fullmatch(r"[A-Z0-9_]{1,96}", code) is None:
+                  code = "SEED_CANDIDATE_DEFECT_CODE_INVALID"
+              if category not in {"FIXTURE", "EVIDENCE", "MAPPED"}:
+                  code = "SEED_CANDIDATE_DEFECT_CATEGORY_INVALID"
+                  category = "EVIDENCE"
+              marker_fd = -1
+              try:
+                  marker_fd = os.open(
+                      candidate_defect_marker_path,
+                      os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                      0o600,
+                  )
+                  with os.fdopen(marker_fd, "w", encoding="ascii") as marker_stream:
+                      marker_fd = -1
+                      marker_stream.write(code + "\n")
+              except OSError:
+                  fail("SEED_CANDIDATE_DEFECT_MARKER_WRITE_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              finally:
+                  if marker_fd >= 0:
+                      os.close(marker_fd)
+              fail(code, f"CANDIDATE_DEFECT__SEED_ACL_{category}")
+
+
+          def expected_work_acl(uid: int, default: bool = False) -> dict[str, str]:
+              prefix = "default:" if default else ""
+              return {
+                  f"{prefix}user::": "rwx",
+                  f"{prefix}user:{uid}": "rwx",
+                  f"{prefix}group::": "---",
+                  f"{prefix}mask::": "rwx",
+                  f"{prefix}other::": "---",
+              }
+
+
+          def expected_seed_acl(uid: int, uid_zero: bool = False) -> dict[str, str]:
+              entries = {
+                  "user::": "rw-",
+                  f"user:{uid}": "rwx",
+                  "group::": "---",
+                  "mask::": "rw-",
+                  "other::": "---",
+              }
+              if uid_zero:
+                  entries["user:0"] = "r--"
+              return entries
+
+
+          def _permission_bits(value: str) -> int:
+              if re.fullmatch(r"[r-][w-][x-]", value) is None:
+                  raise ValueError("ACL_PERMISSION_GRAMMAR")
+              return (4 if value[0] == "r" else 0) | (2 if value[1] == "w" else 0) | (1 if value[2] == "x" else 0)
+
+
+          def _permission_text(value: int) -> str:
+              return ("r" if value & 4 else "-") + ("w" if value & 2 else "-") + ("x" if value & 1 else "-")
+
+
+          def parse_numeric_acl_evidence(
+              output: str,
+              path: pathlib.Path,
+              observed: os.stat_result,
+              scope: str,
+          ) -> dict[str, dict[str, str | None]]:
+              if scope not in {"access", "default"}:
+                  raise ValueError("ACL_SCOPE_INVALID")
+              headers: dict[str, str] = {}
+              entries: dict[str, dict[str, str | None]] = {}
+              prefix = "default:" if scope == "default" else ""
+              for raw_line in output.splitlines():
+                  if not raw_line.strip():
+                      continue
+                  entry_part, has_comment, comment_part = raw_line.partition("#")
+                  entry = entry_part.strip()
+                  comment = comment_part.strip() if has_comment else ""
+                  if not entry:
+                      if not has_comment:
+                          raise ValueError("ACL_HEADER_MISSING")
+                      header_match = re.fullmatch(r"(file|owner|group):\s*(\S.*)", comment)
+                      if header_match is None:
+                          raise ValueError("ACL_HEADER_GRAMMAR")
+                      header_name, header_value = header_match.groups()
+                      if header_name in headers:
+                          raise ValueError("ACL_HEADER_DUPLICATE")
+                      headers[header_name] = header_value.strip()
+                      continue
+                  annotation = None
+                  if has_comment:
+                      annotation_match = re.fullmatch(r"effective:\s*([r-][w-][x-])", comment)
+                      if annotation_match is None:
+                          raise ValueError("ACL_ANNOTATION_GRAMMAR")
+                      annotation = annotation_match.group(1)
+                  if scope == "default":
+                      if not entry.startswith("default:"):
+                          raise ValueError("ACL_ACCESS_ENTRY_IN_DEFAULT_QUERY")
+                      body = entry[len("default:"):]
+                  else:
+                      if entry.startswith("default:"):
+                          raise ValueError("ACL_DEFAULT_ENTRY_IN_ACCESS_QUERY")
+                      body = entry
+                  parts = body.split(":")
+                  if len(parts) != 3:
+                      raise ValueError("ACL_ENTRY_GRAMMAR")
+                  kind, qualifier, permissions = parts
+                  _permission_bits(permissions)
+                  if kind in {"user", "group"}:
+                      if qualifier and re.fullmatch(r"(?:0|[1-9][0-9]*)", qualifier) is None:
+                          raise ValueError("ACL_NUMERIC_QUALIFIER_INVALID")
+                      key = f"{prefix}{kind}:{qualifier}" if qualifier else f"{prefix}{kind}::"
+                  elif kind in {"mask", "other"}:
+                      if qualifier:
+                          raise ValueError("ACL_RESERVED_QUALIFIER_INVALID")
+                      key = f"{prefix}{kind}::"
+                  else:
+                      raise ValueError("ACL_KIND_INVALID")
+                  if key in entries:
+                      raise ValueError("ACL_ENTRY_DUPLICATE")
+                  entries[key] = {"raw": permissions, "annotation": annotation}
+              if set(headers) != {"file", "owner", "group"}:
+                  raise ValueError("ACL_HEADERS_INCOMPLETE")
+              expected_path = os.path.abspath(os.fspath(path))
+              if headers["file"] != expected_path:
+                  raise ValueError("ACL_HEADER_PATH_MISMATCH")
+              if re.fullmatch(r"(?:0|[1-9][0-9]*)", headers["owner"]) is None:
+                  raise ValueError("ACL_HEADER_OWNER_INVALID")
+              if re.fullmatch(r"(?:0|[1-9][0-9]*)", headers["group"]) is None:
+                  raise ValueError("ACL_HEADER_GROUP_INVALID")
+              if int(headers["owner"]) != observed.st_uid or int(headers["group"]) != observed.st_gid:
+                  raise ValueError("ACL_HEADER_IDENTITY_MISMATCH")
+              mask_key = f"{prefix}mask::"
+              mask = entries.get(mask_key)
+              has_named_entries = any(
+                  key.startswith(f"{prefix}user:") and key != f"{prefix}user::"
+                  or key.startswith(f"{prefix}group:") and key != f"{prefix}group::"
+                  for key in entries
+              )
+              if has_named_entries and mask is None:
+                  raise ValueError("ACL_MASK_MISSING")
+              mask_bits = _permission_bits(mask["raw"]) if mask is not None and mask["raw"] is not None else 7
+              for key, entry_value in entries.items():
+                  raw_permissions = entry_value["raw"]
+                  if raw_permissions is None:
+                      raise ValueError("ACL_RAW_PERMISSIONS_MISSING")
+                  unprefixed = key[len(prefix):]
+                  parts = unprefixed.split(":")
+                  if len(parts) == 2 and parts[0] in {"user", "group"}:
+                      kind, qualifier = parts
+                  elif len(parts) == 3:
+                      kind, qualifier, _ = parts
+                  else:
+                      raise ValueError("ACL_ENTRY_INTERNAL_INVALID")
+                  if kind == "other" or kind == "user" and qualifier == "" or kind == "mask":
+                      effective = raw_permissions
+                  elif mask is not None:
+                      effective = _permission_text(_permission_bits(raw_permissions) & mask_bits)
+                  else:
+                      effective = raw_permissions
+                  annotation = entry_value["annotation"]
+                  if annotation is not None and annotation != effective:
+                      raise ValueError("ACL_EFFECTIVE_ANNOTATION_MISMATCH")
+                  entry_value["effective"] = effective
+              return entries
+
+
+          def seed_evidence_signature(snapshot: dict[str, object]) -> tuple[object, ...]:
+              acl_signature = []
+              for scope in ("access", "default"):
+                  scope_entries = snapshot[scope]
+                  acl_signature.append(
+                      tuple(
+                          sorted(
+                              (key, value["raw"], value["effective"])
+                              for key, value in scope_entries.items()
+                          )
+                      )
+                  )
+              return (
+                  snapshot["uid"],
+                  snapshot["gid"],
+                  snapshot["mode"],
+                  snapshot["device"],
+                  snapshot["inode"],
+                  snapshot["digest"],
+                  tuple(acl_signature),
+              )
+
+
+          def emit_seed_acl_evidence(
+              path: pathlib.Path,
+              context: str,
+              phase: str,
+              object_name: str,
+              *,
+              include_default: bool = False,
+              expected_access: dict[str, str] | None = None,
+              expected_default: dict[str, str] | None = None,
+              expected_uid: int | None = None,
+              expected_gid: int | None = None,
+              expected_mode: str | None = None,
+              subject: str | None = None,
+              checkpoint: str | None = None,
+          ) -> dict[str, object]:
+              if context not in {"fixture", "production"}:
+                  prove_seed_candidate_defect("SEED_ACL_CONTEXT_INVALID", "EVIDENCE")
+              if phase not in {"initial", "configured", "pre_admission", "post_admission", "post_probe", "pre_consumer"}:
+                  prove_seed_candidate_defect("SEED_ACL_PHASE_INVALID", "EVIDENCE")
+              if object_name not in {"work", "input.json", "expected.json", "unlisted.json"}:
+                  prove_seed_candidate_defect("SEED_ACL_OBJECT_INVALID", "EVIDENCE")
+              path = pathlib.Path(path)
+              if not path.is_absolute():
+                  prove_seed_candidate_defect("SEED_ACL_PATH_NOT_ABSOLUTE", "EVIDENCE")
+              try:
+                  observed = os.lstat(path)
+              except OSError:
+                  prove_seed_candidate_defect("SEED_ACL_LSTAT_FAILED", "EVIDENCE")
+              if stat.S_ISLNK(observed.st_mode):
+                  prove_seed_candidate_defect("SEED_ACL_OBJECT_IS_SYMLINK", "EVIDENCE")
+              is_directory = stat.S_ISDIR(observed.st_mode)
+              is_regular = stat.S_ISREG(observed.st_mode)
+              if object_name == "work" and not is_directory:
+                  prove_seed_candidate_defect("SEED_WORK_NOT_REAL_DIRECTORY", "EVIDENCE")
+              if object_name != "work" and not is_regular:
+                  prove_seed_candidate_defect("SEED_FILE_NOT_REGULAR", "EVIDENCE")
+              if observed.st_mode & 0o7000:
+                  prove_seed_candidate_defect("SEED_ACL_SPECIAL_MODE_BITS_PRESENT", "EVIDENCE")
+              mode = f"{stat.S_IMODE(observed.st_mode):04o}"
+              if expected_uid is not None and observed.st_uid != expected_uid:
+                  prove_seed_candidate_defect("SEED_ACL_OWNER_UID_MISMATCH", "EVIDENCE")
+              if expected_gid is not None and observed.st_gid != expected_gid:
+                  prove_seed_candidate_defect("SEED_ACL_OWNER_GID_MISMATCH", "EVIDENCE")
+              if expected_mode is not None and mode != expected_mode:
+                  prove_seed_candidate_defect("SEED_ACL_MODE_MISMATCH", "EVIDENCE")
+              digest_before = None
+              if is_regular:
+                  def digest_regular_file() -> str:
+                      descriptor = -1
+                      try:
+                          descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                          opened = os.fstat(descriptor)
+                          if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+                              prove_seed_candidate_defect("SEED_ACL_CONTENT_IDENTITY_MISMATCH", "EVIDENCE")
+                          hasher = hashlib.sha256()
+                          while True:
+                              chunk = os.read(descriptor, 65536)
+                              if not chunk:
+                                  break
+                              hasher.update(chunk)
+                          return hasher.hexdigest()
+                      except OSError:
+                          prove_seed_candidate_defect("SEED_ACL_CONTENT_READ_FAILED", "EVIDENCE")
+                      finally:
+                          if descriptor >= 0:
+                              os.close(descriptor)
+                  digest_before = digest_regular_file()
+              metadata = {
+                  "uid": observed.st_uid,
+                  "gid": observed.st_gid,
+                  "mode": mode,
+                  "device": observed.st_dev,
+                  "inode": observed.st_ino,
+                  "digest": digest_before,
+              }
+              scopes = ["access"] + (["default"] if include_default else [])
+              parsed: dict[str, dict[str, dict[str, str | None]]] = {}
+              for scope in scopes:
+                  command = [
+                      "/usr/bin/getfacl",
+                      "--numeric",
+                      "--absolute-names",
+                      "--all-effective",
+                      "--access" if scope == "access" else "--default",
+                      "--",
+                      str(path),
+                  ]
+                  status = 0
+                  timed_out = False
+                  stdout_bytes = b""
+                  stderr_bytes = b""
+                  try:
+                      result = subprocess.run(
+                          command,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          timeout=30,
+                          check=False,
+                      )
+                      status = int(result.returncode)
+                      stdout_bytes = result.stdout
+                      stderr_bytes = result.stderr
+                  except subprocess.TimeoutExpired as error:
+                      status = 124
+                      timed_out = True
+                      stdout_bytes = error.stdout or b""
+                      stderr_bytes = error.stderr or b""
+                  except OSError as error:
+                      status = 127
+                      stderr_bytes = str(error).encode("utf-8", "replace")
+                  stdout_text = stdout_bytes[:8192].decode("ascii", "replace")
+                  stderr_text = stderr_bytes[:8192].decode("ascii", "replace")
+                  fields = (
+                      f"context={context} phase={phase} object={object_name} "
+                      f"uid={metadata['uid']} gid={metadata['gid']} mode={metadata['mode']} "
+                      f"device={metadata['device']} inode={metadata['inode']} "
+                      f"getfacl_status={status} acl_scope={scope} "
+                      f"checkpoint={checkpoint or '-'} subject={subject or '-'} path={path}"
+                  )
+                  print(f"ACL_SNAPSHOT {fields} timeout={'yes' if timed_out else 'no'}")
+                  print(f"GETFACL_STDOUT_BEGIN acl_scope={scope}")
+                  if stdout_text:
+                      print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+                  print(f"GETFACL_STDOUT_END acl_scope={scope}")
+                  print(f"GETFACL_STDERR_BEGIN acl_scope={scope}")
+                  if stderr_text:
+                      print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
+                  print(f"GETFACL_STDERR_END acl_scope={scope}")
+                  if len(stdout_bytes) > 8192 or len(stderr_bytes) > 8192:
+                      prove_seed_candidate_defect("SEED_ACL_EVIDENCE_OUTPUT_OVERSIZED", "EVIDENCE")
+                  if timed_out or status == 127 or status != 0:
+                      fail("SEED_ACL_GETFACL_UNAVAILABLE", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+                  try:
+                      decoded = stdout_bytes.decode("ascii", "strict")
+                      parsed_scope = parse_numeric_acl_evidence(decoded, path, observed, scope)
+                  except (UnicodeDecodeError, ValueError):
+                      prove_seed_candidate_defect("SEED_ACL_EVIDENCE_PARSE_INVALID", "EVIDENCE")
+                  expected = expected_access if scope == "access" else expected_default
+                  if expected is not None:
+                      actual_raw = {key: value["raw"] for key, value in parsed_scope.items()}
+                      if actual_raw != expected:
+                          prove_seed_candidate_defect("SEED_ACL_EVIDENCE_ENTRIES_MISMATCH", "EVIDENCE")
+                  if scope == "default" and expected_default is None:
+                      prove_seed_candidate_defect("SEED_DEFAULT_ACL_EXPECTATION_MISSING", "EVIDENCE")
+                  parsed[scope] = parsed_scope
+              if not include_default:
+                  parsed["default"] = {}
+              try:
+                  after = os.lstat(path)
+              except OSError:
+                  prove_seed_candidate_defect("SEED_ACL_POST_LSTAT_FAILED", "EVIDENCE")
+              digest_after = None
+              if is_regular:
+                  digest_after = digest_regular_file()
+              if (
+                  after.st_dev != observed.st_dev
+                  or after.st_ino != observed.st_ino
+                  or after.st_uid != observed.st_uid
+                  or after.st_gid != observed.st_gid
+                  or stat.S_IMODE(after.st_mode) != stat.S_IMODE(observed.st_mode)
+                  or digest_after != digest_before
+              ):
+                  prove_seed_candidate_defect("SEED_ACL_SNAPSHOT_IDENTITY_CHANGED", "EVIDENCE")
+              metadata["digest"] = digest_after
+              return {
+                  "context": context,
+                  "phase": phase,
+                  "object": object_name,
+                  "path": str(path),
+                  "uid": metadata["uid"],
+                  "gid": metadata["gid"],
+                  "mode": metadata["mode"],
+                  "device": metadata["device"],
+                  "inode": metadata["inode"],
+                  "digest": metadata["digest"],
+                  "access": parsed["access"],
+                  "default": parsed["default"],
+              }
+
+
+          def assert_runner_acl_semantics(
+              snapshot: dict[str, object],
+              runner_uid: int,
+              category: str = "FIXTURE",
+          ) -> None:
+              runner_entry = snapshot["access"].get(f"user:{runner_uid}")
+              if runner_entry is None or runner_entry["raw"] != "rwx" or runner_entry["effective"] != "rw-":
+                  prove_seed_candidate_defect("SEED_RUNNER_RAW_EFFECTIVE_ACL_MISMATCH", category)
+
+
+          def assert_seed_admission_delta(
+              before: dict[str, object],
+              after: dict[str, object],
+              label: str,
+              category: str = "EVIDENCE",
+          ) -> None:
+              before_entries = before["access"]
+              after_entries = after["access"]
+              if set(after_entries) - set(before_entries) != {"user:0"} or set(before_entries) - set(after_entries):
+                  prove_seed_candidate_defect(f"{label}_UID0_ADMISSION_DELTA_INVALID", category)
+              if "user:0" in before_entries:
+                  prove_seed_candidate_defect(f"{label}_UID0_PREEXISTED", category)
+              if after_entries["user:0"]["raw"] != "r--" or after_entries["user:0"]["effective"] != "r--":
+                  prove_seed_candidate_defect(f"{label}_UID0_PERMISSION_INVALID", category)
+              for key, before_entry in before_entries.items():
+                  after_entry = after_entries.get(key)
+                  if after_entry is None or after_entry["raw"] != before_entry["raw"] or after_entry["effective"] != before_entry["effective"]:
+                      prove_seed_candidate_defect(f"{label}_EXISTING_ACL_ENTRY_CHANGED", category)
+              if before["default"] != after["default"]:
+                  prove_seed_candidate_defect(f"{label}_DEFAULT_ACL_CHANGED", category)
+              for field in ("uid", "gid", "mode", "device", "inode", "digest"):
+                  if before[field] != after[field]:
+                      prove_seed_candidate_defect(f"{label}_SEED_METADATA_CHANGED", category)
+
+
+          def validate_seed_acl(
+              work: pathlib.Path,
+              seed: pathlib.Path,
+              expected_name: str,
+              require_uid_zero: bool,
+              expected_identity: tuple[int, int] | None = None,
+          ) -> tuple[int, int]:
+              if expected_name not in {"input.json", "expected.json"}:
+                  fail("SEED_EXPECTED_NAME_INVALID")
+              if work.name != "work" or work.is_symlink() or not work.is_dir():
+                  fail("SEED_PARENT_INVALID")
+              expected_path = work / expected_name
+              if seed != expected_path or seed.parent != work:
+                  fail("SEED_PATH_INVALID")
+              if seed.is_symlink():
+                  fail("SEED_SYMLINK_REJECTED")
+              try:
+                  seed_stat = seed.lstat()
+              except OSError:
+                  fail("SEED_STAT_FAILED")
+              if not stat.S_ISREG(seed_stat.st_mode):
+                  fail("SEED_NOT_REGULAR")
+              if seed_stat.st_uid != os.getuid():
+                  fail("SEED_OWNER_INVALID")
+              identity = (seed_stat.st_dev, seed_stat.st_ino)
+              if expected_identity is not None and identity != expected_identity:
+                  fail("SEED_IDENTITY_CHANGED")
+              acl_entries = read_numeric_acl(seed)
+              def entry_parts(line: str) -> tuple[str, str | None]:
+                  raw_part, has_comment, comment_part = line.partition("#")
+                  raw_entry = raw_part.strip()
+                  effective = None
+                  if has_comment:
+                      annotation = re.fullmatch(r"effective:\s*([r-][w-][x-])", comment_part.strip())
+                      if annotation is None:
+                          fail("SEED_ACL_FORMAT_INVALID", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+                      effective = annotation.group(1)
+                  return raw_entry, effective
+
+              group_entries = [entry_parts(entry) for entry in acl_entries if entry_parts(entry)[0].startswith("group::")]
+              other_entries = [entry_parts(entry) for entry in acl_entries if entry_parts(entry)[0].startswith("other::")]
+              if len(group_entries) != 1 or group_entries[0][0] != "group::---":
+                  fail("SEED_GROUP_ACCESS_INVALID")
+              if len(other_entries) != 1 or other_entries[0][0] != "other::---":
+                  fail("SEED_OTHER_ACCESS_INVALID")
+              if require_uid_zero:
+                  uid_zero_entries = [entry_parts(entry) for entry in acl_entries if entry_parts(entry)[0].startswith("user:0:")]
+                  if len(uid_zero_entries) != 1:
+                      fail("SEED_UID0_READ_ACL_MISSING")
+                  raw_parts = uid_zero_entries[0][0].split(":")
+                  raw_permission = raw_parts[-1] if len(raw_parts) == 3 else ""
+                  effective_perm = uid_zero_entries[0][1] or raw_permission
+                  if len(raw_parts) != 3 or raw_parts[:2] != ["user", "0"] or raw_permission != "r--":
+                      fail("SEED_UID0_RAW_ACL_INVALID")
+                  if effective_perm != "r--" or "w" in effective_perm or "x" in effective_perm:
+                      fail("SEED_UID0_EFFECTIVE_ACL_INVALID")
+              return identity
+
+
+          def admit_seed(work: pathlib.Path, seed: pathlib.Path, expected_name: str) -> tuple[int, int]:
+              identity = validate_seed_acl(work, seed, expected_name, require_uid_zero=False)
+              try:
+                  result = subprocess.run(
+                      ["/usr/bin/setfacl", "--no-mask", "-m", "u:0:r--", "--", str(seed)],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      timeout=30,
+                      check=False,
+                  )
+              except (OSError, subprocess.TimeoutExpired):
+                  fail("SEED_ACL_MUTATION_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              if result.returncode != 0:
+                  fail("SEED_ACL_MUTATION_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              return validate_seed_acl(work, seed, expected_name, require_uid_zero=True, expected_identity=identity)
+
+
+          def seed_admission_call(label: str, operation):
+              captured = io.StringIO()
+              try:
+                  with contextlib.redirect_stderr(captured):
+                      return operation()
+              except SystemExit:
+                  diagnostic = captured.getvalue()
+                  sys.stderr.write(diagnostic)
+                  if "FAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD" in diagnostic:
+                      raise
+                  prove_seed_candidate_defect(f"{label}_SEED_ADMISSION_CALL_FAILED", "EVIDENCE")
+              except Exception:
+                  prove_seed_candidate_defect(f"{label}_SEED_ADMISSION_CALL_EXCEPTION", "EVIDENCE")
+
+
+          def run_mapped_seed_probe(
+              sandbox: pathlib.Path,
+              runner: pathlib.Path,
+              work: pathlib.Path,
+              runtime_root: pathlib.Path,
+              writer_root: pathlib.Path,
+              expected_snapshots: dict[str, dict[str, object]],
+          ) -> dict[str, dict[str, object]]:
+              carrier_root = work.parent
+              runtime_mount = carrier_mount(runtime_root, carrier_root, "RUNTIME")
+              writer_mount = carrier_mount(writer_root, carrier_root, "WRITER")
+              runner_mount = carrier_mount(runner, carrier_root, "RUNNER")
+              work_mount = carrier_mount(work, carrier_root, "WORK")
+              child_program = r"""import errno
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import stat
+
+          status = {}
+          for line in pathlib.Path("/proc/self/status").read_text(encoding="ascii").splitlines():
+              key, separator, value = line.partition(":")
+              if separator:
+                  status[key] = value.strip()
+          def canonical_map(path):
+              return [" ".join(line.split()) for line in pathlib.Path(path).read_text(encoding="ascii").splitlines() if line.strip()]
+          def digest_file(path):
+              descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+              try:
+                  observed = os.fstat(descriptor)
+                  hasher = hashlib.sha256()
+                  while True:
+                      chunk = os.read(descriptor, 65536)
+                      if not chunk:
+                          break
+                      hasher.update(chunk)
+                  return observed, hasher.hexdigest()
+              finally:
+                  os.close(descriptor)
+          uid_map = canonical_map("/proc/self/uid_map")
+          gid_map = canonical_map("/proc/self/gid_map")
+          capability_names = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+          capabilities = {name: status.get(name, "") for name in capability_names}
+          for name in ("input.json", "expected.json"):
+              path = pathlib.Path("/work") / name
+              before_stat = None
+              before_digest = None
+              read_error = None
+              try:
+                  before_stat, before_digest = digest_file(path)
+                  read_success = stat.S_ISREG(before_stat.st_mode)
+              except OSError as error:
+                  read_success = False
+                  read_error = errno.errorcode.get(error.errno, f"ERRNO_{error.errno}")
+              write_open_errno = "OPEN_SUCCEEDED"
+              try:
+                  write_fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+              except OSError as error:
+                  write_open_errno = errno.errorcode.get(error.errno, f"ERRNO_{error.errno}")
+              else:
+                  os.close(write_fd)
+              after_stat = None
+              after_digest = None
+              after_error = None
+              try:
+                  after_stat, after_digest = digest_file(path)
+              except OSError as error:
+                  after_error = errno.errorcode.get(error.errno, f"ERRNO_{error.errno}")
+              unchanged = (
+                  before_stat is not None
+                  and after_stat is not None
+                  and before_digest == after_digest
+                  and (before_stat.st_dev, before_stat.st_ino) == (after_stat.st_dev, after_stat.st_ino)
+              )
+              result = {
+                  "schemaVersion": "s8-mapped-seed-acl-probe-v1",
+                  "seed": name,
+                  "uid": os.getuid(),
+                  "euid": os.geteuid(),
+                  "gid": os.getgid(),
+                  "egid": os.getegid(),
+                  "uidMap": uid_map,
+                  "gidMap": gid_map,
+                  "capabilities": capabilities,
+                  "noNewPrivs": int(status.get("NoNewPrivs", "-1")),
+                  "readSuccess": bool(read_success),
+                  "readError": read_error,
+                  "digest": before_digest,
+                  "device": before_stat.st_dev if before_stat is not None else None,
+                  "inode": before_stat.st_ino if before_stat is not None else None,
+                  "writeOpenErrno": write_open_errno,
+                  "afterReadError": after_error,
+                  "unchanged": bool(unchanged),
+              }
+              print("S8_SEED_MAPPED_PROBE:" + json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
+          """
+              command = [
+                  str(sandbox),
+                  "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session",
+                  "--ro-bind", runtime_mount, "/runtime/blender-root",
+                  "--ro-bind", writer_mount, "/runtime/writer",
+                  "--ro-bind", runner_mount, "/runtime/process-runner",
+                  "--bind", work_mount, "/work", "--chdir", "/work",
+                  "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                  "--", "/runtime/process-runner",
+                  "--address-space-bytes", str(4 * 1024 * 1024 * 1024),
+                  "--file-bytes", str(128 * 1024 * 1024),
+                  "--timeout-ms", str(RUNNER_TIMEOUT_MS),
+                  "--stdout-bytes", str(RUNNER_STDOUT_BYTES),
+                  "--stderr-bytes", str(RUNNER_STDERR_BYTES),
+                  "--max-children", "0", "--", "/usr/bin/python3", "-c", child_program,
+              ]
+              def print_transport_evidence(status: int, timed_out: bool, stdout: bytes, stderr: bytes) -> None:
+                  print(
+                      f"MAPPED_PROBE_SUBPROCESS_STATUS={status} timeout={'yes' if timed_out else 'no'} "
+                      f"stdout_bytes={len(stdout)} stderr_bytes={len(stderr)}"
+                  )
+                  print("MAPPED_PROBE_STDOUT_BEGIN")
+                  stdout_text = stdout[:8192].decode("utf-8", "replace")
+                  if stdout_text:
+                      print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+                  print("MAPPED_PROBE_STDOUT_END")
+                  print("MAPPED_PROBE_STDERR_BEGIN")
+                  stderr_text = stderr[:8192].decode("utf-8", "replace")
+                  if stderr_text:
+                      print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
+                  print("MAPPED_PROBE_STDERR_END")
+
+              try:
+                  result = subprocess.run(
+                      command,
+                      cwd=work,
+                      env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      timeout=60,
+                      check=False,
+                  )
+              except subprocess.TimeoutExpired as error:
+                  print_transport_evidence(124, True, error.stdout or b"", error.stderr or b"")
+                  fail("MAPPED_SEED_PROBE_LAUNCH_TIMEOUT", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              except OSError as error:
+                  print_transport_evidence(127, False, b"", str(error).encode("utf-8", "replace"))
+                  fail("MAPPED_SEED_PROBE_LAUNCH_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              print_transport_evidence(int(result.returncode), False, result.stdout, result.stderr)
+              if len(result.stdout) > 8192 or len(result.stderr) > 8192:
+                  prove_seed_candidate_defect("MAPPED_SEED_PROBE_OUTPUT_OVERSIZED", "MAPPED")
+              if result.returncode != 0:
+                  if b"S8_RUNNER_RECEIPT:" not in result.stdout:
+                      fail("MAPPED_SEED_PROBE_RUNNER_UNAVAILABLE", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+                  fail("MAPPED_SEED_PROBE_RUNNER_FAILED", "CANDIDATE_DEFECT__SEED_ACL_MAPPED")
+              receipt_prefix = b"S8_RUNNER_RECEIPT:"
+              if not result.stdout.startswith(receipt_prefix) or result.stdout.count(receipt_prefix) != 1:
+                  prove_seed_candidate_defect("MAPPED_SEED_RUNNER_RECEIPT_MISSING_OR_DUPLICATE", "MAPPED")
+              receipt_end = result.stdout.find(b"\n")
+              if receipt_end < len(receipt_prefix):
+                  prove_seed_candidate_defect("MAPPED_SEED_RUNNER_RECEIPT_MALFORMED", "MAPPED")
+              try:
+                  receipt = json.loads(result.stdout[len(receipt_prefix):receipt_end].decode("ascii", "strict"))
+              except (UnicodeDecodeError, ValueError):
+                  prove_seed_candidate_defect("MAPPED_SEED_RUNNER_RECEIPT_INVALID", "MAPPED")
+              if not isinstance(receipt, dict):
+                  prove_seed_candidate_defect("MAPPED_SEED_RUNNER_RECEIPT_SCHEMA_INVALID", "MAPPED")
+              runner_verification = receipt.get("runnerParentVerification")
+              runner_result = receipt.get("result")
+              if not isinstance(runner_verification, dict) or not isinstance(runner_result, dict):
+                  prove_seed_candidate_defect("MAPPED_SEED_RUNNER_RECEIPT_SCHEMA_INVALID", "MAPPED")
+              if (
+                  receipt.get("schemaVersion") != "s8-process-runner-receipt-v2"
+                  or receipt.get("protocol") != "s8-process-runner-receipt-v2"
+                  or receipt.get("policyId") != "s8-zero-child-seccomp-x86_64-v2"
+                  or runner_verification.get("status") != "PASS"
+                  or runner_result.get("code") != 0
+                  or runner_result.get("name") != "S8_RUNNER_SUCCESS"
+                  or runner_result.get("terminationClass") != "target-exit-zero"
+                  or runner_result.get("targetExit") != 0
+              ):
+                  prove_seed_candidate_defect("MAPPED_SEED_RUNNER_RECEIPT_RESULT_INVALID", "MAPPED")
+              try:
+                  payload = result.stdout[receipt_end + 1:].decode("utf-8", "strict")
+              except UnicodeDecodeError:
+                  prove_seed_candidate_defect("MAPPED_SEED_PROBE_OUTPUT_INVALID", "MAPPED")
+              lines = payload.splitlines()
+              if len(lines) != 2 or any(not line.startswith("S8_SEED_MAPPED_PROBE:") for line in lines):
+                  prove_seed_candidate_defect("MAPPED_SEED_PROBE_RECORD_COUNT_INVALID", "MAPPED")
+              expected_names = {"input.json", "expected.json"}
+              records: dict[str, dict[str, object]] = {}
+              expected_fields = {
+                  "schemaVersion", "seed", "uid", "euid", "gid", "egid", "uidMap", "gidMap",
+                  "capabilities", "noNewPrivs", "readSuccess", "readError", "digest", "device", "inode",
+                  "writeOpenErrno", "afterReadError", "unchanged",
+              }
+              for line in lines:
+                  encoded = line.removeprefix("S8_SEED_MAPPED_PROBE:")
+                  try:
+                      record = json.loads(encoded)
+                  except ValueError:
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_RECORD_MALFORMED", "MAPPED")
+                  if not isinstance(record, dict) or set(record) != expected_fields:
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_RECORD_SCHEMA_INVALID", "MAPPED")
+                  name = record["seed"]
+                  if not isinstance(name, str) or name not in expected_names or name in records:
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_RECORD_DUPLICATE_OR_UNKNOWN", "MAPPED")
+                  if record["schemaVersion"] != "s8-mapped-seed-acl-probe-v1":
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_RECORD_VERSION_INVALID", "MAPPED")
+                  if any(type(record[key]) is not int for key in ("uid", "euid", "gid", "egid", "noNewPrivs")):
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_NUMERIC_SCHEMA_INVALID", "MAPPED")
+                  if any(not isinstance(record[key], list) or any(not isinstance(item, str) for item in record[key]) for key in ("uidMap", "gidMap")):
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_MAP_SCHEMA_INVALID", "MAPPED")
+                  if not isinstance(record["readSuccess"], bool) or not isinstance(record["unchanged"], bool):
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_BOOLEAN_SCHEMA_INVALID", "MAPPED")
+                  if record["digest"] is not None and (not isinstance(record["digest"], str) or re.fullmatch(r"[0-9a-f]{64}", record["digest"]) is None):
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_DIGEST_SCHEMA_INVALID", "MAPPED")
+                  if record["device"] is not None and type(record["device"]) is not int:
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_DEVICE_SCHEMA_INVALID", "MAPPED")
+                  if record["inode"] is not None and type(record["inode"]) is not int:
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_INODE_SCHEMA_INVALID", "MAPPED")
+                  if any(record[key] is not None and not isinstance(record[key], str) for key in ("readError", "writeOpenErrno", "afterReadError")):
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_ERROR_SCHEMA_INVALID", "MAPPED")
+                  if (record["uid"], record["euid"], record["gid"], record["egid"]) != (65534, 65534, 65534, 65534):
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_IDENTITY_MISMATCH", "MAPPED")
+                  if record["uidMap"] != ["65534 0 1"] or record["gidMap"] != ["65534 0 1"]:
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_MAP_MISMATCH", "MAPPED")
+                  capabilities = record["capabilities"]
+                  if not isinstance(capabilities, dict) or set(capabilities) != {"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"}:
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_CAPABILITY_SCHEMA_INVALID", "MAPPED")
+                  try:
+                      if any(not value or int(value, 16) != 0 for value in capabilities.values()):
+                          prove_seed_candidate_defect("MAPPED_SEED_PROBE_CAPABILITIES_NONZERO", "MAPPED")
+                  except (TypeError, ValueError):
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_CAPABILITIES_INVALID", "MAPPED")
+                  if record["noNewPrivs"] != 1:
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_NO_NEW_PRIVS_INVALID", "MAPPED")
+                  expected = expected_snapshots[name]
+                  if (
+                      record["readSuccess"] is not True
+                      or record["readError"] is not None
+                      or record["digest"] != expected["digest"]
+                      or record["device"] != expected["device"]
+                      or record["inode"] != expected["inode"]
+                      or record["writeOpenErrno"] != "EACCES"
+                      or record["afterReadError"] is not None
+                      or record["unchanged"] is not True
+                  ):
+                      prove_seed_candidate_defect("MAPPED_SEED_PROBE_PERMISSION_OR_STABILITY_INVALID", "MAPPED")
+                  records[name] = record
+              if set(records) != expected_names:
+                  prove_seed_candidate_defect("MAPPED_SEED_PROBE_RECORD_SET_INVALID", "MAPPED")
+              print("MAPPED_PROBE_SANDBOX_UID_GID=65534:65534")
+              print("MAPPED_PROBE_UID_MAP=65534 0 1")
+              print("MAPPED_PROBE_GID_MAP=65534 0 1")
+              print("MAPPED_PROBE_CAPABILITY_SETS_ZERO=PASS")
+              print("MAPPED_PROBE_NO_NEW_PRIVS=1")
+              return records
+
+
+          '''.lstrip("\n") + "\n"
           seed_admission_anchor = "def main() -> None:\n"
           if source.count(seed_admission_anchor) != 1:
               raise SystemExit("seed admission function anchor is not unique")
@@ -5341,14 +6051,73 @@ jobs:
           )
           if source.count(seed_writes_anchor) != 1:
               raise SystemExit("seed write anchor is not unique")
-          seed_writes_replacement = (
-              '    payload_path.write_text(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")), encoding="ascii")\n'
-              '    admit_seed(work, payload_path, "input.json")\n'
-              '    expected_path.write_text(json.dumps({"objectNames": [payload["objects"][0]["name"]]}, sort_keys=True, separators=(",", ":")), encoding="ascii")\n'
-              '    expected_seed_identity = admit_seed(work, expected_path, "expected.json")\n'
-              '    print("INPUT_SEED_ADMISSION=PASS")\n'
-              '    print("EXPECTED_SEED_ADMISSION=PASS")\n'
-          )
+          seed_writes_replacement = """\
+              production_runner_uid = os.getuid()
+              production_runner_euid = os.geteuid()
+              production_runner_gid = os.getgid()
+              production_runner_egid = os.getegid()
+              if 0 in (production_runner_uid, production_runner_euid, production_runner_gid, production_runner_egid):
+                  fail("PRODUCTION_SEED_RUNNER_ROOT", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              if (production_runner_uid, production_runner_euid, production_runner_gid, production_runner_egid) != (
+                  production_runner_euid, production_runner_euid, production_runner_egid, production_runner_egid
+              ):
+                  fail("PRODUCTION_SEED_RUNNER_IDENTITY_MISMATCH", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              production_work_configured = emit_seed_acl_evidence(
+                  work, "production", "configured", "work", include_default=True,
+                  expected_access=expected_work_acl(production_runner_uid),
+                  expected_default=expected_work_acl(production_runner_uid, default=True),
+                  expected_uid=0, expected_gid=0, expected_mode="0770",
+                  checkpoint="before-production-seed-creation",
+              )
+              payload_path.write_text(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")), encoding="ascii")
+              input_seed_before = emit_seed_acl_evidence(
+                  payload_path, "production", "pre_admission", "input.json",
+                  expected_access=expected_seed_acl(production_runner_uid),
+                  include_default=True, expected_default={},
+                  expected_uid=production_runner_uid, expected_gid=production_runner_gid, expected_mode="0660",
+                  checkpoint="immediately-after-input-creation",
+              )
+              assert_runner_acl_semantics(input_seed_before, production_runner_uid, "EVIDENCE")
+              input_seed_identity = seed_admission_call(
+                  "PRODUCTION_INPUT", lambda: admit_seed(work, payload_path, "input.json")
+              )
+              input_seed_after_admission = emit_seed_acl_evidence(
+                  payload_path, "production", "post_admission", "input.json",
+                  expected_access=expected_seed_acl(production_runner_uid, uid_zero=True),
+                  include_default=True, expected_default={},
+                  expected_uid=production_runner_uid, expected_gid=production_runner_gid, expected_mode="0660",
+                  checkpoint="immediately-after-input-admission",
+              )
+              assert_seed_admission_delta(input_seed_before, input_seed_after_admission, "PRODUCTION_INPUT")
+              if input_seed_identity != (input_seed_after_admission["device"], input_seed_after_admission["inode"]):
+                  prove_seed_candidate_defect("PRODUCTION_INPUT_ADMISSION_IDENTITY_INVALID", "EVIDENCE")
+              input_seed_identity = (input_seed_after_admission["device"], input_seed_after_admission["inode"])
+              expected_path.write_text(json.dumps({"objectNames": [payload["objects"][0]["name"]]}, sort_keys=True, separators=(",", ":")), encoding="ascii")
+              expected_seed_before = emit_seed_acl_evidence(
+                  expected_path, "production", "pre_admission", "expected.json",
+                  expected_access=expected_seed_acl(production_runner_uid),
+                  include_default=True, expected_default={},
+                  expected_uid=production_runner_uid, expected_gid=production_runner_gid, expected_mode="0660",
+                  checkpoint="immediately-after-expected-creation",
+              )
+              assert_runner_acl_semantics(expected_seed_before, production_runner_uid, "EVIDENCE")
+              expected_seed_identity = seed_admission_call(
+                  "PRODUCTION_EXPECTED", lambda: admit_seed(work, expected_path, "expected.json")
+              )
+              expected_seed_after_admission = emit_seed_acl_evidence(
+                  expected_path, "production", "post_admission", "expected.json",
+                  expected_access=expected_seed_acl(production_runner_uid, uid_zero=True),
+                  include_default=True, expected_default={},
+                  expected_uid=production_runner_uid, expected_gid=production_runner_gid, expected_mode="0660",
+                  checkpoint="immediately-after-expected-admission",
+              )
+              assert_seed_admission_delta(expected_seed_before, expected_seed_after_admission, "PRODUCTION_EXPECTED")
+              if expected_seed_identity != (expected_seed_after_admission["device"], expected_seed_after_admission["inode"]):
+                  prove_seed_candidate_defect("PRODUCTION_EXPECTED_ADMISSION_IDENTITY_INVALID", "EVIDENCE")
+              expected_seed_identity = (expected_seed_after_admission["device"], expected_seed_after_admission["inode"])
+              print("INPUT_SEED_ADMISSION=PASS")
+              print("EXPECTED_SEED_ADMISSION=PASS")
+          """
           source = source.replace(seed_writes_anchor, seed_writes_replacement, 1)
           import_consumer_anchor = (
               '    run_sandbox(\n'
@@ -5358,41 +6127,77 @@ jobs:
           )
           if source.count(import_consumer_anchor) != 1:
               raise SystemExit("expected seed import consumer anchor is not unique")
-          source = source.replace(
-              import_consumer_anchor,
-              '    validate_seed_acl(work, expected_path, "expected.json", require_uid_zero=True, expected_identity=expected_seed_identity)\n'
-              + import_consumer_anchor,
-              1,
-          )
+          import_consumer_replacement = """\
+              expected_seed_before_import = emit_seed_acl_evidence(
+                  expected_path, "production", "pre_consumer", "expected.json",
+                  expected_access=expected_seed_acl(production_runner_uid, uid_zero=True),
+                  include_default=True, expected_default={},
+                  expected_uid=production_runner_uid, expected_gid=production_runner_gid, expected_mode="0660",
+                  checkpoint="existing-pre-import-revalidation",
+              )
+              if seed_evidence_signature(expected_seed_after_probe) != seed_evidence_signature(expected_seed_before_import):
+                  prove_seed_candidate_defect("PRODUCTION_EXPECTED_PREIMPORT_CHANGED", "EVIDENCE")
+              seed_admission_call(
+                  "PRODUCTION_EXPECTED_PREIMPORT_VALIDATE",
+                  lambda: validate_seed_acl(
+                      work, expected_path, "expected.json", require_uid_zero=True,
+                      expected_identity=expected_seed_identity,
+                  ),
+              )
+              print("EXPECTED_SEED_PRE_IMPORT_REVALIDATION=PASS")
+          """ + import_consumer_anchor
+          source = source.replace(import_consumer_anchor, import_consumer_replacement, 1)
           writer_anchor = "    writer_output = run_sandbox(\n"
           if source.count(writer_anchor) != 1:
               raise SystemExit("seed mapped probe anchor is not unique")
-          mapped_probe_block = (
-              '    mapped_seed_probe = (\n'
-              '        "from pathlib import Path\\n"\n'
-              '        "for name in (\\"input.json\\", \\"expected.json\\"):\\n"\n'
-              '        "    seed = Path(\\"/work\\") / name\\n"\n'
-              '        "    before = seed.read_bytes()\\n"\n'
-              '        "    try:\\n"\n'
-              '        "        with seed.open(\\"ab\\") as handle:\\n"\n'
-              '        "            handle.write(b\\"s8-write-probe\\")\\n"\n'
-              '        "    except PermissionError:\\n"\n'
-              '        "        pass\\n"\n'
-              '        "    else:\\n"\n'
-              '        "        raise SystemExit(\\"S8_SEED_WRITE_GRANT_PRESENT\\")\\n"\n'
-              '        "    if seed.read_bytes() != before:\\n"\n'
-              '        "        raise SystemExit(\\"S8_SEED_WRITE_PROBE_MUTATED_SEED\\")\\n"\n'
-              '    )\n'
-              '    run_sandbox(\n'
-              '        sandbox, runner, work, runtime_root, writer_root,\n'
-              '        "/usr/bin/python3", ["-c", mapped_seed_probe], 60,\n'
-              '    )\n'
-              '    print("MAPPED_SANDBOX_CAN_READ_SEED=PASS")\n'
-              '    print("MAPPED_SANDBOX_FILE_WRITE_GRANT=ABSENT")\n'
-          )
+          mapped_probe_block = """\
+              mapped_seed_records = run_mapped_seed_probe(
+                  sandbox, runner, work, runtime_root, writer_root,
+                  {
+                      "input.json": input_seed_after_admission,
+                      "expected.json": expected_seed_after_admission,
+                  },
+              )
+              input_seed_after_probe = emit_seed_acl_evidence(
+                  payload_path, "production", "post_probe", "input.json",
+                  expected_access=expected_seed_acl(production_runner_uid, uid_zero=True),
+                  include_default=True, expected_default={},
+                  expected_uid=production_runner_uid, expected_gid=production_runner_gid, expected_mode="0660",
+                  checkpoint="after-real-mapped-probe",
+              )
+              expected_seed_after_probe = emit_seed_acl_evidence(
+                  expected_path, "production", "post_probe", "expected.json",
+                  expected_access=expected_seed_acl(production_runner_uid, uid_zero=True),
+                  include_default=True, expected_default={},
+                  expected_uid=production_runner_uid, expected_gid=production_runner_gid, expected_mode="0660",
+                  checkpoint="after-real-mapped-probe",
+              )
+              assert_seed_admission_delta(input_seed_after_admission, input_seed_after_probe, "PRODUCTION_INPUT_POSTPROBE")
+              assert_seed_admission_delta(expected_seed_after_admission, expected_seed_after_probe, "PRODUCTION_EXPECTED_POSTPROBE")
+              production_work_after_probe = emit_seed_acl_evidence(
+                  work, "production", "post_probe", "work", include_default=True,
+                  expected_access=expected_work_acl(production_runner_uid),
+                  expected_default=expected_work_acl(production_runner_uid, default=True),
+                  expected_uid=0, expected_gid=0, expected_mode="0770",
+                  checkpoint="after-real-mapped-probe",
+              )
+              if seed_evidence_signature(production_work_configured) != seed_evidence_signature(production_work_after_probe):
+                  prove_seed_candidate_defect("PRODUCTION_WORK_ACL_IDENTITY_CHANGED", "EVIDENCE")
+              print("MAPPED_SANDBOX_CAN_READ_SEED=PASS")
+              print("MAPPED_SANDBOX_WRITE_OPEN_EACCES_BOTH=PASS")
+              print("MAPPED_SANDBOX_FILE_WRITE_GRANT=ABSENT")
+              print("MAPPED_SANDBOX_UID_GID_MAP=PASS")
+              print("MAPPED_SANDBOX_ZERO_CAPABILITIES=PASS")
+              print("MAPPED_SANDBOX_NO_NEW_PRIVS=PASS")
+              print("PRODUCTION_SEED_IDENTITY_CONTENT_STABLE=PASS")
+          """
           source = source.replace(writer_anchor, mapped_probe_block + writer_anchor, 1)
           marker_binding_literal = json.dumps(str(marker_path), ensure_ascii=True)
-          marker_binding = f"marker_path = pathlib.Path({marker_binding_literal})\n\n"
+          candidate_defect_binding_literal = json.dumps(str(candidate_defect_marker_path), ensure_ascii=True)
+          marker_binding = (
+              f"marker_path = pathlib.Path({marker_binding_literal})\n"
+              f"candidate_defect_marker_path = pathlib.Path({candidate_defect_binding_literal})\n\n"
+          )
           run_sandbox_anchor = "def run_sandbox(\n"
           if source.count(run_sandbox_anchor) != 1:
               raise SystemExit("run_sandbox anchor is not unique")
@@ -5417,10 +6222,13 @@ jobs:
           binding_text = f"marker_path = pathlib.Path({marker_binding_literal})"
           binding_index = source.find(binding_text)
           first_marker_use = source.find("if not marker_path.exists():")
-          if source.count(binding_text) != 1:
-              raise SystemExit("generated marker binding is not unique")
+          candidate_binding_text = f"candidate_defect_marker_path = pathlib.Path({candidate_defect_binding_literal})"
+          if source.count(binding_text) != 1 or source.count(candidate_binding_text) != 1:
+              raise SystemExit("generated marker bindings are not unique")
           if binding_index < 0 or first_marker_use < 0 or binding_index >= first_marker_use:
               raise SystemExit("generated marker binding is not before first use")
+          if source.find(candidate_binding_text) < 0 or source.find(candidate_binding_text) >= source.find("def prove_seed_candidate_defect("):
+              raise SystemExit("generated candidate defect binding is not before use")
           input_seed_call = 'admit_seed(work, payload_path, "input.json")'
           expected_seed_call = 'admit_seed(work, expected_path, "expected.json")'
           writer_consumer = "    writer_output = run_sandbox(\n"
@@ -5450,75 +6258,265 @@ jobs:
               sandbox.write_text("sandbox\n", encoding="ascii")
               module_globals = {"__name__": "s8_generated_marker_regression"}
               exec(compile(source, str(target_path), "exec"), module_globals)
-              seed_acl_root = regression_root / "seed-acl"
-              seed_acl_work = seed_acl_root / "work"
-              seed_acl_work.mkdir(parents=True)
-              runner_acl = f"user::rwx,user:{os.getuid()}:rwx,group::---,mask::rwx,other::---"
-              for acl_arguments in (
-                  ["--set", runner_acl],
-                  ["--default", "--set", runner_acl],
+              runner_uid = os.getuid()
+              runner_euid = os.geteuid()
+              runner_gid = os.getgid()
+              runner_egid = os.getegid()
+              print(
+                  f"FIXTURE_RUNNER_IDENTITY=uid:{runner_uid},euid:{runner_euid},gid:{runner_gid},egid:{runner_egid}"
+              )
+              if 0 in (runner_uid, runner_euid, runner_gid, runner_egid):
+                  module_globals["fail"]("FIXTURE_RUNNER_IDENTITY_ROOT", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+              if (runner_uid, runner_euid, runner_gid, runner_egid) != (
+                  runner_euid, runner_euid, runner_egid, runner_egid
               ):
-                  acl_result = subprocess.run(
-                      ["/usr/bin/setfacl", "--no-mask", *acl_arguments, "--", str(seed_acl_work)],
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.PIPE,
-                      timeout=30,
-                      check=False,
+                  module_globals["fail"]("FIXTURE_RUNNER_REAL_EFFECTIVE_IDENTITY_MISMATCH", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+
+              def fixture_command(command: list[str], label: str) -> None:
+                  try:
+                      result = subprocess.run(
+                          command,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          timeout=30,
+                          check=False,
+                      )
+                  except (OSError, subprocess.TimeoutExpired):
+                      module_globals["fail"](f"{label}_TOOL_UNAVAILABLE", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+                  if result.returncode != 0:
+                      module_globals["fail"](f"{label}_TOOL_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+
+              def verify_acl_scope(path: Path, scope: str, expected: dict[str, str]) -> None:
+                  command = [
+                      "/usr/bin/getfacl", "--numeric", "--absolute-names", "--all-effective",
+                      "--access" if scope == "access" else "--default", "--", str(path),
+                  ]
+                  try:
+                      result = subprocess.run(
+                          command,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          timeout=30,
+                          check=False,
+                      )
+                  except (OSError, subprocess.TimeoutExpired):
+                      module_globals["fail"]("FIXTURE_ACL_TOOL_UNAVAILABLE", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+                  if result.returncode != 0:
+                      module_globals["fail"]("FIXTURE_ACL_TOOL_FAILED", "HOSTED_SANDBOX_ENVIRONMENT_HOLD")
+                  try:
+                      parsed = module_globals["parse_numeric_acl_evidence"](
+                          result.stdout.decode("ascii", "strict"), path, os.lstat(path), scope
+                      )
+                  except (UnicodeDecodeError, ValueError):
+                      module_globals["prove_seed_candidate_defect"]("FIXTURE_ACL_PARSE_INVALID", "FIXTURE")
+                  actual = {key: entry["raw"] for key, entry in parsed.items()}
+                  if actual != expected:
+                      module_globals["prove_seed_candidate_defect"]("FIXTURE_ACL_SCOPE_NOT_CLEARED", "FIXTURE")
+
+              def assert_clear_runner_parent(parent: Path) -> None:
+                  parent.mkdir(parents=True, exist_ok=False)
+                  fixture_command(["/usr/bin/setfacl", "-b", "--", str(parent)], "FIXTURE_PARENT_ACCESS_ACL_CLEAR")
+                  fixture_command(["/usr/bin/setfacl", "-k", "--", str(parent)], "FIXTURE_PARENT_DEFAULT_ACL_CLEAR")
+                  os.chmod(parent, 0o700)
+                  observed = os.lstat(parent)
+                  if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+                      module_globals["prove_seed_candidate_defect"]("FIXTURE_PARENT_NOT_DIRECTORY", "FIXTURE")
+                  if observed.st_uid != runner_uid or stat.S_IMODE(observed.st_mode) != 0o700 or observed.st_mode & 0o7000:
+                      module_globals["prove_seed_candidate_defect"]("FIXTURE_PARENT_IDENTITY_MODE_INVALID", "FIXTURE")
+                  verify_acl_scope(parent, "access", {"user::": "rwx", "group::": "---", "other::": "---"})
+                  verify_acl_scope(parent, "default", {})
+
+              def create_root_work(parent: Path, label: str) -> tuple[Path, dict[str, object], dict[str, object]]:
+                  assert_clear_runner_parent(parent)
+                  work_path = parent / "work"
+                  try:
+                      os.lstat(work_path)
+                  except OSError as error:
+                      if error.errno != errno.ENOENT:
+                          module_globals["prove_seed_candidate_defect"](f"{label}_WORK_ABSENCE_CHECK_INVALID", "FIXTURE")
+                  else:
+                      module_globals["prove_seed_candidate_defect"](f"{label}_WORK_ALREADY_EXISTS", "FIXTURE")
+                  fixture_command(
+                      ["/usr/bin/sudo", "-n", "/usr/bin/install", "-d", "-o", "0", "-g", "0", "-m", "0700", "--", str(work_path)],
+                      f"{label}_PRIVILEGED_WORK_CREATE",
                   )
-                  if acl_result.returncode != 0:
-                      raise SystemExit("could not construct admitted runner work ACL fixture")
+                  before = os.lstat(work_path)
+                  if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                      module_globals["prove_seed_candidate_defect"](f"{label}_INITIAL_WORK_NOT_DIRECTORY", "FIXTURE")
+                  if (before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode), before.st_mode & 0o7000) != (0, 0, 0o700, 0):
+                      module_globals["prove_seed_candidate_defect"](f"{label}_INITIAL_WORK_SHAPE_INVALID", "FIXTURE")
+                  initial = module_globals["emit_seed_acl_evidence"](
+                      work_path,
+                      "fixture",
+                      "initial",
+                      "work",
+                      include_default=True,
+                      expected_access={"user::": "rwx", "group::": "---", "other::": "---"},
+                      expected_default={},
+                      expected_uid=0,
+                      expected_gid=0,
+                      expected_mode="0700",
+                      checkpoint=f"{label.lower()}-before-acl",
+                  )
+                  identity = (before.st_dev, before.st_ino)
+                  access_acl = f"user::rwx,user:{runner_uid}:rwx,group::---,mask::rwx,other::---"
+                  default_acl = access_acl
+                  fixture_command(
+                      ["/usr/bin/sudo", "-n", "/usr/bin/setfacl", "--no-mask", "--set", access_acl, "--", str(work_path)],
+                      f"{label}_ACCESS_ACL_INSTALL",
+                  )
+                  fixture_command(
+                      ["/usr/bin/sudo", "-n", "/usr/bin/setfacl", "--no-mask", "--default", "--set", default_acl, "--", str(work_path)],
+                      f"{label}_DEFAULT_ACL_INSTALL",
+                  )
+                  configured_stat = os.lstat(work_path)
+                  if not stat.S_ISDIR(configured_stat.st_mode) or stat.S_ISLNK(configured_stat.st_mode):
+                      module_globals["prove_seed_candidate_defect"](f"{label}_CONFIGURED_WORK_NOT_DIRECTORY", "FIXTURE")
+                  if (
+                      configured_stat.st_uid != 0
+                      or configured_stat.st_gid != 0
+                      or stat.S_IMODE(configured_stat.st_mode) != 0o770
+                      or configured_stat.st_mode & 0o7000
+                      or (configured_stat.st_dev, configured_stat.st_ino) != identity
+                  ):
+                      module_globals["prove_seed_candidate_defect"](f"{label}_CONFIGURED_WORK_SHAPE_INVALID", "FIXTURE")
+                  configured = module_globals["emit_seed_acl_evidence"](
+                      work_path,
+                      "fixture",
+                      "configured",
+                      "work",
+                      include_default=True,
+                      expected_access=module_globals["expected_work_acl"](runner_uid),
+                      expected_default=module_globals["expected_work_acl"](runner_uid, default=True),
+                      expected_uid=0,
+                      expected_gid=0,
+                      expected_mode="0770",
+                      checkpoint=f"{label.lower()}-configured",
+                  )
+                  return work_path, initial, configured
+
+              def fixture_seed(path: Path, content: str, checkpoint: str) -> dict[str, object]:
+                  path.write_text(content, encoding="ascii")
+                  observed = os.lstat(path)
+                  if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+                      module_globals["prove_seed_candidate_defect"]("FIXTURE_SEED_NOT_REGULAR", "FIXTURE")
+                  if (observed.st_uid, observed.st_gid, stat.S_IMODE(observed.st_mode), observed.st_mode & 0o7000) != (
+                      runner_uid, runner_gid, 0o660, 0
+                  ):
+                      module_globals["prove_seed_candidate_defect"]("FIXTURE_SEED_OWNER_MODE_INVALID", "FIXTURE")
+                  snapshot = module_globals["emit_seed_acl_evidence"](
+                      path,
+                      "fixture",
+                      "pre_admission",
+                      path.name,
+                      expected_access=module_globals["expected_seed_acl"](runner_uid),
+                      include_default=True, expected_default={},
+                      expected_uid=runner_uid,
+                      expected_gid=runner_gid,
+                      expected_mode="0660",
+                      checkpoint=checkpoint,
+                  )
+                  module_globals["assert_runner_acl_semantics"](snapshot, runner_uid)
+                  return snapshot
+
+              def capture_intended_rejection(operation, expected_reason: str, control: str) -> None:
+                  captured_stdout = io.StringIO()
+                  captured_stderr = io.StringIO()
+                  try:
+                      with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
+                          operation()
+                  except SystemExit as error:
+                      if error.code != 1:
+                          module_globals["prove_seed_candidate_defect"](f"{control}_NEGATIVE_EXIT_INVALID", "FIXTURE")
+                  except Exception:
+                      module_globals["prove_seed_candidate_defect"](f"{control}_NEGATIVE_EXCEPTION_INVALID", "FIXTURE")
+                  else:
+                      module_globals["prove_seed_candidate_defect"](f"{control}_NEGATIVE_CONTROL_ACCEPTED", "FIXTURE")
+                  diagnostic = captured_stderr.getvalue()
+                  if "FAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD" in diagnostic:
+                      sys.stderr.write(diagnostic)
+                      raise SystemExit(f"{control} dependency unavailable")
+                  reason_line = f"S8_RUNTIME_SENSITIVITY_FAIL:{expected_reason}"
+                  if diagnostic.splitlines().count(reason_line) != 1:
+                      module_globals["prove_seed_candidate_defect"](f"{control}_NEGATIVE_REASON_MISMATCH", "FIXTURE")
+
+              def unchanged(before: dict[str, object], after: dict[str, object], code: str) -> None:
+                  if module_globals["seed_evidence_signature"](before) != module_globals["seed_evidence_signature"](after):
+                      module_globals["prove_seed_candidate_defect"](code, "FIXTURE")
+
+              seed_acl_root = regression_root / "seed-acl"
+              seed_acl_work, seed_work_initial, seed_work_configured = create_root_work(seed_acl_root, "MAIN_FIXTURE")
               unlisted_file = seed_acl_work / "unlisted.json"
-              unlisted_file.write_text("unlisted\n", encoding="ascii")
-              work_acl_before = tuple(module_globals["read_numeric_acl"](seed_acl_work))
-              unlisted_acl_before = tuple(module_globals["read_numeric_acl"](unlisted_file))
               input_seed = seed_acl_work / "input.json"
               expected_seed = seed_acl_work / "expected.json"
-              input_seed.write_text("input\n", encoding="ascii")
-              expected_seed.write_text("expected\n", encoding="ascii")
-              for fixture_seed in (unlisted_file, input_seed, expected_seed):
-                  initial_entries = module_globals["read_numeric_acl"](fixture_seed)
-                  expected_runner_entry = f"user:{os.getuid()}:rwx"
-                  if not any(
-                      entry.split(" #effective:", 1)[0] == expected_runner_entry
-                      for entry in initial_entries
-                  ):
-                      raise SystemExit("runner default ACL entry was not inherited by seed fixture")
-                  if any(entry.startswith("user:0:") for entry in initial_entries):
-                      raise SystemExit("pre-admission fixture already grants mapped-root access")
-              input_admitted_identity = module_globals["admit_seed"](
-                  seed_acl_work, input_seed, "input.json"
+              unlisted_before = fixture_seed(unlisted_file, "unlisted\n", "fixture-unlisted-created")
+              input_before = fixture_seed(input_seed, "input\n", "fixture-input-created")
+              expected_before = fixture_seed(expected_seed, "expected\n", "fixture-expected-created")
+              input_admitted_identity = module_globals["seed_admission_call"](
+                  "FIXTURE_INPUT", lambda: module_globals["admit_seed"](seed_acl_work, input_seed, "input.json")
               )
-              expected_admitted_identity = module_globals["admit_seed"](
-                  seed_acl_work, expected_seed, "expected.json"
+              input_after = module_globals["emit_seed_acl_evidence"](
+                  input_seed, "fixture", "post_admission", "input.json",
+                  expected_access=module_globals["expected_seed_acl"](runner_uid, uid_zero=True),
+                  include_default=True, expected_default={},
+                  expected_uid=runner_uid, expected_gid=runner_gid, expected_mode="0660",
+                  checkpoint="fixture-input-admitted",
               )
-              input_identity = module_globals["validate_seed_acl"](
-                  seed_acl_work, input_seed, "input.json", require_uid_zero=True
+              module_globals["assert_seed_admission_delta"](input_before, input_after, "FIXTURE_INPUT", "FIXTURE")
+              if input_admitted_identity != (input_after["device"], input_after["inode"]):
+                  module_globals["prove_seed_candidate_defect"]("FIXTURE_INPUT_ADMISSION_IDENTITY_MISMATCH", "FIXTURE")
+              unlisted_after_input = module_globals["emit_seed_acl_evidence"](
+                  unlisted_file, "fixture", "post_admission", "unlisted.json",
+                  expected_access=module_globals["expected_seed_acl"](runner_uid),
+                  include_default=True, expected_default={},
+                  expected_uid=runner_uid, expected_gid=runner_gid, expected_mode="0660",
+                  checkpoint="after-input-admission",
               )
-              expected_identity = module_globals["validate_seed_acl"](
-                  seed_acl_work, expected_seed, "expected.json", require_uid_zero=True
+              unchanged(unlisted_before, unlisted_after_input, "FIXTURE_UNLISTED_CHANGED_AFTER_INPUT")
+              work_after_input = module_globals["emit_seed_acl_evidence"](
+                  seed_acl_work, "fixture", "post_admission", "work", include_default=True,
+                  expected_access=module_globals["expected_work_acl"](runner_uid),
+                  expected_default=module_globals["expected_work_acl"](runner_uid, default=True),
+                  expected_uid=0, expected_gid=0, expected_mode="0770",
+                  checkpoint="after-input-admission",
               )
-              if input_identity != input_admitted_identity:
-                  raise SystemExit("input seed identity changed after ACL admission")
-              if expected_identity != expected_admitted_identity:
-                  raise SystemExit("expected seed identity changed after ACL admission")
-              if input_identity != (input_seed.stat().st_dev, input_seed.stat().st_ino):
-                  raise SystemExit("input seed identity was not stable")
-              if expected_identity != (expected_seed.stat().st_dev, expected_seed.stat().st_ino):
-                  raise SystemExit("expected seed identity was not stable")
-              if tuple(module_globals["read_numeric_acl"](seed_acl_work)) != work_acl_before:
-                  raise SystemExit("work directory ACL changed during seed admission")
-              if tuple(module_globals["read_numeric_acl"](unlisted_file)) != unlisted_acl_before:
-                  raise SystemExit("unlisted file ACL changed during seed admission")
-              for fixture_seed in (input_seed, expected_seed):
-                  fixture_entries = module_globals["read_numeric_acl"](fixture_seed)
-                  expected_runner_entry = f"user:{os.getuid()}:rwx"
-                  if not any(
-                      entry.split(" #effective:", 1)[0] == expected_runner_entry
-                      for entry in fixture_entries
-                  ):
-                      raise SystemExit("runner ACL entry changed during seed admission")
-              if any(entry.startswith("user:0:") for entry in module_globals["read_numeric_acl"](unlisted_file)):
-                  raise SystemExit("unlisted file received mapped-root access")
+              unchanged(seed_work_configured, work_after_input, "FIXTURE_WORK_CHANGED_AFTER_INPUT")
+              expected_admitted_identity = module_globals["seed_admission_call"](
+                  "FIXTURE_EXPECTED", lambda: module_globals["admit_seed"](seed_acl_work, expected_seed, "expected.json")
+              )
+              expected_after = module_globals["emit_seed_acl_evidence"](
+                  expected_seed, "fixture", "post_admission", "expected.json",
+                  expected_access=module_globals["expected_seed_acl"](runner_uid, uid_zero=True),
+                  include_default=True, expected_default={},
+                  expected_uid=runner_uid, expected_gid=runner_gid, expected_mode="0660",
+                  checkpoint="fixture-expected-admitted",
+              )
+              module_globals["assert_seed_admission_delta"](expected_before, expected_after, "FIXTURE_EXPECTED", "FIXTURE")
+              if expected_admitted_identity != (expected_after["device"], expected_after["inode"]):
+                  module_globals["prove_seed_candidate_defect"]("FIXTURE_EXPECTED_ADMISSION_IDENTITY_MISMATCH", "FIXTURE")
+              unlisted_after_expected = module_globals["emit_seed_acl_evidence"](
+                  unlisted_file, "fixture", "post_admission", "unlisted.json",
+                  expected_access=module_globals["expected_seed_acl"](runner_uid),
+                  include_default=True, expected_default={},
+                  expected_uid=runner_uid, expected_gid=runner_gid, expected_mode="0660",
+                  checkpoint="after-expected-admission",
+              )
+              unchanged(unlisted_before, unlisted_after_expected, "FIXTURE_UNLISTED_CHANGED_AFTER_EXPECTED")
+              work_after_expected = module_globals["emit_seed_acl_evidence"](
+                  seed_acl_work, "fixture", "post_admission", "work", include_default=True,
+                  expected_access=module_globals["expected_work_acl"](runner_uid),
+                  expected_default=module_globals["expected_work_acl"](runner_uid, default=True),
+                  expected_uid=0, expected_gid=0, expected_mode="0770",
+                  checkpoint="after-expected-admission",
+              )
+              unchanged(seed_work_configured, work_after_expected, "FIXTURE_WORK_CHANGED_AFTER_EXPECTED")
+              if module_globals["validate_seed_acl"](seed_acl_work, input_seed, "input.json", True, input_admitted_identity) != input_admitted_identity:
+                  module_globals["prove_seed_candidate_defect"]("FIXTURE_INPUT_VALIDATE_IDENTITY_MISMATCH", "FIXTURE")
+              if module_globals["validate_seed_acl"](seed_acl_work, expected_seed, "expected.json", True, expected_admitted_identity) != expected_admitted_identity:
+                  module_globals["prove_seed_candidate_defect"]("FIXTURE_EXPECTED_VALIDATE_IDENTITY_MISMATCH", "FIXTURE")
+              print("FIXTURE_ROOT_OWNERSHIP_SHAPE=PASS")
+              print("FIXTURE_ACCESS_DEFAULT_ACL=PASS")
+              print("RAW_EFFECTIVE_ACL_PARSING=PASS")
               print("INPUT_SEED_ADMISSION=PASS")
               print("EXPECTED_SEED_ADMISSION=PASS")
               print("SEED_OWNER_REMAINS_RUNNER=PASS")
@@ -5527,57 +6525,70 @@ jobs:
               print("SEED_IDENTITY_STABLE=PASS")
               print("UNLISTED_FILE_ACL_UNCHANGED=PASS")
               print("WORK_DIRECTORY_ACL_UNCHANGED=PASS")
+
               negative_root = regression_root / "seed-negative"
-              negative_work = negative_root / "work"
-              negative_work.mkdir(parents=True)
-              for acl_arguments in (
-                  ["--set", runner_acl],
-                  ["--default", "--set", runner_acl],
-              ):
-                  acl_result = subprocess.run(
-                      ["/usr/bin/setfacl", "--no-mask", *acl_arguments, "--", str(negative_work)],
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.PIPE,
-                      timeout=30,
-                      check=False,
-                  )
-                  if acl_result.returncode != 0:
-                      raise SystemExit("could not construct Run-053 negative work ACL fixture")
+              negative_work, _, negative_work_configured = create_root_work(negative_root, "MISSING_ADMISSION_FIXTURE")
               negative_seed = negative_work / "input.json"
-              negative_seed.write_text("negative\n", encoding="ascii")
-              negative_entries = module_globals["read_numeric_acl"](negative_seed)
-              if any(entry.startswith("user:0:") for entry in negative_entries):
-                  raise SystemExit("Run-053 negative fixture already grants mapped-root access")
-              module_globals["validate_seed_acl"](
-                  negative_work, negative_seed, "input.json", require_uid_zero=False
+              negative_before = fixture_seed(negative_seed, "negative\n", "missing-admission-seed-created")
+              if any(key == "user:0" for key in negative_before["access"]):
+                  module_globals["prove_seed_candidate_defect"]("MISSING_ADMISSION_FIXTURE_ALREADY_ADMITTED", "FIXTURE")
+              negative_identity = module_globals["seed_admission_call"](
+                  "MISSING_ADMISSION_UNREQUIRED",
+                  lambda: module_globals["validate_seed_acl"](negative_work, negative_seed, "input.json", False),
               )
-              try:
-                  with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                      module_globals["validate_seed_acl"](
-                          negative_work, negative_seed, "input.json", require_uid_zero=True
-                      )
-              except SystemExit:
-                  pass
-              else:
-                  raise SystemExit("Run-053 negative seed unexpectedly accepted")
+              if negative_identity != (negative_before["device"], negative_before["inode"]):
+                  module_globals["prove_seed_candidate_defect"]("MISSING_ADMISSION_UNREQUIRED_IDENTITY_INVALID", "FIXTURE")
+              capture_intended_rejection(
+                  lambda: module_globals["validate_seed_acl"](negative_work, negative_seed, "input.json", True),
+                  "SEED_UID0_READ_ACL_MISSING",
+                  "MISSING_ADMISSION",
+              )
+              negative_after = module_globals["emit_seed_acl_evidence"](
+                  negative_seed, "fixture", "pre_admission", "input.json",
+                  expected_access=module_globals["expected_seed_acl"](runner_uid),
+                  include_default=True, expected_default={},
+                  expected_uid=runner_uid, expected_gid=runner_gid, expected_mode="0660",
+                  checkpoint="missing-admission-after-controls",
+              )
+              unchanged(negative_before, negative_after, "MISSING_ADMISSION_SEED_CHANGED")
+              negative_work_after = module_globals["emit_seed_acl_evidence"](
+                  negative_work, "fixture", "configured", "work", include_default=True,
+                  expected_access=module_globals["expected_work_acl"](runner_uid),
+                  expected_default=module_globals["expected_work_acl"](runner_uid, default=True),
+                  expected_uid=0, expected_gid=0, expected_mode="0770",
+                  checkpoint="missing-admission-after-controls",
+              )
+              unchanged(negative_work_configured, negative_work_after, "MISSING_ADMISSION_WORK_CHANGED")
               print("WORK_SEED_NEGATIVE_CONTROL=PASS")
               print("SEED_NEGATIVE_CONTROL=PASS")
+
               symlink_root = regression_root / "seed-symlink"
-              symlink_work = symlink_root / "work"
-              symlink_work.mkdir(parents=True)
-              symlink_target = symlink_root / "target.json"
-              symlink_target.write_text("target\n", encoding="ascii")
+              symlink_work, _, symlink_work_configured = create_root_work(symlink_root, "SYMLINK_FIXTURE")
+              symlink_target = symlink_work / "unlisted.json"
+              symlink_target_before = fixture_seed(symlink_target, "target\n", "symlink-target-created")
               symlink_seed = symlink_work / "input.json"
               symlink_seed.symlink_to(symlink_target)
-              try:
-                  with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                      module_globals["validate_seed_acl"](
-                          symlink_work, symlink_seed, "input.json", require_uid_zero=False
-                      )
-              except SystemExit:
-                  pass
-              else:
-                  raise SystemExit("symlink seed unexpectedly accepted")
+              capture_intended_rejection(
+                  lambda: module_globals["validate_seed_acl"](symlink_work, symlink_seed, "input.json", False),
+                  "SEED_SYMLINK_REJECTED",
+                  "SYMLINK",
+              )
+              symlink_target_after = module_globals["emit_seed_acl_evidence"](
+                  symlink_target, "fixture", "post_admission", "unlisted.json",
+                  expected_access=module_globals["expected_seed_acl"](runner_uid),
+                  include_default=True, expected_default={},
+                  expected_uid=runner_uid, expected_gid=runner_gid, expected_mode="0660",
+                  checkpoint="after-symlink-control",
+              )
+              unchanged(symlink_target_before, symlink_target_after, "SYMLINK_TARGET_CHANGED")
+              symlink_work_after = module_globals["emit_seed_acl_evidence"](
+                  symlink_work, "fixture", "configured", "work", include_default=True,
+                  expected_access=module_globals["expected_work_acl"](runner_uid),
+                  expected_default=module_globals["expected_work_acl"](runner_uid, default=True),
+                  expected_uid=0, expected_gid=0, expected_mode="0770",
+                  checkpoint="after-symlink-control",
+              )
+              unchanged(symlink_work_configured, symlink_work_after, "SYMLINK_WORK_CHANGED")
               print("SYMLINK_SEED_REJECTED=PASS")
               print("WORK_SEED_ACL_REGRESSION=PASS")
               print("SEED_HANDOFF_REGRESSION=PASS")
@@ -5690,6 +6701,16 @@ jobs:
           print("MARKER_IDEMPOTENCE_REGRESSION=PASS")
           print("OUTER_MARKER_CLASSIFICATION=PASS")
           PY
+          seed_generator_status=$?
+          set -e
+          /usr/bin/cat -- "$seed_generator_stderr" >&2
+          if (( seed_generator_status != 0 )); then
+            [[ -x /usr/bin/python3 ]] || fail_hold "SEED_GENERATOR_INTERPRETER_UNAVAILABLE"
+            if ! /usr/bin/grep -Fq -- 'FAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD' "$seed_generator_stderr" && [[ ! -e "$candidate_defect_marker_file" && ! -L "$candidate_defect_marker_file" ]]; then
+              printf '%s\n' 'SEED_HOSTED_GENERATOR_OR_FIXTURE_UNCLASSIFIED' > "$candidate_defect_marker_file"
+            fi
+            exit "$seed_generator_status"
+          fi
 
           (( stop_new_launches == 0 )) || exit "$(signal_exit_status "${received_signal:-TERM}")"
           admit_before_bwrap candidate || fail_hold "BWRAP_IDENTITY_ADMISSION_BEFORE_CANDIDATE_FAILED"
