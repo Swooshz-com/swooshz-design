@@ -5588,6 +5588,7 @@ jobs:
           seed_generator_stderr="$temp_root/s8-seed-generator.stderr"
           set +e
           /usr/bin/python3 - "$GITHUB_WORKSPACE/scripts/s8/s8_runtime_sensitivity.py" "$qualified_helper" "$candidate_marker_file" "$candidate_defect_marker_file" 2>"$seed_generator_stderr" <<'PY'
+          import ast
           import base64
           import builtins
           import contextlib
@@ -6623,6 +6624,24 @@ jobs:
           source = source.replace(readback_anchor, readback_anchor + readback_line, 1)
           target_path.write_text(source, encoding="utf-8")
           compile(source, str(target_path), "exec")
+          parsed_source = ast.parse(source, filename=str(target_path))
+          phase_calls = sorted(
+              (
+                  call.lineno,
+                  next(
+                      keyword.value.value
+                      for keyword in call.keywords
+                      if keyword.arg == "phase" and isinstance(keyword.value, ast.Constant)
+                  ),
+              )
+              for call in ast.walk(parsed_source)
+              if isinstance(call, ast.Call)
+              and isinstance(call.func, ast.Name)
+              and call.func.id == "run_sandbox"
+          )
+          if [phase for _, phase in phase_calls] != ["WRITER", "VALIDATOR", "IMPORT", "EDIT", "REOPEN"]:
+              raise SystemExit(f"production sandbox phase bindings invalid: {phase_calls}")
+          print("PRODUCTION_SANDBOX_PHASE_BINDINGS=PASS")
           binding_text = f"marker_path = pathlib.Path({marker_binding_literal})"
           binding_index = source.find(binding_text)
           first_marker_use = source.find("if not marker_path.exists():")
@@ -7108,6 +7127,8 @@ jobs:
               )
               print("R30_BLANK_PRE_RECEIPT_PRESERVED=PASS")
               print("MAPPED_RECEIPT_FRAMING_REGRESSIONS=PASS")
+              print("MAPPED_SEED_FRAMING_REGRESSION=PASS")
+              print("R36_MAPPED_SEED_FRAMING_FIXTURE=PASS")
 
               if source.count(mapped_probe_block) != 1:
                   raise SystemExit("generated post-probe call path is not unique")
@@ -8259,6 +8280,70 @@ jobs:
               generated_marker = module_globals["marker_path"]
               if generated_marker != marker_path:
                   raise SystemExit("generated marker path differs from outer marker path")
+              test_runner_results = {
+                  0: ("S8_RUNNER_SUCCESS", "target-exit-zero"),
+                  70: ("S8_RUNNER_INTERNAL", "runner-internal"),
+                  71: ("S8_RUNNER_CHILD_SETUP_FAILED", "child-setup-failed"),
+                  72: ("S8_RUNNER_EVIDENCE_INVALID", "evidence-failed"),
+                  73: ("S8_RUNNER_EXEC_FAILED", "exec-failed"),
+                  74: ("S8_RUNNER_STDOUT_LIMIT", "stdout-limit"),
+                  75: ("S8_RUNNER_STDERR_LIMIT", "stderr-limit"),
+                  76: ("S8_RUNNER_TARGET_EXIT_NONZERO", "target-exit-nonzero"),
+                  77: ("S8_RUNNER_TARGET_SIGNAL", "target-signal"),
+                  124: ("S8_RUNNER_TIMEOUT", "wall-timeout"),
+              }
+
+              def make_runner_receipt(
+                  code=0, target_stdout=b"", target_stderr=b"", *,
+                  result_updates=None, parent_updates=None,
+              ):
+                  name, termination = test_runner_results.get(
+                      code, ("S8_RUNNER_ARGUMENT_INVALID", "argument-invalid")
+                  )
+                  result = {
+                      "code": code,
+                      "name": name,
+                      "terminationClass": termination,
+                      "targetExit": 0 if code == 0 else 23 if code == 76 else None,
+                      "targetSignal": 9 if code == 77 else None,
+                      "elapsedMs": 17,
+                      "stdoutBytes": len(target_stdout),
+                      "stderrBytes": len(target_stderr),
+                      "setupStage": "seccomp" if code == 71 else None,
+                      "evidenceCode": "CHILD_EVIDENCE_MALFORMED" if code == 72 else None,
+                  }
+                  if result_updates:
+                      result.update(result_updates)
+                  parent = {"status": "PASS", "mismatchCode": None}
+                  if code in {71, 72}:
+                      parent["status"] = "FAIL"
+                  if code == 72:
+                      parent["mismatchCode"] = "CHILD_EVIDENCE_MALFORMED"
+                  if code == 70:
+                      parent["mismatchCode"] = "CAPTURE_INIT"
+                  if parent_updates:
+                      parent.update(parent_updates)
+                  return {
+                      "schemaVersion": "s8-process-runner-receipt-v2",
+                      "protocol": "s8-process-runner-receipt-v2",
+                      "policyId": "s8-zero-child-seccomp-x86_64-v2",
+                      "runnerParentVerification": parent,
+                      "result": result,
+                  }
+
+              def frame_runner_receipt(receipt, target_stdout=b"", prelude=b""):
+                  encoded = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
+                  return prelude + b"S8_RUNNER_RECEIPT:" + encoded + b"\n" + target_stdout
+
+              def raw_runner_frame(payload, target_stdout=b"", prelude=b"", final_lf=True):
+                  return prelude + b"S8_RUNNER_RECEIPT:" + payload + (b"\n" if final_lf else b"") + target_stdout
+
+              marker_success_payload = b"candidate\n"
+              marker_success_output = frame_runner_receipt(
+                  make_runner_receipt(0, target_stdout=marker_success_payload),
+                  marker_success_payload,
+              )
+
               original_run = module_globals["subprocess"].run
               calls: list[list[str]] = []
               admission_status = 1
@@ -8267,8 +8352,9 @@ jobs:
                   calls.append(command)
                   if len(calls) == 1:
                       return SimpleNamespace(returncode=admission_status, stdout=b"", stderr=b"")
-                  return SimpleNamespace(returncode=0, stdout=b"candidate\n", stderr=b"")
+                  return SimpleNamespace(returncode=0, stdout=marker_success_output, stderr=b"")
 
+              run_kwargs = {"phase": "WRITER"}
               run_args = (
                   sandbox,
                   runner,
@@ -8286,11 +8372,11 @@ jobs:
 
               def missing_fake_run(command, **kwargs):
                   missing_calls.append(command)
-                  return SimpleNamespace(returncode=0, stdout=b"candidate\n", stderr=b"")
+                  return SimpleNamespace(returncode=0, stdout=marker_success_output, stderr=b"")
 
               missing_globals["subprocess"].run = missing_fake_run
               try:
-                  missing_globals["run_sandbox"](*run_args)
+                  missing_globals["run_sandbox"](*run_args, **run_kwargs)
               except NameError as error:
                   if "marker_path" not in str(error):
                       raise
@@ -8302,7 +8388,7 @@ jobs:
                   marker_path.unlink()
               try:
                   with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                      module_globals["run_sandbox"](*run_args)
+                      module_globals["run_sandbox"](*run_args, **run_kwargs)
               except SystemExit as error:
                   if error.code != 1:
                       raise
@@ -8337,20 +8423,20 @@ jobs:
               Path.write_text = observed_write_text
               try:
                   with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
-                      first_result = module_globals["run_sandbox"](*run_args)
+                      first_result = module_globals["run_sandbox"](*run_args, **run_kwargs)
                       first_marker_bytes = marker_path.read_bytes()
                       first_marker_text = marker_path.read_text(encoding="ascii")
                       first_events = list(events)
                       events.clear()
                       calls.clear()
-                      second_result = module_globals["run_sandbox"](*run_args)
+                      second_result = module_globals["run_sandbox"](*run_args, **run_kwargs)
                       second_marker_bytes = marker_path.read_bytes()
                       second_events = list(events)
               finally:
                   Path.write_text = original_write_text
                   builtins.print = original_print
                   module_globals["subprocess"].run = original_run
-              if first_result != b"candidate\n" or second_result != b"candidate\n":
+              if first_result != marker_success_output or second_result != marker_success_output:
                   raise SystemExit("generated helper candidate result mismatch")
               if first_marker_text != "1\n" or second_marker_bytes != first_marker_bytes:
                   raise SystemExit("generated marker was not created idempotently")
@@ -8360,6 +8446,491 @@ jobs:
                   raise SystemExit(f"repeated admission emitted marker events: {second_events}")
               if generated_marker != marker_path or not marker_path.exists():
                   raise SystemExit("outer marker classification path mismatch")
+              def run_sandbox_case(
+                  *, stdout=b"", returncode=0, stderr=b"", phase="WRITER",
+                  launch_exception=None,
+              ):
+                  calls_for_case = []
+
+                  def case_fake_run(command, **kwargs):
+                      calls_for_case.append(command)
+                      if len(calls_for_case) == 1 and len(command) > 1 and command[1] == "--s8-destination-admission-only":
+                          return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+                      if launch_exception is not None:
+                          raise launch_exception
+                      return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+                  prior_run = module_globals["subprocess"].run
+                  module_globals["subprocess"].run = case_fake_run
+                  captured_out = io.StringIO()
+                  captured_err = io.StringIO()
+                  value = None
+                  exit_code = None
+                  try:
+                      with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
+                          try:
+                              value = module_globals["run_sandbox"](*run_args, phase=phase)
+                          except SystemExit as error:
+                              exit_code = error.code
+                  finally:
+                      module_globals["subprocess"].run = prior_run
+                  return {
+                      "value": value,
+                      "exit": exit_code,
+                      "stdout": captured_out.getvalue(),
+                      "stderr": captured_err.getvalue(),
+                      "calls": calls_for_case,
+                  }
+
+              def sandbox_diagnostic(result, label):
+                  if result["stderr"].count("SANDBOX_DIAGNOSTIC_BEGIN") != 1:
+                      raise SystemExit(f"{label}: diagnostic block count invalid")
+                  if result["stderr"].count("SANDBOX_DIAGNOSTIC_END") != 1:
+                      raise SystemExit(f"{label}: diagnostic block terminator count invalid")
+                  start = result["stderr"].index("SANDBOX_DIAGNOSTIC_BEGIN")
+                  end = result["stderr"].index("SANDBOX_DIAGNOSTIC_END") + len("SANDBOX_DIAGNOSTIC_END")
+                  return result["stderr"][start:end]
+
+              def assert_sandbox_failure(
+                  label, stdout, returncode, failure_class, reason, *,
+                  stderr=b"", phase="WRITER",
+              ):
+                  result = run_sandbox_case(
+                      stdout=stdout, returncode=returncode, stderr=stderr, phase=phase
+                  )
+                  if result["exit"] != 1:
+                      raise SystemExit(f"{label}: invocation did not fail terminally")
+                  if f"FAILURE_CLASS={failure_class}\n" not in result["stderr"]:
+                      raise SystemExit(f"{label}: failure classification mismatch")
+                  if f"S8_RUNTIME_SENSITIVITY_FAIL:{reason}\n" not in result["stderr"]:
+                      raise SystemExit(f"{label}: failure reason mismatch")
+                  block = sandbox_diagnostic(result, label)
+                  if f"SANDBOX_VALIDATION_REASON={reason}\n" not in block:
+                      raise SystemExit(f"{label}: diagnostic reason mismatch")
+                  return result, block
+
+              exact_payload = b"candidate payload\x00\n"
+              exact_success_receipt = make_runner_receipt(0, target_stdout=exact_payload)
+              exact_success_frame = frame_runner_receipt(exact_success_receipt, exact_payload)
+              r1 = run_sandbox_case(stdout=exact_success_frame, returncode=0)
+              if r1["exit"] is not None or r1["value"] != exact_success_frame:
+                  raise SystemExit("R1 valid success receipt did not preserve the exact receipt and target payload")
+              if module_globals["receipt_payload"](r1["value"], "R1") != exact_payload:
+                  raise SystemExit("R1 receipt_payload consumer changed the exact target payload")
+              print("R1_VALID_SUCCESS_RECEIPT=PASS")
+
+              failure_stdout = b"writer target output\n"
+              r2_receipt = make_runner_receipt(76, target_stdout=failure_stdout)
+              r2, r2_block = assert_sandbox_failure(
+                  "R2", frame_runner_receipt(r2_receipt, failure_stdout), 76,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "TARGET_EXIT_NONZERO",
+              )
+              if "RUNNER_TARGET_EXIT=23\n" not in r2_block:
+                  raise SystemExit("R2 exact target exit was not surfaced")
+              print("R2_TARGET_EXIT_NONZERO=PASS")
+
+              r3_receipt = make_runner_receipt(
+                  77, result_updates={"targetExit": None, "targetSignal": 9}
+              )
+              _, r3_block = assert_sandbox_failure(
+                  "R3", frame_runner_receipt(r3_receipt), 77,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "TARGET_SIGNAL",
+              )
+              if "RUNNER_TARGET_SIGNAL=9\n" not in r3_block:
+                  raise SystemExit("R3 exact target signal was not surfaced")
+              print("R3_TARGET_SIGNAL=PASS")
+
+              for label, code, reason in (
+                  ("R4", 124, "TARGET_TIMEOUT"),
+                  ("R5", 74, "STDOUT_LIMIT"),
+                  ("R6", 75, "STDERR_LIMIT"),
+              ):
+                  receipt = make_runner_receipt(code)
+                  _, block = assert_sandbox_failure(
+                      label, frame_runner_receipt(receipt), code,
+                      "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", reason,
+                  )
+                  if "RUNNER_TARGET_SIGNAL=null\n" not in block:
+                      raise SystemExit(f"{label}: null target signal was inferred")
+                  print(f"{label}_{reason}=PASS")
+
+              r7_receipt = make_runner_receipt(
+                  71, parent_updates={"status": "FAIL", "mismatchCode": None}
+              )
+              _, r7_block = assert_sandbox_failure(
+                  "R7", frame_runner_receipt(r7_receipt), 71,
+                  "HOSTED_SANDBOX_ENVIRONMENT_HOLD", "RUNNER_CHILD_SETUP_FAILED",
+              )
+              if "RUNNER_SETUP_STAGE=seccomp\n" not in r7_block or "RUNNER_PARENT_VERIFICATION=FAIL\n" not in r7_block:
+                  raise SystemExit("R7 setup stage or legitimate failed parent verification was lost")
+              print("R7_CHILD_SETUP_HOLD=PASS")
+
+              r8_receipt = make_runner_receipt(72)
+              _, r8_block = assert_sandbox_failure(
+                  "R8", frame_runner_receipt(r8_receipt), 72,
+                  "HOSTED_SANDBOX_ENVIRONMENT_HOLD", "RUNNER_EVIDENCE_INVALID",
+              )
+              if (
+                  "RUNNER_EVIDENCE_CODE=CHILD_EVIDENCE_MALFORMED\n" not in r8_block
+                  or "RUNNER_MISMATCH_CODE=CHILD_EVIDENCE_MALFORMED\n" not in r8_block
+              ):
+                  raise SystemExit("R8 evidence or mismatch code was not surfaced")
+              print("R8_EVIDENCE_HOLD=PASS")
+
+              for label, code, reason, parent_updates in (
+                  ("R9", 73, "RUNNER_EXEC_FAILED", {"status": "PASS", "mismatchCode": None}),
+                  ("R10", 70, "RUNNER_INTERNAL", {"status": "PASS", "mismatchCode": "CAPTURE_INIT"}),
+              ):
+                  receipt = make_runner_receipt(code, parent_updates=parent_updates)
+                  _, block = assert_sandbox_failure(
+                      label, frame_runner_receipt(receipt), code,
+                      "HOSTED_SANDBOX_ENVIRONMENT_HOLD", reason,
+                  )
+                  if label == "R10" and (
+                      "RUNNER_PARENT_VERIFICATION=PASS\n" not in block
+                      or "RUNNER_MISMATCH_CODE=CAPTURE_INIT\n" not in block
+                  ):
+                      raise SystemExit("R10 failure receipt parent-verification shape was over-constrained")
+                  print(f"{label}_{reason}=PASS")
+
+              for label, code in (("R11", 0), ("R12", 1)):
+                  _, block = assert_sandbox_failure(
+                      label, b"wrapper output without a receipt\n", code,
+                      "HOSTED_SANDBOX_ENVIRONMENT_HOLD", "RUNNER_RECEIPT_MISSING",
+                  )
+                  if "RUNNER_RECEIPT_VALID=NO\n" not in block:
+                      raise SystemExit(f"{label}: missing receipt was trusted")
+                  print(f"{label}_MISSING_RECEIPT=PASS")
+
+              _, _ = assert_sandbox_failure(
+                  "R13", raw_runner_frame(b"{malformed"), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_MALFORMED_JSON",
+              )
+              print("R13_MALFORMED_JSON=PASS")
+
+              duplicate_key_payload = json.dumps(
+                  make_runner_receipt(0), sort_keys=True, separators=(",", ":")
+              ).encode("ascii")
+              duplicate_key_payload = duplicate_key_payload.replace(
+                  b'"schemaVersion":',
+                  b'"schemaVersion":"wrong","schemaVersion":',
+                  1,
+              )
+              assert_sandbox_failure(
+                  "R14", raw_runner_frame(duplicate_key_payload), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_DUPLICATE_JSON_KEY",
+              )
+              print("R14_DUPLICATE_JSON_KEY=PASS")
+
+              wrong_type_receipt = make_runner_receipt(0, result_updates={"code": True})
+              assert_sandbox_failure(
+                  "R15", frame_runner_receipt(wrong_type_receipt), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_FIELD_TYPE_INVALID",
+              )
+              print("R15_BOOLEAN_IS_NOT_INTEGER=PASS")
+
+              unknown_result_receipt = make_runner_receipt(64)
+              assert_sandbox_failure(
+                  "R16", frame_runner_receipt(unknown_result_receipt), 64,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_RESULT_CODE_UNKNOWN",
+              )
+              print("R16_UNKNOWN_AND_CODE64_RECEIPT=PASS")
+
+              r17_receipt = make_runner_receipt(76)
+              assert_sandbox_failure(
+                  "R17", frame_runner_receipt(r17_receipt), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_TRANSPORT_MISMATCH",
+              )
+              print("R17_OUTER_RESULT_DISAGREEMENT=PASS")
+
+              duplicate_frame = exact_success_frame + b"\n" + exact_success_frame
+              assert_sandbox_failure(
+                  "R18", duplicate_frame, 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_DUPLICATE_MARKER",
+              )
+              print("R18_DUPLICATE_RECEIPT_LINES=PASS")
+
+              embedded_frame = b"wrapper output " + exact_success_frame
+              assert_sandbox_failure(
+                  "R19", embedded_frame, 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_UNANCHORED_MARKER",
+              )
+              print("R19_EMBEDDED_ONLY_MARKER=PASS")
+
+              anchored_embedded_duplicate = exact_success_frame + b"target echoed S8_RUNNER_RECEIPT:duplicate"
+              assert_sandbox_failure(
+                  "R20", anchored_embedded_duplicate, 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_DUPLICATE_MARKER",
+              )
+              print("R20_ANCHORED_AND_EMBEDDED_DUPLICATE=PASS")
+
+              prelude = b"wrapper-owned prelude\n"
+              r21_frame = frame_runner_receipt(
+                  make_runner_receipt(0, target_stdout=exact_payload),
+                  exact_payload,
+                  prelude=prelude,
+              )
+              r21 = run_sandbox_case(stdout=r21_frame, returncode=0)
+              if r21["exit"] is not None or r21["value"] != exact_success_frame:
+                  raise SystemExit("R21 valid wrapper prelude was not excluded from the returned payload")
+              print("R21_WRAPPER_PRELUDE=PASS")
+
+              incomplete_frame = raw_runner_frame(
+                  json.dumps(make_runner_receipt(0), sort_keys=True, separators=(",", ":")).encode("ascii"),
+                  final_lf=False,
+              )
+              assert_sandbox_failure(
+                  "R22", incomplete_frame, 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_INCOMPLETE_LINE",
+              )
+              print("R22_INCOMPLETE_RECEIPT_LINE=PASS")
+
+              phase_failure_frame = frame_runner_receipt(make_runner_receipt(76))
+              phase_results = {}
+              for phase in ("WRITER", "VALIDATOR", "IMPORT", "EDIT", "REOPEN"):
+                  _, phase_block = assert_sandbox_failure(
+                      f"R23_{phase}", phase_failure_frame, 76,
+                      "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "TARGET_EXIT_NONZERO",
+                      phase=phase,
+                  )
+                  if f"SANDBOX_PHASE={phase}\n" not in phase_block:
+                      raise SystemExit(f"{phase}: diagnostic phase identity missing")
+                  if phase != "WRITER" and "SANDBOX_PHASE=WRITER\n" in phase_block:
+                      raise SystemExit(f"{phase}: diagnostic impersonated WRITER")
+                  phase_results[phase] = True
+              invalid_phase = run_sandbox_case(
+                  stdout=phase_failure_frame, returncode=76, phase="NOT_A_PHASE"
+              )
+              if invalid_phase["calls"] or "SANDBOX_DIAGNOSTIC_BEGIN" in invalid_phase["stderr"]:
+                  raise SystemExit("invalid phase launched a process or emitted a misleading phase diagnostic")
+              if "S8_RUNTIME_SENSITIVITY_FAIL:SANDBOX_PHASE_INVALID\n" not in invalid_phase["stderr"]:
+                  raise SystemExit("invalid phase was not rejected")
+              print("R23_WRITER_PHASE_IDENTITY=PASS")
+              print("R24_VALIDATOR_PHASE_IDENTITY=PASS")
+              print("R25_IMPORT_PHASE_IDENTITY=PASS")
+              print("R26_EDIT_PHASE_IDENTITY=PASS")
+              print("R27_REOPEN_PHASE_IDENTITY=PASS")
+
+              oversized_prelude = b"p" * 8193 + b"\n" + exact_success_frame
+              assert_sandbox_failure(
+                  "R28", oversized_prelude, 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_OVERSIZED_PRELUDE",
+              )
+              print("R28_OVERSIZED_PRELUDE=PASS")
+
+              oversized_line = raw_runner_frame(b"x" * 8193)
+              assert_sandbox_failure(
+                  "R29", oversized_line, 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_OVERSIZED_LINE",
+              )
+              print("R29_OVERSIZED_RECEIPT_LINE=PASS")
+
+              large_output = bytes(range(256)) * 4096
+              large_receipt = make_runner_receipt(
+                  76, target_stdout=large_output, target_stderr=large_output
+              )
+              r30, r30_block = assert_sandbox_failure(
+                  "R30", frame_runner_receipt(large_receipt, large_output), 76,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "TARGET_EXIT_NONZERO",
+                  stderr=large_output,
+              )
+              if len(r30_block.encode("ascii")) > 32 * 1024:
+                  raise SystemExit("R30 diagnostic block exceeded 32 KiB")
+              r30_values = dict(line.split("=", 1) for line in r30_block.splitlines() if "=" in line)
+              stdout_excerpt = json.loads(r30_values["TARGET_STDOUT_EXCERPT"])
+              stderr_excerpt = json.loads(r30_values["TARGET_STDERR_EXCERPT"])
+              if (
+                  stdout_excerpt["selectedBytes"] > 2048
+                  or stdout_excerpt["omittedBytes"] != len(large_output) - stdout_excerpt["selectedBytes"]
+                  or stderr_excerpt["selectedBytes"] > 2048
+                  or stderr_excerpt["omittedBytes"] != len(large_output) - stderr_excerpt["selectedBytes"]
+              ):
+                  raise SystemExit("R30 output excerpts or omitted byte counts exceeded their bounds")
+              print("R30_BOUNDED_OUTPUT_EXCERPTS=PASS")
+
+              fake_github_token = b"gh" + b"p_" + b"abcdefghijklmnopqrstuvwxyz0123456789"
+              secret_output = (
+                  b"Authorization: Bearer FixtureBearerSecret123\n"
+                  b"cookie: session=FixtureCookieSecret\n"
+                  b"token=FixtureAccessSecret\n"
+                  + fake_github_token + b"\n"
+              )
+              _, r31_block = assert_sandbox_failure(
+                  "R31", frame_runner_receipt(
+                      make_runner_receipt(76, target_stdout=secret_output), secret_output
+                  ), 76,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "TARGET_EXIT_NONZERO",
+              )
+              for secret in (
+                  b"FixtureBearerSecret123", b"FixtureCookieSecret",
+                  b"FixtureAccessSecret", fake_github_token,
+              ):
+                  if secret.decode("ascii") in r31_block:
+                      raise SystemExit("R31 credential-like diagnostic data was not sanitized")
+              if "[REDACTED]" not in r31_block:
+                  raise SystemExit("R31 sanitized replacement is missing")
+              print("R31_CREDENTIAL_REDACTION=PASS")
+
+              binary_output = b"\x00\xff\x1b\x07\x80control"
+              _, r32_block = assert_sandbox_failure(
+                  "R32", frame_runner_receipt(
+                      make_runner_receipt(76, target_stdout=binary_output), binary_output
+                  ), 76,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "TARGET_EXIT_NONZERO",
+              )
+              if not all(value in r32_block for value in (r"\u0000", r"\u00ff", r"\u001b")):
+                  raise SystemExit("R32 binary/control output did not render as escaped JSON")
+              r32_block.encode("ascii")
+              print("R32_BINARY_CONTROL_OUTPUT=PASS")
+
+              exact_stderr = b"native target stderr evidence"
+              r33_receipt = make_runner_receipt(76, target_stderr=exact_stderr)
+              _, r33_block = assert_sandbox_failure(
+                  "R33", frame_runner_receipt(r33_receipt), 76,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "TARGET_EXIT_NONZERO",
+                  stderr=exact_stderr,
+              )
+              if (
+                  "TARGET_STDERR_ATTRIBUTION=EXACT\n" not in r33_block
+                  or json.loads(dict(
+                      line.split("=", 1) for line in r33_block.splitlines() if "=" in line
+                  )["TARGET_STDERR_EXCERPT"])["data"] != exact_stderr.decode("ascii")
+              ):
+                  raise SystemExit("R33 exact-length target stderr attribution failed")
+              print("R33_EXACT_STDERR_ATTRIBUTION=PASS")
+
+              expected_stderr = b"native-stderr"
+              transport_stderr = b"wrapper transport stderr differs"
+              r34_receipt = make_runner_receipt(76, target_stderr=expected_stderr)
+              _, r34_block = assert_sandbox_failure(
+                  "R34", frame_runner_receipt(r34_receipt), 76,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "TARGET_EXIT_NONZERO",
+                  stderr=transport_stderr,
+              )
+              r34_values = dict(line.split("=", 1) for line in r34_block.splitlines() if "=" in line)
+              if (
+                  "TARGET_STDERR_ATTRIBUTION=UNAVAILABLE_MISMATCH\n" not in r34_block
+                  or r34_values["TARGET_STDERR_EXCERPT"] != "null"
+                  or json.loads(r34_values["TRANSPORT_STDERR_EXCERPT"])["data"] != transport_stderr.decode("ascii")
+              ):
+                  raise SystemExit("R34 transport stderr mismatch was hidden or misattributed")
+              print("R34_STDERR_MISMATCH_ATTRIBUTION=PASS")
+
+              outer_timeout = subprocess.TimeoutExpired(
+                  "sandbox", 60, output=b"outer timeout stdout", stderr=b"outer timeout stderr"
+              )
+              r35 = run_sandbox_case(phase="WRITER", launch_exception=outer_timeout)
+              if (
+                  r35["exit"] != 1
+                  or "FAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD\n" not in r35["stderr"]
+                  or "S8_RUNTIME_SENSITIVITY_FAIL:SANDBOX_LAUNCH_TIMEOUT\n" not in r35["stderr"]
+              ):
+                  raise SystemExit("R35 outer subprocess timeout classification was not distinct")
+              r35_block = sandbox_diagnostic(r35, "R35")
+              if (
+                  "SANDBOX_VALIDATION_REASON=SANDBOX_LAUNCH_TIMEOUT\n" not in r35_block
+                  or "SANDBOX_VALIDATION_REASON=TARGET_TIMEOUT\n" in r35_block
+                  or "SANDBOX_OUTER_RETURN_CODE=null\n" not in r35_block
+              ):
+                  raise SystemExit("R35 outer timeout was conflated with native timeout")
+              print("R35_OUTER_TIMEOUT_DISTINCT=PASS")
+
+              r37 = run_sandbox_case(
+                  phase="WRITER", launch_exception=OSError("fixture launch failure")
+              )
+              if (
+                  r37["exit"] != 1
+                  or "FAILURE_CLASS=HOSTED_SANDBOX_ENVIRONMENT_HOLD\n" not in r37["stderr"]
+                  or "S8_RUNTIME_SENSITIVITY_FAIL:SANDBOX_LAUNCH_FAILED\n" not in r37["stderr"]
+              ):
+                  raise SystemExit("R37 outer launch exception classification was incorrect")
+              if "SANDBOX_VALIDATION_REASON=SANDBOX_LAUNCH_FAILED\n" not in sandbox_diagnostic(r37, "R37"):
+                  raise SystemExit("R37 outer launch exception diagnostic was missing")
+              print("R37_OUTER_LAUNCH_EXCEPTION=PASS")
+
+              nan_payload = json.dumps(
+                  make_runner_receipt(0), sort_keys=True, separators=(",", ":")
+              ).encode("ascii").replace(b'"elapsedMs":17', b'"elapsedMs":NaN')
+              assert_sandbox_failure(
+                  "R38", raw_runner_frame(nan_payload), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_NONSTANDARD_NUMBER",
+              )
+              print("R38_NONSTANDARD_JSON_NUMBER=PASS")
+
+              trailing_payload = json.dumps(
+                  make_runner_receipt(0), sort_keys=True, separators=(",", ":")
+              ).encode("ascii") + b" {}"
+              assert_sandbox_failure(
+                  "R39", raw_runner_frame(trailing_payload), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_MALFORMED_JSON",
+              )
+              print("R39_TRAILING_JSON_DATA=PASS")
+
+              assert_sandbox_failure(
+                  "R40", raw_runner_frame(b'{"bad":\xff}'), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_NON_ASCII",
+              )
+              print("R40_NON_ASCII_RECEIPT=PASS")
+
+              missing_field_receipt = make_runner_receipt(0)
+              del missing_field_receipt["result"]["evidenceCode"]
+              missing_field_result, missing_field_block = assert_sandbox_failure(
+                  "R41", frame_runner_receipt(missing_field_receipt), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_FIELD_MISSING",
+              )
+              if "RUNNER_SCHEMA_VERSION=null\n" not in missing_field_block:
+                  raise SystemExit("R41 unvalidated receipt values were emitted as trusted fields")
+              print("R41_REQUIRED_FIELD_MISSING=PASS")
+
+              wrong_contract_receipt = make_runner_receipt(0)
+              wrong_contract_receipt["policyId"] = "wrong-policy"
+              assert_sandbox_failure(
+                  "R42", frame_runner_receipt(wrong_contract_receipt), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_CONTRACT_MISMATCH",
+              )
+              print("R42_PINNED_CONTRACT=PASS")
+
+              wrong_mapping_receipt = make_runner_receipt(
+                  76,
+                  result_updates={
+                      "name": "S8_RUNNER_SUCCESS",
+                      "terminationClass": "target-exit-zero",
+                  },
+              )
+              assert_sandbox_failure(
+                  "R43", frame_runner_receipt(wrong_mapping_receipt), 76,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_RESULT_MAPPING_INVALID",
+              )
+              print("R43_CODE_NAME_TERMINATION_MAPPING=PASS")
+
+              stdout_count_receipt = make_runner_receipt(0)
+              _, r44_block = assert_sandbox_failure(
+                  "R44", frame_runner_receipt(stdout_count_receipt, b"observed"), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_TRANSPORT_MISMATCH",
+              )
+              if (
+                  "RUNNER_STDOUT_BYTES=0\n" not in r44_block
+                  or "TARGET_STDOUT_ACTUAL_BYTES=8\n" not in r44_block
+              ):
+                  raise SystemExit("R44 observed target stdout length mismatch was not exposed")
+              print("R44_TARGET_STDOUT_COUNT_MISMATCH=PASS")
+
+              invalid_success_parent = make_runner_receipt(
+                  0, parent_updates={"status": "FAIL", "mismatchCode": "PARENT_SECURITY"}
+              )
+              _, r45_block = assert_sandbox_failure(
+                  "R45", frame_runner_receipt(invalid_success_parent), 0,
+                  "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "RUNNER_RECEIPT_SUCCESS_INVALID",
+              )
+              if "RUNNER_PARENT_VERIFICATION=FAIL\n" not in r45_block:
+                  raise SystemExit("R45 failed success parent verification was not surfaced")
+              print("R45_SUCCESS_PARENT_VERIFICATION=PASS")
+
+              print("RUN_SANDBOX_DIAGNOSTIC_REGRESSIONS=PASS")
+              print("PHASE_BINDING_REGRESSIONS=PASS")
+              print("RECEIPT_SCHEMA_REGRESSIONS=PASS")
+              print("RESULT_CLASSIFICATION_REGRESSIONS=PASS")
+              print("BOUNDED_OUTPUT_REGRESSIONS=PASS")
           print("MARKER_ORDERING_REGRESSION=PASS")
           print("MARKER_BINDING_REGRESSION=PASS")
           print("MARKER_IDEMPOTENCE_REGRESSION=PASS")
