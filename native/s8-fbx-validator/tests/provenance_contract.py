@@ -62,6 +62,10 @@ def prop_string(value: str | bytes) -> bytes:
     return b"S" + struct.pack("<I", len(raw)) + raw
 
 
+def binary_object_name(name: str, object_type: str) -> bytes:
+    return name.encode("ascii") + b"\x00\x01" + object_type.encode("ascii")
+
+
 def prop_int32(value: int) -> bytes:
     return b"I" + struct.pack("<i", value)
 
@@ -174,7 +178,11 @@ def geometry_node(geometry_id: int, name: str) -> FbxNode:
     )
     return node(
         "Geometry",
-        (prop_int64(geometry_id), prop_string(f"Geometry::{name}"), prop_string("Mesh")),
+        (
+            prop_int64(geometry_id),
+            prop_string(binary_object_name(name, "Geometry")),
+            prop_string("Mesh"),
+        ),
         (
             node("GeometryVersion", (prop_int32(124),)),
             node("Vertices", (prop_array("d", (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0)),)),
@@ -218,7 +226,11 @@ def build_fbx(models: tuple[ModelSpec, ...]) -> bytes:
         object_nodes.append(
             node(
                 "Model",
-                (prop_int64(model_ids[index]), prop_string(f"Model::{spec.name}"), prop_string(subtype)),
+                (
+                    prop_int64(model_ids[index]),
+                    prop_string(binary_object_name(spec.name, "Model")),
+                    prop_string(subtype),
+                ),
                 (
                     node("Version", (prop_int32(232),)),
                     node("Properties70", (), tuple(model_properties)),
