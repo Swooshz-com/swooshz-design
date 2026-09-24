@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - web/run-081-s8-standalone-bwrap-evidence-001
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
 
 permissions:
   contents: read
