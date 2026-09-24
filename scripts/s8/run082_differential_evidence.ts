@@ -401,8 +401,11 @@ if [[ "\${S8_RUN082_SHIM_SEED_ADMISSION:-NO}" == "YES" ]]; then
   seed_uid0_count="$(/usr/bin/grep -Ec '^user:0:r--([[:space:]]+#effective:[[:space:]]r--)?$' "$seed_post_acl" || true)"
   seed_uid0_acl_valid=NO
   [[ "$seed_uid0_count" == "1" ]] && seed_uid0_acl_valid=YES
-  [[ "$seed_identity_unchanged" == YES && "$seed_existing_acl_unchanged" == YES && "$seed_default_acl_unchanged" == YES && "$seed_uid0_acl_valid" == YES ]] || abort SEED_ADMISSION_DELTA_INVALID 86
-  seed_admission=PASS
+  if [[ "$seed_identity_unchanged" == YES && "$seed_existing_acl_unchanged" == YES && "$seed_default_acl_unchanged" == YES && "$seed_uid0_acl_valid" == YES ]]; then
+    seed_admission=PASS
+  else
+    seed_admission=INVALID
+  fi
 fi
 identity_args=()
 if [[ "\${S8_RUN082_SHIM_IDENTITY:-none}" == "hosted" ]]; then
@@ -658,13 +661,7 @@ function runValidatorSurface(options: { label: string; root: string; identity: "
   try {
     writeFileSync(artifactPath, options.artifact, { mode: 0o600, flag: "wx" });
     if (options.custody === "root-acl") applyCustody(work, options.runnerUid);
-    if (options.seedAdmission && !admitDirectSeed(artifactPath, options.label)) {
-      const failed = { status: 86, stdout: "", stderr: "validator seed admission failed", receiptCode: null, pass: false };
-      console.log(`${options.label}_RESULT=FAIL`);
-      console.log(`${options.label}_STATUS=${failed.status}`);
-      console.log(`${options.label}_RECEIPT_CODE=NONE`);
-      return failed;
-    }
+    if (options.seedAdmission && !admitDirectSeed(artifactPath, options.label)) console.log(`${options.label}_SEED_ADMISSION_INVALID_CONTINUE=YES`);
     const result = directBwrap({ root: options.root, identity: options.identity, custody: options.custody, surfaces: options.surfaceIds, masks: options.masks, envPolicy: options.envPolicy, runner: options.runner, validator: options.validator, bwrap: options.bwrap, target: "/runtime/process-runner", targetArgs: ["--address-space-bytes", String(S8_LIMITS.validatorMemoryBytes), "--file-bytes", String(S8_LIMITS.validatorTempBytes), "--timeout-ms", String(S8_LIMITS.validatorTimeoutMs), "--stdout-bytes", String(S8_LIMITS.readbackBytes), "--stderr-bytes", String(S8_LIMITS.stderrBytes), "--max-children", "0", "--", "/runtime/validator", "/work/artifact.fbx"], work, clearEnv: options.clearEnv });
     console.log(`${options.label}_RESULT=${result.pass ? "PASS" : "FAIL"}`);
     console.log(`${options.label}_STATUS=${result.status}`);
@@ -955,7 +952,7 @@ function main(): void {
         console.log("G4_075_01_EVIDENCE_COMPLETE=NO");
         console.log("G4_075_02_ENVIRONMENT_EVIDENCE_COMPLETE=NO");
         console.log("EVIDENCE_LIMITATIONS=" + limitations.join(";"));
-        return;
+        console.log("DIFFERENTIAL_CONTINUING_AFTER_UPPER_BOUND_FAILURE=YES");
       }
 
       const differential: Record<string, string> = {};
@@ -1143,8 +1140,9 @@ function main(): void {
       console.log("HOSTILE_PYTHONHOME_ABSENT=" + (negativeEnvPass ? "PASS" : "NO"));
       console.log("CHILD_ENV_NEGATIVE_CONTROLS=" + (negativeEnvPass ? "PASS" : "NO"));
 
-      const runtimeComplete = finalSurface.writer.pass && finalSurface.validator?.pass === true && negativeRuntimePass && writableControlPass && identityControlPass && hostRootControlPass;
-      const environmentComplete = finalEnv.writer.pass && finalEnv.validator?.pass === true && negativeEnvPass;
+      const upperControlReady = upper.writer.pass && upper.validator?.pass === true && upper.writer.seedEvidence.SEED_ADMISSION === "PASS";
+      const runtimeComplete = upperControlReady && finalSurface.writer.pass && finalSurface.validator?.pass === true && negativeRuntimePass && writableControlPass && identityControlPass && hostRootControlPass;
+      const environmentComplete = upperControlReady && finalEnv.writer.pass && finalEnv.validator?.pass === true && negativeEnvPass;
       if (!runtimeComplete) limitations.push("RUNTIME_NEGATIVE_CONTROLS_INCOMPLETE_OR_MINIMUM_RUNTIME_FAILED");
       if (!actualValidatorApiPass) limitations.push("ACTUAL_RUN_S8_NATIVE_VALIDATOR_API_DID_NOT_PASS");
       if (!environmentComplete) limitations.push("ENVIRONMENT_NEGATIVE_CONTROLS_INCOMPLETE_OR_MINIMUM_ENV_FAILED");
