@@ -205,6 +205,7 @@ def build_fbx(models: tuple[ModelSpec, ...]) -> bytes:
         if spec.parent_index is not None and not (0 <= spec.parent_index < len(models)):
             raise ValueError("fixture parent index out of bounds")
         model_properties = [
+            field_property("RotationActive", Field("int", 0)),
             field_property("Lcl Translation", Field("vector3", spec.translation)),
             field_property("Lcl Rotation", Field("vector3", (0.0, 0.0, 0.0))),
             field_property("Lcl Scaling", Field("vector3", spec.scale)),
