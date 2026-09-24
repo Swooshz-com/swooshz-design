@@ -526,6 +526,25 @@ function resolveLibrary(name: string): string {
   return realpathSync(match[1]);
 }
 
+function runtimeMaskTargets(path: string): string[] {
+  const targets = new Set([path]);
+  const aliases = [
+    ["/usr/lib/", "/lib/"],
+    ["/lib/", "/usr/lib/"],
+    ["/usr/lib64/", "/lib64/"],
+    ["/lib64/", "/usr/lib64/"],
+  ] as const;
+  for (const [prefix, aliasPrefix] of aliases) if (path.startsWith(prefix)) {
+    const alias = `${aliasPrefix}${path.slice(prefix.length)}`;
+    if (existsSync(alias)) targets.add(alias);
+  }
+  return [...targets];
+}
+
+function runtimeMasks(source: string, target: string): Array<{ source: string; target: string }> {
+  return runtimeMaskTargets(target).map((alias) => ({ source, target: alias }));
+}
+
 function mountDomainKey(value: MountInfo | null): string {
   return value ? `${value.id}:${value.majorMinor}:${value.mountPoint}:${value.filesystem}` : "UNKNOWN";
 }
@@ -757,11 +776,21 @@ function main(): void {
     const emptyValidatorInterpreter = join(controlSourceRoot, "empty-validator-interpreter");
     const emptyValidatorLibc = join(controlSourceRoot, "empty-validator-libc");
     for (const path of [emptyInterpreter, emptyLibc, emptyLibm, emptyValidatorInterpreter, emptyValidatorLibc]) { writeFileSync(path, Buffer.alloc(0), { mode: 0o444 }); chmodSync(path, 0o444); }
-    const interpreterControl = executeSurfaceCase("CONTROL_ELF_INTERPRETER_REMOVED", minimumIds, fullPolicy, [{ source: emptyInterpreter, target: interpreter }]);
-    const libcControl = executeSurfaceCase("CONTROL_RUNNER_LIBC_REMOVED", minimumIds, fullPolicy, [{ source: emptyLibc, target: libc }]);
-    const validatorInterpreterControl = finalSurface.writer.artifact ? runValidatorSurface({ label: "CONTROL_VALIDATOR_INTERPRETER_REMOVED", root: selected.root, identity: selected.identity, custody: selected.custody, artifact: finalSurface.writer.artifact, surfaceIds: minimumIds, masks: [{ source: emptyValidatorInterpreter, target: validatorInterpreter }], envPolicy: fullPolicy, runner: paths.runner, validator: paths.validator, bwrap: paths.bwrap, runnerUid, diagnosticsRoot }) : null;
-    const validatorLibcControl = finalSurface.writer.artifact ? runValidatorSurface({ label: "CONTROL_VALIDATOR_LIBC_REMOVED", root: selected.root, identity: selected.identity, custody: selected.custody, artifact: finalSurface.writer.artifact, surfaceIds: minimumIds, masks: [{ source: emptyValidatorLibc, target: libc }], envPolicy: fullPolicy, runner: paths.runner, validator: paths.validator, bwrap: paths.bwrap, runnerUid, diagnosticsRoot }) : null;
-    const validatorLibmControl = finalSurface.writer.artifact ? runValidatorSurface({ label: "CONTROL_VALIDATOR_LIBM_REMOVED", root: selected.root, identity: selected.identity, custody: selected.custody, artifact: finalSurface.writer.artifact, surfaceIds: minimumIds, masks: [{ source: emptyLibm, target: libm }], envPolicy: fullPolicy, runner: paths.runner, validator: paths.validator, bwrap: paths.bwrap, runnerUid, diagnosticsRoot }) : null;
+    const interpreterMasks = runtimeMasks(emptyInterpreter, interpreter);
+    const libcMasks = runtimeMasks(emptyLibc, libc);
+    const validatorInterpreterMasks = runtimeMasks(emptyValidatorInterpreter, validatorInterpreter);
+    const validatorLibcMasks = runtimeMasks(emptyValidatorLibc, libc);
+    const validatorLibmMasks = runtimeMasks(emptyLibm, libm);
+    console.log(`CONTROL_ELF_INTERPRETER_REMOVED_MASK_TARGETS=${interpreterMasks.map((mask) => mask.target).join(",")}`);
+    console.log(`CONTROL_RUNNER_LIBC_REMOVED_MASK_TARGETS=${libcMasks.map((mask) => mask.target).join(",")}`);
+    console.log(`CONTROL_VALIDATOR_INTERPRETER_REMOVED_MASK_TARGETS=${validatorInterpreterMasks.map((mask) => mask.target).join(",")}`);
+    console.log(`CONTROL_VALIDATOR_LIBC_REMOVED_MASK_TARGETS=${validatorLibcMasks.map((mask) => mask.target).join(",")}`);
+    console.log(`CONTROL_VALIDATOR_LIBM_REMOVED_MASK_TARGETS=${validatorLibmMasks.map((mask) => mask.target).join(",")}`);
+    const interpreterControl = executeSurfaceCase("CONTROL_ELF_INTERPRETER_REMOVED", minimumIds, fullPolicy, interpreterMasks);
+    const libcControl = executeSurfaceCase("CONTROL_RUNNER_LIBC_REMOVED", minimumIds, fullPolicy, libcMasks);
+    const validatorInterpreterControl = finalSurface.writer.artifact ? runValidatorSurface({ label: "CONTROL_VALIDATOR_INTERPRETER_REMOVED", root: selected.root, identity: selected.identity, custody: selected.custody, artifact: finalSurface.writer.artifact, surfaceIds: minimumIds, masks: validatorInterpreterMasks, envPolicy: fullPolicy, runner: paths.runner, validator: paths.validator, bwrap: paths.bwrap, runnerUid, diagnosticsRoot }) : null;
+    const validatorLibcControl = finalSurface.writer.artifact ? runValidatorSurface({ label: "CONTROL_VALIDATOR_LIBC_REMOVED", root: selected.root, identity: selected.identity, custody: selected.custody, artifact: finalSurface.writer.artifact, surfaceIds: minimumIds, masks: validatorLibcMasks, envPolicy: fullPolicy, runner: paths.runner, validator: paths.validator, bwrap: paths.bwrap, runnerUid, diagnosticsRoot }) : null;
+    const validatorLibmControl = finalSurface.writer.artifact ? runValidatorSurface({ label: "CONTROL_VALIDATOR_LIBM_REMOVED", root: selected.root, identity: selected.identity, custody: selected.custody, artifact: finalSurface.writer.artifact, surfaceIds: minimumIds, masks: validatorLibmMasks, envPolicy: fullPolicy, runner: paths.runner, validator: paths.validator, bwrap: paths.bwrap, runnerUid, diagnosticsRoot }) : null;
     console.log(`CONTROL_ELF_INTERPRETER_REMOVED=${interpreterControl.writer.pass ? "FAIL_CONTROL_DID_NOT_REMOVE" : "PASS"}`);
     console.log(`CONTROL_RUNNER_LIBC_REMOVED=${libcControl.writer.pass ? "FAIL_CONTROL_DID_NOT_REMOVE" : "PASS"}`);
     console.log(`CONTROL_VALIDATOR_INTERPRETER_REMOVED=${validatorInterpreterControl?.pass ? "FAIL_CONTROL_DID_NOT_REMOVE" : "PASS"}`);
