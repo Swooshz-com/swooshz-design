@@ -512,7 +512,7 @@ function runValidatorSurface(options: { label: string; root: string; identity: "
 function readElf(path: string): { interpreter: string; needed: string[]; runpath: string } {
   const program = runCommand("/usr/bin/readelf", ["-l", path]);
   const dynamic = runCommand("/usr/bin/readelf", ["-d", path]);
-  const interpreter = program.stdout.match(/Requesting program interpreter:\s*(\S+)/u)?.[1] ?? "UNKNOWN";
+  const interpreter = program.stdout.match(/Requesting program interpreter:\s*([^\]\s]+)/u)?.[1] ?? "UNKNOWN";
   const needed = [...dynamic.stdout.matchAll(/Shared library:\s*\[(.+?)\]/gu)].map((match) => match[1]!).filter((value, index, values) => values.indexOf(value) === index);
   const runpath = dynamic.stdout.match(/(?:Library runpath|Library rpath):\s*\[(.+?)\]/u)?.[1] ?? "NONE";
   return { interpreter, needed, runpath };
@@ -748,11 +748,14 @@ function main(): void {
       console.log(`SURFACE_${surface.id.toUpperCase()}_SUBSTITUTION_RESULT=IDENTITY_SENSITIVE_SUBSTITUTION_REJECTED`);
       console.log(`SURFACE_${surface.id.toUpperCase()}_READ_ONLY_REQUIRED=YES`);
     }
-    const emptyInterpreter = join(diagnosticsRoot, "empty-interpreter");
-    const emptyLibc = join(diagnosticsRoot, "empty-libc");
-    const emptyLibm = join(diagnosticsRoot, "empty-libm");
-    const emptyValidatorInterpreter = join(diagnosticsRoot, "empty-validator-interpreter");
-    const emptyValidatorLibc = join(diagnosticsRoot, "empty-validator-libc");
+    const controlSourceRoot = join(selected.root, "s8-run081-runtime-controls");
+    mkdirSync(controlSourceRoot, { mode: 0o755 });
+    chmodSync(controlSourceRoot, 0o755);
+    const emptyInterpreter = join(controlSourceRoot, "empty-interpreter");
+    const emptyLibc = join(controlSourceRoot, "empty-libc");
+    const emptyLibm = join(controlSourceRoot, "empty-libm");
+    const emptyValidatorInterpreter = join(controlSourceRoot, "empty-validator-interpreter");
+    const emptyValidatorLibc = join(controlSourceRoot, "empty-validator-libc");
     for (const path of [emptyInterpreter, emptyLibc, emptyLibm, emptyValidatorInterpreter, emptyValidatorLibc]) { writeFileSync(path, Buffer.alloc(0), { mode: 0o444 }); chmodSync(path, 0o444); }
     const interpreterControl = executeSurfaceCase("CONTROL_ELF_INTERPRETER_REMOVED", minimumIds, fullPolicy, [{ source: emptyInterpreter, target: interpreter }]);
     const libcControl = executeSurfaceCase("CONTROL_RUNNER_LIBC_REMOVED", minimumIds, fullPolicy, [{ source: emptyLibc, target: libc }]);
