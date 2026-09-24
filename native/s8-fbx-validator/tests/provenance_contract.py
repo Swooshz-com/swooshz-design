@@ -212,7 +212,7 @@ def build_fbx(models: tuple[ModelSpec, ...]) -> bytes:
         ]
         if spec.name == "SWZ_ROOT":
             model_properties.extend(
-                field_property(key, Field("string", value))
+                field_property(f"swz_{key}", Field("string", value))
                 for key, value in SOURCE_METADATA.items()
             )
         for key, value in (
