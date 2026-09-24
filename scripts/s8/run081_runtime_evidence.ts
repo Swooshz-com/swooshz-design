@@ -820,6 +820,31 @@ function main(): void {
       }
     }) : false;
     console.log(`ACTUAL_RUN_S8_NATIVE_VALIDATOR=${actualValidatorApiPass ? "PASS" : "NO"}`);
+    const writableControlPass = !surfaceSourcePolicy(writableSubstitution);
+    const identityControlPass = !!firstSurface && !surfaceCandidatePolicy(firstSurface, identitySubstitution);
+    const hostRootControlPass = !surfaceSourcePolicy("/");
+    const negativeControlsPass = !interpreterControl.writer.pass && !libcControl.writer.pass && validatorInterpreterControl !== null && !validatorInterpreterControl.pass && validatorLibcControl !== null && !validatorLibcControl.pass && validatorLibmControl !== null && !validatorLibmControl.pass && writableControlPass && identityControlPass && hostRootControlPass;
+    if (!negativeControlsPass) limitations.push("RUNTIME_NEGATIVE_CONTROLS_INCOMPLETE");
+    if (!actualValidatorApiPass) limitations.push("ACTUAL_RUN_S8_NATIVE_VALIDATOR_API_DID_NOT_PASS");
+    const runtimeBaselineReady = finalSurface.writer.pass && finalSurface.validator?.pass === true;
+    if (!runtimeBaselineReady) {
+      console.log("MINIMUM_CHILD_ENV_CANDIDATE=NOT_REACHED");
+      console.log("CHILD_ENV_REQUIRED_KEYS=NOT_REACHED");
+      console.log("CHILD_ENV_UNNECESSARY_KEYS=NOT_REACHED");
+      console.log(`CHILD_ENV_FORBIDDEN_KEYS=${FORBIDDEN_ENV_KEYS.join(",")}`);
+      console.log("REAL_WRITER_WITH_MINIMUM_ENV=NO");
+      console.log("REAL_VALIDATOR_WITH_MINIMUM_ENV=NO");
+      console.log("CHILD_ENV_NEGATIVE_CONTROLS=NOT_REACHED");
+      console.log(`PRIVATE_WORK_ROOT_REQUIRED_TOPOLOGY=${selected.label === "T1" ? "TOP_LEVEL_HOST_MOUNT_DOMAIN" : selected.label === "T2" ? "TOP_LEVEL_HOST_MOUNT_DOMAIN_PLUS_HOSTED_LEAF_ACL" : "TOP_LEVEL_HOST_MOUNT_DOMAIN_PLUS_HOSTED_LEAF_ACL_PLUS_HOSTED_SANDBOX_IDENTITY"}`);
+      console.log(`WORK_LEAF_REQUIRED_CUSTODY=${selected.label === "T1" ? "PROVEN_NOT_REQUIRED_FOR_SOURCE_BIND" : "ESTABLISHED"}`);
+      console.log(`SANDBOX_IDENTITY_PREREQUISITE=${selected.label === "T3" ? "ESTABLISHED_T3_REQUIRED" : "PROVEN_NOT_REQUIRED_FOR_SOURCE_BIND"}`);
+      console.log(`POST_WORK_ADMISSION_FAILURE_BOUNDARY=${selected.firstFailureBoundary}`);
+      console.log("G4_075_01_EVIDENCE_COMPLETE=NO");
+      console.log("G4_075_02_ENVIRONMENT_EVIDENCE_COMPLETE=NO");
+      limitations.push("ENVIRONMENT_EVIDENCE_NOT_REACHED");
+      console.log(`EVIDENCE_LIMITATIONS=${limitations.join(";") || "NONE"}`);
+      return;
+    }
     const envAdjudication: Record<string, string> = {};
     const envFailure: Record<string, string> = {};
     const minimumEnv = { ...fullPolicy };
@@ -867,12 +892,6 @@ function main(): void {
     console.log(`HOSTILE_PYTHONHOME_ABSENT=${negativePass ? "PASS" : "NO"}`);
     console.log(`CHILD_ENV_NEGATIVE_CONTROLS=${negativePass ? "PASS" : "NO"}`);
     const topologyComplete = selected.label === "T1" || selected.label === "T2" || selected.label === "T3";
-    const writableControlPass = !surfaceSourcePolicy(writableSubstitution);
-    const identityControlPass = !!firstSurface && !surfaceCandidatePolicy(firstSurface, identitySubstitution);
-    const hostRootControlPass = !surfaceSourcePolicy("/");
-    const negativeControlsPass = !interpreterControl.writer.pass && !libcControl.writer.pass && validatorInterpreterControl !== null && !validatorInterpreterControl.pass && validatorLibcControl !== null && !validatorLibcControl.pass && validatorLibmControl !== null && !validatorLibmControl.pass && writableControlPass && identityControlPass && hostRootControlPass;
-    if (!negativeControlsPass) limitations.push("RUNTIME_NEGATIVE_CONTROLS_INCOMPLETE");
-    if (!actualValidatorApiPass) limitations.push("ACTUAL_RUN_S8_NATIVE_VALIDATOR_API_DID_NOT_PASS");
     const surfaceComplete = finalSurface.writer.pass && finalSurface.validator?.pass === true && negativeControlsPass;
     const envComplete = finalEnv.writer.pass && finalEnvValidator && negativePass;
     console.log(`PRIVATE_WORK_ROOT_REQUIRED_TOPOLOGY=${selected.label === "T1" ? "TOP_LEVEL_HOST_MOUNT_DOMAIN" : selected.label === "T2" ? "TOP_LEVEL_HOST_MOUNT_DOMAIN_PLUS_HOSTED_LEAF_ACL" : "TOP_LEVEL_HOST_MOUNT_DOMAIN_PLUS_HOSTED_LEAF_ACL_PLUS_HOSTED_SANDBOX_IDENTITY"}`);
