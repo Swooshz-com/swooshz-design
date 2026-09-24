@@ -104,7 +104,8 @@ jobs:
           blender_archive="$temp_root/blender-5.2.2-linux-x64.tar.xz"
           /usr/bin/curl --config /dev/null --fail --silent --show-error --proto '=https' --tlsv1.2 --location --max-redirs 0 --retry 3 --output "$blender_archive" \
             'https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz'
-          printf 'BLENDER_ARCHIVE_SHA256=%s  %s\n' 84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168 "$blender_archive" | /usr/bin/sha256sum --check --status
+          printf 'BLENDER_ARCHIVE_SHA256=%s\n' 84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168
+          printf '%s  %s\n' 84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168 "$blender_archive" | /usr/bin/sha256sum --check --status
           /usr/bin/tar -tJf "$blender_archive" | /usr/bin/awk '/^\/|(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }'
           /usr/bin/install -d -m 0700 -- "$temp_root/blender-extracted"
           /usr/bin/tar -xJf "$blender_archive" --directory "$temp_root/blender-extracted" --no-same-owner --no-same-permissions
