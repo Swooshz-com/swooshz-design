@@ -653,12 +653,12 @@ function main(): void {
     let selected: Cell | null = t1.bindSourceReached === "YES" && t1.workChdirReached === "YES" ? t1 : null;
     let t2: Cell | null = null;
     let t3: Cell | null = null;
-    if (t1.bindSourceReached === "NO") {
+    if (t1.bindSourceReached === "NO" || t1.workChdirReached === "NO") {
       t2 = makeCellRunner({ label: "T2", root: topRoot, custody: "root-acl", identity: "none", surfaceIds: [], masks: [], envPolicy: null, diagnosticsRoot, shim, surfaceFile, runnerUid, paths: configPaths, payload });
       cells.push(t2);
       printCell(t2);
       selected = t2.bindSourceReached === "YES" && t2.workChdirReached === "YES" ? t2 : null;
-      if (t2.bindSourceReached === "NO") {
+      if (t2.bindSourceReached === "NO" || t2.workChdirReached === "NO") {
         t3 = makeCellRunner({ label: "T3", root: topRoot, custody: "root-acl", identity: "hosted", surfaceIds: [], masks: [], envPolicy: null, diagnosticsRoot, shim, surfaceFile, runnerUid, paths: configPaths, payload });
         cells.push(t3);
         printCell(t3);
