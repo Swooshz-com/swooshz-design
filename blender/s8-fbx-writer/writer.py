@@ -617,7 +617,7 @@ def _neutral_object_state(obj: Any) -> None:
     obj.hide_render = False
     obj.hide_select = False
     obj.instance_type = "NONE"
-    if hasattr(obj, "instance_collection"):
+    if getattr(obj, "type", None) == "EMPTY":
         obj.instance_collection = None
     if hasattr(obj, "active_material_index"):
         obj.active_material_index = 0
@@ -964,8 +964,8 @@ def main() -> None:
     admission = admit_payload(payload)
 
     state = construct_scene(admission)
-    audit_original_scene(admission, state)
     bpy.context.view_layer.update()
+    audit_original_scene(admission, state)
     authoritative_depsgraph = bpy.context.evaluated_depsgraph_get()
     audit_evaluated_membership(admission, state, authoritative_depsgraph)
     context_objects = build_context_objects(state["objects"])

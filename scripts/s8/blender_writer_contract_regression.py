@@ -15,8 +15,10 @@ import importlib.util
 import inspect
 import pathlib
 import sys
+import tempfile
 import types
 from typing import Any, Callable
+from unittest.mock import patch
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -107,7 +109,8 @@ class FakeObject:
         self.hide_render = False
         self.hide_select = False
         self.instance_type = "NONE"
-        self.instance_collection = None
+        self.instance_collection_set_attempts = 0
+        self._instance_collection = None
         self.library = None
         self.override_library = None
         self.modifiers: list[Any] = []
@@ -116,6 +119,17 @@ class FakeObject:
         self.original = self
         self.custom: dict[str, Any] = {}
         self.selected = False
+
+    @property
+    def instance_collection(self) -> Any:
+        return self._instance_collection
+
+    @instance_collection.setter
+    def instance_collection(self, value: Any) -> None:
+        if self.type == "MESH":
+            self.instance_collection_set_attempts += 1
+            raise AssertionError("instance_collection cannot be assigned on a MESH object")
+        self._instance_collection = value
 
     def __setitem__(self, key: str, value: Any) -> None:
         self.custom[key] = value
@@ -138,10 +152,24 @@ class FakeLinkCollection:
             self.objects.append(obj)
 
 
+class FakeViewLayer:
+    def __init__(self, scene_objects: FakeObjectCollection, events: list[str]):
+        self.objects = FakeObjectCollection()
+        self.scene_objects = scene_objects
+        self.events = events
+        self.active = None
+
+    def update(self) -> None:
+        self.objects[:] = list(self.scene_objects)
+        self.events.append("VIEWLAYER_UPDATE")
+
+
 class FakeWorld:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.events = events if events is not None else []
         self.data = types.SimpleNamespace()
         self.data.objects = FakeObjectCollection()
+        self.data.filepath = ""
         self.data.meshes = FakeCollection(lambda name: FakeMesh(name))
         self.data.materials = FakeCollection(lambda name: FakeMaterial(name))
         self.data.curves = FakeCollection()
@@ -151,7 +179,7 @@ class FakeWorld:
         self.scene.collection = types.SimpleNamespace(objects=FakeLinkCollection(self.data.objects))
         self.scene.objects = self.data.objects
         self.scene.unit_settings = types.SimpleNamespace()
-        self.view_layer = types.SimpleNamespace(objects=self.data.objects, active=None)
+        self.view_layer = FakeViewLayer(self.scene.objects, self.events)
         self.graph = None
         self.context = types.SimpleNamespace(
             scene=self.scene,
@@ -161,12 +189,13 @@ class FakeWorld:
         self.bpy = types.SimpleNamespace(data=self.data, context=self.context)
 
     def evaluated_depsgraph_get(self) -> Any:
+        self.events.append("evaluated_depsgraph_get")
         if self.graph is None:
-            self.graph = FakeDepsgraph(self.data.objects)
+            self.graph = FakeDepsgraph(self.view_layer.objects)
         return self.graph
 
     def new_graph(self) -> Any:
-        self.graph = FakeDepsgraph(self.data.objects)
+        self.graph = FakeDepsgraph(self.view_layer.objects)
         return self.graph
 
 
@@ -315,6 +344,7 @@ def make_state(object_ids: list[str] | None = None, parents: dict[str, str | Non
     payload = make_payload(object_ids or ["obj-a"], parents, order)
     admission = writer.admit_payload(payload)
     state = writer.construct_scene(admission)
+    world.view_layer.update()
     writer.audit_original_scene(admission, state)
     graph = world.new_graph()
     writer.audit_evaluated_membership(admission, state, graph)
@@ -329,6 +359,161 @@ def expect_error(code: str, action: Callable[[], Any]) -> None:
             raise AssertionError(f"expected {code}, received {error}") from error
         return
     raise AssertionError(f"expected {code}, action succeeded")
+
+
+def test_viewlayer_deferred_membership() -> None:
+    world = FakeWorld()
+    install_world(world)
+    admission = writer.admit_payload(make_payload(["obj-a", "obj-b"]))
+    state = writer.construct_scene(admission)
+    expected = state["objects"]
+
+    if world.view_layer.objects is world.data.objects:
+        raise AssertionError("fake ViewLayer aliases bpy.data.objects")
+    writer._assert_surface_identity(world.scene.objects, expected)
+    writer._assert_surface_identity(world.data.objects, expected)
+    if list(world.view_layer.objects):
+        raise AssertionError("fake ViewLayer synchronized during construction or read")
+    expect_error("S8_EXPORT_OBJECT_SET_INVALID", lambda: writer.audit_original_scene(admission, state))
+
+    world.view_layer.update()
+    writer.audit_original_scene(admission, state)
+    graph = world.evaluated_depsgraph_get()
+    writer.audit_evaluated_membership(admission, state, graph)
+    print("ORIGINAL_SCENE_MEMBERSHIP=PASS")
+    print("EVALUATED_MEMBERSHIP=PASS")
+    print("VIEWLAYER_SYNC_BEFORE_AUDIT=PASS")
+    print("VIEWLAYER_DEFERRED_MEMBERSHIP_REGRESSION=PASS")
+
+    world, _payload, admission, state, _graph = make_state()
+    extra = FakeObject("SWZ_EXTRA", FakeMesh("SWZ_EXTRA_MESH"))
+    world.scene.collection.objects.link(extra)
+    world.view_layer.update()
+    expect_error("S8_EXPORT_OBJECT_SET_INVALID", lambda: writer.audit_original_scene(admission, state))
+    print("EXTRA_OBJECT_REJECTION=PASS")
+
+    world, _payload, admission, state, _graph = make_state()
+    world.data.objects.remove(state["objects"]["SWZ_ROOT"])
+    world.view_layer.update()
+    expect_error("S8_EXPORT_OBJECT_SET_INVALID", lambda: writer.audit_original_scene(admission, state))
+    print("MISSING_OBJECT_REJECTION=PASS")
+
+    world, _payload, admission, state, _graph = make_state()
+    world.data.objects.append(state["objects"]["SWZ_ROOT"])
+    world.view_layer.update()
+    expect_error("S8_EXPORT_OBJECT_SET_INVALID", lambda: writer.audit_original_scene(admission, state))
+    print("DUPLICATE_OBJECT_REJECTION=PASS")
+
+    world, _payload, admission, state, _graph = make_state()
+    expected_object = state["objects"]["SWZ_ROOT"]
+    world.view_layer.objects[0] = FakeObject(expected_object.name, expected_object.data)
+    expect_error("S8_EXPORT_OBJECT_SET_INVALID", lambda: writer.audit_original_scene(admission, state))
+    print("WRONG_OBJECT_IDENTITY_REJECTION=PASS")
+
+
+def test_production_main_viewlayer_order() -> None:
+    events: list[str] = []
+    world = FakeWorld(events)
+    install_world(world)
+    payload = make_payload(["obj-a"])
+    original_construct_scene = writer.construct_scene
+    original_audit_original_scene = writer.audit_original_scene
+
+    def observed_construct_scene(admission: dict[str, Any]) -> dict[str, Any]:
+        events.append("construct_scene")
+        return original_construct_scene(admission)
+
+    def observed_audit_original_scene(admission: dict[str, Any], state: dict[str, Any]) -> None:
+        events.append("audit_original_scene")
+        original_audit_original_scene(admission, state)
+
+    def fake_export(artifact_path: pathlib.Path, *_args: Any, **_kwargs: Any) -> None:
+        header = b"Kaydara FBX Binary  \x00\x1a\x00" + (7400).to_bytes(4, "little")
+        artifact_path.write_bytes(header + b"x")
+
+    with tempfile.TemporaryDirectory(prefix="s8-writer-main-order-") as directory:
+        output_root = pathlib.Path(directory)
+        (output_root / "input.json").write_bytes(b"{}")
+        exporter = FakeExporter()
+        with (
+            patch.object(writer, "fixed_path", side_effect=lambda name: output_root / name),
+            patch.object(writer, "load_payload", return_value=payload),
+            patch.object(writer, "assert_runtime", return_value={"version": "fake"}),
+            patch.object(writer, "load_private_exporter", return_value=exporter),
+            patch.object(writer, "require_factory_filepath", return_value=None),
+            patch.object(writer, "construct_scene", side_effect=observed_construct_scene),
+            patch.object(writer, "audit_original_scene", side_effect=observed_audit_original_scene),
+            patch.object(writer, "export_fbx", side_effect=fake_export),
+        ):
+            writer.main()
+
+    expected_events = [
+        "construct_scene",
+        "VIEWLAYER_UPDATE",
+        "audit_original_scene",
+        "evaluated_depsgraph_get",
+    ]
+    if events != expected_events:
+        raise AssertionError(f"production main synchronization order mismatch: {events}")
+
+    tree = ast.parse(WRITER_PATH.read_text(encoding="utf-8"), filename=str(WRITER_PATH))
+    main_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    ordered_calls: list[str] = []
+    for node in sorted(ast.walk(main_node), key=lambda item: getattr(item, "lineno", 0)):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in {"construct_scene", "audit_original_scene"}:
+            ordered_calls.append(node.func.id)
+        elif isinstance(node.func, ast.Attribute) and node.func.attr in {"update", "evaluated_depsgraph_get"}:
+            ordered_calls.append("VIEWLAYER_UPDATE" if node.func.attr == "update" else "evaluated_depsgraph_get")
+    if ordered_calls != expected_events:
+        raise AssertionError(f"supplementary production source order mismatch: {ordered_calls}")
+    print("VIEWLAYER_SYNC_BEFORE_AUDIT=PASS")
+
+
+def test_instance_collection_contract() -> None:
+    _world, _payload, admission, state, graph = make_state()
+    root = state["objects"]["SWZ_ROOT"]
+    mesh = next(obj for name, obj in state["objects"].items() if name != "SWZ_ROOT")
+    writer._assert_neutral_object(root, True)
+    writer._assert_neutral_object(mesh, False)
+    if root.instance_collection is not None or mesh.instance_collection is not None:
+        raise AssertionError("ordinary objects retained collection instancing state")
+    if mesh.instance_collection_set_attempts != 0:
+        raise AssertionError("production writer assigned instance_collection on a MESH object")
+
+    setter_probe = FakeObject("SWZ_PROBE", FakeMesh("SWZ_PROBE_MESH"))
+    try:
+        setter_probe.instance_collection = None
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("fake MESH instance_collection setter did not reject a write")
+    if setter_probe.instance_collection_set_attempts != 1:
+        raise AssertionError("fake MESH setter did not count its rejected write")
+
+    print("EMPTY_INSTANCE_COLLECTION_NEUTRAL=PASS")
+    print("MESH_UNSUPPORTED_INSTANCE_COLLECTION_MUTATION=ABSENT")
+
+    root.instance_collection = object()
+    expect_error("S8_EXPORT_INSTANCE_FORBIDDEN", lambda: writer._assert_neutral_object(root, True))
+    mesh._instance_collection = object()
+    expect_error("S8_EXPORT_INSTANCE_FORBIDDEN", lambda: writer._assert_neutral_object(mesh, False))
+    mesh._instance_collection = None
+    mesh.instance_type = "COLLECTION"
+    expect_error("S8_EXPORT_INSTANCE_FORBIDDEN", lambda: writer._assert_neutral_object(mesh, False))
+    mesh.instance_type = "NONE"
+    print("COLLECTION_INSTANCE_REJECTION=PASS")
+
+    graph.object_instances.append(types.SimpleNamespace(object=mesh, is_instance=True))
+    expect_error(
+        "S8_EXPORT_INSTANCE_FORBIDDEN",
+        lambda: writer.audit_evaluated_membership(admission, state, graph),
+    )
+    print("DEPSGRAPH_INSTANCE_REJECTION=PASS")
 
 
 def test_f01() -> None:
@@ -547,6 +732,9 @@ def test_s04() -> None:
 
 
 CASES: list[tuple[str, Callable[[], None]]] = [
+    ("VIEWLAYER", test_viewlayer_deferred_membership),
+    ("MAIN_ORDER", test_production_main_viewlayer_order),
+    ("INSTANCE", test_instance_collection_contract),
     ("F01", test_f01),
     ("F02", test_f02),
     ("C01", test_c01),
@@ -589,6 +777,7 @@ def main() -> int:
         print("TARGETED_DEFECT_FAMILY_GATE=FAIL")
         return 1
     print("TARGETED_DEFECT_FAMILY_GATE=PASS")
+    print("WRITER_CONTRACT_REGRESSION=PASS")
     return 0
 
 

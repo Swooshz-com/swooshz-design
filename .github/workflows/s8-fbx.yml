@@ -8749,12 +8749,26 @@ jobs:
               print("R30_BOUNDED_OUTPUT_EXCERPTS=PASS")
 
               fake_github_token = b"gh" + b"p_" + b"abcdefghijklmnopqrstuvwxyz0123456789"
+              bearer_value = b"Fixture" + b"Bearer" + b"Secret123"
+              bearer_token = b"Bearer " + bearer_value
+              standalone_bearer_redacted = module_globals["_redact_diagnostic_bytes"](bearer_token)
+              if (
+                  not any(pattern.search(bearer_token) for pattern in module_globals["_RUNNER_SECRET_PATTERNS"])
+                  or b"[REDACTED]" not in standalone_bearer_redacted
+                  or bearer_value in standalone_bearer_redacted
+              ):
+                  raise SystemExit("R31 standalone Bearer value did not match the production redaction rule")
+              print("R31_RUNTIME_BEARER_FIXTURE_MATCHES_REDACTION_PATTERN=PASS")
               secret_output = (
-                  b"Authorization: Bearer FixtureBearerSecret123\n"
-                  b"cookie: session=FixtureCookieSecret\n"
-                  b"token=FixtureAccessSecret\n"
+                  b"Authorization: " + bearer_token + b"\n"
+                  + b"cookie: session=FixtureCookieSecret\n"
+                  + b"token=FixtureAccessSecret\n"
                   + fake_github_token + b"\n"
               )
+              tracked_workflow_source = Path(".github/workflows/s8-fbx.yml").read_bytes()
+              if bearer_token in tracked_workflow_source:
+                  raise SystemExit("R31 Bearer fixture secret is present as a complete tracked literal")
+              print("R31_TRACKED_SOURCE_SECRET_PATTERN=ABSENT")
               _, r31_block = assert_sandbox_failure(
                   "R31", frame_runner_receipt(
                       make_runner_receipt(76, target_stdout=secret_output), secret_output
@@ -8762,7 +8776,7 @@ jobs:
                   "CANDIDATE_DEFECT__NATIVE_PROCESS_BOUNDARY", "TARGET_EXIT_NONZERO",
               )
               for secret in (
-                  b"FixtureBearerSecret123", b"FixtureCookieSecret",
+                  bearer_value, b"FixtureCookieSecret",
                   b"FixtureAccessSecret", fake_github_token,
               ):
                   if secret.decode("ascii") in r31_block:
