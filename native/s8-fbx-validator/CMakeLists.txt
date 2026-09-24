@@ -26,7 +26,10 @@ if(NOT MSVC)
 endif()
 
 enable_testing()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME s8-fbx-validator-self-test COMMAND s8-fbx-validator --self-test)
 
 add_executable(s8-validator-contract-tests tests/validator_contract.c)
 add_test(NAME s8-validator-contract-tests COMMAND s8-validator-contract-tests)
+add_test(NAME s8-fbx-validator-provenance-contract
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/provenance_contract.py" "$<TARGET_FILE:s8-fbx-validator>")

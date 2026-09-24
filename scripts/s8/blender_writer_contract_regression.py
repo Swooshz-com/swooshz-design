@@ -9,6 +9,8 @@ exporter; this harness does not replace that runtime qualification.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import ast
 import hashlib
 import importlib.util
@@ -17,7 +19,7 @@ import pathlib
 import sys
 import tempfile
 import types
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from unittest.mock import patch
 
 
@@ -164,6 +166,78 @@ class FakeViewLayer:
         self.events.append("VIEWLAYER_UPDATE")
 
 
+@dataclass(frozen=True)
+class FakeDepsgraphInstanceRecord:
+    """Durable fixture data from which a fresh depsgraph wrapper is created."""
+
+    object: Any
+    is_instance: bool
+
+
+class FakeDepsgraphObjectInstance:
+    _INVALID_ACCESS = "DepsgraphObjectInstance wrapper is no longer valid"
+
+    def __init__(self, record: FakeDepsgraphInstanceRecord):
+        self._record = record
+        self._valid = True
+
+    def _require_valid(self) -> None:
+        if not self._valid:
+            raise ReferenceError(self._INVALID_ACCESS)
+
+    def invalidate(self) -> None:
+        self._valid = False
+
+    @property
+    def object(self) -> Any:
+        self._require_valid()
+        return self._record.object
+
+    @property
+    def is_instance(self) -> bool:
+        self._require_valid()
+        return self._record.is_instance
+
+
+class FakeDepsgraphInstanceCollection:
+    """Re-iterable durable records with traversal-scoped wrapper lifetimes."""
+
+    def __init__(self, records: Iterable[FakeDepsgraphInstanceRecord] = ()):
+        self._fixture_records = list(records)
+
+    @property
+    def fixture_records(self) -> tuple[FakeDepsgraphInstanceRecord, ...]:
+        return tuple(self._fixture_records)
+
+    @staticmethod
+    def _require_record(record: FakeDepsgraphInstanceRecord) -> None:
+        if type(record) is not FakeDepsgraphInstanceRecord:
+            raise TypeError("depsgraph fixture collections accept durable instance records only")
+
+    def append(self, record: FakeDepsgraphInstanceRecord) -> None:
+        self._require_record(record)
+        self._fixture_records.append(record)
+
+    def pop(self, index: int = -1) -> FakeDepsgraphInstanceRecord:
+        return self._fixture_records.pop(index)
+
+    def replace(self, index: int, record: FakeDepsgraphInstanceRecord) -> None:
+        self._require_record(record)
+        self._fixture_records[index] = record
+
+    def __iter__(self):
+        previous: FakeDepsgraphObjectInstance | None = None
+        try:
+            for record in self._fixture_records:
+                if previous is not None:
+                    previous.invalidate()
+                previous = FakeDepsgraphObjectInstance(record)
+                yield previous
+        finally:
+            if previous is not None:
+                previous.invalidate()
+
+
 class FakeWorld:
     def __init__(self, events: list[str] | None = None) -> None:
         self.events = events if events is not None else []
@@ -203,7 +277,9 @@ class FakeDepsgraph:
     def __init__(self, objects: FakeObjectCollection):
         self.view_layer = types.SimpleNamespace(objects=objects)
         self.objects = objects
-        self.object_instances = [types.SimpleNamespace(object=obj, is_instance=False) for obj in objects]
+        self.object_instances = FakeDepsgraphInstanceCollection(
+            FakeDepsgraphInstanceRecord(object=obj, is_instance=False) for obj in objects
+        )
 
 
 class SaveSingleSpy:
@@ -361,6 +437,18 @@ def expect_error(code: str, action: Callable[[], Any]) -> None:
     raise AssertionError(f"expected {code}, action succeeded")
 
 
+def expect_reference_error(action: Callable[[], Any]) -> None:
+    try:
+        action()
+    except ReferenceError as error:
+        if type(error) is not ReferenceError or str(error) != FakeDepsgraphObjectInstance._INVALID_ACCESS:
+            raise AssertionError(f"expected deterministic ReferenceError, received {type(error).__name__}: {error}") from error
+        return
+    except Exception as error:
+        raise AssertionError(f"expected ReferenceError, received {type(error).__name__}: {error}") from error
+    raise AssertionError("expected ReferenceError, action succeeded")
+
+
 def test_viewlayer_deferred_membership() -> None:
     world = FakeWorld()
     install_world(world)
@@ -508,12 +596,152 @@ def test_instance_collection_contract() -> None:
     mesh.instance_type = "NONE"
     print("COLLECTION_INSTANCE_REJECTION=PASS")
 
-    graph.object_instances.append(types.SimpleNamespace(object=mesh, is_instance=True))
+    graph.object_instances.append(FakeDepsgraphInstanceRecord(object=mesh, is_instance=True))
     expect_error(
         "S8_EXPORT_INSTANCE_FORBIDDEN",
         lambda: writer.audit_evaluated_membership(admission, state, graph),
     )
+    print("INSTANCE_TRUE=S8_EXPORT_INSTANCE_FORBIDDEN")
     print("DEPSGRAPH_INSTANCE_REJECTION=PASS")
+
+
+def reproduce_sequence_materialization(instances: FakeDepsgraphInstanceCollection, materializer: Callable[..., Any]) -> None:
+    wrappers = materializer(instances)
+    for wrapper in wrappers:
+        _ = wrapper.is_instance
+        _ = wrapper.object
+
+
+def test_depsgraph_instance_lifetime_contract() -> None:
+    _world, _payload, admission, state, graph = make_state()
+    if any(type(record) is not FakeDepsgraphInstanceRecord for record in graph.object_instances.fixture_records):
+        raise AssertionError("depsgraph fixture collection retained non-record data")
+
+    captured_originals: list[Any] = []
+    original_object = writer._original_object
+
+    def capture_original(value: Any) -> Any:
+        result = original_object(value)
+        captured_originals.append(result)
+        return result
+
+    with patch.object(writer, "_original_object", side_effect=capture_original):
+        writer.audit_evaluated_membership(admission, state, graph)
+
+    expected_count = len(state["objects"])
+    traversed_originals = captured_originals[-expected_count:]
+    if len(traversed_originals) != expected_count or any(
+        state["objects"].get(getattr(value, "name", None)) is not value
+        for value in traversed_originals
+    ):
+        raise AssertionError("production audit did not retain stable original object identities")
+    print("NORMAL_NON_INSTANCED_OBJECT_SET=PASS")
+    print("GREEN_ACTUAL_PRODUCTION_DIRECT_ITERATION=PASS")
+    print("RETAINED_STABLE_ORIGINAL_IDENTITY=PASS")
+
+    scalar_snapshots: list[tuple[bool, str, int]] = []
+    for wrapper in graph.object_instances:
+        original = wrapper.object
+        is_instance = wrapper.is_instance
+        scalar_snapshots.append((is_instance, original.name, id(original)))
+    expected_names = {obj.name for obj in state["objects"].values()}
+    if {name for _is_instance, name, _identity in scalar_snapshots} != expected_names:
+        raise AssertionError("immutable scalar snapshots did not cover the expected object set")
+    if any(is_instance for is_instance, _name, _identity in scalar_snapshots):
+        raise AssertionError("normal fixture unexpectedly marked an instance")
+    print("RETAINED_IMMUTABLE_VALUES=PASS")
+
+    first_traversal = list(iter(graph.object_instances))
+    second_traversal = list(iter(graph.object_instances))
+    if len(first_traversal) != len(second_traversal) or any(
+        first is second for first, second in zip(first_traversal, second_traversal)
+    ):
+        raise AssertionError("depsgraph traversals did not create fresh wrappers")
+    if not all(not wrapper._valid for wrapper in (*first_traversal, *second_traversal)):
+        raise AssertionError("wrapper remained valid after traversal exhaustion")
+    try:
+        graph.object_instances.append(first_traversal[0])
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("depsgraph fixture accepted a wrapper as durable record data")
+    print("FRESH_WRAPPER_PER_TRAVERSAL=PASS")
+    print("DURABLE_FIXTURE_RECORDS_ONLY=PASS")
+
+    for label, materializer in (("LIST", list), ("TUPLE", tuple)):
+        _world, _payload, _red_admission, _red_state, red_graph = make_state()
+        expect_reference_error(
+            lambda: reproduce_sequence_materialization(red_graph.object_instances, materializer)
+        )
+        print(f"RED_SEQUENCE_MATERIALISATION_{label}=ReferenceError")
+
+    iterator = iter(graph.object_instances)
+    first = next(iterator)
+    second = next(iterator)
+    expect_reference_error(lambda: first.object)
+    expect_reference_error(lambda: first.is_instance)
+    print("WRAPPER_PROPERTY_AFTER_ADVANCEMENT=ReferenceError")
+    iterator.close()
+    expect_reference_error(lambda: second.object)
+    expect_reference_error(lambda: second.is_instance)
+    print("FINAL_WRAPPER_AFTER_CLOSE=ReferenceError")
+
+    exhausted_iterator = iter(graph.object_instances)
+    last: FakeDepsgraphObjectInstance | None = None
+    for last in exhausted_iterator:
+        pass
+    if last is None:
+        raise AssertionError("normal graph unexpectedly had no instance records")
+    expect_reference_error(lambda: last.object)
+    expect_reference_error(lambda: last.is_instance)
+    print("FINAL_WRAPPER_AFTER_EXHAUSTION=ReferenceError")
+
+
+def test_depsgraph_instance_membership_failures() -> None:
+    _world, _payload, admission, state, graph = make_state()
+    mesh = next(obj for name, obj in state["objects"].items() if name != "SWZ_ROOT")
+    graph.object_instances.append(FakeDepsgraphInstanceRecord(object=mesh, is_instance=False))
+    expect_error(
+        "S8_EXPORT_INSTANCE_FORBIDDEN",
+        lambda: writer.audit_evaluated_membership(admission, state, graph),
+    )
+    print("DUPLICATE_ORIGINAL=S8_EXPORT_INSTANCE_FORBIDDEN")
+
+    _world, _payload, admission, state, graph = make_state()
+    unexpected = FakeObject("SWZ_UNEXPECTED", FakeMesh("SWZ_UNEXPECTED_MESH"))
+    graph.object_instances.append(FakeDepsgraphInstanceRecord(object=unexpected, is_instance=False))
+    expect_error(
+        "S8_EXPORT_INSTANCE_FORBIDDEN",
+        lambda: writer.audit_evaluated_membership(admission, state, graph),
+    )
+    print("UNEXPECTED_OBJECT=S8_EXPORT_INSTANCE_FORBIDDEN")
+
+    _world, _payload, admission, state, graph = make_state()
+    graph.object_instances.pop()
+    expect_error(
+        "S8_EXPORT_OBJECT_SET_INVALID",
+        lambda: writer.audit_evaluated_membership(admission, state, graph),
+    )
+    print("MISSING_EXPECTED_OBJECT=S8_EXPORT_OBJECT_SET_INVALID")
+
+    _world, _payload, admission, state, graph = make_state()
+    mesh_name, mesh = next((name, obj) for name, obj in state["objects"].items() if name != "SWZ_ROOT")
+    wrong_original = FakeObject(mesh_name, mesh.data)
+    evaluated = FakeObject(mesh_name, mesh.data)
+    evaluated.original = wrong_original
+    index = next(
+        index for index, record in enumerate(graph.object_instances.fixture_records)
+        if record.object is mesh
+    )
+    graph.object_instances.replace(
+        index,
+        FakeDepsgraphInstanceRecord(object=evaluated, is_instance=False),
+    )
+    expect_error(
+        "S8_EXPORT_INSTANCE_FORBIDDEN",
+        lambda: writer.audit_evaluated_membership(admission, state, graph),
+    )
+    print("WRONG_ORIGINAL_IDENTITY=S8_EXPORT_INSTANCE_FORBIDDEN")
 
 
 def test_f01() -> None:
@@ -735,6 +963,8 @@ CASES: list[tuple[str, Callable[[], None]]] = [
     ("VIEWLAYER", test_viewlayer_deferred_membership),
     ("MAIN_ORDER", test_production_main_viewlayer_order),
     ("INSTANCE", test_instance_collection_contract),
+    ("INSTANCE_LIFETIME", test_depsgraph_instance_lifetime_contract),
+    ("INSTANCE_MEMBERSHIP_FAILURES", test_depsgraph_instance_membership_failures),
     ("F01", test_f01),
     ("F02", test_f02),
     ("C01", test_c01),

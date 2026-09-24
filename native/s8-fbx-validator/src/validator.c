@@ -121,6 +121,29 @@ static int validate_profile(ufbx_scene *scene)
         }
         if (cursor != root) return fail("ROOT_HIERARCHY");
     }
+    if (ufbx_find_prop(&root->props, "swz_object_id") || ufbx_find_prop(&root->props, "swz_identity_key")) {
+        return fail("ROOT_SOURCE_PROVENANCE_FORBIDDEN");
+    }
+    for (size_t node_ix = 0; node_ix < scene->nodes.count; node_ix++) {
+        ufbx_node *node = scene->nodes.data[node_ix];
+        if (node->is_root || node == root) continue;
+        ufbx_string source_object_id = required_string_prop(node, "swz_object_id", 4096);
+        ufbx_string identity_key = required_string_prop(node, "swz_identity_key", 4096);
+        if (!source_object_id.length || !identity_key.length) return fail("SOURCE_OBJECT_PROVENANCE_MISSING");
+        if (source_object_id.length == 8 && !memcmp(source_object_id.data, "SWZ_ROOT", 8)) {
+            return fail("SOURCE_OBJECT_ID_RESERVED");
+        }
+        for (size_t previous_ix = 0; previous_ix < node_ix; previous_ix++) {
+            ufbx_node *previous = scene->nodes.data[previous_ix];
+            if (previous->is_root || previous == root) continue;
+            ufbx_string previous_id = required_string_prop(previous, "swz_object_id", 4096);
+            if (!previous_id.length) return fail("SOURCE_OBJECT_PROVENANCE_MISSING");
+            if (previous_id.length == source_object_id.length &&
+                !memcmp(previous_id.data, source_object_id.data, source_object_id.length)) {
+                return fail("SOURCE_OBJECT_ID_DUPLICATE");
+            }
+        }
+    }
     return 0;
 }
 
@@ -178,12 +201,14 @@ static int print_scene(ufbx_scene *scene)
         if (node->is_root) continue;
         if (!first_node) putchar(',');
         first_node = 0;
-        ufbx_string source_object_id = required_string_prop(node, "swz_object_id", 4096);
-        ufbx_string identity_key = required_string_prop(node, "swz_identity_key", 4096);
-        if (!source_object_id.length || !identity_key.length) return fail("SOURCE_OBJECT_PROVENANCE_MISSING");
         printf("{\"name\":"); json_string(node->name);
-        printf(",\"sourceObjectId\":"); json_string(source_object_id);
-        printf(",\"identityKey\":"); json_string(identity_key);
+        if (node != root) {
+            ufbx_string source_object_id = required_string_prop(node, "swz_object_id", 4096);
+            ufbx_string identity_key = required_string_prop(node, "swz_identity_key", 4096);
+            if (!source_object_id.length || !identity_key.length) return fail("SOURCE_OBJECT_PROVENANCE_MISSING");
+            printf(",\"sourceObjectId\":"); json_string(source_object_id);
+            printf(",\"identityKey\":"); json_string(identity_key);
+        }
         printf(",\"parent\":");
         if (node->parent && !node->parent->is_root) json_string(node->parent->name); else printf("null");
         printf(",\"effectiveScale\":"); print_vec3(node->local_transform.scale);
