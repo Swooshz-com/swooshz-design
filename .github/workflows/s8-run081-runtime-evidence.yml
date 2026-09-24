@@ -1,5 +1,7 @@
 name: S8 Run-081 standalone Bubblewrap runtime evidence
 
+# Run-081 stages candidate inputs on the host-root mount domain; private work topology remains harness-controlled.
+
 on:
   push:
     branches:
