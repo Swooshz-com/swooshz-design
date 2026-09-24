@@ -89,10 +89,14 @@ jobs:
           /usr/bin/sudo -n "$bwrap_path" --version
           printf 'BWRAP_PRIVILEGED_EXECUTION=PASS\n'
 
-          /usr/bin/cmake -S native/s8-process-runner -B "$temp_root/s8-runner" -DCMAKE_BUILD_TYPE=Release
-          /usr/bin/cmake --build "$temp_root/s8-runner" --config Release --parallel
-          /usr/bin/cmake -S native/s8-fbx-validator -B "$temp_root/s8-validator" -DCMAKE_BUILD_TYPE=Release
-          /usr/bin/cmake --build "$temp_root/s8-validator" --config Release --parallel
+          cmake_path=/usr/local/bin/cmake
+          test -x "$cmake_path"
+          cmake_version="$($cmake_path --version | /usr/bin/head -n 1)"
+          printf 'CMAKE_PATH=%s\nCMAKE_VERSION=%s\n' "$cmake_path" "$cmake_version"
+          "$cmake_path" -S native/s8-process-runner -B "$temp_root/s8-runner" -DCMAKE_BUILD_TYPE=Release
+          "$cmake_path" --build "$temp_root/s8-runner" --config Release --parallel
+          "$cmake_path" -S native/s8-fbx-validator -B "$temp_root/s8-validator" -DCMAKE_BUILD_TYPE=Release
+          "$cmake_path" --build "$temp_root/s8-validator" --config Release --parallel
           runner_path="$temp_root/s8-runner/s8-process-runner"
           validator_path="$temp_root/s8-validator/s8-fbx-validator"
           test -x "$runner_path" && test -x "$validator_path"
