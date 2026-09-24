@@ -1,0 +1,159 @@
+name: S8 Run-082 known-good differential launch evidence
+
+# Run-082 is a diagnostic carrier. It starts from the immutable product head and
+# measures the known-good hosted launch controls before any minimization.
+
+on:
+  push:
+    branches:
+      - web/run-082-s8-differential-launch-evidence-001
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  run082:
+    name: Run-082 known-good differential launch evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout carrier head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify carrier scope
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test -f .github/workflows/s8-run082-differential-evidence.yml
+          test -f scripts/s8/run082_differential_evidence.ts
+          mapfile -t changed_files < <(git diff --name-only 2f71e472849055ab8814f7e38d0f8c321707275f HEAD)
+          test "${#changed_files[@]}" -eq 2
+          test "${changed_files[0]}" = ".github/workflows/s8-run082-differential-evidence.yml" || test "${changed_files[1]}" = ".github/workflows/s8-run082-differential-evidence.yml"
+          test "${changed_files[0]}" = "scripts/s8/run082_differential_evidence.ts" || test "${changed_files[1]}" = "scripts/s8/run082_differential_evidence.ts"
+          git diff --check 2f71e472849055ab8814f7e38d0f8c321707275f HEAD
+
+      - name: Setup Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Acquire exact Bubblewrap and run differential evidence
+        shell: bash
+        env:
+          S8_RUN082_RUN_ID: ${{ github.run_id }}
+          S8_RUN082_RUN_ATTEMPT: ${{ github.run_attempt }}
+          S8_RUN082_RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -Eeuo pipefail
+          export LC_ALL=C
+
+          temp_root="$RUNNER_TEMP/s8-run082-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          test ! -e "$temp_root" && test ! -L "$temp_root"
+          /usr/bin/install -d -m 0700 -- "$temp_root"
+          candidate_root="/s8-run082-candidate-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          test ! -e "$candidate_root" && test ! -L "$candidate_root"
+          /usr/bin/sudo -n /usr/bin/install -d -o "$(id -u)" -g "$(id -g)" -m 0755 -- "$candidate_root"
+          trap '/usr/bin/sudo -n /usr/bin/rm -rf -- "$candidate_root"; /usr/bin/rm -rf -- "$temp_root"' EXIT
+
+          test -x /usr/bin/getfacl
+          test -x /usr/bin/setfacl
+          test -x /usr/bin/sudo
+
+          bwrap_deb="$temp_root/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb"
+          bwrap_extract="$temp_root/bubblewrap-extract"
+          bwrap_url='https://security.ubuntu.com/ubuntu/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb'
+          /usr/bin/curl --config /dev/null --fail --silent --show-error --proto '=https' --tlsv1.2 --location --max-redirs 0 --retry 3 --output "$bwrap_deb" "$bwrap_url"
+          test -f "$bwrap_deb" && test ! -L "$bwrap_deb"
+          printf 'BWRAP_DEB_FILENAME=%s\n' "$(basename "$bwrap_deb")"
+          printf 'BWRAP_DEB_SHA256=%s\n' "$(/usr/bin/sha256sum -- "$bwrap_deb" | /usr/bin/awk '{print $1}')"
+          test "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Package)" = bubblewrap
+          test "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Version)" = 0.9.0-1ubuntu0.3
+          test "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Architecture)" = amd64
+          printf 'BWRAP_PACKAGE=%s\n' "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Package)"
+          printf 'BWRAP_VERSION=%s\n' "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Version)"
+          printf 'BWRAP_ARCHITECTURE=%s\n' "$(/usr/bin/dpkg-deb -f "$bwrap_deb" Architecture)"
+
+          /usr/bin/install -d -m 0700 -- "$bwrap_extract"
+          /usr/bin/dpkg-deb -x "$bwrap_deb" "$bwrap_extract"
+          bwrap_path="$bwrap_extract/usr/bin/bwrap"
+          test -f "$bwrap_path" && test ! -L "$bwrap_path" && test -x "$bwrap_path"
+          bwrap_sha256="$(/usr/bin/sha256sum -- "$bwrap_path" | /usr/bin/awk '{print $1}')"
+          test "$bwrap_sha256" = e318903862396f96de3df57264e0158682b952fd3fb53ac23d876413e7b30f71
+          printf 'BWRAP_EXTRACTED_PATH=%s\n' "$bwrap_path"
+          printf 'BWRAP_EXTRACTED_SHA256=%s\n' "$bwrap_sha256"
+          printf 'BWRAP_PT_INTERP=%s\n' "$(/usr/bin/readelf -l "$bwrap_path" | /usr/bin/sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p' | /usr/bin/head -n 1)"
+          printf 'BWRAP_DT_NEEDED=%s\n' "$(/usr/bin/readelf -d "$bwrap_path" | /usr/bin/sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | /usr/bin/paste -sd, -)"
+          printf 'BWRAP_RPATH_RUNPATH=%s\n' "$(/usr/bin/readelf -d "$bwrap_path" | /usr/bin/sed -n -E 's/.*\((RPATH|RUNPATH).*\): \[(.*)\]/\1=\2/p' | /usr/bin/paste -sd, -)"
+          printf 'BWRAP_RESOLVED_DEPENDENCIES=%s\n' "$(/usr/bin/ldd "$bwrap_path" | /usr/bin/tr '\n' ';')"
+          /usr/bin/sudo -n "$bwrap_path" --version
+          printf 'BWRAP_PRIVILEGED_EXECUTION=PASS\n'
+
+          cmake_path=/usr/local/bin/cmake
+          test -x "$cmake_path"
+          printf 'CMAKE_PATH=%s\n' "$cmake_path"
+          "$cmake_path" -S native/s8-process-runner -B "$temp_root/s8-runner" -DCMAKE_BUILD_TYPE=Release
+          "$cmake_path" --build "$temp_root/s8-runner" --config Release --parallel
+          "$cmake_path" -S native/s8-fbx-validator -B "$temp_root/s8-validator" -DCMAKE_BUILD_TYPE=Release
+          "$cmake_path" --build "$temp_root/s8-validator" --config Release --parallel
+          runner_path="$temp_root/s8-runner/s8-process-runner"
+          validator_path="$temp_root/s8-validator/s8-fbx-validator"
+          test -x "$runner_path" && test -x "$validator_path"
+
+          blender_archive="$temp_root/blender-5.2.2-linux-x64.tar.xz"
+          /usr/bin/curl --config /dev/null --fail --silent --show-error --proto '=https' --tlsv1.2 --location --max-redirs 0 --retry 3 --output "$blender_archive" \
+            'https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz'
+          printf 'BLENDER_ARCHIVE_SHA256=%s\n' 84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168
+          printf '%s  %s\n' 84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168 "$blender_archive" | /usr/bin/sha256sum --check --status
+          /usr/bin/tar -tJf "$blender_archive" | /usr/bin/awk '/^\/|(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }'
+          /usr/bin/install -d -m 0700 -- "$temp_root/blender-extracted"
+          /usr/bin/tar -xJf "$blender_archive" --directory "$temp_root/blender-extracted" --no-same-owner --no-same-permissions
+          blender_root="$temp_root/blender-extracted/blender-5.2.2-linux-x64"
+          blender_path="$blender_root/blender"
+          writer_path="$PWD/blender/s8-fbx-writer/writer.py"
+          test -d "$blender_root" && test ! -L "$blender_root" && test -x "$blender_path"
+          for required_writer_file in writer.py export_fbx_bin.py patch-manifest.json; do
+            test -f "$PWD/blender/s8-fbx-writer/$required_writer_file"
+            test ! -L "$PWD/blender/s8-fbx-writer/$required_writer_file"
+          done
+
+          candidate_blender_root="$candidate_root/blender-5.2.2-linux-x64"
+          candidate_writer_root="$candidate_root/writer"
+          candidate_runner="$candidate_root/s8-process-runner"
+          candidate_validator="$candidate_root/s8-fbx-validator"
+          /usr/bin/cp -a --no-preserve=ownership -- "$blender_root" "$candidate_root/"
+          /usr/bin/install -d -m 0755 -- "$candidate_writer_root"
+          /usr/bin/cp -a --no-preserve=ownership -- "$PWD/blender/s8-fbx-writer/." "$candidate_writer_root/"
+          /usr/bin/install -m 0755 -- "$runner_path" "$candidate_runner"
+          /usr/bin/install -m 0755 -- "$validator_path" "$candidate_validator"
+          /usr/bin/find -P "$candidate_root" -type d -exec /usr/bin/chmod 0555 {} +
+          /usr/bin/find -P "$candidate_root" -type f -perm /111 -exec /usr/bin/chmod 0555 {} +
+          /usr/bin/find -P "$candidate_root" -type f ! -perm /111 -exec /usr/bin/chmod 0444 {} +
+          test -d "$candidate_blender_root" && test -x "$candidate_blender_root/blender"
+          test -f "$candidate_writer_root/writer.py" && test -f "$candidate_writer_root/export_fbx_bin.py" && test -f "$candidate_writer_root/patch-manifest.json"
+          test -x "$candidate_runner" && test -x "$candidate_validator"
+          printf 'CANDIDATE_SOURCE_ROOT=%s\n' "$candidate_root"
+
+          export S8_RUN082_BWRAP="$bwrap_path"
+          export S8_RUN082_CANDIDATE_ROOT="$candidate_root"
+          export S8_RUN082_BLENDER_ROOT="$candidate_blender_root"
+          export S8_RUN082_BLENDER="$candidate_blender_root/blender"
+          export S8_RUN082_WRITER="$candidate_writer_root/writer.py"
+          export S8_RUN082_RUNNER="$candidate_runner"
+          export S8_RUN082_VALIDATOR="$candidate_validator"
+          pnpm exec tsx scripts/s8/run082_differential_evidence.ts
