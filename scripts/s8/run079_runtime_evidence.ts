@@ -31,7 +31,7 @@ type CaseResult = {
   name: string;
   result: string;
   firstFailure: string;
-  workChdir: "YES" | "NO" | "UNKNOWN";
+  workChdir: "YES" | "NO" | "UNKNOWN" | "NOT_REACHED";
   runnerStarted: "YES" | "NO";
   targetStarted: "YES" | "NO";
   runnerBoundary: string;
@@ -168,7 +168,9 @@ done
 {
   printf 'WORK_PATH=%s\n' "$work_path"
   if [[ -n "$work_path" ]]; then
-    /usr/bin/stat -c 'OWNER_GROUP=%u:%g\nMODE=%a\nDEVICE_INODE=%d:%i' -- "$work_path"
+    /usr/bin/stat -c 'OWNER_GROUP=%u:%g' -- "$work_path"
+    /usr/bin/stat -c 'MODE=%a' -- "$work_path"
+    /usr/bin/stat -c 'DEVICE_INODE=%d:%i' -- "$work_path"
     acl="$(/usr/bin/getfacl --numeric --omit-header -- "$work_path" 2>/dev/null || true)"
     access="$(printf '%s\n' "$acl" | /usr/bin/sed '/^default:/d' | /usr/bin/paste -sd, -)"
     defaults="$(printf '%s\n' "$acl" | /usr/bin/sed -n 's/^default://p' | /usr/bin/paste -sd, -)"
@@ -186,9 +188,17 @@ printf '%s\0' "@@{args[@]}" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}' > "
 for ((i=0; i<@@{#args[@]}; i++)); do printf 'arg[%03d]=%q\n' "$i" "@@{args[$i]}"; done > "$log_dir/application-argv.txt"
 if [[ "@@{RUN079_ACCESS_ACL:-0}" == 1 ]]; then
   [[ -n "$work_path" ]] || { printf 'RUN079_ACL_ERROR=WORK_BIND_MISSING\n' > "$log_dir/acl-error.txt"; exit 71; }
-  /usr/bin/setfacl -m u:65534:rwx -m d:u:65534:rwx -- "$work_path"
+  acl_subject_uid="$(/usr/bin/id -u)"
+  [[ "$acl_subject_uid" =~ ^[1-9][0-9]*$ && "$acl_subject_uid" != "65534" ]] || { printf 'RUN079_ACL_ERROR=INVALID_RUNNER_UID\n' > "$log_dir/acl-error.txt"; exit 74; }
+  printf '%s\n' "$acl_subject_uid" > "$log_dir/acl-subject.txt"
+  /usr/bin/setfacl --no-mask --set "u::rwx,u:$acl_subject_uid:rwx,g::---,m::rwx,o::---" -- "$work_path"
+  /usr/bin/setfacl --no-mask --default --set "u::rwx,u:$acl_subject_uid:rwx,g::---,m::rwx,o::---" -- "$work_path"
   /usr/bin/getfacl --numeric --absolute-names -- "$work_path" > "$log_dir/work-acl-post.txt"
-  /usr/bin/stat -c 'OWNER_GROUP=%u:%g\nMODE=%a\nDEVICE_INODE=%d:%i' -- "$work_path" > "$log_dir/work-stat-post.txt"
+  {
+    /usr/bin/stat -c 'OWNER_GROUP=%u:%g' -- "$work_path"
+    /usr/bin/stat -c 'MODE=%a' -- "$work_path"
+    /usr/bin/stat -c 'DEVICE_INODE=%d:%i' -- "$work_path"
+  } > "$log_dir/work-stat-post.txt"
 fi
 effective=("@@{args[@]}")
 if [[ "@@{RUN079_IDENTITY:-0}" == 1 ]]; then
@@ -238,6 +248,9 @@ function classify(error: string, receipt: Receipt | undefined, stderr: string): 
   const result = receipt?.result;
   const runnerStarted = receipt ? "YES" : "NO";
   const targetStarted = result && (typeof result.targetExit === "number" || typeof result.targetSignal === "number") ? "YES" : "NO";
+  if (/Can't find source path .*: Permission denied/u.test(stderr)) {
+    return { result: "BWRAP_BIND_SOURCE_DENIED", workChdir: "NOT_REACHED", runnerStarted, targetStarted, runnerBoundary: "BWRAP_BIND_SOURCE" };
+  }
   if (/Can't chdir to \/work/u.test(stderr)) {
     return { result: "WORK_CHDIR_DENIED", workChdir: "NO", runnerStarted, targetStarted, runnerBoundary: "BWRAP_CHDIR" };
   }
@@ -403,6 +416,7 @@ function main(): void {
       const statPost = readFileSync(join(logDir, "work-stat-post.txt"), "utf8").trim().split(/\r?\n/u).join(",").replace(/(^|,)MODE=([0-7]+)/u, "$1MODE=0$2");
       console.log(item.name + "_POST_WORK_ACL=" + aclPost);
       console.log(item.name + "_POST_WORK_OWNER_GROUP_MODE_DEVICE_INODE=" + statPost);
+      console.log(item.name + "_ACL_SUBJECT_UID=" + readFileSync(join(logDir, "acl-subject.txt"), "utf8").trim());
     }
     if (item.name === "M0") {
       console.log("CURRENT_APPLICATION_COUNTEREXAMPLE=" + result.result);
