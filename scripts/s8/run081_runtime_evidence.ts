@@ -622,7 +622,7 @@ function main(): void {
   writeLines(surfaceFile, allSurfaces.map((surface) => `${surface.id}\t${surface.source}\t${surface.target}`));
   const topRoot = `/s8-run081-private-${runId}.${runAttempt}`;
   if (existsSync(topRoot) || lstatSync(topRoot, { throwIfNoEntry: false })) throw new Error("RUN081_TOP_LEVEL_ROOT_NOT_FRESH");
-  const install = sudoCommand(["/usr/bin/install", "-d", "-o", String(runnerUid), "-g", String(runnerGid), "-m", "0700", "--", topRoot]);
+  const install = sudoCommand(["/usr/bin/install", "-d", "-o", String(runnerUid), "-g", String(runnerGid), "-m", "0755", "--", topRoot]);
   if (install.status !== 0) throw new Error("RUN081_TOP_LEVEL_ROOT_CREATE_FAILED");
   let controlRoot = "";
   const cells: Cell[] = [];
