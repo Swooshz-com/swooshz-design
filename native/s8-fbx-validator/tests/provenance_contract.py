@@ -276,12 +276,12 @@ def build_fbx(models: tuple[ModelSpec, ...]) -> bytes:
     )
     top_level = (
         header_extension,
+        settings,
         documents,
         definitions,
         node("Objects", (), tuple(object_nodes)),
         connections,
         takes,
-        settings,
     )
     data = bytearray(MAGIC + struct.pack("<I", 7400))
     for item in top_level:
