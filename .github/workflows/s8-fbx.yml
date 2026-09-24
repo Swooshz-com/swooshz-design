@@ -4471,28 +4471,151 @@ jobs:
           run_bwrap_parser_proof bwrap_good_grammar 0 "$archive_root/bwrap-good-grammar.stdout" "$archive_root/bwrap-good-grammar.stderr"
           printf 'GOOD_GRAMMAR_CONTROL=CAPABILITY_PROBE_NEXT\n'
 
+          iproute2_image_version_is_allowed() {
+            case "$1" in
+              20260907.300.1|20260920.314.1) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          iproute2_metadata_query() {
+            case "$1" in
+              status) /usr/bin/dpkg-query -W -f='${Status}' iproute2 2>/dev/null ;;
+              version) /usr/bin/dpkg-query -W -f='${Version}' iproute2 2>/dev/null ;;
+              architecture) /usr/bin/dpkg-query -W -f='${Architecture}' iproute2 2>/dev/null ;;
+              *) return 1 ;;
+            esac
+          }
+
+          iproute2_capture_metadata() {
+            local ps pv pa
+            ps="$(iproute2_metadata_query status)" || return 1
+            pv="$(iproute2_metadata_query version)" || return 1
+            pa="$(iproute2_metadata_query architecture)" || return 1
+            [[ -n "$ps" && -n "$pv" && -n "$pa" ]] || return 1
+            IPROUTE2_PACKAGE_STATUS="$ps"
+            IPROUTE2_PACKAGE_VERSION="$pv"
+            IPROUTE2_PACKAGE_ARCHITECTURE="$pa"
+          }
+
+          iproute2_host_metadata_query() {
+            case "$1" in
+              ID|VERSION_ID|VERSION_CODENAME)
+                /usr/bin/awk -v key="$1" -F= '
+                  $1 == key {
+                    count++
+                    value = substr($0, index($0, "=") + 1)
+                    if (value ~ /^".*"$/) value = substr(value, 2, length(value) - 2)
+                  }
+                  END { if (count != 1 || value == "") exit 1; print value }
+                ' /etc/os-release
+                ;;
+              DPKG_ARCH) /usr/bin/dpkg --print-architecture ;;
+              KERNEL_RELEASE) /usr/bin/cat /proc/sys/kernel/osrelease ;;
+              *) return 1 ;;
+            esac
+          }
+
+          iproute2_capture_host_metadata() {
+            local id version_id version_codename dpkg_arch kernel_release
+            id="$(iproute2_host_metadata_query ID)" || return 1
+            version_id="$(iproute2_host_metadata_query VERSION_ID)" || return 1
+            version_codename="$(iproute2_host_metadata_query VERSION_CODENAME)" || return 1
+            dpkg_arch="$(iproute2_host_metadata_query DPKG_ARCH)" || return 1
+            kernel_release="$(iproute2_host_metadata_query KERNEL_RELEASE)" || return 1
+            [[ -n "$id" && -n "$version_id" && -n "$version_codename" && -n "$dpkg_arch" && -n "$kernel_release" ]] || return 1
+            IPROUTE2_HOST_ID="$id"
+            IPROUTE2_HOST_VERSION_ID="$version_id"
+            IPROUTE2_HOST_VERSION_CODENAME="$version_codename"
+            IPROUTE2_HOST_DPKG_ARCH="$dpkg_arch"
+            IPROUTE2_HOST_KERNEL_RELEASE="$kernel_release"
+          }
+
+          iproute2_snapshot_fingerprint_payload() {
+            printf '%s\n' "$@"
+          }
+
+          iproute2_sha256_command() {
+            /usr/bin/sha256sum --text
+          }
+
+          iproute2_fingerprint_sha256() {
+            local payload="$1" raw command_status fingerprint
+            raw="$(
+              iproute2_sha256_command <<< "$payload"
+              command_status=$?
+              printf '\001'
+              exit "$command_status"
+            )" || return 1
+            [[ "$raw" == *$'\001' ]] || return 1
+            raw="${raw%$'\001'}"
+            [[ "$raw" == *$'\n' ]] || return 1
+            raw="${raw%$'\n'}"
+            [[ "$raw" =~ ^([A-Fa-f0-9]{64})[[:space:]][[:space:]]-$ ]] || return 1
+            fingerprint="${BASH_REMATCH[1]}"
+            [[ "$fingerprint" =~ ^[A-Fa-f0-9]{64}$ ]] || return 1
+            printf '%s\n' "$fingerprint"
+          }
+
+          iproute2_accept_fingerprint() {
+            local payload="$1" fp
+            fp="$(iproute2_fingerprint_sha256 "$payload")" || return 1
+            [[ "$fp" =~ ^[A-Fa-f0-9]{64}$ ]] || return 1
+            if [[ -z "${iproute2_admission_baseline:-}" ]]; then
+              iproute2_admission_baseline="$fp"
+              readonly iproute2_admission_baseline
+            else
+              [[ "$fp" == "$iproute2_admission_baseline" ]] || return 1
+            fi
+          }
+
           iproute2_contract_values_valid() {
             local rl="$1" iv="$2" ios="$3" ps="$4" pv="$5" pa="$6" dm="$7" fm="$8" cm="$9"
-            local cc="${10}" th="${11}" acl="${12}" alias="${13}" dq="${14}" dqe="${15}" ver="${16}" vere="${17}"
-            [[ "$rl" == ubuntu-24.04 && "$iv" == 20260920.314.1 && "$ios" == ubuntu24 ]] || return 1
+            local cc="${10}" th="${11}" acl="${12}" alias="${13}" same_inode="${14}"
+            local dq="${15}" dqe="${16}" ver="${17}" vere="${18}" id="${19}" version_id="${20}"
+            local version_codename="${21}" dpkg_arch="${22}" kernel_release="${23}"
+            [[ "$rl" == ubuntu-24.04 && "$ios" == ubuntu24 ]] || return 1
+            iproute2_image_version_is_allowed "$iv" || return 1
             [[ "$ps" == 'install ok installed' && "$pv" == 6.1.0-1ubuntu6.4 && "$pa" == amd64 ]] || return 1
             [[ "$dm" == 'directory|755|0:0' && "$fm" == 'regular file|644|0:0' && "$cm" == 'directory|755|0:0' ]] || return 1
             [[ "$cc" == 0 && "$th" == 08c418b8469951cd5c59da91e4b116cd62cb125478dfac12e5f5067d4d07ad3f ]] || return 1
-            [[ "$acl" == 1 && "$alias" == 1 && "$dq" == 1 && "$dqe" == 1 && "$ver" == 1 && "$vere" == 1 ]] || return 1
+            [[ "$acl" == 1 && "$alias" == 1 && "$same_inode" == 1 && "$dq" == 1 && "$dqe" == 1 && "$ver" == 1 && "$vere" == 1 ]] || return 1
+            [[ "$id" == ubuntu && "$version_id" == 24.04 && "$version_codename" == noble && "$dpkg_arch" == amd64 && "$kernel_release" == 6.17.0-1022-azure ]] || return 1
+          }
+
+          iproute2_admit_values() {
+            (( $# == 27 )) || return 1
+            local br="${24}" ur="${25}" bd="${26}" ud="${27}" fingerprint_payload
+            iproute2_contract_values_valid "${@:1:23}" || return 1
+            [[ "$br" == /usr/bin/ip && "$ur" == /usr/bin/ip && "$bd" == "$ud" ]] || return 1
+            fingerprint_payload="$(iproute2_snapshot_fingerprint_payload "$@")" || return 1
+            iproute2_accept_fingerprint "$fingerprint_payload" || return 1
           }
 
           admit_iproute2_snapshot() {
             local phase="$1"
-            local ps pv pa dm fm cm cc th acl=1 alias=0 dq=0 dqe=0 ver=0 vere=0 br ur bd ud
-            local dout derr vout verr ds vs fp
-            [[ "${S8_RUNNER_LABEL:-}" == ubuntu-24.04 && "${ImageVersion:-}" == 20260920.314.1 && "${ImageOS:-}" == ubuntu24 ]] || return 1
-            ps="$(/usr/bin/dpkg-query -W -f='${Status}' iproute2 2>/dev/null)" || return 1
-            pv="$(/usr/bin/dpkg-query -W -f='${Version}' iproute2 2>/dev/null)" || return 1
-            pa="$(/usr/bin/dpkg-query -W -f='${Architecture}' iproute2 2>/dev/null)" || return 1
+            local ps pv pa dm fm cm cc th acl=1 alias=0 same_inode=0 br ur bd ud
+            local dm_value fm_value cm_value dout derr vout verr ds vs
+            local id version_id version_codename dpkg_arch kernel_release
+            [[ "${S8_RUNNER_LABEL:-}" == ubuntu-24.04 && "${ImageOS:-}" == ubuntu24 ]] || return 1
+            iproute2_image_version_is_allowed "${ImageVersion:-}" || return 1
+            iproute2_capture_metadata || return 1
+            ps="$IPROUTE2_PACKAGE_STATUS"
+            pv="$IPROUTE2_PACKAGE_VERSION"
+            pa="$IPROUTE2_PACKAGE_ARCHITECTURE"
+            iproute2_capture_host_metadata || return 1
+            id="$IPROUTE2_HOST_ID"
+            version_id="$IPROUTE2_HOST_VERSION_ID"
+            version_codename="$IPROUTE2_HOST_VERSION_CODENAME"
+            dpkg_arch="$IPROUTE2_HOST_DPKG_ARCH"
+            kernel_release="$IPROUTE2_HOST_KERNEL_RELEASE"
             [[ -d /etc/iproute2 && ! -L /etc/iproute2 && -f /etc/iproute2/rt_tables && ! -L /etc/iproute2/rt_tables && -d /etc/iproute2/rt_tables.d && ! -L /etc/iproute2/rt_tables.d ]] || return 1
-            dm="directory|$(/usr/bin/stat -c '%a|%u:%g' -- /etc/iproute2)"
-            fm="regular file|$(/usr/bin/stat -c '%a|%u:%g' -- /etc/iproute2/rt_tables)"
-            cm="directory|$(/usr/bin/stat -c '%a|%u:%g' -- /etc/iproute2/rt_tables.d)"
+            dm_value="$(/usr/bin/stat -c '%a|%u:%g' -- /etc/iproute2)" || return 1
+            fm_value="$(/usr/bin/stat -c '%a|%u:%g' -- /etc/iproute2/rt_tables)" || return 1
+            cm_value="$(/usr/bin/stat -c '%a|%u:%g' -- /etc/iproute2/rt_tables.d)" || return 1
+            dm="directory|$dm_value"
+            fm="regular file|$fm_value"
+            cm="directory|$cm_value"
             ordinary_acl_is_exact /etc/iproute2 0755 || acl=0
             ordinary_acl_is_exact /etc/iproute2/rt_tables 0644 || acl=0
             ordinary_acl_is_exact /etc/iproute2/rt_tables.d 0755 || acl=0
@@ -4502,9 +4625,11 @@ jobs:
             br="$(/usr/bin/readlink -e -- /bin/ip)" || return 1
             ur="$(/usr/bin/readlink -e -- /usr/bin/ip)" || return 1
             [[ "$br" == "$ur" && "$ur" == /usr/bin/ip ]] || return 1
+            alias=1
             bd="$(/usr/bin/stat -Lc '%d:%i' -- /bin/ip)" || return 1
             ud="$(/usr/bin/stat -Lc '%d:%i' -- /usr/bin/ip)" || return 1
-            [[ "$bd" == "$ud" ]] && alias=1
+            [[ "$bd" == "$ud" ]] || return 1
+            same_inode=1
             dout="$archive_root/ip-${phase}.dpkg.stdout"
             derr="$archive_root/ip-${phase}.dpkg.stderr"
             vout="$archive_root/ip-${phase}.version.stdout"
@@ -4521,15 +4646,9 @@ jobs:
             [[ ! -s "$verr" ]] && vere=1
             if printf 'iproute2: /bin/ip\n' | /usr/bin/cmp --silent - "$dout"; then dq=1; fi
             if printf 'ip utility, iproute2-6.1.0, libbpf 1.3.0\n' | /usr/bin/cmp --silent - "$vout"; then ver=1; fi
-            iproute2_contract_values_valid "${S8_RUNNER_LABEL:-}" "${ImageVersion:-}" "${ImageOS:-}" "$ps" "$pv" "$pa" "$dm" "$fm" "$cm" "$cc" "$th" "$acl" "$alias" "$dq" "$dqe" "$ver" "$vere" || return 1
-            fp="$(printf '%s\n' "${S8_RUNNER_LABEL:-}" "${ImageVersion:-}" "${ImageOS:-}" "$ps" "$pv" "$pa" "$dm" "$fm" "$cm" "$cc" "$th" "$br" "$ur" "$bd" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')"
-            if [[ -z "${iproute2_admission_baseline:-}" ]]; then
-              iproute2_admission_baseline="$fp"
-            else
-              [[ "$fp" == "$iproute2_admission_baseline" ]] || return 1
-            fi
+            iproute2_admit_values "${S8_RUNNER_LABEL:-}" "${ImageVersion:-}" "${ImageOS:-}" "$ps" "$pv" "$pa" "$dm" "$fm" "$cm" "$cc" "$th" "$acl" "$alias" "$same_inode" "$dq" "$dqe" "$ver" "$vere" "$id" "$version_id" "$version_codename" "$dpkg_arch" "$kernel_release" "$br" "$ur" "$bd" "$ud" || return 1
             /usr/bin/rm -f -- "$dout" "$derr" "$vout" "$verr"
-            printf 'IPROUTE2_ADMISSION_%s=PASS\n' "$phase"
+            printf 'IMAGE_VERSION_ADMISSION=PASS\nIMAGE_VERSION=%s\nHOST_IDENTITY_ADMISSION=PASS\nHOST_ID=%s\nHOST_VERSION_ID=%s\nHOST_VERSION_CODENAME=%s\nHOST_DPKG_ARCH=%s\nHOST_KERNEL_RELEASE=%s\nIPROUTE2_ADMISSION_%s=PASS\n' "${ImageVersion:-}" "$id" "$version_id" "$version_codename" "$dpkg_arch" "$kernel_release" "$phase"
           }
 
           validate_capability_ip_paths() {
@@ -4635,6 +4754,7 @@ jobs:
 
               expect_route_accept RUN049_EXACT "$run049_v4" "$run049_v6"
               printf 'RUN049_EXACT_ROUTE_EVIDENCE_REGRESSION=PASS\n'
+              printf 'R29_RUN049_EXACT_ROUTE_EVIDENCE=PASS\n'
               expect_route_accept NUMERIC_LOCAL "$local_v4" "$local_v6"
               broadcast_v4='[{"type":"3","dst":"127.255.255.255","dev":"lo","table":"255","flags":[]}]'
               broadcast_v6="$local_v6"
@@ -4650,6 +4770,7 @@ jobs:
 
               routable_unicast='[{"type":"1","dst":"192.0.2.0/24","dev":"eth0","table":"255","flags":[]}]'
               expect_route_reject NUMERIC_UNICAST_NON_LOOPBACK "$routable_unicast" "$local_v6"
+              printf 'R17_NON_LOOPBACK_ROUTE=REJECT\n'
               for route_type in 0 10 11 99; do
                 invalid_numeric="$(printf '[{"type":"%s","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$route_type")"
                 expect_route_reject "NUMERIC_UNSUPPORTED_$route_type" "$invalid_numeric" "$local_v6"
@@ -4662,6 +4783,7 @@ jobs:
                 blocked_route="$(printf '[{"type":"%s","dst":"192.0.2.1","dev":"eth0","table":"255","flags":[]}]' "$route_type")"
                 expect_route_accept "NUMERIC_BLOCKED_$route_type" "$blocked_route" "$blocked_route"
               done
+              printf 'R27_ROUTE_POSITIVE_CONTROLS=PASS\n'
               printf 'NUMERIC_ROUTE_TYPE_NEGATIVE_CONTROLS=PASS\n'
 
               expect_route_reject TABLE_STRING_ZERO '[{"type":"2","dst":"127.0.0.1","dev":"lo","table":"0","flags":[]}]' "$local_v6"
@@ -4676,6 +4798,7 @@ jobs:
               expect_route_reject IPV4_INVALID_V6_VALID '[{"type":"99","dst":"127.0.0.1","dev":"lo","table":"255","flags":[]}]' "$local_v6"
               expect_route_reject NONEMPTY_STDERR "$local_v4" "$local_v6" 'route stderr is not accepted'
               printf 'STRICT_ROUTE_POLICY_REVALIDATION=PASS\nNUMERIC_ROUTE_TYPE_CANONICALISATION=PASS\n'
+              printf 'R28_ROUTE_NEGATIVE_CONTROLS=PASS\n'
             )
             status=$?
             set -e
@@ -4684,22 +4807,198 @@ jobs:
           }
 
           iproute2_positive_controls() {
-            local -a good=(ubuntu-24.04 20260920.314.1 ubuntu24 'install ok installed' 6.1.0-1ubuntu6.4 amd64 'directory|755|0:0' 'regular file|644|0:0' 'directory|755|0:0' 0 08c418b8469951cd5c59da91e4b116cd62cb125478dfac12e5f5067d4d07ad3f 1 1 1 1 1 1)
-            iproute2_contract_values_valid "${good[@]}" || return 1
-            local label
-            for label in WRONG_VERSION_BYTES NON_EMPTY_STDERR WRONG_CONFIG_HASH WRONG_ACL ALIAS_MISMATCH EXTRA_CONF; do
-              local -a bad=("${good[@]}")
-              case "$label" in
-                WRONG_VERSION_BYTES) bad[15]=0 ;;
-                NON_EMPTY_STDERR) bad[16]=0 ;;
-                WRONG_CONFIG_HASH) bad[10]=deadbeef ;;
-                WRONG_ACL) bad[11]=0 ;;
-                ALIAS_MISMATCH) bad[12]=0 ;;
-                EXTRA_CONF) bad[9]=1 ;;
-              esac
-              if iproute2_contract_values_valid "${bad[@]}"; then return 1; fi
-            done
+            run_iproute2_contract_regressions || return 1
+            run_iproute2_acquisition_regressions || return 1
             printf 'IPROUTE2_POSITIVE_CONTROLS=PASS\n'
+          }
+
+          run_iproute2_contract_regressions() {
+            local -a stable rollout bad stable_fp rollout_fp drift_fp bad_fp
+            local phase
+            stable=(ubuntu-24.04 20260907.300.1 ubuntu24 'install ok installed' 6.1.0-1ubuntu6.4 amd64 'directory|755|0:0' 'regular file|644|0:0' 'directory|755|0:0' 0 08c418b8469951cd5c59da91e4b116cd62cb125478dfac12e5f5067d4d07ad3f 1 1 1 1 1 1 1 ubuntu 24.04 noble amd64 6.17.0-1022-azure)
+            rollout=("${stable[@]}")
+            rollout[1]=20260920.314.1
+            stable_fp=("${stable[@]}" /usr/bin/ip /usr/bin/ip 8:1234 8:1234)
+            rollout_fp=("${rollout[@]}" /usr/bin/ip /usr/bin/ip 8:1234 8:1234)
+
+            ( iproute2_admission_baseline=''; iproute2_admit_values "${stable_fp[@]}" ) || return 1
+            printf 'R1_STABLE_IMAGE_EXACT_EVIDENCE=ACCEPT\n'
+            ( iproute2_admission_baseline=''; iproute2_admit_values "${rollout_fp[@]}" ) || return 1
+            printf 'R2_ROLLOUT_IMAGE_EXACT_EVIDENCE=ACCEPT\n'
+            iproute2_image_version_is_allowed 20260907.300.1 && iproute2_image_version_is_allowed 20260920.314.1 || return 1
+            printf 'DUAL_BOUNDED_IMAGE_ALLOWLIST=PASS\n'
+
+            expect_iproute2_reject() {
+              local label="$1"
+              local -a values
+              shift
+              values=("$@")
+              if (( ${#values[@]} == 23 )); then values+=(/usr/bin/ip /usr/bin/ip 8:1234 8:1234); fi
+              if iproute2_admit_values "${values[@]}"; then return 1; fi
+              printf '%s=REJECT\n' "$label"
+            }
+
+            bad=("${stable[@]}"); bad[1]=20260920.314.2
+            expect_iproute2_reject R3_UNKNOWN_IMAGE "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[1]=''
+            expect_iproute2_reject R4_MISSING_IMAGE "${bad[@]}" || return 1
+            printf 'UNKNOWN_IMAGE_REJECTION=PASS\n'
+
+            bad=("${stable[@]}"); bad[4]=6.1.0-1ubuntu6.3
+            expect_iproute2_reject R5_WRONG_PACKAGE_VERSION "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[5]=arm64
+            expect_iproute2_reject R6_WRONG_PACKAGE_ARCHITECTURE "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[10]=deadbeef
+            expect_iproute2_reject R7_WRONG_RT_TABLES_HASH "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[9]=1
+            expect_iproute2_reject R8_EXTRA_CONF "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[11]=0
+            expect_iproute2_reject R9_ACL_MISMATCH "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[6]='directory|775|0:0'
+            expect_iproute2_reject R10_MODE_MISMATCH "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[7]='regular file|644|0:4'
+            expect_iproute2_reject R10_OWNER_MISMATCH "${bad[@]}" || return 1
+            bad_fp=("${stable[@]}" /usr/bin/ip /usr/local/bin/ip 8:1234 8:1234)
+            expect_iproute2_reject R11_ALIAS_MISMATCH "${bad_fp[@]}" || return 1
+            bad_fp=("${stable[@]}" /usr/bin/ip /usr/bin/ip 8:1234 8:5678)
+            expect_iproute2_reject R12_DEVICE_INODE_MISMATCH "${bad_fp[@]}" || return 1
+            bad=("${stable[@]}"); bad[14]=0
+            expect_iproute2_reject R13_WRONG_DPKG_STDOUT "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[15]=0
+            expect_iproute2_reject R14_DPKG_STDERR "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[16]=0
+            expect_iproute2_reject R15_WRONG_IP_VERSION_STDOUT "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[17]=0
+            expect_iproute2_reject R16_IP_VERSION_STDERR "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[18]=ubuntu-22.04
+            expect_iproute2_reject R18_ID_MISMATCH "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[19]=22.04
+            expect_iproute2_reject R19_VERSION_ID_MISMATCH "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[20]=jammy
+            expect_iproute2_reject R20_VERSION_CODENAME_MISMATCH "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[21]=arm64
+            expect_iproute2_reject R21_DPKG_ARCH_MISMATCH "${bad[@]}" || return 1
+            bad=("${stable[@]}"); bad[22]=6.17.0-1021-azure
+            expect_iproute2_reject R22_KERNEL_MISMATCH "${bad[@]}" || return 1
+
+            (
+              iproute2_admission_baseline=''
+              local payload phase
+              payload="$(iproute2_snapshot_fingerprint_payload "${stable_fp[@]}")" || exit 1
+              iproute2_contract_values_valid "${stable[@]}" || exit 1
+              iproute2_accept_fingerprint "$payload" || exit 1
+              for phase in initial_pre_probe initial_post_reap staged_pre_probe staged_post_reap post_candidate_reap; do
+                iproute2_accept_fingerprint "$payload" || exit 1
+              done
+            ) || return 1
+            drift_fp=("${stable_fp[@]}")
+            drift_fp[25]=8:5678
+            drift_fp[26]=8:5678
+            (
+              iproute2_admission_baseline=''
+              iproute2_admit_values "${stable_fp[@]}" || exit 1
+              if iproute2_admit_values "${drift_fp[@]}"; then exit 1; fi
+            ) || return 1
+            printf 'R23_BASELINE_FIELD_DRIFT=REJECT\nBASELINE_NON_RESETTABLE=PASS\n'
+            bad=("${stable[@]}"); bad[18]=ubuntu-24.04
+            drift_fp=("${bad[@]}" /usr/bin/ip /usr/bin/ip 8:1234 8:1234)
+            (
+              iproute2_admission_baseline=''
+              iproute2_admit_values "${stable_fp[@]}" || exit 1
+              if iproute2_admit_values "${drift_fp[@]}"; then exit 1; fi
+            ) || return 1
+            printf 'MIDRUN_IDENTITY_DRIFT_REJECTION=PASS\n'
+
+            (
+              iproute2_admission_baseline=''
+              iproute2_admit_values "${stable_fp[@]}" || exit 1
+              if iproute2_admit_values "${rollout_fp[@]}"; then exit 1; fi
+            ) || return 1
+            printf 'R24_STABLE_TO_ROLLOUT_IMAGE_SWITCH=REJECT\n'
+            (
+              iproute2_admission_baseline=''
+              iproute2_admit_values "${rollout_fp[@]}" || exit 1
+              if iproute2_admit_values "${stable_fp[@]}"; then exit 1; fi
+            ) || return 1
+            printf 'R24_ROLLOUT_TO_STABLE_IMAGE_SWITCH=REJECT\nIMAGE_SWITCH_REJECTION=PASS\n'
+            if (
+              iproute2_admission_baseline=''
+              iproute2_admit_values "${stable_fp[@]}" || exit 1
+              iproute2_admission_baseline=''
+            ) 2>/dev/null; then return 1; fi
+            printf 'R25_BASELINE_RESET_ATTEMPT=REJECT\n'
+          }
+
+          run_iproute2_acquisition_regressions() {
+            local valid short long nonhex raw
+            local -a malformed
+            valid=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+            short="${valid:0:63}"
+            long="${valid}0"
+            nonhex="g${valid:1}"
+            (
+              iproute2_metadata_query() {
+                local field="$1" value
+                case "$field" in
+                  status) value='install ok installed' ;;
+                  version) value=6.1.0-1ubuntu6.4 ;;
+                  architecture) value=amd64 ;;
+                  *) return 1 ;;
+                esac
+                [[ "${IPROUTE2_TEST_METADATA_MISSING:-}" == "$field" ]] && return 0
+                printf '%s\n' "$value"
+                [[ "${IPROUTE2_TEST_METADATA_FAILURE:-}" == "$field" ]] && return 43
+                return 0
+              }
+              iproute2_capture_metadata || exit 1
+              [[ "$IPROUTE2_PACKAGE_STATUS" == 'install ok installed' && "$IPROUTE2_PACKAGE_VERSION" == 6.1.0-1ubuntu6.4 && "$IPROUTE2_PACKAGE_ARCHITECTURE" == amd64 ]] || exit 1
+              local field
+              for field in status version architecture; do
+                if IPROUTE2_TEST_METADATA_FAILURE="$field" iproute2_capture_metadata; then exit 1; fi
+                if IPROUTE2_TEST_METADATA_MISSING="$field" iproute2_capture_metadata; then exit 1; fi
+              done
+            ) || return 1
+            printf 'METADATA_ACQUISITION_FAIL_CLOSED=PASS\n'
+
+            malformed=(
+              ''
+              "$short  -"
+              "$long  -"
+              "$nonhex  -"
+              " $valid  -"
+              "$valid  - "
+              "${valid:0:32} ${valid:32}  -"
+              "$valid  - extra"
+              "$valid  -"$'\n'"$valid  -"
+              "$valid"
+              "${valid}suffix  -"
+            )
+            (
+              iproute2_sha256_command() {
+                printf '%s' "${IPROUTE2_TEST_SHA_RAW:-}"
+                [[ "${IPROUTE2_TEST_SHA_FAILURE:-}" != 1 ]] || return 47
+                return 0
+              }
+              local raw
+              for raw in "${malformed[@]}"; do
+                (
+                  iproute2_admission_baseline=''
+                  if IPROUTE2_TEST_SHA_RAW="$raw" iproute2_accept_fingerprint regression-payload; then exit 1; fi
+                  [[ -z "${iproute2_admission_baseline:-}" ]] || exit 1
+                ) || exit 1
+              done
+              (
+                iproute2_admission_baseline=''
+                if IPROUTE2_TEST_SHA_RAW="${valid}  -"$'\n' IPROUTE2_TEST_SHA_FAILURE=1 iproute2_accept_fingerprint regression-payload; then exit 1; fi
+                [[ -z "${iproute2_admission_baseline:-}" ]] || exit 1
+              ) || exit 1
+              (
+                iproute2_admission_baseline=''
+                IPROUTE2_TEST_SHA_RAW="${valid}  -"$'\n' iproute2_accept_fingerprint regression-payload || exit 1
+                [[ "$iproute2_admission_baseline" == "$valid" ]] || exit 1
+              ) || exit 1
+            ) || return 1
+            printf 'FINGERPRINT_ACQUISITION_FAIL_CLOSED=PASS\nFINGERPRINT_CANONICAL_SHA256_GUARD=PASS\nR26_ACQUISITION_FAILURE_MATRIX=PASS\n'
           }
 
           read -r -d '' capability_script <<'SH' || true
@@ -4823,6 +5122,7 @@ jobs:
           route_parser_status=$?
           set -e
           (( route_parser_status == 0 )) || fail_amendment "ROUTE_PARSER_REGRESSIONS_FAILED"
+          printf 'ROUTE_PARSER_REGRESSIONS=PASS\nR1_R29_IMAGE_ADMISSION_MATRIX=PASS\n'
 
           run_guarded_caller_regressions() {
             local regression_root caller_script negative_script regression_status negative_status negative_case
