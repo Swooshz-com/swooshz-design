@@ -1,0 +1,92 @@
+name: S8 Run-077 Linux runtime evidence (diagnostic)
+
+on:
+  push:
+    branches:
+      - web/run-077-s8-linux-runtime-evidence-001
+    paths:
+      - .github/workflows/s8-run077-runtime-evidence.yml
+      - scripts/s8/run077_runtime_evidence.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: s8-run077-linux-runtime-evidence-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  evidence:
+    name: Ubuntu 24.04 bounded runtime and environment evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify diagnostic branch and product candidate
+        shell: bash
+        env:
+          EXPECTED_BRANCH: web/run-077-s8-linux-runtime-evidence-001
+          PRODUCT_HEAD: 2f71e472849055ab8814f7e38d0f8c321707275f
+          PRODUCT_TREE: c72036fdc685ad3a78e2b696df212476c1dade36
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_REF_NAME" == "$EXPECTED_BRANCH" ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ "$(git rev-parse "$PRODUCT_HEAD^{tree}")" == "$PRODUCT_TREE" ]]
+          git merge-base --is-ancestor "$PRODUCT_HEAD" HEAD
+          mapfile -t changed < <(git diff --name-only "$PRODUCT_HEAD" HEAD | LC_ALL=C sort)
+          [[ "${#changed[@]}" == 2 ]]
+          [[ "${changed[0]}" == ".github/workflows/s8-run077-runtime-evidence.yml" ]]
+          [[ "${changed[1]}" == "scripts/s8/run077_runtime_evidence.ts" ]]
+          printf 'RUN=Run-077\nPRODUCT_HEAD=%s\nPRODUCT_TREE=%s\nEVIDENCE_CARRIER_HEAD=%s\nEVIDENCE_CARRIER_TREE=%s\n' \
+            "$PRODUCT_HEAD" "$PRODUCT_TREE" "$GITHUB_SHA" "$(git rev-parse HEAD^{tree})"
+
+      - name: Set up Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install exact locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build exact Release native targets and acquire pinned Blender
+        shell: bash
+        env:
+          S8_RUN077_ROOT: ${{ runner.temp }}/s8-run077-${{ github.run_id }}.${{ github.run_attempt }}
+        run: |
+          set -Eeuo pipefail
+          [[ ! -e "$S8_RUN077_ROOT" && ! -L "$S8_RUN077_ROOT" ]]
+          install -d -m 0700 -- "$S8_RUN077_ROOT"
+          archive="$S8_RUN077_ROOT/blender-5.2.2-linux-x64.tar.xz"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz
+          printf '%s  %s\n' \
+            84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168 "$archive" \
+            | sha256sum --check --status
+          printf 'BLENDER_ARCHIVE_SHA256=84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168\n'
+          tar -tJf "$archive" | awk '/^\/|(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }'
+          install -d -m 0700 -- "$S8_RUN077_ROOT/extracted"
+          tar -xJf "$archive" --directory "$S8_RUN077_ROOT/extracted" --no-same-owner --no-same-permissions
+          [[ -x "$S8_RUN077_ROOT/extracted/blender-5.2.2-linux-x64/blender" ]]
+
+          cmake -S native/s8-process-runner -B "$S8_RUN077_ROOT/s8-runner" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$S8_RUN077_ROOT/s8-runner" --config Release --parallel
+          cmake -S native/s8-fbx-validator -B "$S8_RUN077_ROOT/s8-validator" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$S8_RUN077_ROOT/s8-validator" --config Release --parallel
+          [[ -x "$S8_RUN077_ROOT/s8-runner/s8-process-runner" ]]
+          [[ -x "$S8_RUN077_ROOT/s8-validator/s8-fbx-validator" ]]
+          printf 'NATIVE_BUILD=RELEASE_PASS\nBLENDER_VERSION=5.2.2\n'
+
+      - name: Measure exact candidate launches and runtime surfaces
+        env:
+          S8_RUN077_ROOT: ${{ runner.temp }}/s8-run077-${{ github.run_id }}.${{ github.run_attempt }}
+        run: pnpm exec tsx scripts/s8/run077_runtime_evidence.ts
