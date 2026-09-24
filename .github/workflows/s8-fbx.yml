@@ -9518,11 +9518,14 @@ jobs:
           pnpm install --frozen-lockfile || fail_hold "RUN078_FROZEN_DEPENDENCY_INSTALL_FAILED"
           printf 'RUN078_NODE_VERSION=%s\nRUN078_DEPENDENCIES=FROZEN_INSTALL_PASS\n' "$node_version"
 
-          run078_build_root="$RUNNER_TEMP/run078-native-build"
+          [[ "$work" == "$carrier/work" ]] || fail_hold "RUN078_PRIVATE_WORK_ROOT_MISMATCH"
+          work_identity_admission 0770 exact >/dev/null || fail_hold "RUN078_PRIVATE_WORK_ROOT_ADMISSION_FAILED"
+          run078_build_root="$carrier/work/run078-native-build-$run_id.$run_attempt"
           run078_evidence_root="$RUNNER_TEMP/run078-runtime-evidence"
           [[ ! -e "$run078_build_root" && ! -L "$run078_build_root" ]] || fail_hold "RUN078_BUILD_ROOT_NOT_FRESH"
           [[ ! -e "$run078_evidence_root" && ! -L "$run078_evidence_root" ]] || fail_hold "RUN078_EVIDENCE_ROOT_NOT_FRESH"
-          /usr/bin/install -d -m 0700 -- "$run078_build_root" "$run078_evidence_root"
+          /usr/bin/install -d -m 0700 -- "$run078_build_root"
+          /usr/bin/install -d -m 0700 -- "$run078_evidence_root"
           cmake -S native/s8-process-runner -B "$run078_build_root/s8-runner" -DCMAKE_BUILD_TYPE=Release || fail_hold "RUN078_PROCESS_RUNNER_CONFIGURE_FAILED"
           cmake --build "$run078_build_root/s8-runner" --config Release --parallel || fail_hold "RUN078_PROCESS_RUNNER_BUILD_FAILED"
           cmake -S native/s8-fbx-validator -B "$run078_build_root/s8-validator" -DCMAKE_BUILD_TYPE=Release || fail_hold "RUN078_VALIDATOR_CONFIGURE_FAILED"
@@ -9534,6 +9537,7 @@ jobs:
             --validator "$run078_build_root/s8-validator/s8-fbx-validator" \
             --blender-root "$carrier/runtime/blender-5.2.2-linux-x64" \
             --writer "$carrier/writer/writer.py" \
+            --private-work-root "$carrier/work" \
             --evidence-root "$run078_evidence_root" \
             --blender-archive "$blender_archive" \
             --bwrap-sha256 "$bwrap_sha256"

@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 
 type Mount = { source: string; target: string; kind: "file" | "directory"; observed: string[]; consumer: string };
 type SpawnRecord = { command: string; args: string[]; cwd: string; environment: Record<string, string>; status: number | null; stdoutBytes: number; stderrBytes: number; stdoutSha256: string; stderrSha256: string };
-type Options = { runner: string; validator: string; blenderRoot: string; writer: string; evidenceRoot: string; blenderArchive: string; bwrapSha256: string };
+type Options = { runner: string; validator: string; blenderRoot: string; writer: string; privateWorkRoot: string; evidenceRoot: string; blenderArchive: string; bwrapSha256: string };
 
 const controlledKeys = ["S8_TEST_PARENT_SECRET_A", "S8_TEST_PARENT_SECRET_B", "PATH", "HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME"] as const;
 const secretSentinels = { S8_TEST_PARENT_SECRET_A: "RUN078_SYNTHETIC_SENTINEL_A", S8_TEST_PARENT_SECRET_B: "RUN078_SYNTHETIC_SENTINEL_B" };
@@ -50,11 +50,11 @@ function parseArgs(argv: string[]): Options {
     if (!key?.startsWith("--") || !value) throw new Error("RUN078_ARGUMENT_INVALID");
     values.set(key.slice(2), value);
   }
-  const required = ["runner", "validator", "blender-root", "writer", "evidence-root", "blender-archive", "bwrap-sha256"];
+  const required = ["runner", "validator", "blender-root", "writer", "private-work-root", "evidence-root", "blender-archive", "bwrap-sha256"];
   for (const key of required) if (!values.has(key)) throw new Error(`RUN078_ARGUMENT_MISSING_${key.toUpperCase().replaceAll("-", "_")}`);
   return {
     runner: resolve(values.get("runner")!), validator: resolve(values.get("validator")!),
-    blenderRoot: resolve(values.get("blender-root")!), writer: resolve(values.get("writer")!),
+    blenderRoot: resolve(values.get("blender-root")!), writer: resolve(values.get("writer")!), privateWorkRoot: resolve(values.get("private-work-root")!),
     evidenceRoot: resolve(values.get("evidence-root")!), blenderArchive: resolve(values.get("blender-archive")!),
     bwrapSha256: values.get("bwrap-sha256")!,
   };
@@ -265,8 +265,10 @@ async function main(): Promise<void> {
   emit(`WRITER_PAYLOAD_SOURCE=buildS8WriterPayload`);
   emit(`WRITER_PAYLOAD_SHA256=${built.sha256}`);
 
-  const workRoot = join(options.evidenceRoot, "private-work");
-  mkdirSecure(workRoot);
+  const workRoot = options.privateWorkRoot;
+  const workRootInfo = statSync(workRoot);
+  if (!workRootInfo.isDirectory() || realpathSync(workRoot) !== workRoot) throw new Error("RUN078_PRIVATE_WORK_ROOT_INVALID");
+  emit(`PRIVATE_WORK_ROOT_ADMISSION=EXISTING_DIRECTORY;MODE=${(workRootInfo.mode & 0o777).toString(8).padStart(3, "0")}`);
   setCurrentControlledEnvironment();
   const currentManifestPath = join(options.evidenceRoot, "current-application-shim.json");
   const currentShim = writeShim(options, "current-application-shim", { mode: "CURRENT_APPLICATION_TRANSPARENT", manifestPath: currentManifestPath, targetNeedles: ["/runtime/process-runner", "/runtime/blender-root/blender"] });
@@ -526,12 +528,15 @@ async function main(): Promise<void> {
   }
   emit(`ELF_INTERPRETER_REMOVAL_RESULT=${removalResults.get(interpFile) ?? "NOT_IN_FINAL_CANDIDATE"}`);
   emit("HOST_ROOT_BIND=REJECTED_OVERBROAD");
-  const writableRoot = join(options.evidenceRoot, "writable-mount-negative-control");
-  mkdirSecure(writableRoot);
-  const writableMarker = join(writableRoot, "marker.txt");
-  writeFileSync(writableMarker, "before\n", { mode: 0o600 });
-  const writableProbe = runCommand("/usr/bin/sudo", ["-n", "/usr/bin/bwrap", "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/etc", "/etc", "--bind", writableRoot, "/run078-writable-runtime-probe", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--clearenv", "--", "/usr/bin/bash", "-ceu", "printf 'after\\n' >> /run078-writable-runtime-probe/marker.txt"]);
-  const writableConfirmed = writableProbe.status === 0 && readFileSync(writableMarker, "utf8") === "before\nafter\n";
+  const writableRoot = join(workRoot, `run078-writable-runtime-probe-${process.pid}`);
+  let writableConfirmed = false;
+  if (!existsSync(writableRoot)) {
+    mkdirSecure(writableRoot);
+    const writableMarker = join(writableRoot, "marker.txt");
+    writeFileSync(writableMarker, "before\n", { mode: 0o600 });
+    const writableProbe = runCommand("/usr/bin/sudo", ["-n", "/usr/bin/bwrap", "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/etc", "/etc", "--bind", writableRoot, "/run078-writable-runtime-probe", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--clearenv", "--", "/usr/bin/bash", "-ceu", "printf 'after\\n' >> /run078-writable-runtime-probe/marker.txt"]);
+    writableConfirmed = writableProbe.status === 0 && readFileSync(writableMarker, "utf8") === "before\nafter\n";
+  } else limitationSet.add("WRITABLE_RUNTIME_SURFACE_NEGATIVE_CONTROL_PATH_PREEXISTED");
   emit(`WRITABLE_RUNTIME_SURFACE_VARIANT=${writableConfirmed ? "INVALID_CONTRACT_PROVEN_WRITABLE_NEGATIVE_CONTROL" : "NOT_ESTABLISHED"}`);
   if (!writableConfirmed) limitationSet.add("WRITABLE_RUNTIME_SURFACE_NEGATIVE_CONTROL_NOT_ESTABLISHED");
   for (const surface of candidate) {
