@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { buildS8WriterPayload } from "../../src/lib/s8-fbx-payload";
@@ -536,11 +536,18 @@ function sameMountDomain(left: MountInfo | null, right: MountInfo | null): boole
 
 function surfaceSourcePolicy(source: string): boolean {
   if (source === "/") return false;
+  let info: ReturnType<typeof statSync>;
   try {
-    const info = statSync(source);
-    return info.isDirectory() && (info.mode & 0o222) === 0;
+    info = statSync(source);
   } catch {
     return false;
+  }
+  if (!info.isDirectory()) return false;
+  try {
+    accessSync(source, fsConstants.W_OK);
+    return false;
+  } catch {
+    return true;
   }
 }
 
