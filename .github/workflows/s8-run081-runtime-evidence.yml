@@ -58,7 +58,10 @@ jobs:
           temp_root="$RUNNER_TEMP/s8-run081-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           test ! -e "$temp_root" && test ! -L "$temp_root"
           /usr/bin/install -d -m 0700 -- "$temp_root"
-          trap '/usr/bin/rm -rf -- "$temp_root"' EXIT
+          candidate_root="/s8-run081-candidate-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          test ! -e "$candidate_root" && test ! -L "$candidate_root"
+          /usr/bin/sudo -n /usr/bin/install -d -o "$(id -u)" -g "$(id -g)" -m 0755 -- "$candidate_root"
+          trap '/usr/bin/sudo -n /usr/bin/rm -rf -- "$candidate_root"; /usr/bin/rm -rf -- "$temp_root"' EXIT
 
           bwrap_deb="$temp_root/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb"
           bwrap_extract="$temp_root/bubblewrap-extract"
@@ -118,10 +121,28 @@ jobs:
             test ! -L "$PWD/blender/s8-fbx-writer/$required_writer_file"
           done
 
+          candidate_blender_root="$candidate_root/blender-5.2.2-linux-x64"
+          candidate_writer_root="$candidate_root/writer"
+          candidate_runner="$candidate_root/s8-process-runner"
+          candidate_validator="$candidate_root/s8-fbx-validator"
+          /usr/bin/cp -a --no-preserve=ownership -- "$blender_root" "$candidate_root/"
+          /usr/bin/install -d -m 0755 -- "$candidate_writer_root"
+          /usr/bin/cp -a --no-preserve=ownership -- "$PWD/blender/s8-fbx-writer/." "$candidate_writer_root/"
+          /usr/bin/cp --no-preserve=ownership -- "$runner_path" "$candidate_runner"
+          /usr/bin/cp --no-preserve=ownership -- "$validator_path" "$candidate_validator"
+          /usr/bin/find -P "$candidate_root" -type d -exec /usr/bin/chmod 0555 {} +
+          /usr/bin/find -P "$candidate_root" -type f -perm /111 -exec /usr/bin/chmod 0555 {} +
+          /usr/bin/find -P "$candidate_root" -type f ! -perm /111 -exec /usr/bin/chmod 0444 {} +
+          test -d "$candidate_blender_root" && test -x "$candidate_blender_root/blender"
+          test -f "$candidate_writer_root/writer.py" && test -f "$candidate_writer_root/export_fbx_bin.py" && test -f "$candidate_writer_root/patch-manifest.json"
+          test -x "$candidate_runner" && test -x "$candidate_validator"
+          printf 'CANDIDATE_SOURCE_ROOT=%s\n' "$candidate_root"
+
           export S8_RUN081_BWRAP="$bwrap_path"
-          export S8_RUN081_BLENDER_ROOT="$blender_root"
-          export S8_RUN081_BLENDER="$blender_path"
-          export S8_RUN081_WRITER="$writer_path"
-          export S8_RUN081_RUNNER="$runner_path"
-          export S8_RUN081_VALIDATOR="$validator_path"
+          export S8_RUN081_CANDIDATE_ROOT="$candidate_root"
+          export S8_RUN081_BLENDER_ROOT="$candidate_blender_root"
+          export S8_RUN081_BLENDER="$candidate_blender_root/blender"
+          export S8_RUN081_WRITER="$candidate_writer_root/writer.py"
+          export S8_RUN081_RUNNER="$candidate_runner"
+          export S8_RUN081_VALIDATOR="$candidate_validator"
           pnpm exec tsx scripts/s8/run081_runtime_evidence.ts

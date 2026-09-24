@@ -42,7 +42,7 @@ const ENV_KEYS = ["LANG", "LC_ALL", "HOME", "PATH", "TMPDIR", "TZ", "NODE_ENV"] 
 const FORBIDDEN_ENV_KEYS = ["LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONPATH", "PYTHONHOME"] as const;
 const RECEIPT_PREFIX = "S8_RUNNER_RECEIPT:";
 const EXPECTED_BWRAP_SHA256 = "e318903862396f96de3df57264e0158682b952fd3fb53ac23d876413e7b30f71";
-const BIND_FAILURE = /(?:can't|cannot|failed to|unable to)\s+(?:bind|mount)|bind\s+source.*(?:permission denied|denied|invalid)|permission denied.*(?:bind|mount)/iu;
+const BIND_FAILURE = /(?:can't|cannot|failed to|unable to)\s+(?:bind|mount|find source path)|(?:bind|mount|source path).*permission denied|permission denied.*(?:bind|mount|source path)/iu;
 const CHDIR_FAILURE = /(?:chdir|change directory|working directory)/iu;
 
 function requiredEnv(name: string): string {
@@ -577,6 +577,7 @@ function main(): void {
   if (!/^\d+$/u.test(runId) || !/^\d+$/u.test(runAttempt)) throw new Error("RUN081_RUN_ID_INVALID");
   const runnerTemp = realpathSync(requiredEnv("S8_RUN081_RUNNER_TEMP"));
   const hostRoot = realpathSync("/");
+  const candidateRoot = realpathSync(requiredEnv("S8_RUN081_CANDIDATE_ROOT"));
   const bwrapInput = requiredEnv("S8_RUN081_BWRAP");
   const bwrapStat = lstatSync(bwrapInput);
   if (!bwrapStat.isFile() || bwrapStat.isSymbolicLink() || (bwrapStat.mode & 0o111) === 0) throw new Error("RUN081_BWRAP_IDENTITY_INVALID");
@@ -635,6 +636,9 @@ function main(): void {
     console.log(`T0_PRIVATE_WORK_ROOT=${JSON.stringify(pathMetadata(controlRoot))}`);
     console.log(`T1_TOP_LEVEL_PRIVATE_ROOT=${JSON.stringify(pathMetadata(topRoot))}`);
     console.log(`HOST_ROOT_METADATA=${JSON.stringify(pathMetadata(hostRoot))}`);
+    console.log(`CANDIDATE_SOURCE_ROOT=${JSON.stringify(pathMetadata(candidateRoot))}`);
+    console.log(`CANDIDATE_SOURCE_ROOT_MOUNT_DOMAIN=${JSON.stringify(mountInfoForPath(candidateRoot))}`);
+    if (!sameMountDomain(mountInfoForPath(candidateRoot), mountDomains.hostRoot)) throw new Error("RUN081_CANDIDATE_SOURCE_MOUNT_DOMAIN_MISMATCH");
     const configPaths = { ...paths, sha: paths.sha };
     const t0 = makeCellRunner({ label: "T0", root: controlRoot, custody: "none", identity: "none", surfaceIds: [], masks: [], envPolicy: null, diagnosticsRoot, shim, surfaceFile, runnerUid, paths: configPaths, payload });
     cells.push(t0);
@@ -847,13 +851,25 @@ function main(): void {
     console.log(`G4_075_02_ENVIRONMENT_EVIDENCE_COMPLETE=${envComplete ? "YES" : "NO"}`);
     console.log(`EVIDENCE_LIMITATIONS=${limitations.join(";") || "NONE"}`);
   } finally {
-    if (controlRoot && existsSync(controlRoot)) rmSync(controlRoot, { recursive: true, force: true });
+    if (controlRoot && existsSync(controlRoot)) {
+      try { rmSync(controlRoot, { recursive: true, force: true }); }
+      catch { console.log(`RUN081_CLEANUP_CONTROL_ROOT_SUDO=${sudoCommand(["/usr/bin/rm", "-rf", "--", controlRoot]).status === 0 ? "PASS" : "FAIL"}`); }
+    }
     if (topRootCreated && existsSync(topRoot) && !lstatSync(topRoot).isSymbolicLink()) {
       const children = readdirSync(topRoot);
-      if (children.length === 0) rmSync(topRoot, { recursive: true, force: true });
-      else console.log(`RUN081_CLEANUP_RETAINED_CHILDREN=${children.length}`);
+      if (children.length === 0) {
+        try { rmSync(topRoot, { recursive: true, force: true }); }
+        catch { console.log(`RUN081_CLEANUP_TOP_ROOT_SUDO=${sudoCommand(["/usr/bin/rm", "-rf", "--", topRoot]).status === 0 ? "PASS" : "FAIL"}`); }
+      } else {
+        const cleanup = sudoCommand(["/usr/bin/rm", "-rf", "--", topRoot]);
+        console.log(`RUN081_CLEANUP_RETAINED_CHILDREN=${children.length}`);
+        console.log(`RUN081_CLEANUP_TOP_ROOT_SUDO=${cleanup.status === 0 ? "PASS" : "FAIL"}`);
+      }
     }
-    if (existsSync(diagnosticsRoot) && !lstatSync(diagnosticsRoot).isSymbolicLink()) rmSync(diagnosticsRoot, { recursive: true, force: true });
+    if (existsSync(diagnosticsRoot) && !lstatSync(diagnosticsRoot).isSymbolicLink()) {
+      try { rmSync(diagnosticsRoot, { recursive: true, force: true }); }
+      catch { console.log(`RUN081_CLEANUP_DIAGNOSTICS_SUDO=${sudoCommand(["/usr/bin/rm", "-rf", "--", diagnosticsRoot]).status === 0 ? "PASS" : "FAIL"}`); }
+    }
   }
 }
 
