@@ -622,6 +622,16 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Setup Node for Run-080 diagnostic
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Enable pnpm for Run-080 diagnostic
+        shell: bash
+        run: corepack enable
+      - name: Install Run-080 diagnostic runtime
+        shell: bash
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Hosted sandbox environment amendment
         shell: bash
         run: |
@@ -9483,4 +9493,14 @@ jobs:
           [[ "$runner_staged_sha" == "$runner_post_run_sha" ]] || fail_amendment "RUNNER_POST_RUN_HASH_MISMATCH"
           [[ "$validator_staged_sha" == "$validator_post_run_sha" ]] || fail_amendment "VALIDATOR_POST_RUN_HASH_MISMATCH"
           printf 'POST_RUN_MANIFEST_SHA=%s\nBLENDER_POST_RUN_SHA=%s\nRUNNER_POST_RUN_SHA=%s\nVALIDATOR_POST_RUN_SHA=%s\nPOST_RUN_IDENTITY_RESULT=PASS\nMANIFEST_EQUALITY=PASS\n' "$post_run_manifest_sha" "$blender_post_run_sha" "$runner_post_run_sha" "$validator_post_run_sha"
+          export S8_RUN080_RUN_ID="$run_id"
+          export S8_RUN080_RUN_ATTEMPT="$run_attempt"
+          export S8_RUN080_RUNNER_TEMP="$runner_temp_resolved"
+          export S8_RUN080_CARRIER="$carrier"
+          export S8_RUN080_BLENDER_ROOT="$carrier/runtime/blender-5.2.2-linux-x64"
+          export S8_RUN080_BLENDER="$carrier/runtime/blender-5.2.2-linux-x64/blender"
+          export S8_RUN080_WRITER="$carrier/writer/writer.py"
+          export S8_RUN080_RUNNER="$carrier/native/s8-process-runner"
+          export S8_RUN080_VALIDATOR="$carrier/native/s8-fbx-validator"
+          pnpm exec tsx scripts/s8/run080_runtime_evidence.ts
           printf 'S8_PINNED_BLENDER_CHECK=PASS\nEXACT_HEAD_HOSTED_CI_RESULT=PASS\nAMENDMENT_RESULT=PASS\nCANDIDATE_FAILURE_PROVEN=NO\nNON_CONVERGENCE_DECISION_REQUIRED=NO\nG3_RESULT=HOSTED_CI_PASS__REMAINING_G3_EVIDENCE_PENDING\nG4_AUTHORISED=NO\nRETURN_TO_WEB=YES\n'
