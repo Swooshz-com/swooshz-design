@@ -622,6 +622,10 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Setup Node for Run-078 evidence
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
       - name: Hosted sandbox environment amendment
         shell: bash
         run: |
@@ -9484,3 +9488,55 @@ jobs:
           [[ "$validator_staged_sha" == "$validator_post_run_sha" ]] || fail_amendment "VALIDATOR_POST_RUN_HASH_MISMATCH"
           printf 'POST_RUN_MANIFEST_SHA=%s\nBLENDER_POST_RUN_SHA=%s\nRUNNER_POST_RUN_SHA=%s\nVALIDATOR_POST_RUN_SHA=%s\nPOST_RUN_IDENTITY_RESULT=PASS\nMANIFEST_EQUALITY=PASS\n' "$post_run_manifest_sha" "$blender_post_run_sha" "$runner_post_run_sha" "$validator_post_run_sha"
           printf 'S8_PINNED_BLENDER_CHECK=PASS\nEXACT_HEAD_HOSTED_CI_RESULT=PASS\nAMENDMENT_RESULT=PASS\nCANDIDATE_FAILURE_PROVEN=NO\nNON_CONVERGENCE_DECISION_REQUIRED=NO\nG3_RESULT=HOSTED_CI_PASS__REMAINING_G3_EVIDENCE_PENDING\nG4_AUTHORISED=NO\nRETURN_TO_WEB=YES\n'
+
+          # Run-078 evidence is deliberately appended after successful ordinary
+          # candidate qualification. This step reuses the accepted Bubblewrap.
+          bwrap_path=/usr/bin/bwrap
+          [[ -x "$bwrap_path" && -f "$bwrap_path" && ! -L "$bwrap_path" ]] || fail_hold "RUN078_BWRAP_PATH_INVALID"
+          [[ "$(dpkg-query -W -f='${Status}' bubblewrap)" == 'install ok installed' ]] || fail_hold "RUN078_BWRAP_PACKAGE_NOT_INSTALLED"
+          [[ "$(dpkg-query -W -f='${Version}' bubblewrap)" == '0.9.0-1ubuntu0.3' ]] || fail_hold "RUN078_BWRAP_PACKAGE_VERSION_MISMATCH"
+          bwrap_owner="$(stat -c '%U:%G' -- "$bwrap_path")"
+          [[ "$bwrap_owner" == 'root:root' ]] || fail_hold "RUN078_BWRAP_OWNER_MISMATCH"
+          bwrap_mode_raw="$(stat -c '%a' -- "$bwrap_path")"
+          [[ "$bwrap_mode_raw" =~ ^[0-7]{3,4}$ ]] || fail_hold "RUN078_BWRAP_MODE_MALFORMED"
+          bwrap_mode_value=$((8#$bwrap_mode_raw))
+          (( (bwrap_mode_value & 0777) == 0755 )) || fail_hold "RUN078_BWRAP_MODE_MISMATCH"
+          (( (bwrap_mode_value & 06000) == 0 )) || fail_hold "RUN078_BWRAP_SUID_SGID_PRESENT"
+          bwrap_caps="$(/usr/sbin/getcap -n -- "$bwrap_path")" || fail_hold "RUN078_BWRAP_CAPABILITY_QUERY_FAILED"
+          [[ -z "$bwrap_caps" ]] || fail_hold "RUN078_BWRAP_FILE_CAPABILITIES_PRESENT"
+          bwrap_sha256="$(sha256sum -- "$bwrap_path" | awk '{print $1}')" || fail_hold "RUN078_BWRAP_HASH_FAILED"
+          [[ "$bwrap_sha256" == "$verified_bwrap_sha256" ]] || fail_hold "RUN078_BWRAP_AUTHENTICATED_HASH_MISMATCH"
+          bwrap_version_output="$(sudo -n /usr/bin/bwrap --version)" || fail_hold "RUN078_BWRAP_PRIVILEGED_VERSION_INVOCATION_FAILED"
+          [[ "$bwrap_version_output" == 'bubblewrap 0.9.0' ]] || fail_hold "RUN078_BWRAP_VERSION_OUTPUT_MISMATCH"
+          printf 'BWRAP_PATH=%s\nBWRAP_PACKAGE=bubblewrap\nBWRAP_VERSION=0.9.0-1ubuntu0.3\nBWRAP_SHA256=%s\nBWRAP_OWNER=%s\nBWRAP_MODE=0755\nBWRAP_SUID=ABSENT\nBWRAP_SGID=ABSENT\nBWRAP_FILE_CAPABILITIES=NONE\nBWRAP_PRIVILEGED_INVOCATION_RESULT=SUCCESS\nBWRAP_VERSION_OUTPUT=%s\n' \
+            "$bwrap_path" "$bwrap_sha256" "$bwrap_owner" "$bwrap_version_output"
+
+          run078_git_status_before="$(git status --porcelain=v1 --untracked-files=all)"
+          node_version="$(node --version)"
+          [[ "$node_version" == v22.* ]] || fail_hold "RUN078_NODE_22_UNAVAILABLE"
+          corepack enable || fail_hold "RUN078_COREPACK_ENABLE_FAILED"
+          pnpm install --frozen-lockfile || fail_hold "RUN078_FROZEN_DEPENDENCY_INSTALL_FAILED"
+          printf 'RUN078_NODE_VERSION=%s\nRUN078_DEPENDENCIES=FROZEN_INSTALL_PASS\n' "$node_version"
+
+          run078_build_root="$RUNNER_TEMP/run078-native-build"
+          run078_evidence_root="$RUNNER_TEMP/run078-runtime-evidence"
+          [[ ! -e "$run078_build_root" && ! -L "$run078_build_root" ]] || fail_hold "RUN078_BUILD_ROOT_NOT_FRESH"
+          [[ ! -e "$run078_evidence_root" && ! -L "$run078_evidence_root" ]] || fail_hold "RUN078_EVIDENCE_ROOT_NOT_FRESH"
+          /usr/bin/install -d -m 0700 -- "$run078_build_root" "$run078_evidence_root"
+          cmake -S native/s8-process-runner -B "$run078_build_root/s8-runner" -DCMAKE_BUILD_TYPE=Release || fail_hold "RUN078_PROCESS_RUNNER_CONFIGURE_FAILED"
+          cmake --build "$run078_build_root/s8-runner" --config Release --parallel || fail_hold "RUN078_PROCESS_RUNNER_BUILD_FAILED"
+          cmake -S native/s8-fbx-validator -B "$run078_build_root/s8-validator" -DCMAKE_BUILD_TYPE=Release || fail_hold "RUN078_VALIDATOR_CONFIGURE_FAILED"
+          cmake --build "$run078_build_root/s8-validator" --config Release --parallel || fail_hold "RUN078_VALIDATOR_BUILD_FAILED"
+          blender_archive="$temp_root/blender-5.2.2-linux-x64.tar.xz"
+          [[ -f "$blender_archive" && ! -L "$blender_archive" ]] || fail_hold "RUN078_PINNED_BLENDER_ARCHIVE_UNAVAILABLE"
+          pnpm exec tsx scripts/s8/run078_runtime_evidence.ts \
+            --runner "$run078_build_root/s8-runner/s8-process-runner" \
+            --validator "$run078_build_root/s8-validator/s8-fbx-validator" \
+            --blender-root "$carrier/runtime/blender-5.2.2-linux-x64" \
+            --writer "$carrier/writer/writer.py" \
+            --evidence-root "$run078_evidence_root" \
+            --blender-archive "$blender_archive" \
+            --bwrap-sha256 "$bwrap_sha256"
+          run078_git_status_after="$(git status --porcelain=v1 --untracked-files=all)"
+          [[ "$run078_git_status_before" == "$run078_git_status_after" ]] || fail_hold "RUN078_REPOSITORY_STATE_CHANGED"
+          printf 'RUN078_REPOSITORY_STATUS=UNCHANGED\n'
