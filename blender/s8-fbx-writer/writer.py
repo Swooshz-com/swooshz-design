@@ -833,7 +833,7 @@ def audit_evaluated_membership(admission: dict[str, Any], state: dict[str, Any],
     instances = getattr(depsgraph, "object_instances", None)
     if instances is not None:
         seen: list[Any] = []
-        for instance in list(instances):
+        for instance in instances:
             if bool(getattr(instance, "is_instance", False)):
                 fail("S8_EXPORT_INSTANCE_FORBIDDEN")
             candidate = _original_object(getattr(instance, "object", None))
