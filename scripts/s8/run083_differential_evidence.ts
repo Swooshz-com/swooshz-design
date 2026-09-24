@@ -48,6 +48,7 @@ type EvidenceFiles = {
   status?: number;
   runnerStdout?: string;
   runnerStderr?: string;
+  wrapperStderr?: string;
 };
 
 type WriterRun = {
@@ -207,11 +208,12 @@ function evidenceFor(prefix: string): EvidenceFiles {
   if (status) result.status = status.status;
   result.runnerStdout = readBoundedText(`${prefix}.runner.stdout`);
   result.runnerStderr = readBoundedText(`${prefix}.runner.stderr`);
+  result.wrapperStderr = readBoundedText(`${prefix}.wrapper.stderr`);
   return result;
 }
 
 function runnerDiagnostic(evidence: EvidenceFiles): string {
-  return JSON.stringify({ stdout: evidence.runnerStdout ?? "", stderr: evidence.runnerStderr ?? "" });
+  return JSON.stringify({ stdout: evidence.runnerStdout ?? "", stderr: evidence.runnerStderr ?? "", wrapperStderr: evidence.wrapperStderr ?? "" });
 }
 
 function buildPayload(): Buffer {
@@ -317,6 +319,11 @@ function writeSandboxWrapper(path: string): void {
     "set -Eeuo pipefail",
     "phase=${S8_RUN083_PHASE:?}",
     "prefix=${S8_RUN083_EVIDENCE_PREFIX:?}",
+    "wrapper_stderr=${prefix}.wrapper.stderr",
+    "exec 3>&2",
+    ": > \"$wrapper_stderr\"",
+    "exec 2>>\"$wrapper_stderr\"",
+    "trap 'exit_status=$?; /usr/bin/cat \"$wrapper_stderr\" >&3 || true; exit \"$exit_status\"' EXIT",
     "seed_mode=${S8_RUN083_SEED_MODE:?}",
     "runner_uid=${S8_RUN083_RUNNER_UID:?}",
     "runner_gid=${S8_RUN083_RUNNER_GID:?}",
