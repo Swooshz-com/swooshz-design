@@ -46,6 +46,8 @@ type EvidenceFiles = {
   hostedPre?: Snapshot;
   post?: Snapshot;
   status?: number;
+  runnerStdout?: string;
+  runnerStderr?: string;
 };
 
 type WriterRun = {
@@ -164,6 +166,15 @@ function readJson<T>(path: string): T | undefined {
   }
 }
 
+function readBoundedText(path: string, maximum = 4096): string | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    return readFileSync(path).subarray(0, maximum).toString("utf8");
+  } catch {
+    return undefined;
+  }
+}
+
 function snapshotEqual(left: Snapshot, right: Snapshot, withoutUid0 = false): boolean {
   const strip = (values: string[]) => values.filter((value) => !withoutUid0 || !value.startsWith("user:0:"));
   return left.owner === right.owner
@@ -194,7 +205,13 @@ function evidenceFor(prefix: string): EvidenceFiles {
   };
   const status = readJson<{ status: number }>(`${prefix}.status.json`);
   if (status) result.status = status.status;
+  result.runnerStdout = readBoundedText(`${prefix}.runner.stdout`);
+  result.runnerStderr = readBoundedText(`${prefix}.runner.stderr`);
   return result;
+}
+
+function runnerDiagnostic(evidence: EvidenceFiles): string {
+  return JSON.stringify({ stdout: evidence.runnerStdout ?? "", stderr: evidence.runnerStderr ?? "" });
 }
 
 function buildPayload(): Buffer {
@@ -360,11 +377,20 @@ function writeSandboxWrapper(path: string): void {
     "  if [[ ${S8_RUN083_SEED_MASK_DRIFT:-no} == yes ]]; then /usr/bin/sudo -n /usr/bin/setfacl --no-mask -m m::--- -- \"$input\"; fi",
     "fi",
     "snapshot \"$input\" \"$prefix.post.json\"",
-    "if [[ ${S8_RUN083_LAUNCH_MODE:-current} == current ]]; then",
+    "run_bwrap() {",
+    "  local stdout_path=\"${prefix}.runner.stdout\"",
+    "  local stderr_path=\"${prefix}.runner.stderr\"",
+    "  : > \"$stdout_path\"",
+    "  : > \"$stderr_path\"",
     "  set +e",
-    "  /usr/bin/sudo -n /usr/bin/bwrap \"$@\"",
+    "  /usr/bin/sudo -n /usr/bin/bwrap \"$@\" >\"$stdout_path\" 2>\"$stderr_path\"",
     "  status=$?",
     "  set -e",
+    "  /usr/bin/cat \"$stdout_path\"",
+    "  /usr/bin/cat \"$stderr_path\" >&2",
+    "}",
+    "if [[ ${S8_RUN083_LAUNCH_MODE:-current} == current ]]; then",
+    "  run_bwrap \"$@\"",
     "else",
     "  filtered=()",
     "  skip=0",
@@ -403,10 +429,7 @@ function writeSandboxWrapper(path: string): void {
     "  if [[ ${S8_RUN083_WRITABLE_RUNTIME:-no} == yes ]]; then launch+=(--bind /etc /etc); fi",
     "  launch+=(\"${filtered[@]}\")",
     "  launch+=(--proc /proc --dev /dev --tmpfs /tmp --chdir /work)",
-    "  set +e",
-    "  /usr/bin/sudo -n /usr/bin/bwrap \"${launch[@]}\"",
-    "  status=$?",
-    "  set -e",
+    "  run_bwrap \"${launch[@]}\"",
     "fi",
     "printf '{\"status\":%s}\n' \"$status\" > \"$prefix.status.json\"",
     "exit \"$status\"",
@@ -725,6 +748,10 @@ function main(): void {
   emit("KNOWN_GOOD_UPPER_BOUND_CONFIGURATION", "private-root+root-owned-work-leaf+host-runner-access-default-acl+S2+unshare-user-net-pid-ipc-uts+disable-userns+uid65534+gid65534+cap-drop-all+clearenv+ro-/usr-/lib-/lib64-/etc");
   emit("KNOWN_GOOD_UPPER_BOUND_WRITER", upper.ok ? "PASS" : `FAIL_${upper.code}`);
   emit("KNOWN_GOOD_UPPER_BOUND_VALIDATOR", upperSandboxValidator.ok && upperAppValidator.ok ? "PASS" : `FAIL_${upperSandboxValidator.code}_${upperAppValidator.code}`);
+  if (!upper.ok) {
+    noteLimit("known-good-upper-bound-writer-rejected");
+    emit("KNOWN_GOOD_UPPER_BOUND_RUNNER_DIAGNOSTIC", runnerDiagnostic(upper.evidence));
+  }
 
   const ablationRows: string[] = [];
   const ablations: Array<{ name: string; options: Parameters<typeof writerRun>[6]; security: "YES" | "NO"; root?: string }> = [
@@ -773,6 +800,7 @@ function main(): void {
   emit("RUNTIME_SURFACE_REMOVAL_MATRIX", surfaceRows.join(";"));
   emit("REAL_WRITER_WITH_MINIMUM_SURFACES", minimumWriter.ok ? "PASS" : `FAIL_${minimumWriter.code}`);
   emit("REAL_VALIDATOR_WITH_MINIMUM_SURFACES", minimumValidator.ok ? "PASS" : `FAIL_${minimumValidator.code}`);
+  if (!minimumWriter.ok) emit("RUNTIME_MINIMUM_WRITER_RUNNER_DIAGNOSTIC", runnerDiagnostic(minimumWriter.evidence));
 
   const allowedEnvForAblation = ALL_TEST_ENV_KEYS.filter((key) => !FORBIDDEN_ENV_KEYS.includes(key as typeof FORBIDDEN_ENV_KEYS[number]));
   const environmentRows: string[] = [];
@@ -799,6 +827,7 @@ function main(): void {
   emit("ENVIRONMENT_ABLATION_MATRIX", environmentRows.join(";"));
   emit("REAL_WRITER_WITH_MINIMUM_ENV", finalWriter.ok ? "PASS" : `FAIL_${finalWriter.code}`);
   emit("REAL_VALIDATOR_WITH_MINIMUM_ENV", finalValidator.ok ? "PASS" : `FAIL_${finalValidator.code}`);
+  if (!finalWriter.ok) emit("MINIMUM_ENV_WRITER_RUNNER_DIAGNOSTIC", runnerDiagnostic(finalWriter.evidence));
   emit("S8_TEST_PARENT_SECRET_A_ABSENT", finalWriter.ok && finalValidator.ok ? "PASS" : "FAIL");
   emit("S8_TEST_PARENT_SECRET_B_ABSENT", finalWriter.ok && finalValidator.ok ? "PASS" : "FAIL");
   emit("HOSTILE_PATH_ABSENT", finalWriter.ok && finalValidator.ok ? "PASS" : "FAIL");
