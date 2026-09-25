@@ -365,13 +365,14 @@ def manifest_failure_regression() -> None:
 
         with mock.patch(__name__ + "._manifest_scandir_names", side_effect=ManifestError("MANIFEST_ENUMERATION_FAILED")):
             rejected(lambda: create_complete_manifest(str(source), str(root / "enum.manifest")), "MANIFEST_ENUMERATION_FAILED")
+        real_manifest_scandir_names = _manifest_scandir_names
         partial_calls = {"native": 0}
         def partial_enumeration(path: pathlib.Path) -> list[str]:
             if path == source / "native":
                 partial_calls["native"] += 1
                 if partial_calls["native"] == 1:
                     return []
-            return _manifest_scandir_names(path)
+            return real_manifest_scandir_names(path)
         with mock.patch(__name__ + "._manifest_scandir_names", side_effect=partial_enumeration):
             rejected(lambda: create_complete_manifest(str(source), str(root / "partial.manifest")), "MANIFEST_ENUMERATION_PARTIAL_OR_CHANGED")
         with mock.patch(__name__ + "._manifest_lstat", side_effect=ManifestError("MANIFEST_STAT_FAILED")):
