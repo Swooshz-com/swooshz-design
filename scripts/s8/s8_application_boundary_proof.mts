@@ -1,0 +1,110 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const workspace = process.env.GITHUB_WORKSPACE!;
+const carrier = process.env.S8_APP_CARRIER!;
+const work = process.env.S8_APP_WORK!;
+const argvAudit = process.env.S8_APP_ARGV_AUDIT!;
+const load = (path: string) => import(pathToFileURL(join(workspace, path)).href);
+const [{ buildS8WriterPayload }, { runS8BlenderWriter, runS8NativeValidator, S8_SYSTEM_RUNTIME_BIND_PATHS }, { compareS8UfbxReadback }] = await Promise.all([
+  load("src/lib/s8-fbx-payload.ts"), load("src/lib/s8-fbx-worker.ts"), load("src/lib/s8-fbx-semantic.ts"),
+]);
+const hash = "a".repeat(64);
+const projectId = "11111111-1111-4111-8111-111111111111";
+const revisionId = "22222222-2222-4222-8222-222222222222";
+const object = {
+  objectId: "object-1", identityKey: "object-1", parentObjectId: null,
+  objectType: "box", role: "furniture", label: "Box",
+  geometry: { kind: "rect_prism", dimensionsMm: { widthMm: 100, depthMm: 100, heightMm: 100 }, geometryState: "exact", localAnchor: "floor" },
+  footprint: { kind: "rectangle", widthMm: 100, depthMm: 100 },
+  transform: { positionMm: { xMm: 0, yMm: 0, zMm: 0 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } },
+  boundsMm: { widthMm: 100, depthMm: 100, heightMm: 100 },
+  zoneIds: [], requirementIds: [], materialIds: [], unknownIds: [],
+  provenance: { kind: "user_confirmed_design_decision", sourceRef: "g3-runtime-proof", sourceFingerprint: hash, acceptedByUser: true, note: null },
+};
+const s6 = {
+  schemaVersion: "s6-to-s7-handoff-v1", projectId, acceptedRevisionId: revisionId, acceptedRevisionHash: hash,
+  sourceS5Fingerprint: hash, spatialSchemaVersion: "s6-spatial-model-v1", units: "millimetres",
+  coordinateConvention: { version: "booth-local-right-handed-v1", units: "millimetres", handedness: "right-handed", origin: "north-west-floor-corner", xAxis: "east", yAxis: "up", zAxis: "south" },
+  booth: { widthMm: 1000, depthMm: 1000, openSides: ["north"], maxHeightMm: 1000, heightState: "known" },
+  objects: [object], hierarchy: [{ objectId: object.objectId, parentObjectId: null }], zones: [], requirements: [], materials: [], assumptions: [], unknowns: [],
+  validationReceipt: { receiptId: "33333333-3333-4333-8333-333333333333", validationHash: hash, outcome: "pass" },
+  eligibility: { currentAccepted: true, sourceCurrent: true, stale: false },
+};
+const s7 = {
+  schemaVersion: "s7-to-s8-handoff-v1", projectId, sourceRevisionId: revisionId, sourceRevisionHash: hash, sourceS5Fingerprint: hash,
+  s7ArtifactId: "44444444-4444-4444-8444-444444444444", s7ArtifactHash: hash, s7ArtifactByteSize: 1,
+  manifestId: "55555555-5555-4555-8555-555555555555", manifestHash: hash, readbackReceiptId: "66666666-6666-4666-8666-666666666666", readbackHash: hash,
+  dxfVersion: "s7-dxf-r2000-ascii-v1", worldToPlanVersion: "s7-world-to-plan-v1", coordinateConvention: "booth-local-right-handed-v1",
+  dxfIsNot3DAuthority: true, s8MustReadAcceptedS6Model: true,
+};
+const prepared = buildS8WriterPayload(s6, s7);
+const runtimeRoot = join(carrier, "runtime", "blender-5.2.2-linux-x64");
+const blender = join(runtimeRoot, "blender");
+const workerConfig = {
+  blenderRuntimeRoot: runtimeRoot, blenderExecutable: blender,
+  writerScript: join(carrier, "writer", "writer.py"), privateWorkRoot: work,
+  processRunnerExecutable: join(carrier, "native", "s8-process-runner"),
+  sandboxExecutable: process.env.S8_APP_SANDBOX!,
+  nativeValidatorExecutable: join(carrier, "native", "s8-fbx-validator"),
+  blenderExecutableSha256: createHash("sha256").update(readFileSync(blender)).digest("hex"),
+};
+process.env.PATH = "/s8-hostile-path";
+process.env.HOME = "/s8-hostile-home";
+process.env.LD_PRELOAD = "/s8-hostile-ld-preload.so";
+process.env.LD_LIBRARY_PATH = "/s8-hostile-library-path";
+process.env.PYTHONPATH = "/s8-hostile-python-path";
+process.env.PYTHONHOME = "/s8-hostile-python-home";
+process.env.G3_SYNTHETIC_CREDENTIAL = `ghp_${"A".repeat(24)}`;
+
+const written = runS8BlenderWriter(prepared.bytes, workerConfig);
+if (written.artifact.length <= 27) throw new Error("application writer did not return a real FBX");
+const native = runS8NativeValidator(written.artifact, workerConfig);
+if (!native.runnerEvidence || !native.validatorIdentity) throw new Error("application validator receipt is missing");
+const semantic = compareS8UfbxReadback(s6, s7, native.readback);
+if (semantic.outcome !== "pass") throw new Error("application semantic readback rejected the FBX");
+
+const lines = readFileSync(argvAudit, "utf8").trim().split("\n");
+const invocations: string[][] = [];
+let current: string[] | undefined;
+for (const line of lines) {
+  if (line === "S8APP_BWRAP_BEGIN") { if (current) throw new Error("nested bwrap audit frame"); current = []; }
+  else if (line === "S8APP_BWRAP_END") { if (!current) throw new Error("unmatched bwrap audit frame"); invocations.push(current); current = undefined; }
+  else { if (!current) throw new Error("unframed bwrap argument"); current.push(line); }
+}
+if (current || invocations.length !== 2) throw new Error("application did not launch writer and validator exactly once");
+const allowedRuntime = [...S8_SYSTEM_RUNTIME_BIND_PATHS].sort();
+let explicitSetenvCount = 0;
+for (const args of invocations) {
+  explicitSetenvCount += args.filter((value) => value === "--setenv" || value.startsWith("--setenv=")).length;
+  for (const required of ["--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--disable-userns", "--assert-userns-disabled", "--die-with-parent", "--new-session", "--clearenv"]) {
+    if (args.filter((value) => value === required).length !== 1) throw new Error(`application bwrap boundary option count invalid: ${required}`);
+  }
+  for (const [option, value] of [["--uid", "65534"], ["--gid", "65534"], ["--cap-drop", "ALL"], ["--proc", "/proc"], ["--dev", "/dev"], ["--tmpfs", "/tmp"], ["--chdir", "/work"]] as const) {
+    if (args.filter((argument, index) => argument === option && args[index + 1] === value).length !== 1) throw new Error(`application bwrap boundary argument invalid: ${option}`);
+  }
+  const identityBinds: Array<{ option: string; source: string; destination: string }> = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const option = args[index]!;
+    if (!option.includes("bind")) continue;
+    const source = args[index + 1];
+    const destination = args[index + 2];
+    for (const path of [source, destination]) {
+      if (path && ["/", "/usr", "/lib", "/lib64", "/etc"].includes(resolve(path))) throw new Error("broad runtime bind detected");
+    }
+    if (source === destination) identityBinds.push({ option, source: source!, destination: destination! });
+  }
+  if (identityBinds.some(({ option }) => option !== "--ro-bind") || JSON.stringify(identityBinds.map(({ source }) => source).sort()) !== JSON.stringify(allowedRuntime)) throw new Error("system runtime bind allowlist mismatch");
+}
+if (explicitSetenvCount !== 0) throw new Error("application setenv count is not zero");
+console.log("APPLICATION_GENERATED_WRITER=PASS");
+console.log("APPLICATION_GENERATED_VALIDATOR=PASS");
+console.log("APPLICATION_SEMANTIC_READBACK=PASS");
+console.log("APPLICATION_EXPLICIT_SETENV_COUNT=0");
+console.log("APPLICATION_UID_GID=65534:65534");
+console.log("APPLICATION_CAP_DROP=ALL");
+console.log("BWRAP_CLEAR_ENV_REQUIRED=PASS");
+console.log("FINAL_RUNTIME_ALLOWLIST_PROOF=PASS");
+console.log("BROAD_RUNTIME_BINDS_ABSENT=YES");
