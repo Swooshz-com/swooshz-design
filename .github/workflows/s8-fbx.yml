@@ -693,6 +693,34 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Setup Node 22 for hosted toolchain
+        id: setup_node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Classify Node setup failure
+        if: ${{ failure() && steps.setup_node.outcome == 'failure' }}
+        shell: bash
+        run: printf 'FAILURE_CLASS=HOSTED_TOOLCHAIN_HOLD\nTOOLCHAIN_STAGE=SETUP_NODE\n' >&2
+      - name: Admit pinned TypeScript toolchain
+        shell: bash
+        env:
+          COREPACK_ENABLE_AUTO_PIN: "0"
+        run: |
+          set -Eeuo pipefail
+          hold() { printf 'FAILURE_CLASS=HOSTED_TOOLCHAIN_HOLD\nTOOLCHAIN_STAGE=%s\n' "$1" >&2; exit 1; }
+          [[ "$(node -p 'process.versions.node.split(".")[0]')" == 22 ]] || hold NODE
+          command -v corepack >/dev/null 2>&1 || hold COREPACK
+          version="$(corepack pnpm@12.6.0 --version)" || hold PNPM_ACTIVATION
+          [[ "$version" == 12.6.0 ]] || hold PNPM_VERSION
+          [[ -f pnpm-lock.yaml ]] || hold LOCKFILE
+          corepack pnpm@12.6.0 install --frozen-lockfile --ignore-scripts --prod=false || hold FROZEN_INSTALL
+          [[ -x node_modules/.bin/tsx ]] || hold TSX
+          smoke="$RUNNER_TEMP/s8-tsx-smoke.ts"
+          trap 'rm -f -- "$smoke"' EXIT
+          printf 'const answer: number = 42;\nif (answer !== 42) throw new Error("TSX_SMOKE_FAILED");\n' > "$smoke"
+          corepack pnpm@12.6.0 exec tsx "$smoke" || hold TSX
+          printf 'NODE_TOOLCHAIN_ADMISSION=PASS\nPNPM_VERSION=12.6.0\nFROZEN_LOCKFILE_INSTALL=PASS\nTSX_RESOLUTION=PASS\nTSX_SMOKE=PASS\n'
       - name: Hosted sandbox environment amendment
         shell: bash
         run: |
@@ -9369,7 +9397,7 @@ jobs:
           export S8_APP_WORK="$carrier/work"
           export S8_APP_ARGV_AUDIT="$app_argv_audit"
           export S8_APP_SANDBOX="$app_sandbox"
-          /usr/bin/pnpm exec tsx "$app_proof" >"$temp_root/application-proof.stdout" 2>"$temp_root/application-proof.stderr" &
+          COREPACK_ENABLE_AUTO_PIN=0 corepack pnpm@12.6.0 exec tsx "$app_proof" >"$temp_root/application-proof.stdout" 2>"$temp_root/application-proof.stderr" &
           app_proof_pid=$!
           set +e
           /usr/bin/sudo -n /usr/bin/python3 - "$app_proof_pid" "$temp_root/application-target-env.status" <<'PY'
@@ -9417,6 +9445,9 @@ jobs:
           wait "$app_proof_pid"
           app_proof_status=$?
           set -e
+          if (( app_proof_status == 126 || app_proof_status == 127 )); then
+            printf 'FAILURE_CLASS=HOSTED_TOOLCHAIN_HOLD\nTOOLCHAIN_STAGE=APPLICATION_PROOF_LAUNCH\nAPPLICATION_PROOF_LAUNCH_STATUS=%s\n' "$app_proof_status" >&2
+          fi
           if (( app_proof_status != 0 )); then
             /usr/bin/cat -- "$temp_root/application-proof.stderr" >&2
             exit "$app_proof_status"

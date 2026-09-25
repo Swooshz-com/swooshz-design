@@ -377,7 +377,8 @@ function emitWorkflowSizeResult(result: WorkflowSizeResult): void {
 }
 
 const helperInstallLine = '/usr/bin/install -m 0600 -- "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.mts" "$app_proof"';
-const helperExecutionLine = '/usr/bin/pnpm exec tsx "$app_proof"';
+const oldHelperExecutionLine = '/usr/bin/pnpm exec tsx "$app_proof"';
+const helperExecutionLine = 'COREPACK_ENABLE_AUTO_PIN=0 corepack pnpm@12.6.0 exec tsx "$app_proof"';
 
 function helperExtractionIsValid(workflow: string, helper: Buffer | undefined): boolean {
   if (!helper || helper.length !== workflowProofHelperBytes) return false;
@@ -391,8 +392,63 @@ function helperExtractionIsValid(workflow: string, helper: Buffer | undefined): 
   return !helperText.includes("\r")
     && helperHash === workflowProofHelperSha256
     && workflow.split(helperInstallLine).length - 1 === 1
+    && workflow.split(oldHelperExecutionLine).length - 1 === 0
     && workflow.split(helperExecutionLine).length - 1 === 1
     && !workflow.includes('cat > "$app_proof" <<\'TS\'');
+}
+
+const toolchainJobMarker = "  s8-pinned-blender:";
+const exactHeadStepMarker = "      - name: Verify exact PR head";
+const hostedAmendmentStepMarker = "      - name: Hosted sandbox environment amendment";
+const setupNodeAction = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
+const setupNodeStep = [
+  "      - name: Setup Node 22 for hosted toolchain",
+  "        id: setup_node",
+  "        uses: " + setupNodeAction,
+  "        with:",
+  "          node-version: 22",
+].join("\n");
+const pinnedPnpm = "corepack pnpm@12.6.0";
+const frozenInstall = pinnedPnpm + " install --frozen-lockfile --ignore-scripts --prod=false";
+
+function countText(source: string, value: string): number {
+  return source.split(value).length - 1;
+}
+
+function hostedToolchainSourceIsValid(workflow: string): boolean {
+  const source = workflow.replace(/\r\n/g, "\n");
+  if (countText(source, toolchainJobMarker) !== 1 || countText(source, hostedAmendmentStepMarker) !== 1) return false;
+  const jobStart = source.indexOf(toolchainJobMarker);
+  const verifyStart = source.indexOf(exactHeadStepMarker, jobStart);
+  const amendmentStart = source.indexOf(hostedAmendmentStepMarker, verifyStart);
+  const verifyEnd = source.indexOf("      - name: ", verifyStart + exactHeadStepMarker.length);
+  if (jobStart < 0 || verifyStart <= jobStart || amendmentStart <= verifyStart
+    || countText(source.slice(jobStart, amendmentStart), exactHeadStepMarker) !== 1
+    || verifyEnd < 0 || verifyEnd > amendmentStart) return false;
+  if (!source.slice(verifyStart, verifyEnd).includes('run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"')) return false;
+  const interval = source.slice(verifyEnd, amendmentStart);
+  if (countText(interval, setupNodeStep) !== 1
+    || countText(interval, "      - name: Classify Node setup failure") !== 1
+    || countText(interval, "      - name: Admit pinned TypeScript toolchain") !== 1
+    || countText(interval, "uses: actions/setup-node@") !== 1
+    || countText(interval, 'COREPACK_ENABLE_AUTO_PIN: "0"') !== 1
+    || !interval.includes("if: $" + "{{ failure() && steps.setup_node.outcome == 'failure' }}")
+    || !interval.includes("node -p 'process.versions.node.split(\".\")[0]'")
+    || !interval.includes("|| hold NODE")
+    || !interval.includes("command -v corepack")
+    || !interval.includes("|| hold COREPACK")
+    || countText(interval, pinnedPnpm + " --version") !== 1
+    || !interval.includes("|| hold PNPM_ACTIVATION")
+    || !interval.includes('[[ "$version" == 12.6.0 ]] || hold PNPM_VERSION')
+    || !interval.includes("[[ -f pnpm-lock.yaml ]] || hold LOCKFILE")
+    || countText(interval, frozenInstall) !== 1
+    || !interval.includes("|| hold FROZEN_INSTALL")
+    || !interval.includes("[[ -x node_modules/.bin/tsx ]] || hold TSX")
+    || countText(interval, pinnedPnpm + ' exec tsx "$smoke"') !== 1
+    || !interval.includes("FAILURE_CLASS=HOSTED_TOOLCHAIN_HOLD")
+    || !interval.includes("TOOLCHAIN_STAGE=SETUP_NODE")) return false;
+  const unpinnedPnpm = interval.replace(/corepack pnpm@12\.6\.0/g, "").replace(/pnpm-lock\.yaml/g, "");
+  return !/\bpnpm\b/.test(unpinnedPnpm);
 }
 
 function fakeWorkflowSizeIo(options: {
@@ -536,5 +592,43 @@ test("workflow application proof helper extraction and the two runtime consumers
   assert.equal(helperExtractionIsValid(workflow.replace(helperInstallLine, ""), helper), false);
   assert.equal(helperExtractionIsValid(workflow.replace(helperExecutionLine, ""), helper), false);
   assert.equal(helperExtractionIsValid(workflow + "\n" + helperExecutionLine, helper), false);
+  assert.equal(workflow.split(oldHelperExecutionLine).length - 1, 0);
+  assert.equal(workflow.split(helperExecutionLine).length - 1, 1);
+  assert.equal(helperExtractionIsValid(workflow + "\n" + helperInstallLine, helper), false);
+  assert.equal(helperExtractionIsValid(workflow + "\n" + oldHelperExecutionLine, helper), false);
   assert.equal(helperExtractionIsValid(workflow + '\ncat > "$app_proof" <<\'TS\'', helper), false);
+});
+
+test("hosted toolchain source integrity is bounded to the verified Blender setup", () => {
+  const workflow = readFileSync(join(resolve(process.cwd()), workflowSizePath), "utf8").replace(/\r\n/g, "\n");
+  assert.equal(hostedToolchainSourceIsValid(workflow), true);
+  const installLine = frozenInstall;
+  const smokeLine = pinnedPnpm + ' exec tsx "$smoke"';
+  const verifyStep = exactHeadStepMarker;
+  const amendmentStep = hostedAmendmentStepMarker;
+  const inTargetJob = (mutate: (job: string) => string) => {
+    const start = workflow.indexOf(toolchainJobMarker);
+    return workflow.slice(0, start) + mutate(workflow.slice(start));
+  };
+  const wrongAction = setupNodeStep.replace(setupNodeAction, "actions/setup-node@deadbeef");
+
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, wrongAction)), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, setupNodeStep.replace("node-version: 22", "node-version: 20"))), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(pinnedPnpm + " --version", "corepack pnpm@latest --version")), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(installLine, installLine.replace("--frozen-lockfile ", ""))), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(installLine, installLine.replace("--ignore-scripts ", ""))), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(installLine, installLine.replace("--prod=false", ""))), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(smokeLine, smokeLine + "\n          pnpm --version")), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, "")), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, setupNodeStep + "\n" + setupNodeStep)), false);
+  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(verifyStep, ""))), false);
+  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(amendmentStep, ""))), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(toolchainJobMarker, "")), false);
+  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(verifyStep, verifyStep + "\n" + verifyStep))), false);
+  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(amendmentStep, amendmentStep + "\n" + amendmentStep))), false);
+  assert.equal(hostedToolchainSourceIsValid(workflow.replace(toolchainJobMarker, toolchainJobMarker + "\n" + toolchainJobMarker)), false);
+  const reversed = inTargetJob((job) => job.replace(verifyStep, "VERIFY_BOUNDARY_TEMP")
+    .replace(amendmentStep, verifyStep)
+    .replace("VERIFY_BOUNDARY_TEMP", amendmentStep));
+  assert.equal(hostedToolchainSourceIsValid(reversed), false);
 });
