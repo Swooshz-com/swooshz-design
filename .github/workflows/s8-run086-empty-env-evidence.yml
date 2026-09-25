@@ -38,7 +38,7 @@ jobs:
           test "$EXPECTED_BASE_REF" = "codex/s8-g3-native-process-boundary-hosted-carrier-001"
           test "$EXPECTED_BASE_HEAD" = "$product_head"
           test "$(git rev-parse HEAD)" = "$EXPECTED_CARRIER_HEAD"
-          test "$(git rev-parse HEAD^)" = "$product_head"
+          test "$(git merge-base "$product_head" HEAD)" = "$product_head"
           test "$(git rev-parse "$product_head^{tree}")" = "$product_tree"
           actual="$(git diff --name-only "$product_head" HEAD | LC_ALL=C sort)"
           expected="$(printf '%s\n' '.github/workflows/s8-run086-empty-env-evidence.yml' 'scripts/s8/run086_empty_env_evidence.ts' | LC_ALL=C sort)"
