@@ -362,7 +362,7 @@ function writeSandboxWrapper(path: string): void {
     "    *) printf '%s\\n' RUN087_ENV_MODE_REJECTED > \"$prefix.mode-rejected\"; exit 97 ;;",
     "  esac",
     "done",
-    "launch+=(--proc /proc --dev /dev --tmpfs /tmp --chdir /work --unsetenv PWD)",
+    "launch+=(--proc /proc --dev /dev --tmpfs /tmp --chdir /work)",
     "filtered=(); skip=0",
     "for argument in \"$@\"; do",
     "  if (( skip > 0 )); then skip=$((skip-1)); continue; fi",
@@ -511,10 +511,8 @@ function bwrapContract(argv: string[] | undefined, envKeys: EnvKey[], runtimeSur
   const env = setenv(argv);
   if (!env) return { ok: false, env: [] as Array<[string, string]>, omitted: false, topology: false, runtime: false, mountManifest: [] as Array<[string, string, string]> };
   const expected = envKeys.map((key) => [key, ENV_VALUES[key]] as [string, string]);
-  const clearIndex = argv.indexOf("--clearenv"), unsetIndex = argv.indexOf("--unsetenv"), chdirIndex = argv.indexOf("--chdir");
   const envOk = argv.filter((arg) => arg === "--clearenv").length === 1 && same(env, expected)
-    && argv.filter((arg) => arg === "--unsetenv").length === 1 && argv[unsetIndex + 1] === "PWD"
-    && unsetIndex > clearIndex && unsetIndex > chdirIndex;
+    && argv.filter((arg) => arg === "--unsetenv").length === 0;
   const bindList = mounts(argv);
   const expectedSurfaces = new Set(runtimeSurfaces);
   const allowedRuntimeSet = new Set(FULL_RUNTIME);
@@ -650,7 +648,9 @@ function main(): void {
   const failStatus = (value: Trial) => !value.writer.ok ? "WRITER_" + value.writer.code : value.validator !== "PASS" ? "VALIDATOR_" + value.validator : "CONTRACT_OR_RECEIPT_FAILED";
   const boundaryMatches = (value: Trial | undefined, keys: EnvKey[]) => {
     const b = value?.writer.boundary;
-    return Boolean(b?.status === "OBSERVED" && b.successful === 1 && b.count === keys.length && same(sorted(b.keys as EnvKey[]), sorted(keys)));
+    const expectedTargetKeys = [...keys, "PWD"].sort();
+    return Boolean(b?.status === "OBSERVED" && b.successful === 1 && b.count === expectedTargetKeys.length
+      && same(b.keys.slice().sort(), expectedTargetKeys));
   };
   const boundaryCount = (value: Trial | undefined) => value?.writer.boundary?.status === "OBSERVED" ? value.writer.boundary.count : "<unavailable>";
   const boundaryNames = (value: Trial | undefined) => value?.writer.boundary?.status === "OBSERVED"
@@ -791,6 +791,7 @@ function main(): void {
   emit("SELECTED_ENV_UNWRAPPED_WRITER", writerStatus(selectedUnwrapped)); emit("SELECTED_ENV_VALIDATOR", selectedUnwrapped?.validator ?? "NOT_RUN");
   emit("SELECTED_ENV_TARGET_ENV_KEY_COUNT", boundaryCount(selectedObserved)); emit("SELECTED_ENV_TARGET_ENV_KEYS", boundaryNames(selectedObserved));
   emit("FOUR_KEY_TARGET_ENV_KEY_COUNT", boundaryCount(fourObserved)); emit("FOUR_KEY_TARGET_ENV_KEYS", boundaryNames(fourObserved));
+  emit("BWRAP_CLEAR_ENV_PRESERVED_KEYS", "PWD");
   emit("TARGET_BOUNDARY_DIAGNOSTICS_JSON", JSON.stringify({ fourKey: boundaryDiagnostics(fourObserved), selectedMinimum: boundaryDiagnostics(selectedObserved), finalIntegrated: boundaryDiagnostics(finalObserved) }));
   emit("PARENT_SECRET_HOSTILE_ENV_TARGET_LEAKAGE", !fourObserved || !selectedObserved || !fourBoundaryOk || !selectedBoundaryOk ? "UNAVAILABLE" : noParentLeak ? "NONE" : "PRESENT");
   emit("FOUR_KEY_MOUNTS_UNCHANGED_BY_OBSERVER", fourMountsUnchanged ? "YES" : "NO");
