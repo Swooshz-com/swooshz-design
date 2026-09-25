@@ -877,10 +877,10 @@ function sandboxEnvironmentNegativeControl(runner: string, surfaces: string[], e
   };
   for (const key of envKeys) if (values[key]) args.push("--setenv", key, values[key]!);
   args.push(
-    "--ro-bind", "/usr/bin/bash", "/runtime/probe-bash",
+    "--ro-bind", "/bin/sh", "/runtime/probe-sh",
     "--ro-bind", runner, "/runtime/process-runner",
     "--bind", root, "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/work",
-    "--", "/runtime/probe-bash", "-ceu",
+    "--", "/runtime/probe-sh", "-ceu",
     "test -z \"${S8_TEST_PARENT_SECRET_A+x}\"; test -z \"${S8_TEST_PARENT_SECRET_B+x}\"; test \"${PATH-}\" != S8_RUN084_HOSTILE_PATH_SENTINEL; test \"${HOME-}\" != S8_RUN084_HOSTILE_HOME_SENTINEL; test -z \"${LD_PRELOAD+x}\"; test \"${LD_LIBRARY_PATH-}\" != /tmp/S8_RUN084_HOSTILE_LD_LIBRARY_PATH_SENTINEL; test \"${PYTHONPATH-}\" != /tmp/S8_RUN084_HOSTILE_PYTHONPATH_SENTINEL; test -z \"${PYTHONHOME+x}\"; printf 'ENV_NEGATIVE_CONTROLS=PASS\\n'",
   );
   const cleanBoundary = [
