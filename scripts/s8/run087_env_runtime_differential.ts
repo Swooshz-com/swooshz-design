@@ -29,8 +29,10 @@ type LaunchDiagnostic = {
   runnerStdoutFirstLine: "EMPTY" | "RECEIPT_SUMMARY" | "RECEIPT_UNPARSED" | "NON_RECEIPT";
   runnerStderrBytes: number;
   runnerStderrClass: string;
+  runnerStderrSummary: string;
   wrapperStderrBytes: number;
   wrapperStderrClass: string;
+  wrapperStderrSummary: string;
 };
 type WriterRun = {
   ok: boolean; code: string; domainBPresent: boolean; artifactPath: string; artifactBytes: number; artifactSha256: string;
@@ -425,12 +427,23 @@ function runnerSummary(prefix: string): RunnerSummary | undefined {
 function stderrClass(text: string): string {
   if (!text.trim()) return "EMPTY";
   if (/no such file or directory|cannot find|not found/iu.test(text)) return "NO_SUCH_FILE";
-  if (/permission denied|operation not permitted/iu.test(text)) return "PERMISSION_OR_NAMESPACE";
-  if (/creating new namespace failed|namespace.*failed/iu.test(text)) return "NAMESPACE_SETUP_FAILED";
+  if (/creating new namespace failed|namespace.*failed|unshare.*failed/iu.test(text)) return "NAMESPACE_SETUP_FAILED";
+  if (/operation not permitted/iu.test(text)) return "OPERATION_NOT_PERMITTED";
+  if (/permission denied/iu.test(text)) return "PERMISSION_DENIED";
   if (/invalid argument/iu.test(text)) return "INVALID_ARGUMENT";
   if (/exec format error/iu.test(text)) return "EXEC_FORMAT";
   if (/too many levels of symbolic links/iu.test(text)) return "SYMLINK_LOOP";
   return "NONEMPTY_OTHER";
+}
+function stderrSummary(text: string): string {
+  const lines = text.split(/\r?\n/u).filter(Boolean).slice(0, 2);
+  if (!lines.length) return "EMPTY";
+  return lines.join(" | ")
+    .replace(/\/(?:tmp|home|usr|lib64?|etc|runtime|work|proc|dev)(?:\/[^\s:'\"]*)?/gu, "<path>")
+    .replace(/\bS8_RUN087_[A-Z0-9_]+\b/gu, "<redacted>")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/giu, "<id>")
+    .replace(/[^\x20-\x7e]/gu, "?")
+    .slice(0, 240);
 }
 function launchDiagnostic(prefix: string): LaunchDiagnostic {
   let bwrapStatus: number | null = null;
@@ -451,8 +464,10 @@ function launchDiagnostic(prefix: string): LaunchDiagnostic {
     runnerStdoutFirstLine,
     runnerStderrBytes: fileBytes(prefix + ".runner.stderr"),
     runnerStderrClass: stderrClass(runnerStderr),
+    runnerStderrSummary: stderrSummary(runnerStderr),
     wrapperStderrBytes: fileBytes(prefix + ".wrapper.stderr"),
     wrapperStderrClass: stderrClass(wrapperStderr),
+    wrapperStderrSummary: stderrSummary(wrapperStderr),
   };
 }
 function setenv(argv: string[]): Array<[string, string]> | undefined {
