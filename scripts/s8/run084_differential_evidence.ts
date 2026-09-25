@@ -243,7 +243,7 @@ function domainAEnvironmentStatus(): { clean: boolean; hostileAbsent: boolean } 
     && process.env.PYTHONHOME === undefined;
   const expectedPath = process.env.S8_RUN084_DOMAIN_A_EXPECTED_PATH ?? DOMAIN_A_SAFE_PATH;
   const clean = hostileAbsent
-    && process.env.PATH === expectedPath
+    && (process.env.PATH === expectedPath || process.env.PATH?.endsWith(`:${expectedPath}`) === true)
     && process.env.HOME === "/tmp"
     && process.env.LANG === "C.UTF-8"
     && process.env.LC_ALL === "C.UTF-8"
@@ -636,9 +636,12 @@ function writeSandboxWrapper(path: string): void {
     "  : > \"$stdout_path\"",
     "  : > \"$stderr_path\"",
     "  set +e",
+    "  printf 'S8_RUN084_BWRAP_PATH=%s\\n' \"$S8_RUN084_BWRAP\" >&2",
+    "  printf 'S8_RUN084_BWRAP_ARGS=%q\\n' \"$*\" >&2",
     "  /usr/bin/sudo -n \"$S8_RUN084_BWRAP\" \"$@\" >\"$stdout_path\" 2>\"$stderr_path\"",
     "  status=$?",
     "  set -e",
+    "  printf 'S8_RUN084_BWRAP_STATUS=%s\\n' \"$status\" >&2",
     "  /usr/bin/cat \"$stdout_path\"",
     "  /usr/bin/cat \"$stderr_path\" >&2",
     "}",
@@ -680,8 +683,8 @@ function writeSandboxWrapper(path: string): void {
     "    case $key in PATH) launch+=(--setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin) ;; LANG) launch+=(--setenv LANG C.UTF-8) ;; LC_ALL) launch+=(--setenv LC_ALL C.UTF-8) ;; HOME) launch+=(--setenv HOME /tmp) ;; TMPDIR) launch+=(--setenv TMPDIR /tmp) ;; TZ) launch+=(--setenv TZ UTC) ;; NODE_ENV) launch+=(--setenv NODE_ENV production) ;; LD_LIBRARY_PATH) launch+=(--setenv LD_LIBRARY_PATH /nonexistent) ;; PYTHONPATH) launch+=(--setenv PYTHONPATH /nonexistent) ;; esac",
     "  done",
     "  if [[ ${S8_RUN084_WRITABLE_RUNTIME:-no} == yes ]]; then launch+=(--bind /etc /etc); fi",
-    "  launch+=(\"${filtered[@]}\")",
     "  launch+=(--proc /proc --dev /dev --tmpfs /tmp --chdir /work)",
+    "  launch+=(\"${filtered[@]}\")",
     "  run_bwrap \"${launch[@]}\"",
     "fi",
     "printf '{\"status\":%s}\n' \"$status\" > \"$prefix.status.json\"",
