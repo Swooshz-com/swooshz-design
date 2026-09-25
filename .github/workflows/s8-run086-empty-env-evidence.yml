@@ -121,11 +121,12 @@ jobs:
           root="/tmp/s8-run086-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           /usr/bin/install -d -m 0700 -- "$root/evidence"
           node_dir="$(dirname "$(command -v node)")"
-          pnpm_bin="$(command -v pnpm)"
+          tsx_bin="$GITHUB_WORKSPACE/node_modules/.bin/tsx"
+          test -x "$tsx_bin"
           clean_path="$node_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           clean=(/usr/bin/env -i "PATH=$clean_path" HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 "S8_RUN086_DOMAIN_A_EXPECTED_PATH=$clean_path" "GITHUB_RUN_ID=$GITHUB_RUN_ID" "GITHUB_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT")
           set +e
-          "${clean[@]}" "$pnpm_bin" exec tsx scripts/s8/run086_empty_env_evidence.ts --blender-root "$root/layout/runtime/blender-5.2.2-linux-x64" --blender "$root/layout/runtime/blender-5.2.2-linux-x64/blender" --writer "$root/layout/writer/writer.py" --runner "$root/layout/native/s8-process-runner" --validator "$root/layout/native/s8-fbx-validator" --bubblewrap "$root/bubblewrap-extracted/usr/bin/bwrap" --evidence-dir "$root/evidence" 2>&1 | /usr/bin/tee "$root/evidence/terminal-packet.txt"
+          "${clean[@]}" "$tsx_bin" scripts/s8/run086_empty_env_evidence.ts --blender-root "$root/layout/runtime/blender-5.2.2-linux-x64" --blender "$root/layout/runtime/blender-5.2.2-linux-x64/blender" --writer "$root/layout/writer/writer.py" --runner "$root/layout/native/s8-process-runner" --validator "$root/layout/native/s8-fbx-validator" --bubblewrap /usr/bin/bwrap --evidence-dir "$root/evidence" 2>&1 | /usr/bin/tee "$root/evidence/terminal-packet.txt"
           status=$?
           set -e
           printf 'RUN086_SCRIPT_STATUS=%s\n' "$status"
