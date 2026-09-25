@@ -45,7 +45,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          root="$RUNNER_TEMP/s8-run084-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          root="/tmp/s8-run084-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
           test ! -e "$root" && test ! -L "$root"
           /usr/bin/install -d -m 0700 -- "$root"
           /usr/bin/sudo -n /usr/bin/apt-get update
@@ -68,7 +68,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          root="$RUNNER_TEMP/s8-run084-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          root="/tmp/s8-run084-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
           test -d "$root" && test ! -L "$root"
           archive="$root/blender-5.2.2-linux-x64.tar.xz"
           /usr/bin/curl --fail --location --retry 3 --output "$archive" \
@@ -106,7 +106,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          root="$RUNNER_TEMP/s8-run084-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          root="/tmp/s8-run084-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
           mkdir -p "$root/evidence"
           node_dir="$(dirname "$(command -v node)")"
           pnpm_bin="$(command -v pnpm)"
