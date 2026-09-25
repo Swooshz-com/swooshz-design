@@ -347,8 +347,168 @@ function expectedRequested(limits: S8RunnerLimits): Record<string, number> {
   return { rlimitAsBytes: limits.addressSpaceBytes, rlimitFsizeBytes: limits.fileBytes, rlimitCpuSeconds: cpuSeconds(limits.timeoutMs), rlimitNproc: 64, wallTimeoutMs: limits.timeoutMs, stdoutBytes: limits.stdoutBytes, stderrBytes: limits.stderrBytes, maxChildren: limits.maxChildren ?? 0 };
 }
 
-function equalFields(record: Record<string, unknown>, expected: Record<string, number>): void {
-  for (const [key, value] of Object.entries(expected)) if (record[key] !== value) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+type S8RunnerReceiptDiagnostic = { exactFailedInvariant: string | null };
+
+function markRunnerReceiptInvariant(diagnostic: S8RunnerReceiptDiagnostic | undefined, invariant: string): void {
+  if (diagnostic) diagnostic.exactFailedInvariant = invariant;
+}
+
+function diagnosticRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function diagnosticNumber(value: unknown): string {
+  if (value === null) return "null";
+  return typeof value === "number" && Number.isSafeInteger(value) ? String(value) : "UNAVAILABLE";
+}
+
+function diagnosticBoolean(value: boolean | null): string {
+  return value === null ? "UNAVAILABLE" : value ? "YES" : "NO";
+}
+
+function diagnosticSymbol(value: unknown, pattern: RegExp): string {
+  return typeof value === "string" && pattern.test(value) ? value : "UNAVAILABLE";
+}
+
+function diagnosticNullableSymbol(value: unknown, pattern: RegExp): string {
+  return value === null ? "null" : diagnosticSymbol(value, pattern);
+}
+
+function diagnosticByteMarkerCount(output: Buffer, prefix: Buffer): number {
+  let count = 0;
+  let offset = 0;
+  while (offset <= output.length - prefix.length) {
+    const found = output.indexOf(prefix, offset);
+    if (found === -1) break;
+    count += 1;
+    offset = found + prefix.length;
+  }
+  return count;
+}
+
+function runnerEvidenceDiagnosticBlock(
+  output: Buffer,
+  expected: S8RunnerLimits,
+  runnerSha256: string,
+  postLaunchSha256: string,
+  capture: RunnerCapture,
+  diagnostic: S8RunnerReceiptDiagnostic,
+): string {
+  const prefix = Buffer.from(RUNNER_RECEIPT_PREFIX, "ascii");
+  const prefixAtOffsetZero = output.subarray(0, prefix.length).equals(prefix);
+  const newline = output.indexOf(0x0a, prefix.length);
+  const receiptLineBytes = prefixAtOffsetZero && newline >= prefix.length ? output.subarray(prefix.length, newline) : null;
+  let parsed: Record<string, unknown> | null = null;
+  let strictJsonParseOk = false;
+  if (receiptLineBytes && !receiptLineBytes.includes(0x0d) && !receiptLineBytes.some((byte) => byte > 0x7f)) {
+    try {
+      parsed = parseStrictJson(receiptLineBytes.toString("ascii"));
+      strictJsonParseOk = true;
+    } catch {
+      // Diagnostic only. The production parser remains the authority.
+    }
+  }
+  const requested = diagnosticRecord(parsed?.requested);
+  const applied = diagnosticRecord(parsed?.appliedByChild);
+  const observed = diagnosticRecord(parsed?.observedByRunnerParent);
+  const parentVerification = diagnosticRecord(parsed?.runnerParentVerification);
+  const runnerBinary = diagnosticRecord(parsed?.runnerBinary);
+  const result = diagnosticRecord(parsed?.result);
+  const expectedFields = expectedRequested(expected);
+  const captureStderrBytes = Buffer.isBuffer(capture.stderr) ? capture.stderr.length : 0;
+  const observedTargetStdoutBytes = prefixAtOffsetZero && newline > prefix.length ? output.length - newline - 1 : null;
+  let canonicalReceiptBytesEqual: boolean | null = null;
+  if (parsed && receiptLineBytes) {
+    try {
+      canonicalReceiptBytesEqual = canonicalS8RunnerReceiptBytes(parsed as unknown as S8RunnerEvidence).equals(receiptLineBytes);
+    } catch {
+      canonicalReceiptBytesEqual = null;
+    }
+  }
+  const runnerReportedSelfSha256 = diagnosticSymbol(runnerBinary?.selfSha256, /^[A-Fa-f0-9]{64}$/);
+  const runnerHashMatch = runnerReportedSelfSha256 !== "UNAVAILABLE"
+    && runnerReportedSelfSha256 === runnerSha256
+    && runnerSha256 === postLaunchSha256;
+  const actualCode = result?.code;
+  const targetStdoutCountMatch = typeof result?.stdoutBytes === "number" && Number.isSafeInteger(result.stdoutBytes) && observedTargetStdoutBytes !== null
+    ? result.stdoutBytes === observedTargetStdoutBytes
+    : null;
+  const outerStderrCountMatch = typeof result?.stderrBytes === "number" && Number.isSafeInteger(result.stderrBytes)
+    ? result.stderrBytes === captureStderrBytes
+    : null;
+  const requestedNames: ReadonlyArray<readonly [string, string]> = [
+    ["RLIMIT_AS", "rlimitAsBytes"],
+    ["RLIMIT_FSIZE", "rlimitFsizeBytes"],
+    ["RLIMIT_CPU", "rlimitCpuSeconds"],
+    ["RLIMIT_NPROC", "rlimitNproc"],
+    ["WALL_TIMEOUT_MS", "wallTimeoutMs"],
+    ["STDOUT_BYTES", "stdoutBytes"],
+    ["STDERR_BYTES", "stderrBytes"],
+    ["MAX_CHILDREN", "maxChildren"],
+  ];
+  const appliedNames: ReadonlyArray<readonly [string, string]> = [
+    ["RLIMIT_AS", "rlimitAsBytes"],
+    ["RLIMIT_FSIZE", "rlimitFsizeBytes"],
+    ["RLIMIT_CPU", "rlimitCpuSeconds"],
+    ["RLIMIT_NPROC", "rlimitNproc"],
+    ["NO_NEW_PRIVS", "noNewPrivs"],
+    ["SECCOMP_MODE", "seccompMode"],
+  ];
+  const lines = [
+    "S8_G0_RUNNER_EVIDENCE_DIAGNOSTIC_BEGIN",
+    "OUTER_EXIT_STATUS=" + diagnosticNumber(capture.status),
+    "OUTER_SIGNAL=" + diagnosticNullableSymbol(capture.signal, /^SIG[A-Z0-9]{1,12}$/),
+    "OUTER_STDOUT_BYTES=" + output.length,
+    "OUTER_STDERR_BYTES=" + captureStderrBytes,
+    "RECEIPT_PREFIX_AT_OFFSET_ZERO=" + diagnosticBoolean(prefixAtOffsetZero),
+    "RECEIPT_MARKER_COUNT=" + diagnosticByteMarkerCount(output, prefix),
+    "RECEIPT_LINE_BYTES=" + (receiptLineBytes === null ? "UNAVAILABLE" : receiptLineBytes.length),
+    "STRICT_JSON_PARSE_OK=" + diagnosticBoolean(strictJsonParseOk),
+    "CANONICAL_RECEIPT_BYTES_EQUAL=" + diagnosticBoolean(canonicalReceiptBytesEqual),
+    "SCHEMA_MATCH=" + diagnosticBoolean(parsed ? parsed.schemaVersion === S8_PROCESS_RUNNER_PIN.protocol : null),
+    "PROTOCOL_MATCH=" + diagnosticBoolean(parsed ? parsed.protocol === S8_PROCESS_RUNNER_PIN.protocol : null),
+    "POLICY_MATCH=" + diagnosticBoolean(parsed ? parsed.policyId === S8_PROCESS_RUNNER_PIN.policy : null),
+  ];
+  for (const [label, key] of requestedNames) {
+    lines.push("REQUESTED_" + label + "=" + diagnosticNumber(requested?.[key]));
+    lines.push("EXPECTED_" + label + "=" + diagnosticNumber(expectedFields[key]));
+  }
+  for (const [label, key] of appliedNames) {
+    lines.push("APPLIED_" + label + "=" + diagnosticNumber(applied?.[key]));
+    lines.push("OBSERVED_" + label + "=" + diagnosticNumber(observed?.[key]));
+  }
+  lines.push(
+    "PARENT_VERIFICATION_STATUS=" + (parentVerification?.status === "PASS" || parentVerification?.status === "FAIL" ? parentVerification.status : "UNAVAILABLE"),
+    "PARENT_VERIFICATION_MISMATCH_CODE=" + diagnosticNullableSymbol(parentVerification?.mismatchCode, /^[A-Z0-9_]{1,64}$/),
+    "RUNNER_REPORTED_SELF_SHA256=" + runnerReportedSelfSha256,
+    "PRE_LAUNCH_SHA256=" + diagnosticSymbol(runnerSha256, /^[A-Fa-f0-9]{64}$/),
+    "POST_LAUNCH_SHA256=" + diagnosticSymbol(postLaunchSha256, /^[A-Fa-f0-9]{64}$/),
+    "RUNNER_HASH_MATCH=" + diagnosticBoolean(runnerHashMatch),
+    "RESULT_CODE=" + diagnosticNumber(actualCode),
+    "RESULT_NAME=" + diagnosticSymbol(result?.name, /^[A-Z0-9_]{1,64}$/),
+    "RESULT_TERMINATION_CLASS=" + diagnosticSymbol(result?.terminationClass, /^[a-z0-9-]{1,48}$/),
+    "RESULT_TARGET_EXIT=" + diagnosticNumber(result?.targetExit),
+    "RESULT_TARGET_SIGNAL=" + diagnosticNumber(result?.targetSignal),
+    "RESULT_SETUP_STAGE=" + diagnosticNullableSymbol(result?.setupStage, /^[a-z][a-z0-9_]{0,47}$/),
+    "RESULT_EVIDENCE_CODE=" + diagnosticNullableSymbol(result?.evidenceCode, /^[A-Z0-9_]{1,64}$/),
+    "RESULT_STDOUT_BYTES=" + diagnosticNumber(result?.stdoutBytes),
+    "RESULT_STDERR_BYTES=" + diagnosticNumber(result?.stderrBytes),
+    "OBSERVED_TARGET_STDOUT_BYTES=" + (observedTargetStdoutBytes === null ? "UNAVAILABLE" : observedTargetStdoutBytes),
+    "OBSERVED_OUTER_STDERR_BYTES=" + captureStderrBytes,
+    "OUTER_STATUS_EQUALS_RESULT_CODE=" + diagnosticBoolean(typeof capture.status === "number" && typeof actualCode === "number" && Number.isSafeInteger(actualCode) ? capture.status === actualCode : null),
+    "TARGET_STDOUT_COUNT_MATCH=" + diagnosticBoolean(targetStdoutCountMatch),
+    "OUTER_STDERR_COUNT_MATCH=" + diagnosticBoolean(outerStderrCountMatch),
+    "EXACT_FAILED_INVARIANT=" + diagnosticSymbol(diagnostic.exactFailedInvariant ?? "UNCLASSIFIED", /^[A-Z0-9_]{1,64}$/),
+    "S8_G0_RUNNER_EVIDENCE_DIAGNOSTIC_END",
+  );
+  return lines.join("\n");
+}
+
+function equalFields(record: Record<string, unknown>, expected: Record<string, number>, onMismatch?: (key: string) => void): void {
+  for (const [key, value] of Object.entries(expected)) if (record[key] !== value) {
+    onMismatch?.(key);
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
 }
 
 export function canonicalS8RunnerReceiptBytes(value: S8RunnerEvidence): Buffer {
@@ -408,49 +568,113 @@ export function parseS8RunnerReceipt(
   runnerSha256: string,
   postLaunchSha256 = runnerSha256,
   capture: RunnerCapture = { status: 0, signal: null, stderr: Buffer.alloc(0) },
+  diagnostic?: S8RunnerReceiptDiagnostic,
 ): { stdout: string; stdoutBytes: Buffer; evidence: S8RunnerEvidence } {
   const prefix = Buffer.from(RUNNER_RECEIPT_PREFIX, "ascii");
+  markRunnerReceiptInvariant(diagnostic, "RECEIPT_PREFIX_AT_OFFSET_ZERO");
   if (!output.subarray(0, prefix.length).equals(prefix)) {
     if (capture.status === 64 && capture.signal === null && output.indexOf(prefix) === -1) fail("S8_PROCESS_RUNNER_ARGUMENT_INVALID");
     fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   }
+  markRunnerReceiptInvariant(diagnostic, "RECEIPT_MARKER_COUNT");
   if (output.indexOf(prefix, prefix.length) !== -1) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  markRunnerReceiptInvariant(diagnostic, "RECEIPT_LINE_FRAME");
   const newline = output.indexOf(0x0a, prefix.length);
   if (newline <= prefix.length) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   const receiptBytes = output.subarray(prefix.length, newline);
+  markRunnerReceiptInvariant(diagnostic, "RECEIPT_LINE_ENCODING");
   if (receiptBytes.includes(0x0d) || receiptBytes.some((byte) => byte > 0x7f)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   const receiptText = receiptBytes.toString("ascii");
+  markRunnerReceiptInvariant(diagnostic, "STRICT_JSON_PARSE");
   const parsed = parseStrictJson(receiptText);
+  markRunnerReceiptInvariant(diagnostic, "RECEIPT_SCHEMA_KEYS");
   exactKeys(parsed, ["schemaVersion", "protocol", "policyId", "requested", "appliedByChild", "observedByRunnerParent", "runnerParentVerification", "runnerBinary", "result"]);
-  if (parsed.schemaVersion !== S8_PROCESS_RUNNER_PIN.protocol || parsed.protocol !== S8_PROCESS_RUNNER_PIN.protocol || parsed.policyId !== S8_PROCESS_RUNNER_PIN.policy) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
-  const resultCode = checkedNumber(objectValue(parsed.result).code);
+  if (parsed.schemaVersion !== S8_PROCESS_RUNNER_PIN.protocol) {
+    markRunnerReceiptInvariant(diagnostic, "SCHEMA_MISMATCH");
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
+  if (parsed.protocol !== S8_PROCESS_RUNNER_PIN.protocol) {
+    markRunnerReceiptInvariant(diagnostic, "PROTOCOL_MISMATCH");
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
+  if (parsed.policyId !== S8_PROCESS_RUNNER_PIN.policy) {
+    markRunnerReceiptInvariant(diagnostic, "POLICY_MISMATCH");
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
+  markRunnerReceiptInvariant(diagnostic, "RESULT_OBJECT_SHAPE");
+  const resultRecord = objectValue(parsed.result);
+  markRunnerReceiptInvariant(diagnostic, "RESULT_CODE_INVALID");
+  const resultCode = checkedNumber(resultRecord.code);
   const setupFailure = resultCode === 71;
+  markRunnerReceiptInvariant(diagnostic, "REQUESTED_LIMIT_SHAPE_OR_VALUE");
   const requested = checkedLimitObject(parsed.requested, ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc", "wallTimeoutMs", "stdoutBytes", "stderrBytes", "maxChildren"], true);
+  markRunnerReceiptInvariant(diagnostic, "APPLIED_LIMIT_SHAPE_OR_VALUE");
   const applied = checkedLimitObject(parsed.appliedByChild, ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc", "noNewPrivs", "seccompMode"], false, setupFailure);
+  markRunnerReceiptInvariant(diagnostic, "OBSERVED_LIMIT_SHAPE_OR_VALUE");
   const observed = checkedLimitObject(parsed.observedByRunnerParent, ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc", "noNewPrivs", "seccompMode"], false, setupFailure);
   if (setupFailure) {
     // Native code 71 emits a zeroed setup record before releasing the target.
+    markRunnerReceiptInvariant(diagnostic, "SETUP_LIMITS_NOT_ZERO");
     if ([applied.rlimitAsBytes, applied.rlimitFsizeBytes, applied.rlimitCpuSeconds, applied.rlimitNproc, applied.noNewPrivs, applied.seccompMode, observed.rlimitAsBytes, observed.rlimitFsizeBytes, observed.rlimitCpuSeconds, observed.rlimitNproc, observed.noNewPrivs, observed.seccompMode].some((value) => value !== 0)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   } else {
+    markRunnerReceiptInvariant(diagnostic, "APPLIED_OBSERVED_SECURITY_FIELDS_INVALID");
     checkedNumber(applied.noNewPrivs, true); checkedNumber(applied.seccompMode, true); checkedNumber(observed.noNewPrivs, true); checkedNumber(observed.seccompMode, true);
-    if (applied.noNewPrivs !== 1 || applied.seccompMode !== 2 || observed.noNewPrivs !== 1 || observed.seccompMode !== 2) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    if (applied.noNewPrivs !== 1) {
+      markRunnerReceiptInvariant(diagnostic, "APPLIED_NO_NEW_PRIVS_MISMATCH");
+      fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    }
+    if (applied.seccompMode !== 2) {
+      markRunnerReceiptInvariant(diagnostic, "APPLIED_SECCOMP_MODE_MISMATCH");
+      fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    }
+    if (observed.noNewPrivs !== 1) {
+      markRunnerReceiptInvariant(diagnostic, "OBSERVED_NO_NEW_PRIVS_MISMATCH");
+      fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    }
+    if (observed.seccompMode !== 2) {
+      markRunnerReceiptInvariant(diagnostic, "OBSERVED_SECCOMP_MODE_MISMATCH");
+      fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    }
   }
-  equalFields(requested, expectedRequested(expected));
-  if (!setupFailure) for (const key of ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc"]) if (applied[key] !== requested[key] || observed[key] !== applied[key]) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  markRunnerReceiptInvariant(diagnostic, "REQUESTED_LIMIT_MISMATCH");
+  equalFields(requested, expectedRequested(expected), () => markRunnerReceiptInvariant(diagnostic, "REQUESTED_LIMIT_MISMATCH"));
+  if (!setupFailure) for (const key of ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc"]) {
+    if (applied[key] !== requested[key]) {
+      markRunnerReceiptInvariant(diagnostic, "APPLIED_LIMIT_MISMATCH");
+      fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    }
+    if (observed[key] !== applied[key]) {
+      markRunnerReceiptInvariant(diagnostic, "OBSERVED_LIMIT_MISMATCH");
+      fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    }
+  }
+  markRunnerReceiptInvariant(diagnostic, "PARENT_VERIFICATION_OBJECT_SHAPE");
   const verification = objectValue(parsed.runnerParentVerification);
+  markRunnerReceiptInvariant(diagnostic, "PARENT_VERIFICATION_KEYS");
   exactKeys(verification, ["status", "mismatchCode"]);
+  markRunnerReceiptInvariant(diagnostic, "PARENT_VERIFICATION_STATUS_OR_CODE_INVALID");
   if ((verification.status !== "PASS" && verification.status !== "FAIL") || (verification.mismatchCode !== null && typeof verification.mismatchCode !== "string")) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  markRunnerReceiptInvariant(diagnostic, "RUNNER_BINARY_OBJECT_SHAPE");
   const binary = objectValue(parsed.runnerBinary);
+  markRunnerReceiptInvariant(diagnostic, "RUNNER_BINARY_KEYS");
   exactKeys(binary, ["selfSha256"]);
   if (typeof binary.selfSha256 !== "string" || !HEX64.test(binary.selfSha256) || binary.selfSha256 !== runnerSha256 || runnerSha256 !== postLaunchSha256) fail("S8_RUNNER_HASH_DRIFT");
+  markRunnerReceiptInvariant(diagnostic, "RESULT_OBJECT_SHAPE");
   const result = objectValue(parsed.result);
+  markRunnerReceiptInvariant(diagnostic, "RESULT_KEYS");
   exactKeys(result, ["code", "name", "terminationClass", "targetExit", "targetSignal", "elapsedMs", "stdoutBytes", "stderrBytes", "setupStage", "evidenceCode"]);
+  markRunnerReceiptInvariant(diagnostic, "RECEIPT_CANONICAL_BYTES_MISMATCH");
   if (!canonicalS8RunnerReceiptBytes(parsed as unknown as S8RunnerEvidence).equals(receiptBytes)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   const code = resultCode;
+  markRunnerReceiptInvariant(diagnostic, "RESULT_ELAPSED_TIME_INVALID");
   checkedNumber(result.elapsedMs);
+  markRunnerReceiptInvariant(diagnostic, "RESULT_STDOUT_BYTE_COUNT_INVALID");
   const stdoutBytes = checkedNumber(result.stdoutBytes);
+  markRunnerReceiptInvariant(diagnostic, "RESULT_STDERR_BYTE_COUNT_INVALID");
   const stderrBytes = checkedNumber(result.stderrBytes);
+  markRunnerReceiptInvariant(diagnostic, "RESULT_FIELDS_INVALID");
   if (typeof result.name !== "string" || typeof result.terminationClass !== "string" || (result.targetExit !== null && !isNonnegativeInteger(result.targetExit)) || (result.targetSignal !== null && !isPositiveInteger(result.targetSignal)) || (result.setupStage !== null && typeof result.setupStage !== "string") || (result.evidenceCode !== null && typeof result.evidenceCode !== "string")) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  markRunnerReceiptInvariant(diagnostic, "RESULT_BYTE_COUNT_LIMIT_EXCEEDED");
   if (stdoutBytes > expected.stdoutBytes || stderrBytes > expected.stderrBytes) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   const resultContracts: Record<number, readonly [string, string]> = {
     0: ["S8_RUNNER_SUCCESS", "target-exit-zero"],
@@ -465,29 +689,39 @@ export function parseS8RunnerReceipt(
     124: ["S8_RUNNER_TIMEOUT", "wall-timeout"],
   };
   const contract = resultContracts[code];
+  markRunnerReceiptInvariant(diagnostic, "RESULT_MAPPING_MISMATCH");
   if (!contract || result.name !== contract[0] || result.terminationClass !== contract[1]) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   const noTargetTermination = result.targetExit === null && result.targetSignal === null;
   if (code === 0) {
+    markRunnerReceiptInvariant(diagnostic, "RESULT_SUCCESS_TERMINATION_MISMATCH");
     if (result.targetExit !== 0 || result.targetSignal !== null || result.setupStage !== null || result.evidenceCode !== null) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   } else if (code === 70) {
+    markRunnerReceiptInvariant(diagnostic, "RESULT_INTERNAL_TERMINATION_MISMATCH");
     if (!noTargetTermination || result.setupStage !== null || result.evidenceCode !== null) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   } else if (code === 71) {
     const setupStages = new Set(["setpgid", "pdeathsig", "parent_check", "rlimit_as", "rlimit_fsize", "rlimit_cpu", "rlimit_nproc", "no_new_privs", "seccomp", "child_evidence", "release"]);
+    markRunnerReceiptInvariant(diagnostic, "RESULT_SETUP_FAILURE_MAPPING_MISMATCH");
     if (!noTargetTermination || typeof result.setupStage !== "string" || !setupStages.has(result.setupStage) || result.evidenceCode !== null || verification.status !== "FAIL" || verification.mismatchCode !== null || result.stdoutBytes !== 0 || result.stderrBytes !== 0) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   } else if (code === 72) {
+    markRunnerReceiptInvariant(diagnostic, "RESULT_EVIDENCE_FAILURE_MAPPING_MISMATCH");
     if (!noTargetTermination || result.setupStage !== null || typeof result.evidenceCode !== "string" || result.evidenceCode.length === 0 || verification.mismatchCode !== result.evidenceCode) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   } else if (code === 76) {
+    markRunnerReceiptInvariant(diagnostic, "RESULT_TARGET_EXIT_MAPPING_MISMATCH");
     if (result.targetExit === null || result.targetExit === 0 || result.targetExit > 255 || result.targetSignal !== null || result.setupStage !== null || result.evidenceCode !== null) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   } else if (code === 77) {
+    markRunnerReceiptInvariant(diagnostic, "RESULT_TARGET_SIGNAL_MAPPING_MISMATCH");
     if (result.targetExit !== null || result.targetSignal === null || result.targetSignal > 64 || result.setupStage !== null || result.evidenceCode !== null) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   } else if (!noTargetTermination || result.setupStage !== null || result.evidenceCode !== null) {
+    markRunnerReceiptInvariant(diagnostic, "RESULT_TERMINATION_MAPPING_MISMATCH");
     fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   }
   if (code === 70) {
     const verifiedInternalMismatchCodes = new Set(["CAPTURE_INIT", "EXEC_CHANNEL", "POLL", "STDOUT_READ", "STDERR_READ", "WAITPID", "INTERNAL"]);
     if (verification.status === "FAIL") {
+      markRunnerReceiptInvariant(diagnostic, "PARENT_INTERNAL_VERIFICATION_MISMATCH");
       if (verification.mismatchCode !== "PARENT_SETPGID") fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
     } else if (verification.mismatchCode !== null && (typeof verification.mismatchCode !== "string" || !verifiedInternalMismatchCodes.has(verification.mismatchCode))) {
+      markRunnerReceiptInvariant(diagnostic, "PARENT_INTERNAL_MISMATCH_CODE_INVALID");
       fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
     }
   }
@@ -496,18 +730,37 @@ export function parseS8RunnerReceipt(
       "CHILD_EVIDENCE_MALFORMED", "PARENT_PRLIMIT_AS", "PARENT_PRLIMIT_FSIZE", "PARENT_PRLIMIT_CPU", "PARENT_PRLIMIT_NPROC",
       "PARENT_PROC_STATUS", "PARENT_PROC_SECURITY", "REQUESTED_APPLIED_OBSERVED", "RELEASE_CHANNEL",
     ]);
+    markRunnerReceiptInvariant(diagnostic, "RESULT_EVIDENCE_CODE_INVALID");
     if (typeof result.evidenceCode !== "string" || !evidenceMismatchCodes.has(result.evidenceCode)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
     if (result.evidenceCode === "RELEASE_CHANNEL") {
+      markRunnerReceiptInvariant(diagnostic, "PARENT_RELEASE_CHANNEL_STATUS_MISMATCH");
       if (verification.status !== "PASS") fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
     } else if (verification.status !== "FAIL") {
+      markRunnerReceiptInvariant(diagnostic, "PARENT_EVIDENCE_STATUS_MISMATCH");
       fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
     }
   }
+  markRunnerReceiptInvariant(diagnostic, "PARENT_VERIFICATION_RESULT_MAPPING_MISMATCH");
   if (code !== 70 && code !== 71 && code !== 72 && (verification.status !== "PASS" || verification.mismatchCode !== null)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
 
   const targetStdout = output.subarray(newline + 1);
   const capturedStderr = Buffer.isBuffer(capture.stderr) ? capture.stderr : Buffer.alloc(0);
-  if (capture.signal !== null || capture.status !== code || stdoutBytes !== targetStdout.length || stderrBytes !== capturedStderr.length) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if (capture.signal !== null) {
+    markRunnerReceiptInvariant(diagnostic, "OUTER_SIGNAL_MISMATCH");
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
+  if (capture.status !== code) {
+    markRunnerReceiptInvariant(diagnostic, "OUTER_STATUS_MISMATCH");
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
+  if (stdoutBytes !== targetStdout.length) {
+    markRunnerReceiptInvariant(diagnostic, "TARGET_STDOUT_BYTE_COUNT_MISMATCH");
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
+  if (stderrBytes !== capturedStderr.length) {
+    markRunnerReceiptInvariant(diagnostic, "OUTER_STDERR_BYTE_COUNT_MISMATCH");
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
   const evidence = parsed as unknown as S8RunnerEvidence;
   evidence.verifiedByCaller = {
     schemaVersion: "s8-runner-caller-verification-v2",
@@ -607,13 +860,22 @@ function runUnderNativeRunner(command: string, args: readonly string[], config: 
   if (!sameRunnerIdentity(before, after)) fail("S8_RUNNER_IDENTITY_DRIFT");
   const postLaunchSha256 = fileSha256(after.path);
   const stderrBytes = Buffer.isBuffer(child.stderr) ? child.stderr : Buffer.from(child.stderr ?? "");
-  const parsed = parseS8RunnerReceipt(
-    Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(child.stdout ?? ""),
-    options,
-    preLaunchSha256,
-    postLaunchSha256,
-    { status: child.status, signal: child.signal, stderr: stderrBytes },
-  );
+  const stdoutBytes = Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(child.stdout ?? "");
+  const capture = { status: child.status, signal: child.signal, stderr: stderrBytes };
+  const diagnostic: S8RunnerReceiptDiagnostic = { exactFailedInvariant: null };
+  let parsed: ReturnType<typeof parseS8RunnerReceipt>;
+  try {
+    parsed = parseS8RunnerReceipt(stdoutBytes, options, preLaunchSha256, postLaunchSha256, capture, diagnostic);
+  } catch (error) {
+    if (error instanceof AppError && error.code === "S8_PROCESS_RUNNER_EVIDENCE_INVALID") {
+      try {
+        process.stderr.write(runnerEvidenceDiagnosticBlock(stdoutBytes, options, preLaunchSha256, postLaunchSha256, capture, diagnostic) + "\n");
+      } catch {
+        // Preserve the original parser failure if diagnostic output is unavailable.
+      }
+    }
+    throw error;
+  }
   if (child.status !== 0) fail(runnerFailure(parsed.evidence.result.code));
   return { stdout: parsed.stdout, stdoutBytes: parsed.stdoutBytes, stderr: stderrBytes.toString("utf8"), evidence: parsed.evidence };
 }
