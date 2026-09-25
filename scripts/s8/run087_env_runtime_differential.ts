@@ -348,7 +348,7 @@ function writeSandboxWrapper(path: string): void {
     "for system_path in \"${surfaces[@]}\"; do [[ -n $system_path && -f $system_path ]] || { printf '%s\\n' RUNTIME_SURFACE_MISSING >&2; exit 95; }; launch+=(--ro-bind \"$system_path\" \"$system_path\"); done",
     "if [[ $mode == INVALID ]]; then printf '%s\\n' RUN087_ENV_MODE_REJECTED > \"$prefix.mode-rejected\"; exit 97; fi",
     "if [[ $mode == FOUR_KEY_CONTROL && $S8_RUN087_ENV_KEYS != PATH,LANG,LC_ALL,HOME ]]; then printf '%s\\n' RUN087_ENV_MODE_REJECTED > \"$prefix.mode-rejected\"; exit 97; fi",
-    "launch+=(--clearenv --unsetenv PWD)",
+    "launch+=(--clearenv)",
     "selected_keys=(); if [[ -n $S8_RUN087_ENV_KEYS ]]; then IFS=, read -r -a selected_keys <<< \"$S8_RUN087_ENV_KEYS\"; fi",
     "seen_keys=,",
     "for key in \"${selected_keys[@]}\"; do",
@@ -362,7 +362,7 @@ function writeSandboxWrapper(path: string): void {
     "    *) printf '%s\\n' RUN087_ENV_MODE_REJECTED > \"$prefix.mode-rejected\"; exit 97 ;;",
     "  esac",
     "done",
-    "launch+=(--proc /proc --dev /dev --tmpfs /tmp --chdir /work)",
+    "launch+=(--proc /proc --dev /dev --tmpfs /tmp --chdir /work --unsetenv PWD)",
     "filtered=(); skip=0",
     "for argument in \"$@\"; do",
     "  if (( skip > 0 )); then skip=$((skip-1)); continue; fi",
@@ -511,8 +511,10 @@ function bwrapContract(argv: string[] | undefined, envKeys: EnvKey[], runtimeSur
   const env = setenv(argv);
   if (!env) return { ok: false, env: [] as Array<[string, string]>, omitted: false, topology: false, runtime: false, mountManifest: [] as Array<[string, string, string]> };
   const expected = envKeys.map((key) => [key, ENV_VALUES[key]] as [string, string]);
+  const clearIndex = argv.indexOf("--clearenv"), unsetIndex = argv.indexOf("--unsetenv"), chdirIndex = argv.indexOf("--chdir");
   const envOk = argv.filter((arg) => arg === "--clearenv").length === 1 && same(env, expected)
-    && argv.filter((arg) => arg === "--unsetenv").length === 1 && argv[argv.indexOf("--unsetenv") + 1] === "PWD";
+    && argv.filter((arg) => arg === "--unsetenv").length === 1 && argv[unsetIndex + 1] === "PWD"
+    && unsetIndex > clearIndex && unsetIndex > chdirIndex;
   const bindList = mounts(argv);
   const expectedSurfaces = new Set(runtimeSurfaces);
   const allowedRuntimeSet = new Set(FULL_RUNTIME);
