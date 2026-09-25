@@ -67,19 +67,16 @@ jobs:
           test ! -e "$root" && test ! -L "$root"
           /usr/bin/install -d -m 0700 -- "$root"
           /usr/bin/sudo -n /usr/bin/apt-get update
-          /usr/bin/sudo -n /usr/bin/apt-get install --yes --no-install-recommends acl binutils strace
+          /usr/bin/sudo -n /usr/bin/apt-get install --yes --no-install-recommends acl binutils strace bubblewrap=0.9.0-1ubuntu0.3
           test -x /usr/bin/getfacl
           test -x /usr/bin/setfacl
           test -x /usr/bin/readelf
           test -x /usr/bin/strace
-          archive="$root/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb"
-          /usr/bin/curl --fail --location --retry 3 --output "$archive" https://archive.ubuntu.com/ubuntu/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb
-          printf 'e318903862396f96de3df57264e0158682b952fd3fb53ac23d876413e7b30f71  %s\n' "$archive" | /usr/bin/sha256sum --check --status
-          bwrap_root="$root/bubblewrap-extracted"
-          /usr/bin/install -d -m 0700 -- "$bwrap_root"
-          /usr/bin/dpkg-deb --extract "$archive" "$bwrap_root"
-          bwrap="$bwrap_root/usr/bin/bwrap"
+          bwrap_version="$(/usr/bin/dpkg-query --show --showformat='${Version}' bubblewrap)"
+          test "$bwrap_version" = "0.9.0-1ubuntu0.3"
+          bwrap="/usr/bin/bwrap"
           test -x "$bwrap"
+          "$bwrap" --version
           printf 'S8_RUN086_BWRAP=%s\n' "$bwrap"
 
       - name: Build the pinned Blender runtime and native targets
