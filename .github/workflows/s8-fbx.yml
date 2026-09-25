@@ -5972,7 +5972,7 @@ jobs:
           marker_path = Path(sys.argv[3])
           candidate_defect_marker_path = Path(sys.argv[4])
           source = source_path.read_text(encoding="utf-8")
-          admission_anchor = "    try:\n        result = subprocess.run(\n"
+          admission_anchor = "    try:\n        result = subprocess.run(\n            command,\n            cwd=work,\n"
           if source.count(admission_anchor) != 1:
               raise SystemExit("destination admission anchor is not unique")
           admission_block = (
