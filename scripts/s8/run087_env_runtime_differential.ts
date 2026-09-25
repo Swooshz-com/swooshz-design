@@ -439,7 +439,7 @@ function stderrSummary(text: string): string {
   const lines = text.split(/\r?\n/u).filter(Boolean).slice(0, 2);
   if (!lines.length) return "EMPTY";
   return lines.join(" | ")
-    .replace(/\/(?:tmp|home|usr|lib64?|etc|runtime|work|proc|dev)(?:\/[^\s:'\"]*)?/gu, "<path>")
+    .replace(/\/(?:tmp|home|usr|lib64?|etc|runtime|work|proc|dev)(?:\/[^\s:"]*)?/gu, "<path>")
     .replace(/\bS8_RUN087_[A-Z0-9_]+\b/gu, "<redacted>")
     .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/giu, "<id>")
     .replace(/[^\x20-\x7e]/gu, "?")
