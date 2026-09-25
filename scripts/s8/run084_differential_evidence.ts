@@ -883,7 +883,23 @@ function sandboxEnvironmentNegativeControl(runner: string, surfaces: string[], e
     "--", "/runtime/probe-bash", "-ceu",
     "test -z \"${S8_TEST_PARENT_SECRET_A+x}\"; test -z \"${S8_TEST_PARENT_SECRET_B+x}\"; test \"${PATH-}\" != S8_RUN084_HOSTILE_PATH_SENTINEL; test \"${HOME-}\" != S8_RUN084_HOSTILE_HOME_SENTINEL; test -z \"${LD_PRELOAD+x}\"; test \"${LD_LIBRARY_PATH-}\" != /tmp/S8_RUN084_HOSTILE_LD_LIBRARY_PATH_SENTINEL; test \"${PYTHONPATH-}\" != /tmp/S8_RUN084_HOSTILE_PYTHONPATH_SENTINEL; test -z \"${PYTHONHOME+x}\"; printf 'ENV_NEGATIVE_CONTROLS=PASS\\n'",
   );
-  const result = command("/usr/bin/sudo", ["-n", "/usr/bin/env", "-i", ...Object.entries(DOMAIN_B_VALUES).map(([key, value]) => `${key}=${value}`), bubblewrapPath, ...args], VALIDATOR_TIMEOUT + 30_000);
+  const cleanBoundary = [
+    `PATH=${DOMAIN_A_SAFE_PATH}`,
+    "LANG=C.UTF-8",
+    "LC_ALL=C.UTF-8",
+    "HOME=/tmp",
+  ];
+  const result = command("/usr/bin/sudo", [
+    "-n",
+    "/usr/bin/env",
+    "-i",
+    ...Object.entries(DOMAIN_B_VALUES).map(([key, value]) => `${key}=${value}`),
+    "/usr/bin/env",
+    "-i",
+    ...cleanBoundary,
+    bubblewrapPath,
+    ...args,
+  ], VALIDATOR_TIMEOUT + 30_000);
   rmSync(root, { recursive: true, force: true });
   return result.status === 0 && result.stdout.includes("ENV_NEGATIVE_CONTROLS=PASS");
 }
