@@ -98,6 +98,7 @@ jobs:
           /usr/bin/find -P "$root/layout/writer" -type d -exec /usr/bin/chmod 0555 {} +
           /usr/bin/find -P "$root/layout/writer" -type f -perm /111 -exec /usr/bin/chmod 0555 {} +
           /usr/bin/find -P "$root/layout/writer" -type f ! -perm /111 -exec /usr/bin/chmod 0444 {} +
+          /usr/bin/chmod 0555 "$root/layout/native"
           /usr/bin/chmod 0555 "$root/layout/native/s8-process-runner" "$root/layout/native/s8-fbx-validator"
           /usr/bin/chmod 0755 "$root" "$root/layout"
           printf 'S8_RUN084_LAYOUT=%s\n' "$root/layout"
