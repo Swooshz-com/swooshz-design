@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { TextDecoder } from "node:util";
 import { AppError } from "./types";
 import type { S8UfbxReadback } from "./s8-fbx-semantic";
 import { S8_BLENDER_PIN, S8_EXPORTER_PATCH_PIN, S8_LIMITS, S8_PROCESS_RUNNER_PIN, S8_WRITER_RECEIPT_VERSION, s8Sha256 } from "./s8-fbx-profile";
@@ -120,6 +121,7 @@ type CommandSpec = { command: string; args: string[] };
 export type S8SandboxCommand = CommandSpec & { target: CommandSpec };
 type RunnerIdentity = { path: string; device: number; inode: number; size: number; mtimeMs: number };
 type RunnerCapture = { status: number | null; signal: string | null; stderr: Buffer };
+type DiagnosticPathPrefix = { path: string; placeholder: string };
 
 const RUNNER_RECEIPT_PREFIX = "S8_RUNNER_RECEIPT:";
 const HEX64 = /^[0-9a-f]{64}$/u;
@@ -524,6 +526,144 @@ export function parseS8RunnerReceipt(
   return { stdout: targetStdout.toString("utf8"), stdoutBytes: Buffer.from(targetStdout), evidence };
 }
 
+function preRunnerStderrSource(text: string): "BWRAP" | "SUDO" | "SHELL" | "OTHER" {
+  const line = text.trimStart();
+  if (/^bwrap:/iu.test(line)) return "BWRAP";
+  if (/^sudo:/iu.test(line)) return "SUDO";
+  if (/^(?:[^:\r\n]*[\\/])?(?:bash|sh|dash|zsh)(?::|\s|\[)/iu.test(line)) return "SHELL";
+  return "OTHER";
+}
+
+function preRunnerStderrClassification(source: "BWRAP" | "SUDO" | "SHELL" | "OTHER", text: string): string {
+  if (source === "BWRAP") {
+    if (/(?:unrecognized|unknown|invalid|unsupported)\s+option|option\s+[^\n]*\b(?:requires|needs)\b[^\n]*(?:argument|value)/iu.test(text)) return "BWRAP_OPTION_PARSER_FAILURE";
+    if (/source\s+(?:path|file)|(?:failed|unable|cannot|can't)\s+to\s+(?:open|stat|access)[^\n]*\bsource\b|(?:can't|cannot)\s+find\s+source/iu.test(text)) return "BWRAP_SOURCE_PATH_FAILURE";
+    if (/(?:destination|target)\s+(?:path|file)|(?:failed|unable|cannot|can't)\s+to\s+(?:create|open|make)[^\n]*(?:destination|target)|mkdir[^\n]*(?:failed|denied|error)/iu.test(text)) return "BWRAP_DESTINATION_PATH_FAILURE";
+    if (/(?:mount|bind mount|tmpfs|\/proc|\/dev)/iu.test(text) && /(?:failed|unable|cannot|can't|error|denied|permission|operation not permitted|no such)/iu.test(text)) return "BWRAP_MOUNT_FAILURE";
+    if (/(?:namespace|userns|uid map|gid map)/iu.test(text)) return "BWRAP_NAMESPACE_USERNS_FAILURE";
+    if (/(?:permission denied|operation not permitted|access denied)/iu.test(text)) return "BWRAP_PERMISSION_FAILURE";
+    return "BWRAP_OTHER_EXACT_FAMILY";
+  }
+  if (source === "SUDO") {
+    if (/(?:not in sudoers|not allowed|policy plugin|denied by policy)/iu.test(text)) return "SUDO_POLICY_FAILURE";
+    if (/(?:password|authenticate|authentication|terminal is required|a tty is required)/iu.test(text)) return "SUDO_AUTH_FAILURE";
+    if (/(?:unable to execute|command not found|no such file|exec.*failed)/iu.test(text)) return "SUDO_EXECUTION_FAILURE";
+    return "SUDO_POLICY_AUTH_OR_EXECUTION_UNCLASSIFIED";
+  }
+  if (source === "SHELL") {
+    if (/(?:syntax error|unexpected (?:token|end of file))/iu.test(text)) return "SHELL_SYNTAX_FAILURE";
+    if (/(?:redirection|cannot open|can't open|permission denied|read-only file system)/iu.test(text)) return "SHELL_REDIRECTION_OR_PERMISSION_FAILURE";
+    if (/(?:command not found|not found|no such file|cannot execute|permission denied)/iu.test(text)) return "SHELL_COMMAND_EXECUTION_FAILURE";
+    return "SHELL_WRAPPER_OPERATION_UNCLASSIFIED";
+  }
+  return "OTHER_ORIGIN_UNRESOLVED";
+}
+
+function hasCredentialLikeMaterial(text: string): boolean {
+  return /(?:sk-|ghp_|github_pat_|AIza)[A-Za-z0-9._-]*/iu.test(text)
+    || /\bBearer\s+\S+/iu.test(text)
+    || /\bBearer\s*[:=]\s*\S+/iu.test(text)
+    || /["']?(?:authorization|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|api[_-]?key)["']?\s*(?:=|:)\s*["']?[^\s"'`,;]+/iu.test(text)
+    || /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/iu.test(text);
+}
+
+function replaceDiagnosticPathPrefixes(text: string, prefixes: readonly DiagnosticPathPrefix[]): string {
+  return [...prefixes]
+    .filter(({ path }) => path.length > 0)
+    .sort((left, right) => right.path.length - left.path.length)
+    .reduce((value, { path, placeholder }) => value.split(path).join(placeholder), text);
+}
+
+function escapeDiagnosticText(text: string, maxBytes: number): string {
+  let escaped = "";
+  for (const character of text) {
+    const codePoint = character.codePointAt(0)!;
+    const fragment = character === "\n" ? "\\n"
+      : character === "\t" ? "\\t"
+        : character === "\\" ? "\\\\"
+          : character === '"' ? '\\"'
+            : codePoint >= 0x20 && codePoint <= 0x7e ? character
+              : `\\u{${codePoint.toString(16)}}`;
+    if (Buffer.byteLength(escaped) + Buffer.byteLength(fragment) > maxBytes) break;
+    escaped += fragment;
+  }
+  return escaped;
+}
+
+function formatPreRunnerStderrDiagnostic(
+  output: Buffer,
+  capture: RunnerCapture,
+  prefixes: readonly DiagnosticPathPrefix[],
+): string | null {
+  const receiptPrefix = Buffer.from(RUNNER_RECEIPT_PREFIX, "ascii");
+  if (capture.status !== 1 || capture.signal !== null || output.length !== 0 || output.indexOf(receiptPrefix) !== -1 || capture.stderr.length > 256) return null;
+
+  const hash = createHash("sha256").update(capture.stderr).digest("hex");
+  let utf8 = "NO";
+  let source: "BWRAP" | "SUDO" | "SHELL" | "OTHER" = "OTHER";
+  let classification = "OTHER_INVALID_UTF8";
+  let escaped = "[NOT_EMITTED_INVALID_UTF8]";
+  let contentRedacted = false;
+  let decoded: string | null = null;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(capture.stderr);
+  } catch {
+    decoded = null;
+  }
+
+  if (decoded !== null) {
+    utf8 = "YES";
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(decoded)) {
+      classification = "OTHER_UNEXPECTED_CONTROL_CHARACTERS";
+      escaped = "[NOT_EMITTED_UNEXPECTED_CONTROL_CHARACTERS]";
+    } else {
+      source = preRunnerStderrSource(decoded);
+      classification = preRunnerStderrClassification(source, decoded);
+      if (hasCredentialLikeMaterial(decoded)) {
+        contentRedacted = true;
+        escaped = "[REDACTED]";
+      } else {
+        escaped = escapeDiagnosticText(replaceDiagnosticPathPrefixes(decoded, prefixes), 256);
+      }
+    }
+  }
+
+  const lines = [
+    "S8_G0_PRE_RUNNER_STDERR_BEGIN",
+    `PRE_RUNNER_STDERR_SOURCE=${source}`,
+    `PRE_RUNNER_STDERR_BYTES=${capture.stderr.length}`,
+    `PRE_RUNNER_STDERR_UTF8=${utf8}`,
+    `PRE_RUNNER_STDERR_SHA256=${hash}`,
+    `PRE_RUNNER_STDERR_ESCAPED=${escaped}`,
+  ];
+  if (contentRedacted) lines.push("STDERR_CONTENT_REDACTED=YES");
+  lines.push(`PRE_RUNNER_STDERR_CLASSIFICATION=${classification}`, "S8_G0_PRE_RUNNER_STDERR_END", "");
+  return lines.join("\n");
+}
+
+export function parseS8RunnerReceiptWithDiagnostic(
+  output: Buffer,
+  expected: S8RunnerLimits,
+  runnerSha256: string,
+  postLaunchSha256: string,
+  capture: RunnerCapture,
+  prefixes: readonly DiagnosticPathPrefix[] = [],
+): ReturnType<typeof parseS8RunnerReceipt> {
+  try {
+    return parseS8RunnerReceipt(output, expected, runnerSha256, postLaunchSha256, capture);
+  } catch (error) {
+    if (error instanceof AppError && error.code === "S8_PROCESS_RUNNER_EVIDENCE_INVALID") {
+      try {
+        const diagnostic = formatPreRunnerStderrDiagnostic(output, capture, prefixes);
+        if (diagnostic !== null) process.stderr.write(diagnostic);
+      } catch {
+        // Diagnostic failure must not replace the original evidence rejection.
+      }
+    }
+    throw error;
+  }
+}
+
 export function buildS8BlenderSandboxCommand(config: S8WorkerConfig, blenderRoot: string, blender: string, writer: string, privateExporter: string, patchManifest: string, work: string): S8SandboxCommand {
   if (!config.sandboxExecutable) fail("S8_WORKER_SANDBOX_REQUIRED");
   const sandbox = assertRegularFile(config.sandboxExecutable, "sandboxExecutable");
@@ -607,12 +747,19 @@ function runUnderNativeRunner(command: string, args: readonly string[], config: 
   if (!sameRunnerIdentity(before, after)) fail("S8_RUNNER_IDENTITY_DRIFT");
   const postLaunchSha256 = fileSha256(after.path);
   const stderrBytes = Buffer.isBuffer(child.stderr) ? child.stderr : Buffer.from(child.stderr ?? "");
-  const parsed = parseS8RunnerReceipt(
+  const parsed = parseS8RunnerReceiptWithDiagnostic(
     Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(child.stdout ?? ""),
     options,
     preLaunchSha256,
     postLaunchSha256,
     { status: child.status, signal: child.signal, stderr: stderrBytes },
+    [
+      { path: process.cwd(), placeholder: "[WORKSPACE]" },
+      { path: config.privateWorkRoot, placeholder: "[TEMP]" },
+      { path: options.cwd, placeholder: "[TEMP]" },
+      { path: before.path, placeholder: "[RUNNER]" },
+      ...(sandbox ? [{ path: sandbox.command, placeholder: "[SANDBOX]" }] : []),
+    ],
   );
   if (child.status !== 0) fail(runnerFailure(parsed.evidence.result.code));
   return { stdout: parsed.stdout, stdoutBytes: parsed.stdoutBytes, stderr: stderrBytes.toString("utf8"), evidence: parsed.evidence };
