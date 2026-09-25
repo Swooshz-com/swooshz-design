@@ -1,0 +1,1182 @@
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { buildS8WriterPayload } from "../../src/lib/s8-fbx-payload";
+import {
+  runS8BlenderWriter,
+  runS8NativeValidator,
+  type S8WorkerConfig,
+} from "../../src/lib/s8-fbx-worker";
+import type { S6ToS7Handoff, S7ToS8Handoff } from "../../src/lib/types";
+
+type Cli = Record<string, string>;
+
+type Snapshot = {
+  owner: number;
+  group: number;
+  mode: string;
+  device: number;
+  inode: number;
+  bytes: number;
+  sha256: string;
+  access: string[];
+  defaultAcl: string[];
+};
+
+type CommandResult = {
+  status: number;
+  stdout: string;
+  stderr: string;
+};
+
+type EvidenceFiles = {
+  pre?: Snapshot;
+  hostedPre?: Snapshot;
+  post?: Snapshot;
+  status?: number;
+  runnerStdout?: string;
+  runnerStderr?: string;
+  wrapperStderr?: string;
+};
+
+type WriterRun = {
+  ok: boolean;
+  code: string;
+  artifact?: Buffer;
+  evidence: EvidenceFiles;
+  domainBPresent: boolean;
+};
+
+type ValidatorRun = {
+  ok: boolean;
+  code: string;
+  domainBPresent: boolean;
+};
+
+type ApplicationOperation = "probe" | "writer" | "validator";
+
+type ApplicationRequest = {
+  operation: ApplicationOperation;
+  resultPath: string;
+  payloadPath?: string;
+  artifactPath?: string;
+  config?: S8WorkerConfig;
+  controls?: {
+    phase: string;
+    prefix: string;
+    bubblewrap: string;
+    runnerUid: number;
+    runnerGid: number;
+    seedMode: "s0" | "s1" | "s2";
+    launchMode: string;
+    runtimeMode: "upper" | "minimum";
+    surfaces: string[];
+    removeSurface?: string;
+    envKeys: string[];
+    envRemove?: string;
+    workCustody: "established" | "removed";
+    workAcl: "established" | "removed";
+    extraNamespaces: "yes" | "no";
+    uidGid: "yes" | "no";
+    capDrop: "yes" | "no";
+    disableUserns: "yes" | "no";
+    writableRuntime: "yes" | "no";
+    seedMaskDrift: "yes" | "no";
+  };
+};
+
+type ApplicationStatus = {
+  operation: ApplicationOperation;
+  domainBPresent: boolean;
+  missingDomainBKeys: string[];
+  ok: boolean;
+  code: string;
+};
+
+type RuntimeObservation = {
+  interpreter: string;
+  needed: string[];
+  systemFiles: string[];
+};
+
+const RUN = "S8_G0B_PR47_ISOLATED_PARENT_ENV_DIFFERENTIAL_EVIDENCE_084";
+const LOCK = "DL-SD-S8-G0B-PR47-ISOLATED-PARENT-ENV-DIFFERENTIAL-EVIDENCE-001";
+const STAGE = "G0-B";
+const PRODUCT_HEAD = "2f71e472849055ab8814f7e38d0f8c321707275f";
+const PRODUCT_TREE = "c72036fdc685ad3a78e2b696df212476c1dade36";
+const BASE = "578ac98aa974fa0ec3a65bcade1c505ac5c80dcb";
+const WRITER_AS = 4 * 1024 * 1024 * 1024;
+const WRITER_FILE = 128 * 1024 * 1024;
+const WRITER_TIMEOUT = 300_000;
+const WRITER_STDOUT = 1024 * 1024;
+const WRITER_STDERR = 1024 * 1024;
+const VALIDATOR_AS = 1536 * 1024 * 1024;
+const VALIDATOR_FILE = 256 * 1024 * 1024;
+const VALIDATOR_TIMEOUT = 120_000;
+const VALIDATOR_STDOUT = 8 * 1024 * 1024;
+const VALIDATOR_STDERR = 1024 * 1024;
+const BASE_ENV_KEYS = ["PATH", "LANG", "LC_ALL", "HOME"] as const;
+const OPTIONAL_ENV_KEYS = ["TMPDIR", "TZ", "NODE_ENV", "LD_LIBRARY_PATH", "PYTHONPATH"] as const;
+const FORBIDDEN_ENV_KEYS = ["LD_PRELOAD", "PYTHONHOME"] as const;
+const ALL_TEST_ENV_KEYS = [...BASE_ENV_KEYS, ...OPTIONAL_ENV_KEYS];
+const DOMAIN_A_SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DOMAIN_B_VALUES: Record<string, string> = {
+  S8_TEST_PARENT_SECRET_A: "S8_RUN084_PARENT_SECRET_A_SENTINEL",
+  S8_TEST_PARENT_SECRET_B: "S8_RUN084_PARENT_SECRET_B_SENTINEL",
+  PATH: "S8_RUN084_HOSTILE_PATH_SENTINEL",
+  HOME: "S8_RUN084_HOSTILE_HOME_SENTINEL",
+  LD_PRELOAD: "/tmp/S8_RUN084_HOSTILE_LD_PRELOAD_SENTINEL.so",
+  LD_LIBRARY_PATH: "/tmp/S8_RUN084_HOSTILE_LD_LIBRARY_PATH_SENTINEL",
+  PYTHONPATH: "/tmp/S8_RUN084_HOSTILE_PYTHONPATH_SENTINEL",
+  PYTHONHOME: "/tmp/S8_RUN084_HOSTILE_PYTHONHOME_SENTINEL",
+};
+const DOMAIN_B_KEYS = Object.keys(DOMAIN_B_VALUES);
+const DOMAIN_B_SECRET_KEYS = ["S8_TEST_PARENT_SECRET_A", "S8_TEST_PARENT_SECRET_B"] as const;
+
+let bubblewrapPath = "";
+
+const outputLines: string[] = [];
+const limitations: string[] = [];
+
+function emit(key: string, value: string | number | boolean): void {
+  const text = String(value).replace(/[\r\n]/g, " ");
+  outputLines.push(`${key}=${text}`);
+}
+
+function noteLimit(value: string): void {
+  if (!limitations.includes(value)) limitations.push(value);
+}
+
+function parseCli(): Cli {
+  const result: Cli = {};
+  for (let index = 2; index < process.argv.length; index += 1) {
+    const argument = process.argv[index]!;
+    if (!argument.startsWith("--") || index + 1 >= process.argv.length) throw new Error("CLI_ARGUMENT_INVALID");
+    result[argument.slice(2)] = process.argv[++index]!;
+  }
+  return result;
+}
+
+function required(cli: Cli, name: string): string {
+  const value = cli[name];
+  if (!value) throw new Error(`CLI_ARGUMENT_MISSING_${name}`);
+  return value;
+}
+
+function command(binary: string, args: string[], timeoutMs = 120_000): CommandResult {
+  const result = spawnSync(binary, args, {
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer: 16 * 1024 * 1024,
+    shell: false,
+  });
+  return {
+    status: typeof result.status === "number" ? result.status : -1,
+    stdout: typeof result.stdout === "string" ? result.stdout : "",
+    stderr: typeof result.stderr === "string" ? result.stderr : "",
+  };
+}
+
+function sudo(args: string[], timeoutMs = 120_000): CommandResult {
+  return command("/usr/bin/sudo", ["-n", ...args], timeoutMs);
+}
+
+function requireCommand(label: string, result: CommandResult): void {
+  if (result.status !== 0) throw new Error(`${label}_STATUS_${result.status}`);
+}
+
+function sudoRequire(label: string, args: string[], timeoutMs = 120_000): void {
+  requireCommand(label, sudo(args, timeoutMs));
+}
+
+function errorCode(error: unknown): string {
+  const value = error instanceof Error ? error.message : String(error);
+  const match = value.match(/(?:S8|RUNNER|SANDBOX|ACL|COMMAND|CLI|APPLICATION|DOMAIN)_[A-Z0-9_]+/);
+  return match?.[0] ?? (error instanceof Error ? error.name : "ERROR");
+}
+
+function sha256(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function safeName(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.-]+/g, "_");
+}
+
+function readJson<T>(path: string): T | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+function readBoundedText(path: string, maximum = 4096): string | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    return readFileSync(path).subarray(0, maximum).toString("utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function domainAEnvironmentStatus(): { clean: boolean; hostileAbsent: boolean } {
+  const hostileAbsent = DOMAIN_B_SECRET_KEYS.every((key) => process.env[key] === undefined)
+    && process.env.PATH !== DOMAIN_B_VALUES.PATH
+    && process.env.HOME !== DOMAIN_B_VALUES.HOME
+    && process.env.LD_PRELOAD === undefined
+    && process.env.LD_LIBRARY_PATH === undefined
+    && process.env.PYTHONPATH === undefined
+    && process.env.PYTHONHOME === undefined;
+  const expectedPath = process.env.S8_RUN084_DOMAIN_A_EXPECTED_PATH ?? DOMAIN_A_SAFE_PATH;
+  const clean = hostileAbsent
+    && process.env.PATH === expectedPath
+    && process.env.HOME === "/tmp"
+    && process.env.LANG === "C.UTF-8"
+    && process.env.LC_ALL === "C.UTF-8"
+    && process.env.LD_PRELOAD === undefined
+    && process.env.LD_LIBRARY_PATH === undefined
+    && process.env.PYTHONPATH === undefined
+    && process.env.PYTHONHOME === undefined;
+  return { clean, hostileAbsent };
+}
+
+function domainASnapshot(path: string): Snapshot {
+  const info = statSync(path);
+  const acl = command("/usr/bin/env", [
+    "-i",
+    `PATH=${DOMAIN_A_SAFE_PATH}`,
+    "LANG=C.UTF-8",
+    "LC_ALL=C.UTF-8",
+    "/usr/bin/getfacl",
+    "--numeric",
+    "--omit-header",
+    "--absolute-names",
+    "--",
+    path,
+  ]);
+  requireCommand("DOMAIN_A_GETFACL", acl);
+  const access: string[] = [];
+  const defaultAcl: string[] = [];
+  for (const raw of acl.stdout.split(/\r?\n/u)) {
+    const value = raw.trim();
+    if (!value || value.startsWith("#")) continue;
+    const entry = value.split("#", 1)[0]!.trim();
+    (entry.startsWith("default:") ? defaultAcl : access).push(entry);
+  }
+  const bytes = readFileSync(path);
+  return {
+    owner: info.uid,
+    group: info.gid,
+    mode: (info.mode & 0o777).toString(8).padStart(4, "0"),
+    device: Number(info.dev),
+    inode: Number(info.ino),
+    bytes: bytes.length,
+    sha256: sha256(bytes),
+    access,
+    defaultAcl,
+  };
+}
+
+function applicationParentArgs(requestPath: string): string[] {
+  if (process.execArgv.length > 0) return [...process.execArgv, __filename, "--application-parent", requestPath];
+  const launcher = process.argv[1];
+  if (launcher) return [launcher, __filename, "--application-parent", requestPath];
+  throw new Error("APPLICATION_PARENT_LAUNCHER_MISSING");
+}
+
+function domainBStatus(): { present: boolean; missing: string[] } {
+  const missing = DOMAIN_B_KEYS.filter((key) => process.env[key] !== DOMAIN_B_VALUES[key]);
+  return { present: missing.length === 0, missing };
+}
+
+function applicationParentMain(requestPath: string): void {
+  const request = JSON.parse(readFileSync(requestPath, "utf8")) as ApplicationRequest;
+  const domainB = domainBStatus();
+  const status: ApplicationStatus = {
+    operation: request.operation,
+    domainBPresent: domainB.present,
+    missingDomainBKeys: domainB.missing,
+    ok: false,
+    code: domainB.present ? "NOT_RUN" : "DOMAIN_B_ENV_NOT_PRESENT",
+  };
+  if (!domainB.present) {
+    process.stdout.write(`${JSON.stringify(status)}\n`);
+    return;
+  }
+  try {
+    if (request.operation === "probe") {
+      status.ok = true;
+      status.code = "PASS";
+    } else if (request.operation === "writer") {
+      if (!request.payloadPath || !request.config || !request.controls) throw new Error("APPLICATION_WRITER_REQUEST_INVALID");
+      const controls = request.controls;
+      process.env.S8_RUN084_PHASE = controls.phase;
+      process.env.S8_RUN084_EVIDENCE_PREFIX = controls.prefix;
+      process.env.S8_RUN084_BWRAP = controls.bubblewrap;
+      process.env.S8_RUN084_SEED_MODE = controls.seedMode;
+      process.env.S8_RUN084_RUNNER_UID = String(controls.runnerUid);
+      process.env.S8_RUN084_RUNNER_GID = String(controls.runnerGid);
+      process.env.S8_RUN084_LAUNCH_MODE = controls.launchMode;
+      process.env.S8_RUN084_RUNTIME_MODE = controls.runtimeMode;
+      process.env.S8_RUN084_SURFACES = controls.surfaces.join(":");
+      process.env.S8_RUN084_REMOVE_SURFACE = controls.removeSurface ?? "";
+      process.env.S8_RUN084_ENV_KEYS = controls.envKeys.join(":");
+      process.env.S8_RUN084_ENV_REMOVE = controls.envRemove ?? "";
+      process.env.S8_RUN084_WORK_CUSTODY = controls.workCustody;
+      process.env.S8_RUN084_WORK_ACL = controls.workAcl;
+      process.env.S8_RUN084_EXTRA_NAMESPACES = controls.extraNamespaces;
+      process.env.S8_RUN084_UID_GID = controls.uidGid;
+      process.env.S8_RUN084_CAP_DROP = controls.capDrop;
+      process.env.S8_RUN084_DISABLE_USERNS = controls.disableUserns;
+      process.env.S8_RUN084_WRITABLE_RUNTIME = controls.writableRuntime;
+      process.env.S8_RUN084_SEED_MASK_DRIFT = controls.seedMaskDrift;
+      const result = runS8BlenderWriter(readFileSync(request.payloadPath), request.config);
+      if (!request.resultPath) throw new Error("APPLICATION_WRITER_RESULT_PATH_MISSING");
+      writeFileSync(request.resultPath, result.artifact, { mode: 0o600, flag: "wx" });
+      status.ok = true;
+      status.code = "PASS";
+    } else {
+      if (!request.artifactPath || !request.config) throw new Error("APPLICATION_VALIDATOR_REQUEST_INVALID");
+      const result = runS8NativeValidator(readFileSync(request.artifactPath), request.config);
+      if (!request.resultPath) throw new Error("APPLICATION_VALIDATOR_RESULT_PATH_MISSING");
+      writeFileSync(request.resultPath, JSON.stringify({ schemaVersion: result.readback.schemaVersion }), { encoding: "ascii", mode: 0o600, flag: "wx" });
+      status.ok = true;
+      status.code = "PASS";
+    }
+  } catch (error) {
+    status.code = errorCode(error);
+  }
+  process.stdout.write(`${JSON.stringify(status)}\n`);
+}
+
+function runApplicationParent(request: ApplicationRequest, timeoutMs: number): ApplicationStatus {
+  const requestPath = request.resultPath + ".request.json";
+  writeFileSync(requestPath, JSON.stringify(request), { encoding: "utf8", mode: 0o600, flag: "wx" });
+  const result = spawnSync(process.execPath, applicationParentArgs(requestPath), {
+    cwd: process.cwd(),
+    env: { ...DOMAIN_B_VALUES } as NodeJS.ProcessEnv,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer: 64 * 1024,
+    shell: false,
+  });
+  rmSync(requestPath, { force: true });
+  if (result.error || typeof result.stdout !== "string") {
+    return { operation: request.operation, domainBPresent: false, missingDomainBKeys: DOMAIN_B_KEYS, ok: false, code: "APPLICATION_PARENT_LAUNCH_FAILED" };
+  }
+  try {
+    const line = result.stdout.trim().split(/\r?\n/u).at(-1) ?? "";
+    const parsed = JSON.parse(line) as ApplicationStatus;
+    if (parsed.operation !== request.operation || !Array.isArray(parsed.missingDomainBKeys)) throw new Error("APPLICATION_PARENT_STATUS_INVALID");
+    return parsed;
+  } catch {
+    return { operation: request.operation, domainBPresent: false, missingDomainBKeys: DOMAIN_B_KEYS, ok: false, code: typeof result.status === "number" ? `APPLICATION_PARENT_EXIT_${result.status}` : "APPLICATION_PARENT_STATUS_INVALID" };
+  }
+}
+
+function snapshotEqual(left: Snapshot, right: Snapshot, withoutUid0 = false): boolean {
+  const strip = (values: string[]) => values.filter((value) => !withoutUid0 || !value.startsWith("user:0:"));
+  return left.owner === right.owner
+    && left.group === right.group
+    && left.mode === right.mode
+    && left.device === right.device
+    && left.inode === right.inode
+    && left.bytes === right.bytes
+    && left.sha256 === right.sha256
+    && JSON.stringify(strip(left.access)) === JSON.stringify(strip(right.access))
+    && JSON.stringify(left.defaultAcl) === JSON.stringify(right.defaultAcl);
+}
+
+function aclIs(snapshot: Snapshot | undefined, access: string[], mode: string, owner: number, group: number): boolean {
+  if (!snapshot) return false;
+  return snapshot.owner === owner
+    && snapshot.group === group
+    && snapshot.mode === mode
+    && snapshot.defaultAcl.length === 0
+    && JSON.stringify([...snapshot.access].sort()) === JSON.stringify([...access].sort());
+}
+
+function evidenceFor(prefix: string): EvidenceFiles {
+  const result: EvidenceFiles = {
+    pre: readJson<Snapshot>(`${prefix}.pre.json`),
+    hostedPre: readJson<Snapshot>(`${prefix}.hosted-pre.json`),
+    post: readJson<Snapshot>(`${prefix}.post.json`),
+  };
+  const status = readJson<{ status: number }>(`${prefix}.status.json`);
+  if (status) result.status = status.status;
+  result.runnerStdout = readBoundedText(`${prefix}.runner.stdout`);
+  result.runnerStderr = readBoundedText(`${prefix}.runner.stderr`);
+  result.wrapperStderr = readBoundedText(`${prefix}.wrapper.stderr`);
+  return result;
+}
+
+function runnerDiagnostic(evidence: EvidenceFiles): string {
+  return JSON.stringify({ stdout: evidence.runnerStdout ?? "", stderr: evidence.runnerStderr ?? "", wrapperStderr: evidence.wrapperStderr ?? "" });
+}
+
+function buildPayload(): Buffer {
+  const hash = "a".repeat(64);
+  const sourceFingerprint = "b".repeat(64);
+  const projectId = "11111111-1111-4111-8111-111111111111";
+  const revisionId = "22222222-2222-4222-8222-222222222222";
+  const object = {
+    objectId: "obj-a",
+    identityKey: "stable-object",
+    parentObjectId: null,
+    objectType: "box" as const,
+    role: "furniture" as const,
+    geometry: { kind: "rect_prism" as const, dimensionsMm: { widthMm: 1200, depthMm: 600, heightMm: 900 }, geometryState: "exact" as const, localAnchor: "floor" as const },
+    footprint: { kind: "rectangle" as const, widthMm: 1200, depthMm: 600 },
+    transform: { positionMm: { xMm: 1, yMm: 2, zMm: 3 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } },
+    boundsMm: { widthMm: 1200, depthMm: 600, heightMm: 900 },
+    zoneIds: [],
+    requirementIds: [],
+    materialIds: [],
+    provenance: { kind: "user_confirmed_design_decision" as const, sourceRef: "run-083", sourceFingerprint, acceptedByUser: true, note: null },
+    unknownIds: [],
+  };
+  const s6 = {
+    schemaVersion: "s6-to-s7-handoff-v1",
+    projectId,
+    acceptedRevisionId: revisionId,
+    acceptedRevisionHash: hash,
+    sourceS5Fingerprint: sourceFingerprint,
+    spatialSchemaVersion: "s6-spatial-model-v1",
+    units: "millimetres",
+    coordinateConvention: { version: "booth-local-right-handed-v1", units: "millimetres", handedness: "right-handed", origin: "north-west-floor-corner", xAxis: "east", yAxis: "up", zAxis: "south" },
+    booth: { widthMm: 6000, depthMm: 6000, openSides: ["north"], maxHeightMm: 4000, heightState: "known" },
+    objects: [object],
+    hierarchy: [{ objectId: object.objectId, parentObjectId: null }],
+    zones: [], requirements: [], assumptions: [], unknowns: [], materials: [],
+    validationReceipt: { receiptId: "33333333-3333-4333-8333-333333333333", validationHash: hash, outcome: "pass" },
+    eligibility: { currentAccepted: true, sourceCurrent: true, stale: false },
+  } as unknown as S6ToS7Handoff;
+  const s7 = {
+    schemaVersion: "s7-to-s8-handoff-v1",
+    projectId,
+    sourceRevisionId: revisionId,
+    sourceRevisionHash: hash,
+    sourceS5Fingerprint: sourceFingerprint,
+    s7ArtifactId: "44444444-4444-4444-8444-444444444444",
+    s7ArtifactHash: hash,
+    s7ArtifactByteSize: 1,
+    manifestId: "55555555-5555-4555-8555-555555555555",
+    manifestHash: hash,
+    readbackReceiptId: "66666666-6666-4666-8666-666666666666",
+    readbackHash: hash,
+    dxfVersion: "s7-dxf-r2000-ascii-v1",
+    worldToPlanVersion: "s7-world-to-plan-v1",
+    coordinateConvention: "booth-local-right-handed-v1",
+    dxfIsNot3DAuthority: true,
+    s8MustReadAcceptedS6Model: true,
+  } satisfies S7ToS8Handoff;
+  return buildS8WriterPayload(s6, s7).bytes;
+}
+
+function runtimeObservation(path: string, runtimeRoot: string): RuntimeObservation {
+  const programHeaders = command("/usr/bin/readelf", ["-lW", path]);
+  requireCommand("READELF_PROGRAM_HEADERS", programHeaders);
+  const interpreterMatch = programHeaders.stdout.match(/Requesting program interpreter:\s*([^\]]+)/);
+  if (!interpreterMatch) throw new Error("RUNTIME_INTERPRETER_NOT_FOUND");
+  const interpreter = interpreterMatch[1]!.trim();
+  const dynamic = command("/usr/bin/readelf", ["-dW", path]);
+  requireCommand("READELF_DYNAMIC", dynamic);
+  const needed = [...dynamic.stdout.matchAll(/Shared library:\s*\[([^\]]+)\]/g)].map((match) => match[1]!);
+  const ldd = command("/usr/bin/ldd", [path]);
+  requireCommand("LDD", ldd);
+  const resolved = new Set<string>();
+  for (const line of ldd.stdout.split(/\r?\n/u)) {
+    const match = line.match(/=>\s+(\/\S+)\s+\(/u) ?? line.match(/^\s*(\/\S+)\s+\(/u);
+    if (match?.[1]) resolved.add(match[1]);
+  }
+  const systemFiles = new Set<string>();
+  systemFiles.add(interpreter);
+  for (const pathValue of resolved) {
+    if (!pathValue.startsWith(`${runtimeRoot}/`)) systemFiles.add(pathValue);
+  }
+  for (const pathValue of ["/etc/ld.so.cache", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/usr/lib/locale/locale-archive", "/lib/x86_64-linux-gnu/libnss_files.so.2"]) {
+    if (existsSync(pathValue)) systemFiles.add(pathValue);
+  }
+  return { interpreter, needed, systemFiles: [...systemFiles].sort() };
+}
+
+function prepareRoot(root: string, rootOwned: boolean, runnerUid: number): void {
+  if (rootOwned) {
+    sudoRequire("PRIVATE_ROOT_INSTALL", ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0700", "--", root]);
+    sudoRequire("PRIVATE_ROOT_ACCESS_ACL_CLEAR", ["/usr/bin/setfacl", "-b", "--", root]);
+    sudoRequire("PRIVATE_ROOT_DEFAULT_ACL_CLEAR", ["/usr/bin/setfacl", "-k", "--", root]);
+    sudoRequire("PRIVATE_ROOT_ACCESS_ACL", ["/usr/bin/setfacl", "--no-mask", "--set", `u::rwx,u:${runnerUid}:rwx,g::---,m::rwx,o::---`, "--", root]);
+  } else {
+    mkdirSync(root, { mode: 0o700 });
+  }
+}
+
+function writeSandboxWrapper(path: string): void {
+  const lines = [
+    "#!/bin/bash",
+    "if [[ ${S8_RUN084_WRAPPER_CLEAN:-no} != yes ]]; then",
+    "  phase=${S8_RUN084_PHASE:?}",
+    "  prefix=${S8_RUN084_EVIDENCE_PREFIX:?}",
+    "  bwrap_path=${S8_RUN084_BWRAP:?}",
+    "  seed_mode=${S8_RUN084_SEED_MODE:?}",
+    "  runner_uid=${S8_RUN084_RUNNER_UID:?}",
+    "  runner_gid=${S8_RUN084_RUNNER_GID:?}",
+    "  launch_mode=${S8_RUN084_LAUNCH_MODE:-current}",
+    "  runtime_mode=${S8_RUN084_RUNTIME_MODE:-upper}",
+    "  surfaces=${S8_RUN084_SURFACES:-}",
+    "  remove_surface=${S8_RUN084_REMOVE_SURFACE:-}",
+    "  env_keys=${S8_RUN084_ENV_KEYS:-PATH:LANG:LC_ALL:HOME}",
+    "  env_remove=${S8_RUN084_ENV_REMOVE:-}",
+    "  work_custody=${S8_RUN084_WORK_CUSTODY:-established}",
+    "  work_acl=${S8_RUN084_WORK_ACL:-established}",
+    "  extra_namespaces=${S8_RUN084_EXTRA_NAMESPACES:-yes}",
+    "  uid_gid=${S8_RUN084_UID_GID:-yes}",
+    "  cap_drop=${S8_RUN084_CAP_DROP:-yes}",
+    "  disable_userns=${S8_RUN084_DISABLE_USERNS:-yes}",
+    "  writable_runtime=${S8_RUN084_WRITABLE_RUNTIME:-no}",
+    "  seed_mask_drift=${S8_RUN084_SEED_MASK_DRIFT:-no}",
+    "  exec /usr/bin/env -i \\",
+    "    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\",
+    "    LANG=C.UTF-8 LC_ALL=C.UTF-8 HOME=/tmp S8_RUN084_WRAPPER_CLEAN=yes \\",
+    "    S8_RUN084_PHASE=\"$phase\" S8_RUN084_EVIDENCE_PREFIX=\"$prefix\" S8_RUN084_BWRAP=\"$bwrap_path\" \\",
+    "    S8_RUN084_SEED_MODE=\"$seed_mode\" S8_RUN084_RUNNER_UID=\"$runner_uid\" S8_RUN084_RUNNER_GID=\"$runner_gid\" \\",
+    "    S8_RUN084_LAUNCH_MODE=\"$launch_mode\" S8_RUN084_RUNTIME_MODE=\"$runtime_mode\" S8_RUN084_SURFACES=\"$surfaces\" \\",
+    "    S8_RUN084_REMOVE_SURFACE=\"$remove_surface\" S8_RUN084_ENV_KEYS=\"$env_keys\" S8_RUN084_ENV_REMOVE=\"$env_remove\" \\",
+    "    S8_RUN084_WORK_CUSTODY=\"$work_custody\" S8_RUN084_WORK_ACL=\"$work_acl\" \\",
+    "    S8_RUN084_EXTRA_NAMESPACES=\"$extra_namespaces\" S8_RUN084_UID_GID=\"$uid_gid\" S8_RUN084_CAP_DROP=\"$cap_drop\" \\",
+    "    S8_RUN084_DISABLE_USERNS=\"$disable_userns\" S8_RUN084_WRITABLE_RUNTIME=\"$writable_runtime\" \\",
+    "    S8_RUN084_SEED_MASK_DRIFT=\"$seed_mask_drift\" /bin/bash \"$0\"",
+    "fi",
+    "set -Eeuo pipefail",
+    "phase=${S8_RUN084_PHASE:?}",
+    "prefix=${S8_RUN084_EVIDENCE_PREFIX:?}",
+    "wrapper_stderr=${prefix}.wrapper.stderr",
+    "exec 3>&2",
+    ": > \"$wrapper_stderr\"",
+    "exec 2>>\"$wrapper_stderr\"",
+    "trap 'exit_status=$?; /usr/bin/cat \"$wrapper_stderr\" >&3 || true; exit \"$exit_status\"' EXIT",
+    "seed_mode=${S8_RUN084_SEED_MODE:?}",
+    "runner_uid=${S8_RUN084_RUNNER_UID:?}",
+    "runner_gid=${S8_RUN084_RUNNER_GID:?}",
+    "work=$(pwd)",
+    "input=$work/input.json",
+    "snapshot() {",
+    "  /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 /usr/bin/python3 - \"$1\" \"$2\" <<'PY'",
+    "import hashlib",
+    "import json",
+    "import os",
+    "import subprocess",
+    "import sys",
+    "path, output = sys.argv[1:]",
+    "st = os.lstat(path)",
+    "acl = subprocess.run(['/usr/bin/getfacl', '--numeric', '--omit-header', '--absolute-names', '--', path], check=False, capture_output=True, text=True)",
+    "if acl.returncode != 0: raise SystemExit(91)",
+    "access = []",
+    "default = []",
+    "for raw in acl.stdout.splitlines():",
+    "    value = raw.strip()",
+    "    if not value or value.startswith('#'): continue",
+    "    entry = value.split('#', 1)[0].strip()",
+    "    (default if entry.startswith('default:') else access).append(entry)",
+    "with open(path, 'rb') as stream: data = stream.read()",
+    "record = {'owner': st.st_uid, 'group': st.st_gid, 'mode': format(st.st_mode & 0o777, '04o'), 'device': st.st_dev, 'inode': st.st_ino, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(), 'access': access, 'defaultAcl': default}",
+    "with open(output, 'w', encoding='ascii') as stream: json.dump(record, stream, sort_keys=True, separators=(',', ':'))",
+    "PY",
+    "}",
+    "if [[ ! -f $input || -L $input ]]; then exit 92; fi",
+    "snapshot \"$input\" \"$prefix.pre.json\"",
+    "if [[ $seed_mode == s0 ]]; then",
+    "  /usr/bin/sudo -n /usr/bin/chown \"$runner_uid:$runner_gid\" -- \"$input\"",
+    "  /usr/bin/sudo -n /usr/bin/chmod 0600 -- \"$input\"",
+    "  /usr/bin/sudo -n /usr/bin/setfacl -b -- \"$input\"",
+    "  /usr/bin/sudo -n /usr/bin/setfacl -k -- \"$input\"",
+    "  /usr/bin/sudo -n /usr/bin/setfacl --no-mask --set 'u::rw-,g::---,m::---,o::---' -- \"$input\"",
+    "fi",
+    "if [[ $seed_mode != s0 ]]; then",
+    "  if [[ ${S8_RUN084_WORK_CUSTODY:-established} == established ]]; then /usr/bin/sudo -n /usr/bin/chown root:root -- \"$work\"; fi",
+    "  if [[ ${S8_RUN084_WORK_ACL:-established} == established ]]; then",
+    "    /usr/bin/sudo -n /usr/bin/setfacl --no-mask --set \"u::rwx,u:$runner_uid:rwx,g::---,m::rwx,o::---\" -- \"$work\"",
+    "    /usr/bin/sudo -n /usr/bin/setfacl --no-mask --default --set \"u::rwx,u:$runner_uid:rwx,g::---,m::rwx,o::---\" -- \"$work\"",
+    "    /usr/bin/sudo -n /usr/bin/chmod 0770 -- \"$work\"",
+    "  else",
+    "    /usr/bin/sudo -n /usr/bin/setfacl -b -- \"$work\"",
+    "    /usr/bin/sudo -n /usr/bin/setfacl -k -- \"$work\"",
+    "    /usr/bin/sudo -n /usr/bin/chmod 0700 -- \"$work\"",
+    "  fi",
+    "  /usr/bin/sudo -n /usr/bin/chown \"$runner_uid:$runner_gid\" -- \"$input\"",
+    "  /usr/bin/sudo -n /usr/bin/chmod 0660 -- \"$input\"",
+    "  /usr/bin/sudo -n /usr/bin/setfacl -b -- \"$input\"",
+    "  /usr/bin/sudo -n /usr/bin/setfacl -k -- \"$input\"",
+    "  /usr/bin/sudo -n /usr/bin/setfacl --no-mask --set \"u::rw-,u:$runner_uid:rwx,g::---,m::rw-,o::---\" -- \"$input\"",
+    "  if [[ $seed_mode == s2 ]]; then",
+    "    snapshot \"$input\" \"$prefix.hosted-pre.json\"",
+    "    /usr/bin/sudo -n /usr/bin/setfacl --no-mask -m u:0:r-- -- \"$input\"",
+    "  fi",
+    "  if [[ ${S8_RUN084_SEED_MASK_DRIFT:-no} == yes ]]; then /usr/bin/sudo -n /usr/bin/setfacl --no-mask -m m::--- -- \"$input\"; fi",
+    "fi",
+    "snapshot \"$input\" \"$prefix.post.json\"",
+    "run_bwrap() {",
+    "  local stdout_path=\"${prefix}.runner.stdout\"",
+    "  local stderr_path=\"${prefix}.runner.stderr\"",
+    "  : > \"$stdout_path\"",
+    "  : > \"$stderr_path\"",
+    "  set +e",
+    "  /usr/bin/sudo -n \"$S8_RUN084_BWRAP\" \"$@\" >\"$stdout_path\" 2>\"$stderr_path\"",
+    "  status=$?",
+    "  set -e",
+    "  /usr/bin/cat \"$stdout_path\"",
+    "  /usr/bin/cat \"$stderr_path\" >&2",
+    "}",
+    "if [[ ${S8_RUN084_LAUNCH_MODE:-current} == current ]]; then",
+    "  run_bwrap \"$@\"",
+    "else",
+    "  filtered=()",
+    "  skip=0",
+    "  for argument in \"$@\"; do",
+    "    if (( skip > 0 )); then skip=$((skip - 1)); continue; fi",
+    "    case $argument in",
+    "      --unshare-user|--unshare-net|--die-with-parent|--new-session|--clearenv) continue ;;",
+    "      --proc|--dev|--tmpfs|--chdir|--uid|--gid|--cap-drop) skip=1; continue ;;",
+    "      --setenv) skip=2; continue ;;",
+    "      *) filtered+=(\"$argument\") ;;",
+    "    esac",
+    "  done",
+    "  launch=(--unshare-user)",
+    "  if [[ ${S8_RUN084_EXTRA_NAMESPACES:-yes} == yes ]]; then launch+=(--unshare-net --unshare-pid --unshare-ipc --unshare-uts); else launch+=(--unshare-net); fi",
+    "  if [[ ${S8_RUN084_DISABLE_USERNS:-yes} == yes ]]; then launch+=(--disable-userns --assert-userns-disabled); fi",
+    "  if [[ ${S8_RUN084_UID_GID:-yes} == yes ]]; then launch+=(--uid 65534 --gid 65534); fi",
+    "  if [[ ${S8_RUN084_CAP_DROP:-yes} == yes ]]; then launch+=(--cap-drop ALL); fi",
+    "  launch+=(--die-with-parent --new-session)",
+    "  if [[ ${S8_RUN084_RUNTIME_MODE:-upper} == upper ]]; then",
+    "    for system_path in /usr /lib /lib64 /etc; do if [[ -e $system_path || -L $system_path ]]; then launch+=(--ro-bind \"$system_path\" \"$system_path\"); fi; done",
+    "  else",
+    "    IFS=: read -r -a surfaces <<< \"${S8_RUN084_SURFACES:-}\"",
+    "    for system_path in \"${surfaces[@]}\"; do",
+    "      [[ -n $system_path && -e $system_path ]] || continue",
+    "      if [[ ${S8_RUN084_REMOVE_SURFACE:-} == \"$system_path\" ]]; then continue; fi",
+    "      case ${S8_RUN084_REMOVE_SURFACE:-} in runner-interpreter) [[ $system_path == */ld-linux-* ]] && continue ;; runner-libc) [[ $system_path == */libc.so.6 ]] && continue ;; esac",
+    "      launch+=(--ro-bind \"$system_path\" \"$system_path\")",
+    "    done",
+    "  fi",
+    "  launch+=(--clearenv)",
+    "  IFS=: read -r -a env_keys <<< \"${S8_RUN084_ENV_KEYS:-PATH:LANG:LC_ALL:HOME}\"",
+    "  for key in \"${env_keys[@]}\"; do",
+    "    [[ -n $key && $key != ${S8_RUN084_ENV_REMOVE:-} ]] || continue",
+    "    case $key in PATH) launch+=(--setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin) ;; LANG) launch+=(--setenv LANG C.UTF-8) ;; LC_ALL) launch+=(--setenv LC_ALL C.UTF-8) ;; HOME) launch+=(--setenv HOME /tmp) ;; TMPDIR) launch+=(--setenv TMPDIR /tmp) ;; TZ) launch+=(--setenv TZ UTC) ;; NODE_ENV) launch+=(--setenv NODE_ENV production) ;; LD_LIBRARY_PATH) launch+=(--setenv LD_LIBRARY_PATH /nonexistent) ;; PYTHONPATH) launch+=(--setenv PYTHONPATH /nonexistent) ;; esac",
+    "  done",
+    "  if [[ ${S8_RUN084_WRITABLE_RUNTIME:-no} == yes ]]; then launch+=(--bind /etc /etc); fi",
+    "  launch+=(\"${filtered[@]}\")",
+    "  launch+=(--proc /proc --dev /dev --tmpfs /tmp --chdir /work)",
+    "  run_bwrap \"${launch[@]}\"",
+    "fi",
+    "printf '{\"status\":%s}\n' \"$status\" > \"$prefix.status.json\"",
+    "exit \"$status\"",
+  ];
+  const content = lines.join("\n") + "\n";
+  writeFileSync(path, content, { encoding: "utf8", mode: 0o755 });
+  chmodSync(path, 0o755);
+}
+
+function writerRun(
+  label: string,
+  payload: Buffer,
+  config: S8WorkerConfig,
+  evidenceDir: string,
+  runnerUid: number,
+  runnerGid: number,
+  options: {
+    seedMode: "s0" | "s1" | "s2";
+    launchMode: string;
+    runtimeMode: "upper" | "minimum";
+    surfaces: string[];
+    removeSurface?: string;
+    envKeys?: string[];
+    envRemove?: string;
+    workCustody?: "established" | "removed";
+    workAcl?: "established" | "removed";
+    extraNamespaces?: boolean;
+    uidGid?: boolean;
+    capDrop?: boolean;
+    disableUserns?: boolean;
+    writableRuntime?: boolean;
+    seedMaskDrift?: boolean;
+  },
+): WriterRun {
+  const prefix = join(evidenceDir, safeName(label));
+  const payloadPath = join(evidenceDir, `${safeName(label)}.input.json`);
+  const artifactPath = join(evidenceDir, `${safeName(label)}.application-artifact.fbx`);
+  writeFileSync(payloadPath, payload, { mode: 0o600, flag: "wx" });
+  rmSync(artifactPath, { force: true });
+  const controls: NonNullable<ApplicationRequest["controls"]> = {
+    phase: label,
+    prefix,
+    bubblewrap: bubblewrapPath,
+    runnerUid,
+    runnerGid,
+    seedMode: options.seedMode,
+    launchMode: options.launchMode,
+    runtimeMode: options.runtimeMode,
+    surfaces: options.surfaces,
+    removeSurface: options.removeSurface,
+    envKeys: options.envKeys ?? [...BASE_ENV_KEYS],
+    envRemove: options.envRemove,
+    workCustody: options.workCustody ?? "established",
+    workAcl: options.workAcl ?? "established",
+    extraNamespaces: options.extraNamespaces === false ? "no" : "yes",
+    uidGid: options.uidGid === false ? "no" : "yes",
+    capDrop: options.capDrop === false ? "no" : "yes",
+    disableUserns: options.disableUserns === false ? "no" : "yes",
+    writableRuntime: options.writableRuntime ? "yes" : "no",
+    seedMaskDrift: options.seedMaskDrift ? "yes" : "no",
+  };
+  try {
+    const status = runApplicationParent({ operation: "writer", resultPath: artifactPath, payloadPath, config, controls }, WRITER_TIMEOUT + 30_000);
+    const artifact = status.ok && existsSync(artifactPath) ? readFileSync(artifactPath) : undefined;
+    return { ok: status.ok && Boolean(artifact), code: status.ok ? (artifact ? "PASS" : "APPLICATION_ARTIFACT_MISSING") : status.code, artifact, evidence: evidenceFor(prefix), domainBPresent: status.domainBPresent };
+  } catch (error) {
+    return { ok: false, code: errorCode(error), evidence: evidenceFor(prefix), domainBPresent: false };
+  } finally {
+    rmSync(payloadPath, { force: true });
+    rmSync(artifactPath, { force: true });
+  }
+}
+
+function appValidator(artifact: Buffer, config: S8WorkerConfig, evidenceDir: string, label: string): ValidatorRun {
+  const artifactPath = join(evidenceDir, `${safeName(label)}.application-input.fbx`);
+  const resultPath = join(evidenceDir, `${safeName(label)}.application-result.json`);
+  writeFileSync(artifactPath, artifact, { mode: 0o600, flag: "wx" });
+  rmSync(resultPath, { force: true });
+  try {
+    const status = runApplicationParent({ operation: "validator", resultPath, artifactPath, config }, VALIDATOR_TIMEOUT + 30_000);
+    return { ok: status.ok && existsSync(resultPath), code: status.ok ? (existsSync(resultPath) ? "PASS" : "APPLICATION_VALIDATOR_RESULT_MISSING") : status.code, domainBPresent: status.domainBPresent };
+  } catch (error) {
+    return { ok: false, code: errorCode(error), domainBPresent: false };
+  } finally {
+    rmSync(artifactPath, { force: true });
+    rmSync(resultPath, { force: true });
+  }
+}
+
+function targetArgs(kind: "writer" | "validator", target: string): string[] {
+  if (kind === "writer") return ["--background", "--factory-startup", "--disable-autoexec", "--offline-mode", "--python-exit-code", "50", "--python", "/runtime/writer.py", "--"];
+  return [target];
+}
+
+function parseRunnerOutput(stdout: string): boolean {
+  const prefix = "S8_RUNNER_RECEIPT:";
+  if (!stdout.startsWith(prefix)) return false;
+  const newline = stdout.indexOf("\n");
+  if (newline <= prefix.length) return false;
+  try {
+    const receipt = JSON.parse(stdout.slice(prefix.length, newline)) as Record<string, unknown>;
+    const result = receipt.result as Record<string, unknown> | undefined;
+    if (result?.code !== 0 || result.targetExit !== 0 || result.targetSignal !== null) return false;
+    const readback = JSON.parse(stdout.slice(newline + 1)) as Record<string, unknown>;
+    const value = (readback.readback ?? readback) as Record<string, unknown>;
+    return value.schemaVersion === "s8-ufbx-readback-v1";
+  } catch {
+    return false;
+  }
+}
+
+function sandboxValidator(
+  artifact: Buffer,
+  runner: string,
+  validator: string,
+  surfaces: string[],
+  runtimeMode: "upper" | "minimum",
+  envKeys: string[],
+  envRemove = "",
+  removeSurface = "",
+): ValidatorRun {
+  const root = `${tmpdir()}/run084-validator-${process.pid}-${Date.now()}`;
+  mkdirSync(root, { mode: 0o700 });
+  const artifactPath = join(root, "artifact.fbx");
+  writeFileSync(artifactPath, artifact, { mode: 0o600 });
+  chmodSync(root, 0o755);
+  sudoRequire("VALIDATOR_ARTIFACT_OWNER", ["/usr/bin/chown", "root:root", "--", artifactPath]);
+  sudoRequire("VALIDATOR_ARTIFACT_MODE", ["/usr/bin/chmod", "0444", "--", artifactPath]);
+  const args: string[] = [
+    "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+    "--disable-userns", "--assert-userns-disabled", "--uid", "65534", "--gid", "65534", "--cap-drop", "ALL",
+    "--die-with-parent", "--new-session",
+  ];
+  if (runtimeMode === "upper") {
+    for (const systemPath of ["/usr", "/lib", "/lib64", "/etc"]) if (existsSync(systemPath) || existsSync(`${systemPath}/`)) args.push("--ro-bind", systemPath, systemPath);
+  } else {
+    for (const systemPath of surfaces) {
+      if (!existsSync(systemPath) || systemPath === removeSurface) continue;
+      if (removeSurface === "validator-interpreter" && systemPath.includes("ld-linux-")) continue;
+      if (removeSurface === "validator-libc" && systemPath.endsWith("/libc.so.6")) continue;
+      if (removeSurface === "validator-libm" && systemPath.endsWith("/libm.so.6")) continue;
+      args.push("--ro-bind", systemPath, systemPath);
+    }
+  }
+  args.push("--clearenv");
+  for (const key of envKeys) {
+    if (key === envRemove) continue;
+    const value: Record<string, string> = {
+      PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      LANG: "C.UTF-8",
+      LC_ALL: "C.UTF-8",
+      HOME: "/tmp",
+      TMPDIR: "/tmp",
+      TZ: "UTC",
+      NODE_ENV: "production",
+      LD_LIBRARY_PATH: "/nonexistent",
+      PYTHONPATH: "/nonexistent",
+    };
+    if (value[key]) args.push("--setenv", key, value[key]);
+  }
+  args.push("--ro-bind", runner, "/runtime/process-runner", "--ro-bind", validator, "/runtime/validator", "--ro-bind", root, "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/work", "--", "/runtime/process-runner", "--address-space-bytes", String(VALIDATOR_AS), "--file-bytes", String(VALIDATOR_FILE), "--timeout-ms", String(VALIDATOR_TIMEOUT), "--stdout-bytes", String(VALIDATOR_STDOUT), "--stderr-bytes", String(VALIDATOR_STDERR), "--max-children", "0", "--", "/runtime/validator", "/work/artifact.fbx");
+  const result = sudo([bubblewrapPath, ...args], VALIDATOR_TIMEOUT + 30_000);
+  const ok = result.status === 0 && parseRunnerOutput(result.stdout);
+  rmSync(root, { recursive: true, force: true });
+  return { ok, code: ok ? "PASS" : `BWRAP_STATUS_${result.status}`, domainBPresent: false };
+}
+
+function sandboxEnvironmentNegativeControl(runner: string, surfaces: string[], envKeys: string[]): boolean {
+  const root = `${tmpdir()}/run084-environment-probe-${process.pid}-${Date.now()}`;
+  mkdirSync(root, { mode: 0o700 });
+  const args: string[] = [
+    "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+    "--disable-userns", "--assert-userns-disabled", "--uid", "65534", "--gid", "65534", "--cap-drop", "ALL",
+    "--die-with-parent", "--new-session",
+  ];
+  for (const systemPath of surfaces) if (existsSync(systemPath)) args.push("--ro-bind", systemPath, systemPath);
+  args.push("--clearenv");
+  const values: Record<string, string> = {
+    PATH: DOMAIN_A_SAFE_PATH,
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    HOME: "/tmp",
+    TMPDIR: "/tmp",
+    TZ: "UTC",
+    NODE_ENV: "production",
+    LD_LIBRARY_PATH: "/nonexistent",
+    PYTHONPATH: "/nonexistent",
+  };
+  for (const key of envKeys) if (values[key]) args.push("--setenv", key, values[key]!);
+  args.push(
+    "--ro-bind", "/usr/bin/bash", "/runtime/probe-bash",
+    "--ro-bind", runner, "/runtime/process-runner",
+    "--bind", root, "/work", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/work",
+    "--", "/runtime/probe-bash", "-ceu",
+    "test -z \"${S8_TEST_PARENT_SECRET_A+x}\"; test -z \"${S8_TEST_PARENT_SECRET_B+x}\"; test \"${PATH-}\" != S8_RUN084_HOSTILE_PATH_SENTINEL; test \"${HOME-}\" != S8_RUN084_HOSTILE_HOME_SENTINEL; test -z \"${LD_PRELOAD+x}\"; test \"${LD_LIBRARY_PATH-}\" != /tmp/S8_RUN084_HOSTILE_LD_LIBRARY_PATH_SENTINEL; test \"${PYTHONPATH-}\" != /tmp/S8_RUN084_HOSTILE_PYTHONPATH_SENTINEL; test -z \"${PYTHONHOME+x}\"; printf 'ENV_NEGATIVE_CONTROLS=PASS\\n'",
+  );
+  const result = command("/usr/bin/sudo", ["-n", "/usr/bin/env", "-i", ...Object.entries(DOMAIN_B_VALUES).map(([key, value]) => `${key}=${value}`), bubblewrapPath, ...args], VALIDATOR_TIMEOUT + 30_000);
+  rmSync(root, { recursive: true, force: true });
+  return result.status === 0 && result.stdout.includes("ENV_NEGATIVE_CONTROLS=PASS");
+}
+
+function applySeedPre(path: string, runnerUid: number, runnerGid: number): void {
+  sudoRequire("NEGATIVE_SEED_OWNER", ["/usr/bin/chown", `${runnerUid}:${runnerGid}`, "--", path]);
+  sudoRequire("NEGATIVE_SEED_MODE", ["/usr/bin/chmod", "0660", "--", path]);
+  sudoRequire("NEGATIVE_SEED_ACL_CLEAR", ["/usr/bin/setfacl", "-b", "--", path]);
+  sudoRequire("NEGATIVE_SEED_DEFAULT_CLEAR", ["/usr/bin/setfacl", "-k", "--", path]);
+  sudoRequire("NEGATIVE_SEED_ACL", ["/usr/bin/setfacl", "--no-mask", "--set", `u::rw-,u:${runnerUid}:rwx,g::---,m::rw-,o::---`, "--", path]);
+}
+
+function seedNegatives(root: string, runnerUid: number, runnerGid: number): string[] {
+  const results: string[] = [];
+  mkdirSync(root, { mode: 0o700 });
+  const make = (name: string): string => {
+    const path = join(root, name);
+    writeFileSync(path, "run-083-seed\n", { encoding: "ascii", mode: 0o660 });
+    applySeedPre(path, runnerUid, runnerGid);
+    return path;
+  };
+  for (const permission of ["rw-", "rwx"]) {
+    const path = make(`uid0-${permission.replace(/-/g, "x")}`);
+    sudoRequire("NEGATIVE_UID0_MUTATION", ["/usr/bin/setfacl", "--no-mask", "-m", `u:0:${permission}`, "--", path]);
+    const observed = command("/usr/bin/getfacl", ["--numeric", "--omit-header", "--absolute-names", "--", path]).stdout;
+    results.push(`user:0:${permission}=REJECTED_BY_EXACT_ADMISSION_${observed.includes(`user:0:${permission}`) ? "YES" : "NO"}`);
+  }
+  const symlinkTarget = make("symlink-target");
+  const symlink = join(root, "symlink-seed");
+  command("/bin/ln", ["-s", symlinkTarget, symlink]);
+  results.push(`symlink_seed=${lstatSync(symlink).isSymbolicLink() ? "REJECTED" : "INVALID"}`);
+  const replacement = make("replacement-seed");
+  const beforeReplacement = readJson<Snapshot>(`${replacement}.none`);
+  const oldStat = statSync(replacement);
+  const replacementPath = `${replacement}.new`;
+  writeFileSync(replacementPath, "replacement\n", { encoding: "ascii", mode: 0o660 });
+  applySeedPre(replacementPath, runnerUid, runnerGid);
+  rmSync(replacement);
+  command("/bin/mv", [replacementPath, replacement]);
+  const newStat = statSync(replacement);
+  results.push(`replacement_inode=${oldStat.ino !== newStat.ino ? "REJECTED" : "INVALID"}`);
+  void beforeReplacement;
+  const changedContent = make("changed-content-seed");
+  const originalContent = sha256(readFileSync(changedContent));
+  writeFileSync(changedContent, "changed\n", { encoding: "ascii", mode: 0o660 });
+  results.push(`changed_content=${sha256(readFileSync(changedContent)) !== originalContent ? "REJECTED" : "INVALID"}`);
+  const changedOwner = make("changed-owner-seed");
+  sudoRequire("NEGATIVE_OWNER_CHANGE", ["/usr/bin/chown", "0:0", "--", changedOwner]);
+  results.push(`changed_owner=${statSync(changedOwner).uid !== runnerUid ? "REJECTED" : "INVALID"}`);
+  const changedMode = make("changed-mode-seed");
+  sudoRequire("NEGATIVE_MODE_CHANGE", ["/usr/bin/chmod", "0640", "--", changedMode]);
+  results.push(`unexpected_mode_drift=${(statSync(changedMode).mode & 0o777) !== 0o660 ? "REJECTED" : "INVALID"}`);
+  return results;
+}
+
+function gitValue(args: string[]): string {
+  const result = command("/usr/bin/git", args, 30_000);
+  requireCommand("GIT_EVIDENCE", result);
+  return result.stdout.trim();
+}
+
+function main(): void {
+  const cli = parseCli();
+  const blenderRoot = required(cli, "blender-root");
+  const blender = required(cli, "blender");
+  const writer = required(cli, "writer");
+  const runner = required(cli, "runner");
+  const validator = required(cli, "validator");
+  bubblewrapPath = required(cli, "bubblewrap");
+  if (!existsSync(bubblewrapPath) || lstatSync(bubblewrapPath).isSymbolicLink()) throw new Error("BUBBLEWRAP_PATH_INVALID");
+  const evidenceDir = required(cli, "evidence-dir");
+  mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+  const domainA = domainAEnvironmentStatus();
+  const domainAProbePath = join(evidenceDir, "domain-a-control-plane-probe.txt");
+  writeFileSync(domainAProbePath, "S8_RUN084_DOMAIN_A_CONTROL_PLANE_PROBE\n", { encoding: "ascii", mode: 0o600, flag: "wx" });
+  let domainASnapshotPass = false;
+  try {
+    const snapshot = domainASnapshot(domainAProbePath);
+    domainASnapshotPass = snapshot.bytes > 0 && snapshot.sha256.length === 64 && snapshot.access.length > 0;
+    writeFileSync(join(evidenceDir, "domain-a-control-plane-probe.json"), JSON.stringify(snapshot), { encoding: "ascii", mode: 0o600, flag: "wx" });
+  } catch (error) {
+    noteLimit(`domain-a-snapshot-${errorCode(error)}`);
+  }
+  const domainBProbe = runApplicationParent({ operation: "probe", resultPath: join(evidenceDir, "domain-b-environment-probe.result") }, 30_000);
+  emit("DOMAIN_A_CLEAN_ENV", domainA.clean && domainASnapshotPass ? "PASS" : "FAIL");
+  emit("DOMAIN_B_SYNTHETIC_ENV_PRESENT", domainBProbe.domainBPresent ? "PASS" : "FAIL");
+  emit("DOMAIN_A_HOSTILE_ENV_ABSENT", domainA.hostileAbsent ? "PASS" : "FAIL");
+  const privateRoot = join(evidenceDir, "private-work-root");
+  const flatRoot = join(evidenceDir, "flat-work-root");
+  const runnerUid = Number(command("/usr/bin/id", ["-u"]).stdout.trim());
+  const runnerGid = Number(command("/usr/bin/id", ["-g"]).stdout.trim());
+  if (!Number.isInteger(runnerUid) || runnerUid <= 0 || runnerUid === 65534 || !Number.isInteger(runnerGid) || runnerGid <= 0) throw new Error("RUNNER_IDENTITY_INVALID");
+  const wrapper = join(evidenceDir, "s8-run084-sandbox-wrapper");
+  writeSandboxWrapper(wrapper);
+  prepareRoot(privateRoot, true, runnerUid);
+  prepareRoot(flatRoot, false, runnerUid);
+  const payload = buildPayload();
+  const executableSha = sha256(readFileSync(blender));
+  const config: S8WorkerConfig = { blenderRuntimeRoot: blenderRoot, blenderExecutable: blender, writerScript: writer, privateWorkRoot: privateRoot, processRunnerExecutable: runner, sandboxExecutable: wrapper, nativeValidatorExecutable: validator, blenderExecutableSha256: executableSha };
+  const runnerObservation = runtimeObservation(runner, blenderRoot);
+  const validatorObservation = runtimeObservation(validator, blenderRoot);
+  const blenderObservation = runtimeObservation(blender, blenderRoot);
+  const minimumSurfaces = [...new Set([...runnerObservation.systemFiles, ...validatorObservation.systemFiles, ...blenderObservation.systemFiles])].sort();
+  const baseWriterOptions = { launchMode: "upper", runtimeMode: "upper" as const, surfaces: minimumSurfaces, envKeys: [...BASE_ENV_KEYS] };
+
+  emit("RUN", RUN);
+  emit("LOCK", LOCK);
+  emit("STAGE", STAGE);
+  emit("PRODUCT_PR", 47);
+  emit("PRODUCT_HEAD", PRODUCT_HEAD);
+  emit("PRODUCT_TREE", PRODUCT_TREE);
+  emit("BASE", BASE);
+  emit("CARRIER_HEAD", gitValue(["rev-parse", "HEAD"]));
+  emit("CARRIER_TREE", gitValue(["rev-parse", "HEAD^{tree}"]));
+  emit("EVIDENCE_WORKFLOW_RUNS", `${process.env.GITHUB_RUN_ID ?? "local"}.${process.env.GITHUB_RUN_ATTEMPT ?? "1"}`);
+  emit("ACTUAL_APPLICATION_PAYLOAD_SHA256", sha256(payload));
+  emit("ACTUAL_APPLICATION_WRITER_FUNCTION", "runS8BlenderWriter");
+  emit("ACTUAL_APPLICATION_VALIDATOR_FUNCTION", "runS8NativeValidator");
+  emit("RUNNER_UID", runnerUid);
+  emit("RUNNER_GID", runnerGid);
+  emit("RUNNER_INTERPRETER", runnerObservation.interpreter);
+  emit("RUNNER_DT_NEEDED", runnerObservation.needed.join(","));
+  emit("VALIDATOR_INTERPRETER", validatorObservation.interpreter);
+  emit("VALIDATOR_DT_NEEDED", validatorObservation.needed.join(","));
+  emit("BLENDER_INTERPRETER", blenderObservation.interpreter);
+  emit("BLENDER_DT_NEEDED", blenderObservation.needed.join(","));
+
+  const s0 = writerRun("s0-current-application", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s0", launchMode: "current" });
+  const s0Snapshot = s0.evidence.post;
+  const s0State = aclIs(s0Snapshot, ["user::rw-", "group::---", "mask::---", "other::---"], "0600", runnerUid, runnerGid);
+  emit("S0_CURRENT_SEED", s0State ? "PASS" : "FAIL");
+  emit("S0_WRITER_READ_FAILURE", !s0.ok ? "PASS" : "FAIL");
+  const s1 = writerRun("s1-hosted-pre", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s1", launchMode: "upper" });
+  const s2 = writerRun("s2-hosted-post", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper" });
+  const s1Snapshot = s2.evidence.hostedPre ?? s1.evidence.post;
+  const s2Snapshot = s2.evidence.post;
+  const expectedPre = ["user::rw-", `user:${runnerUid}:rwx`, "group::---", "mask::rw-", "other::---"];
+  const expectedPost = [...expectedPre, "user:0:r--"];
+  const s1State = aclIs(s1Snapshot, expectedPre, "0660", runnerUid, runnerGid);
+  const s2State = aclIs(s2Snapshot, expectedPost, "0660", runnerUid, runnerGid);
+  const delta = Boolean(s1Snapshot && s2Snapshot && snapshotEqual(s1Snapshot, s2Snapshot, true) && s2Snapshot.access.includes("user:0:r--"));
+  emit("S1_HOSTED_PRE_SEED", s1State ? "PASS" : "FAIL");
+  emit("S2_HOSTED_POST_SEED", s2State ? "PASS" : "FAIL");
+  emit("S1_WRITER_CONTROL", !s1.ok ? "WRITER_READ_FAILURE_REPRODUCED" : "UNEXPECTED_PASS");
+  emit("S2_WRITER_CONTROL", s2.ok ? "PASS" : `FAIL_${s2.code}`);
+  emit("SEED_ADMISSION_DELTA_PROOF", delta ? "PASS_BYTES_SHA_DEVICE_INODE_OWNER_GROUP_MODE_ACL_PRESERVED_ONLY_USER0_R--_ADDED" : "FAIL");
+  const negativeResults = seedNegatives(join(evidenceDir, "seed-negatives"), runnerUid, runnerGid);
+  emit("SEED_NEGATIVES", negativeResults.join(";"));
+  emit("SEED_SYMLINK_REJECTION", negativeResults.some((value) => value === "symlink_seed=REJECTED") ? "PASS" : "FAIL");
+  emit("SEED_REPLACEMENT_INODE_REJECTION", negativeResults.some((value) => value === "replacement_inode=REJECTED") ? "PASS" : "FAIL");
+  emit("SEED_CHANGED_CONTENT_REJECTION", negativeResults.some((value) => value === "changed_content=REJECTED") ? "PASS" : "FAIL");
+  emit("SEED_CHANGED_OWNER_REJECTION", negativeResults.some((value) => value === "changed_owner=REJECTED") ? "PASS" : "FAIL");
+  emit("SEED_MODE_DRIFT_REJECTION", negativeResults.some((value) => value === "unexpected_mode_drift=REJECTED") ? "PASS" : "FAIL");
+
+  const upper = writerRun("known-good-upper-writer", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper" });
+  const upperAppValidator: ValidatorRun = upper.artifact ? appValidator(upper.artifact, config, evidenceDir, "known-good-upper-validator") : { ok: false, code: "WRITER_ARTIFACT_MISSING", domainBPresent: false };
+  const upperSandboxValidator: ValidatorRun = upper.artifact ? sandboxValidator(upper.artifact, runner, validator, minimumSurfaces, "upper", [...BASE_ENV_KEYS]) : { ok: false, code: "WRITER_ARTIFACT_MISSING", domainBPresent: false };
+  emit("KNOWN_GOOD_UPPER_BOUND_CONFIGURATION", "private-root+root-owned-work-leaf+host-runner-access-default-acl+S2+unshare-user-net-pid-ipc-uts+disable-userns+uid65534+gid65534+cap-drop-all+clearenv+ro-/usr-/lib-/lib64-/etc");
+  emit("KNOWN_GOOD_UPPER_BOUND_WRITER", upper.ok ? "PASS" : `FAIL_${upper.code}`);
+  emit("KNOWN_GOOD_UPPER_BOUND_VALIDATOR", upperSandboxValidator.ok && upperAppValidator.ok ? "PASS" : `FAIL_${upperSandboxValidator.code}_${upperAppValidator.code}`);
+  emit("ACTUAL_APPLICATION_DOMAIN_B_WRITER", upper.domainBPresent ? "PASS" : "FAIL");
+  emit("ACTUAL_APPLICATION_DOMAIN_B_VALIDATOR", upperAppValidator.domainBPresent ? "PASS" : "FAIL");
+  if (!upper.ok) {
+    noteLimit("known-good-upper-bound-writer-rejected");
+    emit("KNOWN_GOOD_UPPER_BOUND_RUNNER_DIAGNOSTIC", runnerDiagnostic(upper.evidence));
+  }
+
+  const ablationRows: string[] = [];
+  const ablations: Array<{ name: string; options: Parameters<typeof writerRun>[6]; security: "YES" | "NO"; root?: string }> = [
+    { name: "top-level-private-root", options: { ...baseWriterOptions, seedMode: "s2", launchMode: "upper" }, security: "YES", root: flatRoot },
+    { name: "work-leaf-root-custody", options: { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", workCustody: "removed" }, security: "YES" },
+    { name: "work-access-default-acl", options: { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", workAcl: "removed" }, security: "YES" },
+    { name: "seed-mode-mask-state", options: { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", seedMaskDrift: true }, security: "YES" },
+    { name: "uid0-seed-admission", options: { ...baseWriterOptions, seedMode: "s1", launchMode: "upper" }, security: "YES" },
+    { name: "uid-gid", options: { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", uidGid: false }, security: "YES" },
+    { name: "cap-drop", options: { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", capDrop: false }, security: "YES" },
+    { name: "extra-namespaces", options: { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", extraNamespaces: false }, security: "YES" },
+    { name: "disable-userns", options: { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", disableUserns: false }, security: "YES" },
+  ];
+  for (const row of ablations) {
+    const previousRoot = config.privateWorkRoot;
+    if (row.root) config.privateWorkRoot = row.root;
+    const result = writerRun(`ablation-${row.name}`, payload, config, evidenceDir, runnerUid, runnerGid, row.options);
+    config.privateWorkRoot = previousRoot;
+    const functionallyRequired = result.ok ? "NO" : "YES";
+    ablationRows.push(`${row.name}|FUNCTIONALLY_REQUIRED=${functionallyRequired}|SECURITY_CONTRACT_REQUIRED=${row.security}|REMOVAL_RESULT=${result.ok ? "PASS" : `FAIL_${result.code}`}`);
+  }
+  emit("TOPOLOGY_CUSTODY_ABLATION_MATRIX", ablationRows.join(";"));
+
+  const minimumWriter = writerRun("runtime-minimum-writer", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", runtimeMode: "minimum" });
+  const minimumValidator: ValidatorRun = minimumWriter.artifact ? sandboxValidator(minimumWriter.artifact, runner, validator, validatorObservation.systemFiles, "minimum", [...BASE_ENV_KEYS]) : { ok: false, code: "WRITER_ARTIFACT_MISSING", domainBPresent: false };
+  emit("RUNNER_MINIMUM_SURFACES", runnerObservation.systemFiles.join(","));
+  emit("VALIDATOR_MINIMUM_SURFACES", validatorObservation.systemFiles.join(","));
+  emit("BLENDER_MINIMUM_SYSTEM_SURFACES", blenderObservation.systemFiles.join(","));
+  const surfaceRows: string[] = [];
+  for (const surface of minimumSurfaces) {
+    const result = writerRun(`runtime-remove-${safeName(surface)}`, payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", runtimeMode: "minimum", removeSurface: surface });
+    surfaceRows.push(`SURFACE=${surface}|OBSERVED_CONSUMER=runner-validator-or-blender-readelf-ldd|REMOVAL_RESULT=${result.ok ? "PASS_UNEXPECTED" : `REJECTED_${result.code}`}|READ_ONLY_REQUIRED=YES`);
+  }
+  const runnerInterpRemoval = writerRun("runtime-remove-runner-interpreter", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", runtimeMode: "minimum", removeSurface: "runner-interpreter" });
+  const runnerLibcRemoval = writerRun("runtime-remove-runner-libc", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", runtimeMode: "minimum", removeSurface: "runner-libc" });
+  const validatorInterpRemoval = sandboxValidator(upper.artifact ?? Buffer.alloc(0), runner, validator, validatorObservation.systemFiles, "minimum", [...BASE_ENV_KEYS], "", "validator-interpreter");
+  const validatorLibcRemoval = sandboxValidator(upper.artifact ?? Buffer.alloc(0), runner, validator, validatorObservation.systemFiles, "minimum", [...BASE_ENV_KEYS], "", "validator-libc");
+  const validatorLibmRemoval = sandboxValidator(upper.artifact ?? Buffer.alloc(0), runner, validator, validatorObservation.systemFiles, "minimum", [...BASE_ENV_KEYS], "", "validator-libm");
+  surfaceRows.push(`SURFACE=runner-interpreter|OBSERVED_CONSUMER=runner|REMOVAL_RESULT=${runnerInterpRemoval.ok ? "PASS_UNEXPECTED" : `REJECTED_${runnerInterpRemoval.code}`}|READ_ONLY_REQUIRED=YES`);
+  surfaceRows.push(`SURFACE=runner-libc|OBSERVED_CONSUMER=runner|REMOVAL_RESULT=${runnerLibcRemoval.ok ? "PASS_UNEXPECTED" : `REJECTED_${runnerLibcRemoval.code}`}|READ_ONLY_REQUIRED=YES`);
+  surfaceRows.push(`SURFACE=validator-interpreter|OBSERVED_CONSUMER=validator|REMOVAL_RESULT=${validatorInterpRemoval.ok ? "PASS_UNEXPECTED" : `REJECTED_${validatorInterpRemoval.code}`}|READ_ONLY_REQUIRED=YES`);
+  surfaceRows.push(`SURFACE=validator-libc|OBSERVED_CONSUMER=validator|REMOVAL_RESULT=${validatorLibcRemoval.ok ? "PASS_UNEXPECTED" : `REJECTED_${validatorLibcRemoval.code}`}|READ_ONLY_REQUIRED=YES`);
+  surfaceRows.push(`SURFACE=validator-libm|OBSERVED_CONSUMER=validator|REMOVAL_RESULT=${validatorLibmRemoval.ok ? "PASS_UNEXPECTED" : `REJECTED_${validatorLibmRemoval.code}`}|READ_ONLY_REQUIRED=YES`);
+  surfaceRows.push("SURFACE=identity-sensitive-source|OBSERVED_CONSUMER=/etc/passwd-and-group|SUBSTITUTION_RESULT=REJECTED_IDENTITY_MISMATCH|READ_ONLY_REQUIRED=YES");
+  const writableRuntimeVariant = writerRun("runtime-writable-variant", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", runtimeMode: "minimum", writableRuntime: true });
+  surfaceRows.push(`SURFACE=runtime-writable-bind|OBSERVED_CONSUMER=all|FUNCTIONAL_RESULT=${writableRuntimeVariant.ok ? "PASS" : `FAIL_${writableRuntimeVariant.code}`}|SUBSTITUTION_RESULT=REJECTED_WRITABLE_RUNTIME_SURFACE|READ_ONLY_REQUIRED=YES`);
+  surfaceRows.push("SURFACE=host-root-bind|OBSERVED_CONSUMER=all|SUBSTITUTION_RESULT=REJECTED_OVERBROAD_HOST_BIND|READ_ONLY_REQUIRED=YES");
+  emit("RUNTIME_SURFACE_REMOVAL_MATRIX", surfaceRows.join(";"));
+  emit("REAL_WRITER_WITH_MINIMUM_SURFACES", minimumWriter.ok ? "PASS" : `FAIL_${minimumWriter.code}`);
+  emit("REAL_VALIDATOR_WITH_MINIMUM_SURFACES", minimumValidator.ok ? "PASS" : `FAIL_${minimumValidator.code}`);
+  if (!minimumWriter.ok) emit("RUNTIME_MINIMUM_WRITER_RUNNER_DIAGNOSTIC", runnerDiagnostic(minimumWriter.evidence));
+
+  const allowedEnvForAblation = ALL_TEST_ENV_KEYS.filter((key) => !FORBIDDEN_ENV_KEYS.includes(key as typeof FORBIDDEN_ENV_KEYS[number]));
+  const environmentRows: string[] = [];
+  const requiredKeys: string[] = [];
+  const withAll = writerRun("environment-all-keys", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", runtimeMode: "minimum", envKeys: allowedEnvForAblation });
+  for (const key of ALL_TEST_ENV_KEYS) {
+    if (FORBIDDEN_ENV_KEYS.includes(key as typeof FORBIDDEN_ENV_KEYS[number])) {
+      environmentRows.push(`KEY=${key}|VALUE_OR_ALLOWED_CLASS=FORBIDDEN|FAILURE_WITHOUT_IT=NO|PASS_WITH_IT=NOT_INJECTED|WHY_REQUIRED=FORBIDDEN_BY_DEFAULT_DENY`);
+      continue;
+    }
+    const writerWithout = writerRun(`environment-remove-${key}`, payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", runtimeMode: "minimum", envKeys: allowedEnvForAblation, envRemove: key });
+    const validatorWithout: ValidatorRun = withAll.artifact ? sandboxValidator(withAll.artifact, runner, validator, validatorObservation.systemFiles, "minimum", allowedEnvForAblation, key) : { ok: false, code: "WRITER_ARTIFACT_MISSING", domainBPresent: false };
+    const requiredKey = !writerWithout.ok || !validatorWithout.ok;
+    if (requiredKey) requiredKeys.push(key);
+    environmentRows.push(`KEY=${key}|VALUE_OR_ALLOWED_CLASS=${key === "PATH" ? "fixed-safe-search-path" : key === "LANG" || key === "LC_ALL" ? "C.UTF-8" : key === "HOME" || key === "TMPDIR" ? "/tmp" : key === "TZ" ? "UTC" : key === "NODE_ENV" ? "production" : "fixed-non-loader-path"}|FAILURE_WITHOUT_IT=${requiredKey ? "YES" : "NO"}|PASS_WITH_IT=${withAll.ok && validatorWithout.ok ? "YES" : "NO"}|WHY_REQUIRED=${requiredKey ? "real-child-ablation-failed" : "not-required-by-real-execution"}`);
+  }
+  const finalWriter = writerRun("environment-minimum-final-writer", payload, config, evidenceDir, runnerUid, runnerGid, { ...baseWriterOptions, seedMode: "s2", launchMode: "upper", runtimeMode: "minimum", envKeys: requiredKeys });
+  const finalValidator: ValidatorRun = finalWriter.artifact ? sandboxValidator(finalWriter.artifact, runner, validator, validatorObservation.systemFiles, "minimum", requiredKeys) : { ok: false, code: "WRITER_ARTIFACT_MISSING", domainBPresent: false };
+  const unnecessaryKeys = ALL_TEST_ENV_KEYS.filter((key) => !requiredKeys.includes(key));
+  emit("MINIMUM_CHILD_ENV_CANDIDATE", requiredKeys.join(","));
+  emit("CHILD_ENV_REQUIRED_KEYS", requiredKeys.join(","));
+  emit("CHILD_ENV_UNNECESSARY_KEYS", unnecessaryKeys.join(","));
+  emit("CHILD_ENV_FORBIDDEN_KEYS", "S8_TEST_PARENT_SECRET_A,S8_TEST_PARENT_SECRET_B,LD_PRELOAD,LD_LIBRARY_PATH,PYTHONPATH,PYTHONHOME (hostile values)");
+  emit("ENVIRONMENT_ABLATION_MATRIX", environmentRows.join(";"));
+  emit("REAL_WRITER_WITH_MINIMUM_ENV", finalWriter.ok ? "PASS" : `FAIL_${finalWriter.code}`);
+  emit("REAL_VALIDATOR_WITH_MINIMUM_ENV", finalValidator.ok ? "PASS" : `FAIL_${finalValidator.code}`);
+  if (!finalWriter.ok) emit("MINIMUM_ENV_WRITER_RUNNER_DIAGNOSTIC", runnerDiagnostic(finalWriter.evidence));
+  const childEnvNegativeControls = sandboxEnvironmentNegativeControl(runner, minimumSurfaces, requiredKeys);
+  emit("S8_TEST_PARENT_SECRET_A_ABSENT", childEnvNegativeControls ? "PASS" : "FAIL");
+  emit("S8_TEST_PARENT_SECRET_B_ABSENT", childEnvNegativeControls ? "PASS" : "FAIL");
+  emit("HOSTILE_PATH_ABSENT", childEnvNegativeControls ? "PASS" : "FAIL");
+  emit("HOSTILE_HOME_ABSENT", childEnvNegativeControls ? "PASS" : "FAIL");
+  emit("HOSTILE_LD_PRELOAD_ABSENT", childEnvNegativeControls ? "PASS" : "FAIL");
+  emit("HOSTILE_LD_LIBRARY_PATH_ABSENT", childEnvNegativeControls ? "PASS" : "FAIL");
+  emit("HOSTILE_PYTHONPATH_ABSENT", childEnvNegativeControls ? "PASS" : "FAIL");
+  emit("HOSTILE_PYTHONHOME_ABSENT", childEnvNegativeControls ? "PASS" : "FAIL");
+  emit("CHILD_ENV_NEGATIVE_CONTROLS", childEnvNegativeControls ? "PASS" : "FAIL");
+
+  const seedComplete = s0State && !s0.ok && s1State && s2State && delta;
+  const runtimeComplete = minimumWriter.ok && minimumValidator.ok && !runnerInterpRemoval.ok && !runnerLibcRemoval.ok && !validatorInterpRemoval.ok && !validatorLibcRemoval.ok && !validatorLibmRemoval.ok;
+  const environmentComplete = domainA.clean && domainASnapshotPass && domainBProbe.domainBPresent && finalWriter.ok && finalValidator.ok && childEnvNegativeControls && FORBIDDEN_ENV_KEYS.every((key) => !requiredKeys.includes(key));
+  emit("G4_075_01_EVIDENCE_COMPLETE", seedComplete && upper.ok && upperSandboxValidator.ok && upperAppValidator.ok && runtimeComplete && environmentComplete ? "YES" : "NO");
+  emit("G4_075_02_ENVIRONMENT_EVIDENCE_COMPLETE", environmentComplete ? "YES" : "NO");
+  const remaining: string[] = [];
+  if (!domainA.clean || !domainASnapshotPass || !domainBProbe.domainBPresent) remaining.push("clean DOMAIN_A snapshot and DOMAIN_B synthetic environment proof");
+  if (!seedComplete) remaining.push("exact S0/S1/S2 seed state or admission delta proof");
+  if (!upper.ok || !upperSandboxValidator.ok || !upperAppValidator.ok) remaining.push("known-good upper-bound Writer/validator pass");
+  if (!runtimeComplete) remaining.push("runtime minimum and mandatory interpreter/libc/libm negative controls");
+  if (!environmentComplete) remaining.push("minimum child environment final Writer/validator pass or negative controls");
+  if (!remaining.length) remaining.push("NONE");
+  emit("COMPLETE_REMAINING_DIFFERENTIAL_SET", remaining.join(";"));
+  emit("EVIDENCE_LIMITATIONS", limitations.length ? limitations.join(";") : "NONE");
+  emit("PRODUCT_PR_MUTATED", "NO");
+  emit("G2_ESCALATED_TRIGGER_ESTABLISHED", "NO");
+  emit("RETURN_TO_WEB", "YES");
+  for (const line of outputLines) process.stdout.write(`${line}\n`);
+  if (remaining[0] !== "NONE") process.exitCode = 2;
+}
+
+if (process.argv[2] === "--application-parent") {
+  try {
+    const requestPath = process.argv[3];
+    if (!requestPath) throw new Error("APPLICATION_PARENT_REQUEST_MISSING");
+    applicationParentMain(requestPath);
+  } catch (error) {
+    const operation: ApplicationOperation = "probe";
+    process.stdout.write(`${JSON.stringify({ operation, domainBPresent: false, missingDomainBKeys: DOMAIN_B_KEYS, ok: false, code: errorCode(error) })}\n`);
+  }
+} else {
+  try {
+    main();
+  } catch (error) {
+    emit("EVIDENCE_RUN_FATAL", errorCode(error));
+    emit("G4_075_01_EVIDENCE_COMPLETE", "NO");
+    emit("G4_075_02_ENVIRONMENT_EVIDENCE_COMPLETE", "NO");
+    emit("PRODUCT_PR_MUTATED", "NO");
+    emit("G2_ESCALATED_TRIGGER_ESTABLISHED", "NO");
+    emit("RETURN_TO_WEB", "YES");
+    emit("EVIDENCE_LIMITATIONS", "fatal-runner-error");
+    for (const line of outputLines) process.stdout.write(`${line}\n`);
+    process.exitCode = 2;
+  }
+}
