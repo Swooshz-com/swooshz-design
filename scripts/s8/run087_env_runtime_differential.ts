@@ -13,7 +13,7 @@ import type { S6ToS7Handoff, S7ToS8Handoff } from "../../src/lib/types";
 type EnvKey = "PATH" | "LANG" | "LC_ALL" | "HOME";
 type Mode = "SUBSET" | "FOUR_KEY_CONTROL" | "INVALID";
 type Snapshot = { owner: number; group: number; mode: string; device: number; inode: number; bytes: number; sha256: string; access: string[]; defaultAcl: string[] };
-type Boundary = { status: string; target: string; attempts: number; successful: number; keys: string[]; count: number };
+type Boundary = { status: string; target: string; attempts: number; successful: number; keys: string[]; count: number; traceLines: number; execveLines: number; targetMatches: number; parseErrors: number };
 type Request = {
   operation: "writer";
   resultPath: string;
@@ -211,7 +211,7 @@ function runAppParent(request: Request, timeoutMs: number): AppStatus {
 function writeObserver(path: string): void {
   const source = [
     "#!/usr/bin/python3", "import json", "import os", "import re", "import sys", "",
-    "target, output = sys.argv[1:]", "events = []", "",
+    "target, output = sys.argv[1:]", "events = []; trace_lines = 0; execve_lines = 0; target_matches = 0; parse_errors = 0", "",
     "def skip_ws(text, index):",
     "    while index < len(text) and text[index].isspace(): index += 1",
     "    return index",
@@ -246,12 +246,15 @@ function writeObserver(path: string): void {
     "        index += 1",
     "    raise ValueError()",
     "for raw in sys.stdin:",
+    "    trace_lines += 1",
     "    marker = raw.find('execve(')",
     "    if marker < 0: continue",
+    "    execve_lines += 1",
     "    text = raw[marker + len('execve('):]",
     "    try:",
     "        executable, index = parse_string(text, 0)",
     "        if executable != target: continue",
+    "        target_matches += 1",
     "        index = skip_ws(text, index)",
     "        if text[index] != ',': raise ValueError()",
     "        index = skip_ws(text, index + 1)",
@@ -264,13 +267,13 @@ function writeObserver(path: string): void {
     "        keys = re.findall(r'\"([A-Za-z_][A-Za-z0-9_]*)=', env)",
     "        tail = text[index:].lstrip()",
     "        events.append({'keys': keys, 'success': tail.startswith('= 0') or tail.startswith('=0')})",
-    "    except Exception: events.append({'keys': [], 'success': False, 'parseError': True})",
+    "    except Exception: parse_errors += 1; events.append({'keys': [], 'success': False, 'parseError': True})",
     "successful = [entry for entry in events if entry.get('success') and 'parseError' not in entry]",
     "if len(successful) == 1:",
     "    entry = successful[0]",
-    "    result = {'status':'OBSERVED','target':target,'attempts':len(events),'successful':1,'keys':entry['keys'],'count':len(entry['keys'])}",
+    "    result = {'status':'OBSERVED','target':target,'attempts':len(events),'successful':1,'keys':entry['keys'],'count':len(entry['keys']),'traceLines':trace_lines,'execveLines':execve_lines,'targetMatches':target_matches,'parseErrors':parse_errors}",
     "else:",
-    "    result = {'status':'NOT_OBSERVED' if not events else 'AMBIGUOUS','target':target,'attempts':len(events),'successful':len(successful),'keys':[],'count':-1}",
+    "    result = {'status':'NOT_OBSERVED' if not events else 'AMBIGUOUS','target':target,'attempts':len(events),'successful':len(successful),'keys':[],'count':-1,'traceLines':trace_lines,'execveLines':execve_lines,'targetMatches':target_matches,'parseErrors':parse_errors}",
     "with open(output, 'x', encoding='ascii') as stream: json.dump(result, stream, sort_keys=True, separators=(',', ':'))",
     "os.chmod(output, 0o644)",
   ].join("\n") + "\n";
@@ -647,6 +650,17 @@ function main(): void {
   const boundaryCount = (value: Trial | undefined) => value?.writer.boundary?.status === "OBSERVED" ? value.writer.boundary.count : "<unavailable>";
   const boundaryNames = (value: Trial | undefined) => value?.writer.boundary?.status === "OBSERVED"
     ? (value.writer.boundary.keys.length ? value.writer.boundary.keys.slice().sort().join(",") : "<empty>") : "<unavailable>";
+  const boundaryDiagnostics = (value: Trial | undefined) => {
+    const observation = value?.writer.boundary;
+    return {
+      status: observation?.status ?? "NO_RECEIPT", attempts: observation?.attempts ?? 0,
+      successful: observation?.successful ?? 0, traceLines: observation?.traceLines ?? 0,
+      execveLines: observation?.execveLines ?? 0, targetMatches: observation?.targetMatches ?? 0,
+      parseErrors: observation?.parseErrors ?? 0,
+      wrapperStderrClass: value?.writer.launchDiagnostic.wrapperStderrClass ?? "NOT_RUN",
+      wrapperStderrSummary: value?.writer.launchDiagnostic.wrapperStderrSummary ?? "NOT_RUN",
+    };
+  };
   const noLeak = (value: Trial | undefined, keys: EnvKey[]) => {
     if (!value || !value.writer.domainBPresent || value.writer.boundary?.status !== "OBSERVED") return false;
     const expected = keys.map((key) => [key, ENV_VALUES[key]] as [string, string]);
@@ -772,6 +786,7 @@ function main(): void {
   emit("SELECTED_ENV_UNWRAPPED_WRITER", writerStatus(selectedUnwrapped)); emit("SELECTED_ENV_VALIDATOR", selectedUnwrapped?.validator ?? "NOT_RUN");
   emit("SELECTED_ENV_TARGET_ENV_KEY_COUNT", boundaryCount(selectedObserved)); emit("SELECTED_ENV_TARGET_ENV_KEYS", boundaryNames(selectedObserved));
   emit("FOUR_KEY_TARGET_ENV_KEY_COUNT", boundaryCount(fourObserved)); emit("FOUR_KEY_TARGET_ENV_KEYS", boundaryNames(fourObserved));
+  emit("TARGET_BOUNDARY_DIAGNOSTICS_JSON", JSON.stringify({ fourKey: boundaryDiagnostics(fourObserved), selectedMinimum: boundaryDiagnostics(selectedObserved), finalIntegrated: boundaryDiagnostics(finalObserved) }));
   emit("PARENT_SECRET_HOSTILE_ENV_TARGET_LEAKAGE", !fourObserved || !selectedObserved || !fourBoundaryOk || !selectedBoundaryOk ? "UNAVAILABLE" : noParentLeak ? "NONE" : "PRESENT");
   emit("FOUR_KEY_MOUNTS_UNCHANGED_BY_OBSERVER", fourMountsUnchanged ? "YES" : "NO");
   emit("SELECTED_ENV_MOUNTS_UNCHANGED_BY_OBSERVER", selectedMountsUnchanged ? "YES" : "NO");
