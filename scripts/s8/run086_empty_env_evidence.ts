@@ -489,9 +489,10 @@ function main(): void {
   const carrierTree = gitValue(["rev-parse", "HEAD^{tree}"]);
   const productTree = gitValue(["rev-parse", PRODUCT_HEAD + "^{tree}"]);
   const firstParent = gitValue(["rev-parse", "HEAD^"]);
+  const productMergeBase = gitValue(["merge-base", PRODUCT_HEAD, "HEAD"]);
   const changed = gitValue(["diff", "--name-only", PRODUCT_HEAD, "HEAD"]).split(/\r?\n/u).filter(Boolean).sort();
   const allowed = [".github/workflows/s8-run086-empty-env-evidence.yml", "scripts/s8/run086_empty_env_evidence.ts"].sort();
-  if (productTree !== PRODUCT_TREE || firstParent !== PRODUCT_HEAD || !same(changed, allowed)) throw new Error("CARRIER_BINDING_INVALID");
+  if (productTree !== PRODUCT_TREE || productMergeBase !== PRODUCT_HEAD || !same(changed, allowed)) throw new Error("CARRIER_BINDING_INVALID");
 
   const source = fixture();
   const built = buildS8WriterPayload(source.s6, source.s7);
@@ -554,6 +555,7 @@ function main(): void {
   emit("EVIDENCE_CARRIER_HEAD", carrierHead); emit("EVIDENCE_CARRIER_TREE", carrierTree);
   emit("EVIDENCE_WORKFLOW_RUN", process.env.GITHUB_RUN_ID ?? "local"); emit("EVIDENCE_WORKFLOW_JOB", "run086-empty-env");
   emit("CARRIER_FIRST_PARENT", firstParent); emit("CARRIER_ALLOWED_PATHS_ONLY", same(changed, allowed) ? "YES" : "NO");
+  emit("CARRIER_PRODUCT_HEAD_MERGE_BASE", productMergeBase);
   emit("ACTUAL_APPLICATION_FUNCTIONS", "buildS8WriterPayload,runS8BlenderWriter,runS8NativeValidator");
   emit("ACTUAL_APPLICATION_PAYLOAD_SHA256", built.sha256); emit("ACTUAL_APPLICATION_PAYLOAD_BYTES", built.bytes.length);
   emit("DOMAIN_A_CLEAN", domainAStatus() ? "YES" : "NO"); emit("DOMAIN_B_SYNTHETIC_ENV_PRESENT", domainBOk ? "YES" : "NO");
