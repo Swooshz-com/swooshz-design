@@ -23,9 +23,18 @@ type Request = {
 };
 type AppStatus = { domainBPresent: boolean; ok: boolean; code: string };
 type RunnerSummary = { code: number; name: string; terminationClass: string; targetExit: number | null; targetSignal: number | null; setupStage: string | null; evidenceCode: string | null };
+type LaunchDiagnostic = {
+  bwrapStatus: number | null;
+  runnerStdoutBytes: number;
+  runnerStdoutFirstLine: "EMPTY" | "RECEIPT_SUMMARY" | "RECEIPT_UNPARSED" | "NON_RECEIPT";
+  runnerStderrBytes: number;
+  runnerStderrClass: string;
+  wrapperStderrBytes: number;
+  wrapperStderrClass: string;
+};
 type WriterRun = {
   ok: boolean; code: string; domainBPresent: boolean; artifactPath: string; artifactBytes: number; artifactSha256: string;
-  argv?: string[]; boundary?: Boundary; runner?: RunnerSummary; modeRejected: boolean; workContract: boolean;
+  argv?: string[]; boundary?: Boundary; runner?: RunnerSummary; launchDiagnostic: LaunchDiagnostic; modeRejected: boolean; workContract: boolean;
   snapshots: { hostedPre?: Snapshot; post?: Snapshot };
 };
 type Trial = { writer: WriterRun; validator: string; validatorReceipt: boolean; passed: boolean; contract: ReturnType<typeof bwrapContract> };
@@ -391,6 +400,9 @@ function smallText(path: string): string {
   if (!existsSync(path)) return "";
   try { return readFileSync(path).subarray(0, 4096).toString("utf8"); } catch { return ""; }
 }
+function fileBytes(path: string): number {
+  try { return statSync(path).size; } catch { return 0; }
+}
 function runnerSummary(prefix: string): RunnerSummary | undefined {
   const first = smallText(prefix + ".runner.stdout").split(/\r?\n/u)[0] ?? "";
   const marker = "S8_RUNNER_RECEIPT:";
@@ -409,6 +421,39 @@ function runnerSummary(prefix: string): RunnerSummary | undefined {
       evidenceCode: typeof result.evidenceCode === "string" ? result.evidenceCode : null,
     };
   } catch { return undefined; }
+}
+function stderrClass(text: string): string {
+  if (!text.trim()) return "EMPTY";
+  if (/no such file or directory|cannot find|not found/iu.test(text)) return "NO_SUCH_FILE";
+  if (/permission denied|operation not permitted/iu.test(text)) return "PERMISSION_OR_NAMESPACE";
+  if (/creating new namespace failed|namespace.*failed/iu.test(text)) return "NAMESPACE_SETUP_FAILED";
+  if (/invalid argument/iu.test(text)) return "INVALID_ARGUMENT";
+  if (/exec format error/iu.test(text)) return "EXEC_FORMAT";
+  if (/too many levels of symbolic links/iu.test(text)) return "SYMLINK_LOOP";
+  return "NONEMPTY_OTHER";
+}
+function launchDiagnostic(prefix: string): LaunchDiagnostic {
+  let bwrapStatus: number | null = null;
+  try {
+    const value = JSON.parse(smallText(prefix + ".status.json")) as { status?: unknown };
+    if (typeof value.status === "number" && Number.isInteger(value.status)) bwrapStatus = value.status;
+  } catch {}
+  const stdout = smallText(prefix + ".runner.stdout");
+  const firstLine = stdout.split(/\r?\n/u)[0] ?? "";
+  const runner = runnerSummary(prefix);
+  const runnerStdoutFirstLine: LaunchDiagnostic["runnerStdoutFirstLine"] = !firstLine
+    ? "EMPTY" : firstLine.startsWith("S8_RUNNER_RECEIPT:") ? (runner ? "RECEIPT_SUMMARY" : "RECEIPT_UNPARSED") : "NON_RECEIPT";
+  const runnerStderr = smallText(prefix + ".runner.stderr");
+  const wrapperStderr = smallText(prefix + ".wrapper.stderr");
+  return {
+    bwrapStatus,
+    runnerStdoutBytes: fileBytes(prefix + ".runner.stdout"),
+    runnerStdoutFirstLine,
+    runnerStderrBytes: fileBytes(prefix + ".runner.stderr"),
+    runnerStderrClass: stderrClass(runnerStderr),
+    wrapperStderrBytes: fileBytes(prefix + ".wrapper.stderr"),
+    wrapperStderrClass: stderrClass(wrapperStderr),
+  };
 }
 function setenv(argv: string[]): Array<[string, string]> | undefined {
   const result: Array<[string, string]> = [];
@@ -491,7 +536,7 @@ function writerRun(label: string, mode: Mode, envKeys: EnvKey[], observe: boolea
     ok: artifactPresent && artifact.length > 27,
     code: status.ok ? (artifactPresent && artifact.length > 27 ? "PASS" : "APPLICATION_ARTIFACT_MISSING") : status.code,
     domainBPresent: status.domainBPresent, artifactPath, artifactBytes: artifact.length, artifactSha256: artifact.length ? hash(artifact) : "",
-    argv: argvFor(prefix), boundary: boundary(prefix + ".boundary.json"), runner: runnerSummary(prefix),
+    argv: argvFor(prefix), boundary: boundary(prefix + ".boundary.json"), runner: runnerSummary(prefix), launchDiagnostic: launchDiagnostic(prefix),
     modeRejected: existsSync(prefix + ".mode-rejected") && smallText(prefix + ".mode-rejected").includes("RUN087_ENV_MODE_REJECTED"),
     workContract: smallText(prefix + ".work-contract").trim() === "PASS",
     snapshots: { hostedPre: readSnapshot(prefix + ".hosted-pre.json"), post: readSnapshot(prefix + ".post.json") },
@@ -694,6 +739,7 @@ function main(): void {
   emit("PHASE_A_COMPLETE_PATH", phaseAOk ? "PASS" : "FAIL"); emit("PHASE_A_DETAILS_JSON", JSON.stringify(packet(phaseA)));
   emit("PHASE_A_BWRAP_ARGV_JSON", phaseA.writer.argv ? JSON.stringify(phaseA.writer.argv) : "<unavailable>");
   emit("PHASE_A_RUNNER_RECEIPT_SUMMARY_JSON", phaseA.writer.runner ? JSON.stringify(phaseA.writer.runner) : "<unavailable>");
+  if (!phaseAOk) emit("PHASE_A_LAUNCH_DIAGNOSTICS_JSON", JSON.stringify(phaseA.writer.launchDiagnostic));
   emit("ENV_POWERSET_CASES", JSON.stringify(phaseB.map((item) => ({ subset: sorted(item.keys), empty: !item.keys.length, ...packet(item.result) }))));
   emit("ENV_PASSING_SUBSETS", passing.length ? passing.map((item) => subsetName(item.keys)).join(";") : "<none>");
   emit("MINIMUM_CHILD_ENV", minimum ? subsetName(minimum.keys) : "<none>");
