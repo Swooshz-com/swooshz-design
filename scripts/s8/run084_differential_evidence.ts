@@ -901,7 +901,12 @@ function sandboxEnvironmentNegativeControl(runner: string, surfaces: string[], e
     ...args,
   ], VALIDATOR_TIMEOUT + 30_000);
   rmSync(root, { recursive: true, force: true });
-  return result.status === 0 && result.stdout.includes("ENV_NEGATIVE_CONTROLS=PASS");
+  const pass = result.status === 0 && result.stdout.includes("ENV_NEGATIVE_CONTROLS=PASS");
+  if (!pass) {
+    noteLimit(`environment-negative-controls-status-${result.status}`);
+    emit("CHILD_ENV_NEGATIVE_CONTROL_DIAGNOSTIC", JSON.stringify({ status: result.status, stdout: result.stdout.slice(0, 1024), stderr: result.stderr.slice(0, 2048) }));
+  }
+  return pass;
 }
 
 function applySeedPre(path: string, runnerUid: number, runnerGid: number): void {
