@@ -560,7 +560,7 @@ function writeSandboxWrapper(path: string): void {
     "    S8_RUN084_WORK_CUSTODY=\"$work_custody\" S8_RUN084_WORK_ACL=\"$work_acl\" \\",
     "    S8_RUN084_EXTRA_NAMESPACES=\"$extra_namespaces\" S8_RUN084_UID_GID=\"$uid_gid\" S8_RUN084_CAP_DROP=\"$cap_drop\" \\",
     "    S8_RUN084_DISABLE_USERNS=\"$disable_userns\" S8_RUN084_WRITABLE_RUNTIME=\"$writable_runtime\" \\",
-    "    S8_RUN084_SEED_MASK_DRIFT=\"$seed_mask_drift\" /bin/bash \"$0\"",
+    "    S8_RUN084_SEED_MASK_DRIFT=\"$seed_mask_drift\" /bin/bash \"$0\" \"$@\"",
     "fi",
     "set -Eeuo pipefail",
     "phase=${S8_RUN084_PHASE:?}",
