@@ -1,0 +1,134 @@
+name: S8 Run-087 env/runtime orthogonal differential evidence
+
+on:
+  pull_request:
+    branches:
+      - codex/s8-g3-native-process-boundary-hosted-carrier-001
+    paths:
+      - .github/workflows/s8-run087-env-runtime-differential.yml
+      - scripts/s8/run087_env_runtime_differential.ts
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  run087-env-runtime:
+    name: Run-087 orthogonal environment/runtime real S8 Writer proof
+    if: github.event.pull_request.base.ref == 'codex/s8-g3-native-process-boundary-hosted-carrier-001' && github.event.pull_request.head.ref == 'web/run-087-s8-env-runtime-differential-evidence-001' && github.event.pull_request.draft == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact carrier head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact product and carrier bindings
+        shell: bash
+        env:
+          EXPECTED_CARRIER_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_BASE_HEAD: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -Eeuo pipefail
+          product_head="2f71e472849055ab8814f7e38d0f8c321707275f"
+          product_tree="c72036fdc685ad3a78e2b696df212476c1dade36"
+          test "$EXPECTED_BASE_REF" = "codex/s8-g3-native-process-boundary-hosted-carrier-001"
+          test "$EXPECTED_BASE_HEAD" = "$product_head"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CARRIER_HEAD"
+          test "$(git rev-parse HEAD^)" = "$product_head"
+          test "$(git merge-base "$product_head" HEAD)" = "$product_head"
+          test "$(git rev-parse "$product_head^{tree}")" = "$product_tree"
+          actual="$(git diff --name-only "$product_head" HEAD | LC_ALL=C sort)"
+          expected="$(printf '%s\n' '.github/workflows/s8-run087-env-runtime-differential.yml' 'scripts/s8/run087_env_runtime_differential.ts' | LC_ALL=C sort)"
+          test "$actual" = "$expected"
+          printf 'PRODUCT_HEAD=%s\nPRODUCT_TREE=%s\nCARRIER_HEAD=%s\nCARRIER_TREE=%s\nCARRIER_ALLOWED_PATHS_ONLY=YES\n' "$product_head" "$product_tree" "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        shell: bash
+        run: corepack enable
+
+      - name: Install locked JavaScript dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Install bounded hosted evidence prerequisites
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          root="/tmp/s8-run087-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          test ! -e "$root" && test ! -L "$root"
+          /usr/bin/install -d -m 0700 -- "$root"
+          /usr/bin/sudo -n /usr/bin/apt-get update
+          /usr/bin/sudo -n /usr/bin/apt-get install --yes --no-install-recommends acl binutils strace bubblewrap=0.9.0-1ubuntu0.3
+          test -x /usr/bin/getfacl
+          test -x /usr/bin/setfacl
+          test -x /usr/bin/readelf
+          test -x /usr/bin/strace
+          bwrap_version="$(/usr/bin/dpkg-query --show --showformat='${Version}' bubblewrap)"
+          test "$bwrap_version" = "0.9.0-1ubuntu0.3"
+          bwrap="/usr/bin/bwrap"
+          test -x "$bwrap"
+          "$bwrap" --version
+          printf 'S8_RUN087_BWRAP=%s\n' "$bwrap"
+
+      - name: Build the pinned Blender runtime and native targets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          root="/tmp/s8-run087-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          archive="$root/blender-5.2.2-linux-x64.tar.xz"
+          /usr/bin/curl --fail --location --retry 3 --output "$archive" https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz
+          printf '84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168  %s\n' "$archive" | /usr/bin/sha256sum --check --status
+          /usr/bin/tar -tJf "$archive" | /usr/bin/awk '/^\/|(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }'
+          /usr/bin/install -d -m 0700 -- "$root/extracted"
+          /usr/bin/tar -xJf "$archive" --directory "$root/extracted" --no-same-owner --no-same-permissions
+          blender_source="$root/extracted/blender-5.2.2-linux-x64"
+          test -x "$blender_source/blender"
+          /usr/local/bin/cmake -S native/s8-process-runner -B "$root/runner" -DCMAKE_BUILD_TYPE=Release
+          /usr/local/bin/cmake --build "$root/runner" --config Release --parallel
+          /usr/local/bin/cmake -S native/s8-fbx-validator -B "$root/validator" -DCMAKE_BUILD_TYPE=Release
+          /usr/local/bin/cmake --build "$root/validator" --config Release --parallel
+          test -x "$root/runner/s8-process-runner"
+          test -x "$root/validator/s8-fbx-validator"
+          /usr/bin/install -d -m 0700 -- "$root/layout/runtime" "$root/layout/native" "$root/layout/writer"
+          /usr/bin/cp -a --no-dereference -- "$blender_source" "$root/layout/runtime/"
+          /usr/bin/install -m 0755 -- "$root/runner/s8-process-runner" "$root/layout/native/s8-process-runner"
+          /usr/bin/install -m 0755 -- "$root/validator/s8-fbx-validator" "$root/layout/native/s8-fbx-validator"
+          /usr/bin/cp -a --no-dereference -- blender/s8-fbx-writer/. "$root/layout/writer/"
+          /usr/bin/find -P "$root/layout/runtime" -type d -exec /usr/bin/chmod 0555 {} +
+          /usr/bin/find -P "$root/layout/runtime" -type f -perm /111 -exec /usr/bin/chmod 0555 {} +
+          /usr/bin/find -P "$root/layout/runtime" -type f ! -perm /111 -exec /usr/bin/chmod 0444 {} +
+          /usr/bin/find -P "$root/layout/writer" -type d -exec /usr/bin/chmod 0555 {} +
+          /usr/bin/find -P "$root/layout/writer" -type f -perm /111 -exec /usr/bin/chmod 0555 {} +
+          /usr/bin/find -P "$root/layout/writer" -type f ! -perm /111 -exec /usr/bin/chmod 0444 {} +
+          /usr/bin/chmod 0555 "$root/layout/native"
+          /usr/bin/chmod 0555 "$root/layout/native/s8-process-runner" "$root/layout/native/s8-fbx-validator"
+          /usr/bin/chmod 0755 "$root" "$root/layout"
+          printf 'S8_RUN087_LAYOUT=%s\n' "$root/layout"
+
+      - name: Run bounded Run-087 evidence acquisition
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          root="/tmp/s8-run087-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          /usr/bin/install -d -m 0700 -- "$root/evidence"
+          node_dir="$(dirname "$(command -v node)")"
+          tsx_bin="$GITHUB_WORKSPACE/node_modules/.bin/tsx"
+          test -x "$tsx_bin"
+          clean_path="$node_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          clean=(/usr/bin/env -i "PATH=$clean_path" HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 "S8_RUN087_DOMAIN_A_EXPECTED_PATH=$clean_path" "GITHUB_RUN_ID=$GITHUB_RUN_ID" "GITHUB_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT")
+          set +e
+          "${clean[@]}" "$tsx_bin" scripts/s8/run087_env_runtime_differential.ts --blender-root "$root/layout/runtime/blender-5.2.2-linux-x64" --blender "$root/layout/runtime/blender-5.2.2-linux-x64/blender" --writer "$root/layout/writer/writer.py" --runner "$root/layout/native/s8-process-runner" --validator "$root/layout/native/s8-fbx-validator" --bubblewrap /usr/bin/bwrap --evidence-dir "$root/evidence" 2>&1 | /usr/bin/tee "$root/evidence/terminal-packet.txt"
+          status=$?
+          set -e
+          printf 'RUN087_SCRIPT_STATUS=%s\n' "$status"
+          exit "$status"
