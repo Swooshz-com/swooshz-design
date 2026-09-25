@@ -15,10 +15,17 @@ SHA-256. The writer calls this module directly with the source-rigid table; it
 does not invoke `bpy.ops.export_scene.fbx` or use Blender transform
 decomposition as an admission or serialization fallback.
 
-The supervisor must run the exact official Blender 5.2.2 LTS Linux x64
+The application worker runs the exact official Blender 5.2.2 LTS Linux x64
 portable build with `--background --factory-startup --disable-autoexec
---offline-mode --python-exit-code 50`, a private working directory, no inherited
-credentials, OS-enforced network denial, and fixed input/output basenames.
+--offline-mode --python-exit-code 50` through the pinned native process runner
+and bubblewrap. Writer and validator launches use the same production boundary:
+UID/GID 65534, all capabilities dropped, user/network/PID/IPC/UTS namespaces,
+disabled nested user namespaces, parent-death and session controls, a private
+working directory, private `/tmp`, and no inherited credentials. Bubblewrap
+clears the environment and uses only its intrinsic `PWD` key after changing to
+`/work`; the application sets no environment variables. The only additional
+system file bind is read-only `/etc/passwd`; pinned runtime files are mounted
+read-only and one-to-one. No network access is available in the sandbox.
 
 Only `artifact.fbx` and `writer-receipt.json` may leave the process boundary,
 and neither is publishable until the separate pinned ufbx validator compares

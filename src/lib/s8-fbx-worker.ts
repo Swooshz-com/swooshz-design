@@ -67,11 +67,15 @@ type RunnerLimitEvidence = {
 };
 
 export type S8CallerVerification = {
-  schemaVersion: "s8-runner-caller-verification-v1";
+  schemaVersion: "s8-runner-caller-verification-v2";
   status: "VERIFIED_BY_CALLER";
   preLaunchSha256: string;
   postLaunchSha256: string;
   runnerReportedSelfSha256: string;
+  outerExitStatus: number;
+  outerSignal: string | null;
+  observedStdoutBytes: number;
+  observedStderrBytes: number;
   receiptSha256: string;
 };
 
@@ -111,13 +115,54 @@ export type S8NativeValidatorResult = {
 };
 
 type RunnerOptions = { cwd: string } & S8RunnerLimits;
-type RunnerResult = { stdout: string; stderr: string; evidence: S8RunnerEvidence };
+type RunnerResult = { stdout: string; stdoutBytes: Buffer; stderr: string; evidence: S8RunnerEvidence };
 type CommandSpec = { command: string; args: string[] };
-type SandboxCommand = CommandSpec & { target: CommandSpec };
+export type S8SandboxCommand = CommandSpec & { target: CommandSpec };
 type RunnerIdentity = { path: string; device: number; inode: number; size: number; mtimeMs: number };
+type RunnerCapture = { status: number | null; signal: string | null; stderr: Buffer };
 
 const RUNNER_RECEIPT_PREFIX = "S8_RUNNER_RECEIPT:";
 const HEX64 = /^[0-9a-f]{64}$/u;
+export const S8_SYSTEM_RUNTIME_BIND_PATHS = [
+  "/lib64/ld-linux-x86-64.so.2",
+  "/lib/x86_64-linux-gnu/libGL.so.1",
+  "/lib/x86_64-linux-gnu/libGLX.so.0",
+  "/lib/x86_64-linux-gnu/libGLdispatch.so.0",
+  "/lib/x86_64-linux-gnu/libICE.so.6",
+  "/lib/x86_64-linux-gnu/libSM.so.6",
+  "/lib/x86_64-linux-gnu/libX11.so.6",
+  "/lib/x86_64-linux-gnu/libXau.so.6",
+  "/lib/x86_64-linux-gnu/libXdmcp.so.6",
+  "/lib/x86_64-linux-gnu/libXext.so.6",
+  "/lib/x86_64-linux-gnu/libXfixes.so.3",
+  "/lib/x86_64-linux-gnu/libXi.so.6",
+  "/lib/x86_64-linux-gnu/libXrender.so.1",
+  "/lib/x86_64-linux-gnu/libbsd.so.0",
+  "/lib/x86_64-linux-gnu/libc.so.6",
+  "/lib/x86_64-linux-gnu/libdl.so.2",
+  "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+  "/lib/x86_64-linux-gnu/libm.so.6",
+  "/lib/x86_64-linux-gnu/libmd.so.0",
+  "/lib/x86_64-linux-gnu/libpthread.so.0",
+  "/lib/x86_64-linux-gnu/librt.so.1",
+  "/lib/x86_64-linux-gnu/libstdc++.so.6",
+  "/lib/x86_64-linux-gnu/libutil.so.1",
+  "/lib/x86_64-linux-gnu/libuuid.so.1",
+  "/lib/x86_64-linux-gnu/libxcb.so.1",
+  "/lib/x86_64-linux-gnu/libxkbcommon.so.0",
+  "/etc/passwd",
+] as const;
+
+function assertS8SystemRuntimePaths(): void {
+  for (const path of S8_SYSTEM_RUNTIME_BIND_PATHS) {
+    try {
+      if (!statSync(path).isFile()) fail("S8_TOOLING_HOLD_RUNTIME_ALLOWLIST", "runtime");
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      fail("S8_TOOLING_HOLD_RUNTIME_ALLOWLIST", "runtime");
+    }
+  }
+}
 
 function fail(code: string, field = "worker"): never {
   throw new AppError(502, code, [{ field, code }]);
@@ -159,12 +204,6 @@ function runnerIdentity(path: string): RunnerIdentity {
 
 function sameRunnerIdentity(left: RunnerIdentity, right: RunnerIdentity): boolean {
   return left.path === right.path && left.device === right.device && left.inode === right.inode && left.size === right.size && left.mtimeMs === right.mtimeMs;
-}
-
-function boundedOutput(value: Buffer | string | null, maximum: number, code: string): string {
-  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value ?? "", "utf8");
-  if (bytes.length > maximum) fail(code);
-  return bytes.toString("utf8");
 }
 
 function runnerPath(config: S8WorkerConfig): RunnerIdentity {
@@ -284,13 +323,13 @@ function checkedNumber(value: unknown, positive = false): number {
   return value;
 }
 
-function checkedLimitObject(value: unknown, keys: readonly string[], includeWall: boolean): Record<string, unknown> {
+function checkedLimitObject(value: unknown, keys: readonly string[], includeWall: boolean, allowZero = false): Record<string, unknown> {
   const record = objectValue(value);
   exactKeys(record, keys);
-  checkedNumber(record.rlimitAsBytes, true);
-  checkedNumber(record.rlimitFsizeBytes, true);
-  checkedNumber(record.rlimitCpuSeconds, true);
-  checkedNumber(record.rlimitNproc, true);
+  checkedNumber(record.rlimitAsBytes, !allowZero);
+  checkedNumber(record.rlimitFsizeBytes, !allowZero);
+  checkedNumber(record.rlimitCpuSeconds, !allowZero);
+  checkedNumber(record.rlimitNproc, !allowZero);
   if (includeWall) {
     checkedNumber(record.wallTimeoutMs, true);
     checkedNumber(record.stdoutBytes, true);
@@ -312,47 +351,180 @@ function equalFields(record: Record<string, unknown>, expected: Record<string, n
   for (const [key, value] of Object.entries(expected)) if (record[key] !== value) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
 }
 
-export function parseS8RunnerReceipt(output: Buffer, expected: S8RunnerLimits, runnerSha256: string, postLaunchSha256 = runnerSha256): { stdout: string; evidence: S8RunnerEvidence } {
-  const text = output.toString("utf8");
-  const newline = text.indexOf("\n");
-  if (!text.startsWith(RUNNER_RECEIPT_PREFIX) || newline <= RUNNER_RECEIPT_PREFIX.length || text.slice(RUNNER_RECEIPT_PREFIX.length, newline).includes("\r")) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
-  const receiptText = text.slice(RUNNER_RECEIPT_PREFIX.length, newline);
+export function canonicalS8RunnerReceiptBytes(value: S8RunnerEvidence): Buffer {
+  return Buffer.from(JSON.stringify({
+    schemaVersion: value.schemaVersion,
+    protocol: value.protocol,
+    policyId: value.policyId,
+    requested: {
+      rlimitAsBytes: value.requested.rlimitAsBytes,
+      rlimitFsizeBytes: value.requested.rlimitFsizeBytes,
+      rlimitCpuSeconds: value.requested.rlimitCpuSeconds,
+      rlimitNproc: value.requested.rlimitNproc,
+      wallTimeoutMs: value.requested.wallTimeoutMs,
+      stdoutBytes: value.requested.stdoutBytes,
+      stderrBytes: value.requested.stderrBytes,
+      maxChildren: value.requested.maxChildren,
+    },
+    appliedByChild: {
+      rlimitAsBytes: value.appliedByChild.rlimitAsBytes,
+      rlimitFsizeBytes: value.appliedByChild.rlimitFsizeBytes,
+      rlimitCpuSeconds: value.appliedByChild.rlimitCpuSeconds,
+      rlimitNproc: value.appliedByChild.rlimitNproc,
+      noNewPrivs: value.appliedByChild.noNewPrivs,
+      seccompMode: value.appliedByChild.seccompMode,
+    },
+    observedByRunnerParent: {
+      rlimitAsBytes: value.observedByRunnerParent.rlimitAsBytes,
+      rlimitFsizeBytes: value.observedByRunnerParent.rlimitFsizeBytes,
+      rlimitCpuSeconds: value.observedByRunnerParent.rlimitCpuSeconds,
+      rlimitNproc: value.observedByRunnerParent.rlimitNproc,
+      noNewPrivs: value.observedByRunnerParent.noNewPrivs,
+      seccompMode: value.observedByRunnerParent.seccompMode,
+    },
+    runnerParentVerification: {
+      status: value.runnerParentVerification.status,
+      mismatchCode: value.runnerParentVerification.mismatchCode,
+    },
+    runnerBinary: { selfSha256: value.runnerBinary.selfSha256 },
+    result: {
+      code: value.result.code,
+      name: value.result.name,
+      terminationClass: value.result.terminationClass,
+      targetExit: value.result.targetExit,
+      targetSignal: value.result.targetSignal,
+      elapsedMs: value.result.elapsedMs,
+      stdoutBytes: value.result.stdoutBytes,
+      stderrBytes: value.result.stderrBytes,
+      setupStage: value.result.setupStage,
+      evidenceCode: value.result.evidenceCode,
+    },
+  }), "utf8");
+}
+
+export function parseS8RunnerReceipt(
+  output: Buffer,
+  expected: S8RunnerLimits,
+  runnerSha256: string,
+  postLaunchSha256 = runnerSha256,
+  capture: RunnerCapture = { status: 0, signal: null, stderr: Buffer.alloc(0) },
+): { stdout: string; stdoutBytes: Buffer; evidence: S8RunnerEvidence } {
+  const prefix = Buffer.from(RUNNER_RECEIPT_PREFIX, "ascii");
+  if (!output.subarray(0, prefix.length).equals(prefix)) {
+    if (capture.status === 64 && capture.signal === null && output.indexOf(prefix) === -1) fail("S8_PROCESS_RUNNER_ARGUMENT_INVALID");
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
+  if (output.indexOf(prefix, prefix.length) !== -1) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const newline = output.indexOf(0x0a, prefix.length);
+  if (newline <= prefix.length) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const receiptBytes = output.subarray(prefix.length, newline);
+  if (receiptBytes.includes(0x0d) || receiptBytes.some((byte) => byte > 0x7f)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const receiptText = receiptBytes.toString("ascii");
   const parsed = parseStrictJson(receiptText);
   exactKeys(parsed, ["schemaVersion", "protocol", "policyId", "requested", "appliedByChild", "observedByRunnerParent", "runnerParentVerification", "runnerBinary", "result"]);
   if (parsed.schemaVersion !== S8_PROCESS_RUNNER_PIN.protocol || parsed.protocol !== S8_PROCESS_RUNNER_PIN.protocol || parsed.policyId !== S8_PROCESS_RUNNER_PIN.policy) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const resultCode = checkedNumber(objectValue(parsed.result).code);
+  const setupFailure = resultCode === 71;
   const requested = checkedLimitObject(parsed.requested, ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc", "wallTimeoutMs", "stdoutBytes", "stderrBytes", "maxChildren"], true);
-  const applied = checkedLimitObject(parsed.appliedByChild, ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc", "noNewPrivs", "seccompMode"], false);
-  const observed = checkedLimitObject(parsed.observedByRunnerParent, ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc", "noNewPrivs", "seccompMode"], false);
-  checkedNumber(applied.noNewPrivs, true); checkedNumber(applied.seccompMode, true); checkedNumber(observed.noNewPrivs, true); checkedNumber(observed.seccompMode, true);
-  if (applied.noNewPrivs !== 1 || applied.seccompMode !== 2 || observed.noNewPrivs !== 1 || observed.seccompMode !== 2) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const applied = checkedLimitObject(parsed.appliedByChild, ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc", "noNewPrivs", "seccompMode"], false, setupFailure);
+  const observed = checkedLimitObject(parsed.observedByRunnerParent, ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc", "noNewPrivs", "seccompMode"], false, setupFailure);
+  if (setupFailure) {
+    // Native code 71 emits a zeroed setup record before releasing the target.
+    if ([applied.rlimitAsBytes, applied.rlimitFsizeBytes, applied.rlimitCpuSeconds, applied.rlimitNproc, applied.noNewPrivs, applied.seccompMode, observed.rlimitAsBytes, observed.rlimitFsizeBytes, observed.rlimitCpuSeconds, observed.rlimitNproc, observed.noNewPrivs, observed.seccompMode].some((value) => value !== 0)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  } else {
+    checkedNumber(applied.noNewPrivs, true); checkedNumber(applied.seccompMode, true); checkedNumber(observed.noNewPrivs, true); checkedNumber(observed.seccompMode, true);
+    if (applied.noNewPrivs !== 1 || applied.seccompMode !== 2 || observed.noNewPrivs !== 1 || observed.seccompMode !== 2) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
   equalFields(requested, expectedRequested(expected));
-  for (const key of ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc"]) if (applied[key] !== requested[key] || observed[key] !== applied[key]) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if (!setupFailure) for (const key of ["rlimitAsBytes", "rlimitFsizeBytes", "rlimitCpuSeconds", "rlimitNproc"]) if (applied[key] !== requested[key] || observed[key] !== applied[key]) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   const verification = objectValue(parsed.runnerParentVerification);
   exactKeys(verification, ["status", "mismatchCode"]);
-  if (verification.status !== "PASS" || verification.mismatchCode !== null) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if ((verification.status !== "PASS" && verification.status !== "FAIL") || (verification.mismatchCode !== null && typeof verification.mismatchCode !== "string")) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   const binary = objectValue(parsed.runnerBinary);
   exactKeys(binary, ["selfSha256"]);
   if (typeof binary.selfSha256 !== "string" || !HEX64.test(binary.selfSha256) || binary.selfSha256 !== runnerSha256 || runnerSha256 !== postLaunchSha256) fail("S8_RUNNER_HASH_DRIFT");
   const result = objectValue(parsed.result);
   exactKeys(result, ["code", "name", "terminationClass", "targetExit", "targetSignal", "elapsedMs", "stdoutBytes", "stderrBytes", "setupStage", "evidenceCode"]);
-  checkedNumber(result.code); checkedNumber(result.elapsedMs);
+  if (!canonicalS8RunnerReceiptBytes(parsed as unknown as S8RunnerEvidence).equals(receiptBytes)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const code = resultCode;
+  checkedNumber(result.elapsedMs);
   const stdoutBytes = checkedNumber(result.stdoutBytes);
   const stderrBytes = checkedNumber(result.stderrBytes);
   if (typeof result.name !== "string" || typeof result.terminationClass !== "string" || (result.targetExit !== null && !isNonnegativeInteger(result.targetExit)) || (result.targetSignal !== null && !isPositiveInteger(result.targetSignal)) || (result.setupStage !== null && typeof result.setupStage !== "string") || (result.evidenceCode !== null && typeof result.evidenceCode !== "string")) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   if (stdoutBytes > expected.stdoutBytes || stderrBytes > expected.stderrBytes) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const resultContracts: Record<number, readonly [string, string]> = {
+    0: ["S8_RUNNER_SUCCESS", "target-exit-zero"],
+    70: ["S8_RUNNER_INTERNAL", "runner-internal"],
+    71: ["S8_RUNNER_CHILD_SETUP_FAILED", "child-setup-failed"],
+    72: ["S8_RUNNER_EVIDENCE_INVALID", "evidence-failed"],
+    73: ["S8_RUNNER_EXEC_FAILED", "exec-failed"],
+    74: ["S8_RUNNER_STDOUT_LIMIT", "stdout-limit"],
+    75: ["S8_RUNNER_STDERR_LIMIT", "stderr-limit"],
+    76: ["S8_RUNNER_TARGET_EXIT_NONZERO", "target-exit-nonzero"],
+    77: ["S8_RUNNER_TARGET_SIGNAL", "target-signal"],
+    124: ["S8_RUNNER_TIMEOUT", "wall-timeout"],
+  };
+  const contract = resultContracts[code];
+  if (!contract || result.name !== contract[0] || result.terminationClass !== contract[1]) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const noTargetTermination = result.targetExit === null && result.targetSignal === null;
+  if (code === 0) {
+    if (result.targetExit !== 0 || result.targetSignal !== null || result.setupStage !== null || result.evidenceCode !== null) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  } else if (code === 70) {
+    if (!noTargetTermination || result.setupStage !== null || result.evidenceCode !== null) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  } else if (code === 71) {
+    const setupStages = new Set(["setpgid", "pdeathsig", "parent_check", "rlimit_as", "rlimit_fsize", "rlimit_cpu", "rlimit_nproc", "no_new_privs", "seccomp", "child_evidence", "release"]);
+    if (!noTargetTermination || typeof result.setupStage !== "string" || !setupStages.has(result.setupStage) || result.evidenceCode !== null || verification.status !== "FAIL" || verification.mismatchCode !== null || result.stdoutBytes !== 0 || result.stderrBytes !== 0) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  } else if (code === 72) {
+    if (!noTargetTermination || result.setupStage !== null || typeof result.evidenceCode !== "string" || result.evidenceCode.length === 0 || verification.mismatchCode !== result.evidenceCode) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  } else if (code === 76) {
+    if (result.targetExit === null || result.targetExit === 0 || result.targetExit > 255 || result.targetSignal !== null || result.setupStage !== null || result.evidenceCode !== null) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  } else if (code === 77) {
+    if (result.targetExit !== null || result.targetSignal === null || result.targetSignal > 64 || result.setupStage !== null || result.evidenceCode !== null) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  } else if (!noTargetTermination || result.setupStage !== null || result.evidenceCode !== null) {
+    fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  }
+  if (code === 70) {
+    const verifiedInternalMismatchCodes = new Set(["CAPTURE_INIT", "EXEC_CHANNEL", "POLL", "STDOUT_READ", "STDERR_READ", "WAITPID", "INTERNAL"]);
+    if (verification.status === "FAIL") {
+      if (verification.mismatchCode !== "PARENT_SETPGID") fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    } else if (verification.mismatchCode !== null && (typeof verification.mismatchCode !== "string" || !verifiedInternalMismatchCodes.has(verification.mismatchCode))) {
+      fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    }
+  }
+  if (code === 72) {
+    const evidenceMismatchCodes = new Set([
+      "CHILD_EVIDENCE_MALFORMED", "PARENT_PRLIMIT_AS", "PARENT_PRLIMIT_FSIZE", "PARENT_PRLIMIT_CPU", "PARENT_PRLIMIT_NPROC",
+      "PARENT_PROC_STATUS", "PARENT_PROC_SECURITY", "REQUESTED_APPLIED_OBSERVED", "RELEASE_CHANNEL",
+    ]);
+    if (typeof result.evidenceCode !== "string" || !evidenceMismatchCodes.has(result.evidenceCode)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    if (result.evidenceCode === "RELEASE_CHANNEL") {
+      if (verification.status !== "PASS") fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    } else if (verification.status !== "FAIL") {
+      fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+    }
+  }
+  if (code !== 70 && code !== 71 && code !== 72 && (verification.status !== "PASS" || verification.mismatchCode !== null)) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+
+  const targetStdout = output.subarray(newline + 1);
+  const capturedStderr = Buffer.isBuffer(capture.stderr) ? capture.stderr : Buffer.alloc(0);
+  if (capture.signal !== null || capture.status !== code || stdoutBytes !== targetStdout.length || stderrBytes !== capturedStderr.length) fail("S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   const evidence = parsed as unknown as S8RunnerEvidence;
   evidence.verifiedByCaller = {
-    schemaVersion: "s8-runner-caller-verification-v1",
+    schemaVersion: "s8-runner-caller-verification-v2",
     status: "VERIFIED_BY_CALLER",
     preLaunchSha256: runnerSha256,
     postLaunchSha256,
     runnerReportedSelfSha256: binary.selfSha256 as string,
-    receiptSha256: s8Sha256(receiptText),
+    outerExitStatus: capture.status as number,
+    outerSignal: capture.signal,
+    observedStdoutBytes: targetStdout.length,
+    observedStderrBytes: capturedStderr.length,
+    receiptSha256: s8Sha256(receiptBytes),
   };
-  return { stdout: text.slice(newline + 1), evidence };
+  return { stdout: targetStdout.toString("utf8"), stdoutBytes: Buffer.from(targetStdout), evidence };
 }
 
-function makeSandboxCommand(config: S8WorkerConfig, blenderRoot: string, blender: string, writer: string, privateExporter: string, patchManifest: string, work: string): SandboxCommand {
+export function buildS8BlenderSandboxCommand(config: S8WorkerConfig, blenderRoot: string, blender: string, writer: string, privateExporter: string, patchManifest: string, work: string): S8SandboxCommand {
   if (!config.sandboxExecutable) fail("S8_WORKER_SANDBOX_REQUIRED");
   const sandbox = assertRegularFile(config.sandboxExecutable, "sandboxExecutable");
   const blenderRelativePath = relative(blenderRoot, blender);
@@ -360,7 +532,10 @@ function makeSandboxCommand(config: S8WorkerConfig, blenderRoot: string, blender
   return {
     command: sandbox,
     args: [
-      "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session",
+      "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+      "--disable-userns", "--assert-userns-disabled", "--uid", "65534", "--gid", "65534", "--cap-drop", "ALL",
+      "--die-with-parent", "--new-session", "--clearenv",
+      ...S8_SYSTEM_RUNTIME_BIND_PATHS.flatMap((path) => ["--ro-bind", path, path]),
       "--ro-bind", blenderRoot, "/runtime/blender-root",
       "--ro-bind", writer, "/runtime/writer.py",
       "--ro-bind", privateExporter, "/runtime/export_fbx_bin.py",
@@ -372,6 +547,24 @@ function makeSandboxCommand(config: S8WorkerConfig, blenderRoot: string, blender
       command: `/runtime/blender-root/${blenderRelativePath.replaceAll("\\", "/")}`,
       args: ["--background", "--factory-startup", "--disable-autoexec", "--offline-mode", "--python-exit-code", "50", "--python", "/runtime/writer.py", "--"],
     },
+  };
+}
+
+export function buildS8ValidatorSandboxCommand(config: S8WorkerConfig, validator: string, work: string): S8SandboxCommand {
+  if (!config.sandboxExecutable) fail("S8_WORKER_SANDBOX_REQUIRED");
+  const sandbox = assertRegularFile(config.sandboxExecutable, "sandboxExecutable");
+  return {
+    command: sandbox,
+    args: [
+      "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+      "--disable-userns", "--assert-userns-disabled", "--uid", "65534", "--gid", "65534", "--cap-drop", "ALL",
+      "--die-with-parent", "--new-session", "--clearenv",
+      ...S8_SYSTEM_RUNTIME_BIND_PATHS.flatMap((path) => ["--ro-bind", path, path]),
+      "--ro-bind", validator, "/runtime/validator",
+      "--bind", work, "/work", "--chdir", "/work",
+      "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    ],
+    target: { command: "/runtime/validator", args: ["/work/artifact.fbx"] },
   };
 }
 
@@ -395,9 +588,10 @@ function runUnderNativeRunner(command: string, args: readonly string[], config: 
   const expected = runnerArgs(options, command, args);
   const executable = sandbox?.command ?? before.path;
   const childArgs = sandbox ? [...sandbox.args, "--ro-bind", before.path, "/runtime/process-runner", "/runtime/process-runner", ...expected] : expected;
+  const emptyEnvironment = Object.create(null) as NodeJS.ProcessEnv;
   const child = spawnSync(executable, childArgs, {
     cwd: options.cwd,
-    env: { ...process.env, NODE_ENV: "production", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
+    env: emptyEnvironment,
     shell: false,
     windowsHide: true,
     timeout: options.timeoutMs + 10_000,
@@ -412,11 +606,16 @@ function runUnderNativeRunner(command: string, args: readonly string[], config: 
   const after = runnerIdentity(before.path);
   if (!sameRunnerIdentity(before, after)) fail("S8_RUNNER_IDENTITY_DRIFT");
   const postLaunchSha256 = fileSha256(after.path);
-  const parsed = parseS8RunnerReceipt(Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(child.stdout ?? ""), options, preLaunchSha256, postLaunchSha256);
-  const stdout = boundedOutput(parsed.stdout, options.stdoutBytes, "S8_STDOUT_LIMIT");
-  const stderr = boundedOutput(child.stderr, options.stderrBytes, "S8_STDERR_LIMIT");
+  const stderrBytes = Buffer.isBuffer(child.stderr) ? child.stderr : Buffer.from(child.stderr ?? "");
+  const parsed = parseS8RunnerReceipt(
+    Buffer.isBuffer(child.stdout) ? child.stdout : Buffer.from(child.stdout ?? ""),
+    options,
+    preLaunchSha256,
+    postLaunchSha256,
+    { status: child.status, signal: child.signal, stderr: stderrBytes },
+  );
   if (child.status !== 0) fail(runnerFailure(parsed.evidence.result.code));
-  return { stdout, stderr, evidence: parsed.evidence };
+  return { stdout: parsed.stdout, stdoutBytes: parsed.stdoutBytes, stderr: stderrBytes.toString("utf8"), evidence: parsed.evidence };
 }
 
 function parseWriterReceipt(bytes: Buffer, payloadSha256: string, writerSha256: string, executableSha256: string, artifact: Buffer, privateExporterSha256: string, manifestSha256: string): S8WriterReceipt {
@@ -435,6 +634,7 @@ function parseWriterReceipt(bytes: Buffer, payloadSha256: string, writerSha256: 
 
 export function runS8BlenderWriter(payloadBytes: Buffer, config: S8WorkerConfig, onHeartbeat?: () => void): S8WriterResult {
   if (process.platform !== "linux" || process.arch !== "x64") fail("S8_TOOLING_HOLD_PLATFORM");
+  assertS8SystemRuntimePaths();
   if (payloadBytes.length === 0 || payloadBytes.length > S8_LIMITS.payloadBytes) fail("S8_PAYLOAD_RESOURCE_LIMIT");
   const blenderRoot = assertDirectory(config.blenderRuntimeRoot, "blenderRuntimeRoot");
   const blender = assertRegularFile(config.blenderExecutable, "blenderExecutable");
@@ -454,7 +654,7 @@ export function runS8BlenderWriter(payloadBytes: Buffer, config: S8WorkerConfig,
   writeFileSync(join(work, "input.json"), payloadBytes, { mode: 0o600, flag: "wx" });
   try {
     onHeartbeat?.();
-    const sandbox = makeSandboxCommand(config, blenderRoot, blender, writer, privateExporter, patchManifest, work);
+    const sandbox = buildS8BlenderSandboxCommand(config, blenderRoot, blender, writer, privateExporter, patchManifest, work);
     const result = runUnderNativeRunner(sandbox.target.command, [...sandbox.target.args, ...[]], config, { cwd: work, addressSpaceBytes: S8_LIMITS.writerAddressSpaceBytes, fileBytes: S8_LIMITS.artifactBytes, timeoutMs: S8_LIMITS.timeoutMs, stdoutBytes: S8_LIMITS.stdoutBytes, stderrBytes: S8_LIMITS.stderrBytes, maxChildren: 0 }, sandbox);
     onHeartbeat?.();
     const artifactPath = join(work, "artifact.fbx");
@@ -471,9 +671,16 @@ export function runS8BlenderWriter(payloadBytes: Buffer, config: S8WorkerConfig,
   }
 }
 
-function parseNativeReadback(stdout: string): S8UfbxReadback {
+function parseNativeReadback(stdout: Buffer): S8UfbxReadback {
   let parsed: unknown;
-  try { parsed = JSON.parse(stdout); } catch { fail("S8_NATIVE_READBACK_INVALID"); }
+  try {
+    const text = stdout.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(stdout)) fail("S8_NATIVE_READBACK_INVALID");
+    parsed = JSON.parse(text);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    fail("S8_NATIVE_READBACK_INVALID");
+  }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) fail("S8_NATIVE_READBACK_INVALID");
   const wrapper = parsed as Record<string, unknown>;
   const value = wrapper.readback && typeof wrapper.readback === "object" ? wrapper.readback : parsed;
@@ -485,6 +692,7 @@ function parseNativeReadback(stdout: string): S8UfbxReadback {
 
 export function runS8NativeValidator(artifact: Buffer, config: S8WorkerConfig, onHeartbeat?: () => void): S8NativeValidatorResult {
   if (process.platform !== "linux" || process.arch !== "x64") fail("S8_TOOLING_HOLD_PLATFORM");
+  assertS8SystemRuntimePaths();
   if (!config.nativeValidatorExecutable) fail("S8_NATIVE_VALIDATOR_REQUIRED");
   const validator = assertRegularFile(config.nativeValidatorExecutable, "nativeValidatorExecutable");
   const validatorIdentity = `s8-validator-sha256:${fileSha256(validator)}`;
@@ -494,10 +702,10 @@ export function runS8NativeValidator(artifact: Buffer, config: S8WorkerConfig, o
   writeFileSync(artifactPath, artifact, { mode: 0o600, flag: "wx" });
   try {
     onHeartbeat?.();
-    const result = runUnderNativeRunner(validator, [artifactPath], config, { cwd: work, addressSpaceBytes: S8_LIMITS.validatorMemoryBytes, fileBytes: S8_LIMITS.validatorTempBytes, timeoutMs: S8_LIMITS.validatorTimeoutMs, stdoutBytes: S8_LIMITS.readbackBytes, stderrBytes: S8_LIMITS.stderrBytes, maxChildren: 0 });
+    const sandbox = buildS8ValidatorSandboxCommand(config, validator, work);
+    const result = runUnderNativeRunner(sandbox.target.command, sandbox.target.args, config, { cwd: work, addressSpaceBytes: S8_LIMITS.validatorMemoryBytes, fileBytes: S8_LIMITS.validatorTempBytes, timeoutMs: S8_LIMITS.validatorTimeoutMs, stdoutBytes: S8_LIMITS.readbackBytes, stderrBytes: S8_LIMITS.stderrBytes, maxChildren: 0 }, sandbox);
     onHeartbeat?.();
-    if (Buffer.byteLength(result.stdout, "utf8") > S8_LIMITS.readbackBytes) fail("S8_NATIVE_READBACK_LIMIT");
-    return { readback: parseNativeReadback(result.stdout), readbackBytes: Buffer.from(result.stdout, "utf8"), validatorIdentity, runnerEvidence: result.evidence, stdout: result.stdout, stderr: result.stderr };
+    return { readback: parseNativeReadback(result.stdoutBytes), readbackBytes: result.stdoutBytes, validatorIdentity, runnerEvidence: result.evidence, stdout: result.stdout, stderr: result.stderr };
   } finally {
     rmSync(work, { recursive: true, force: true });
   }

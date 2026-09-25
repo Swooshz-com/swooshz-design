@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { parseS8RunnerReceipt, runS8NativeValidator, type S8RunnerLimits, type S8WorkerConfig } from "../src/lib/s8-fbx-worker";
+import { buildS8BlenderSandboxCommand, buildS8ValidatorSandboxCommand, parseS8RunnerReceipt, runS8NativeValidator, S8_SYSTEM_RUNTIME_BIND_PATHS, type S8RunnerLimits, type S8WorkerConfig } from "../src/lib/s8-fbx-worker";
 import { readS8RuntimeConfig } from "../src/lib/s8-fbx-config";
 
 type MutableReceipt = {
@@ -35,10 +35,11 @@ function receiptValue(): MutableReceipt {
   };
 }
 
-function receipt(mutator?: (value: MutableReceipt) => void): Buffer {
+function receipt(mutator?: (value: MutableReceipt) => void, targetOutput = "child-output"): Buffer {
   const value = receiptValue();
+  value.result.stdoutBytes = Buffer.byteLength(targetOutput);
   mutator?.(value);
-  return Buffer.from(`S8_RUNNER_RECEIPT:${JSON.stringify(value)}\nchild-output`, "utf8");
+  return Buffer.from(`S8_RUNNER_RECEIPT:${JSON.stringify(value)}\n${targetOutput}`, "utf8");
 }
 
 function invalid(value: Buffer, postHash = runnerHash): void {
@@ -107,4 +108,136 @@ test("v2 receipt negatives reject identity, policy, requested, applied, observed
 test("caller hash verification rejects pre/post drift and runner-reported hash drift", () => {
   assert.throws(() => parseS8RunnerReceipt(receipt(), runnerLimits, runnerHash, "b".repeat(64)), /S8_RUNNER_HASH_DRIFT/);
   assert.throws(() => parseS8RunnerReceipt(receipt((value) => { value.runnerBinary.selfSha256 = "b".repeat(64); }), runnerLimits, runnerHash), /S8_RUNNER_HASH_DRIFT/);
+});
+
+test("native v2 code, name, termination, and captured byte counts must agree", () => {
+  invalid(receipt((value) => { value.result.code = 79; }));
+  invalid(receipt((value) => { value.result.name = "S8_RUNNER_TARGET_EXIT_NONZERO"; }));
+  invalid(receipt((value) => { value.result.terminationClass = "target-exit-nonzero"; }));
+  invalid(receipt((value) => { value.result.targetExit = 1; }));
+  invalid(receipt((value) => { value.result.targetSignal = 9; }));
+  invalid(receipt((value) => {
+    value.result.code = 124;
+    value.result.name = "S8_RUNNER_TIMEOUT";
+    value.result.terminationClass = "wall-timeout";
+    value.result.targetExit = 0;
+  }));
+  invalid(receipt((value) => { value.result.stdoutBytes = 0; }));
+});
+
+test("caller records the raw stdout byte count before UTF-8 decoding", () => {
+  const value = receiptValue();
+  value.result.stdoutBytes = 1;
+  const line = Buffer.from(`S8_RUNNER_RECEIPT:${JSON.stringify(value)}\n`, "utf8");
+  const parsed = parseS8RunnerReceipt(Buffer.concat([line, Buffer.from([0xff])]), runnerLimits, runnerHash);
+  assert.equal(parsed.evidence.verifiedByCaller.observedStdoutBytes, 1);
+});
+
+test("native v2 mapping validates every defined runner result and preserves outer observations", () => {
+  const cases: Array<{ code: number; name: string; terminationClass: string; update?: (value: MutableReceipt) => void }> = [
+    { code: 0, name: "S8_RUNNER_SUCCESS", terminationClass: "target-exit-zero" },
+    { code: 70, name: "S8_RUNNER_INTERNAL", terminationClass: "runner-internal", update: (value) => { value.runnerParentVerification = { status: "PASS", mismatchCode: "CAPTURE_INIT" }; } },
+    { code: 71, name: "S8_RUNNER_CHILD_SETUP_FAILED", terminationClass: "child-setup-failed", update: (value) => { value.runnerParentVerification = { status: "FAIL", mismatchCode: null }; value.appliedByChild = { rlimitAsBytes: 0, rlimitFsizeBytes: 0, rlimitCpuSeconds: 0, rlimitNproc: 0, noNewPrivs: 0, seccompMode: 0 }; value.observedByRunnerParent = { rlimitAsBytes: 0, rlimitFsizeBytes: 0, rlimitCpuSeconds: 0, rlimitNproc: 0, noNewPrivs: 0, seccompMode: 0 }; value.result.setupStage = "seccomp"; value.result.stdoutBytes = 0; } },
+    { code: 72, name: "S8_RUNNER_EVIDENCE_INVALID", terminationClass: "evidence-failed", update: (value) => { value.runnerParentVerification = { status: "FAIL", mismatchCode: "CHILD_EVIDENCE_MALFORMED" }; value.result.evidenceCode = "CHILD_EVIDENCE_MALFORMED"; } },
+    { code: 73, name: "S8_RUNNER_EXEC_FAILED", terminationClass: "exec-failed" },
+    { code: 74, name: "S8_RUNNER_STDOUT_LIMIT", terminationClass: "stdout-limit" },
+    { code: 75, name: "S8_RUNNER_STDERR_LIMIT", terminationClass: "stderr-limit" },
+    { code: 76, name: "S8_RUNNER_TARGET_EXIT_NONZERO", terminationClass: "target-exit-nonzero", update: (value) => { value.result.targetExit = 3; } },
+    { code: 77, name: "S8_RUNNER_TARGET_SIGNAL", terminationClass: "target-signal", update: (value) => { value.result.targetSignal = 9; } },
+    { code: 124, name: "S8_RUNNER_TIMEOUT", terminationClass: "wall-timeout" },
+  ];
+  for (const item of cases) {
+    let parsed: ReturnType<typeof parseS8RunnerReceipt>;
+    try {
+      parsed = parseS8RunnerReceipt(
+        receipt((value) => {
+          value.result.code = item.code;
+          value.result.name = item.name;
+          value.result.terminationClass = item.terminationClass;
+          if (item.code !== 0) { value.result.targetExit = null; value.result.targetSignal = null; }
+          item.update?.(value);
+        }, item.code === 71 ? "" : "child-output"),
+        runnerLimits,
+        runnerHash,
+        runnerHash,
+        { status: item.code, signal: null, stderr: Buffer.alloc(0) },
+      );
+    } catch (error) {
+      throw new Error(`native runner result ${item.code} rejected: ${(error as Error).message}`);
+    }
+    assert.equal(parsed.evidence.verifiedByCaller.outerExitStatus, item.code);
+  }
+});
+
+test("outer runner status, signal, stderr count, setup, evidence, and pre-receipt argument failures reject", () => {
+  assert.throws(() => parseS8RunnerReceipt(receipt(), runnerLimits, runnerHash, runnerHash, { status: 1, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  assert.throws(() => parseS8RunnerReceipt(receipt(), runnerLimits, runnerHash, runnerHash, { status: 0, signal: "SIGKILL", stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  assert.throws(() => parseS8RunnerReceipt(receipt((value) => { value.result.stderrBytes = 1; }), runnerLimits, runnerHash, runnerHash, { status: 0, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  assert.throws(() => parseS8RunnerReceipt(receipt((value) => { value.result.code = 71; value.result.name = "S8_RUNNER_CHILD_SETUP_FAILED"; value.result.terminationClass = "child-setup-failed"; }), runnerLimits, runnerHash, runnerHash, { status: 71, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  assert.throws(() => parseS8RunnerReceipt(receipt((value) => { value.result.code = 72; value.result.name = "S8_RUNNER_EVIDENCE_INVALID"; value.result.terminationClass = "evidence-failed"; }), runnerLimits, runnerHash, runnerHash, { status: 72, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  assert.throws(() => parseS8RunnerReceipt(Buffer.alloc(0), runnerLimits, runnerHash, runnerHash, { status: 64, signal: null, stderr: Buffer.from("usage") }), /S8_PROCESS_RUNNER_ARGUMENT_INVALID/);
+});
+
+test("native runner internal failures accept only its exact internal mismatch semantics", () => {
+  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
+    value.result.code = 70;
+    value.result.name = "S8_RUNNER_INTERNAL";
+    value.result.terminationClass = "runner-internal";
+    value.runnerParentVerification = { status: "FAIL", mismatchCode: "PARENT_PROC_STATUS" };
+  }), runnerLimits, runnerHash, runnerHash, { status: 70, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
+    value.result.code = 70;
+    value.result.name = "S8_RUNNER_INTERNAL";
+    value.result.terminationClass = "runner-internal";
+    value.runnerParentVerification = { status: "PASS", mismatchCode: "INVENTED" };
+  }), runnerLimits, runnerHash, runnerHash, { status: 70, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
+    value.result.code = 70;
+    value.result.name = "S8_RUNNER_INTERNAL";
+    value.result.terminationClass = "runner-internal";
+    value.runnerParentVerification = { status: "PASS", mismatchCode: "PARENT_SETPGID" };
+  }), runnerLimits, runnerHash, runnerHash, { status: 70, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
+    value.result.code = 72;
+    value.result.name = "S8_RUNNER_EVIDENCE_INVALID";
+    value.result.terminationClass = "evidence-failed";
+    value.result.evidenceCode = "INVENTED";
+    value.runnerParentVerification = { status: "FAIL", mismatchCode: "INVENTED" };
+  }), runnerLimits, runnerHash, runnerHash, { status: 72, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
+    value.result.code = 76;
+    value.result.name = "S8_RUNNER_TARGET_EXIT_NONZERO";
+    value.result.terminationClass = "target-exit-nonzero";
+    value.result.targetExit = 256;
+  }), runnerLimits, runnerHash, runnerHash, { status: 76, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+});
+
+test("application sandbox argv uses only the accepted read-only runtime binds and cleared environment", () => {
+  assert.equal(S8_SYSTEM_RUNTIME_BIND_PATHS.length, 27);
+  assert.equal(new Set(S8_SYSTEM_RUNTIME_BIND_PATHS).size, 27);
+  const root = mkdtempSync(join(tmpdir(), "s8-sandbox-"));
+  try {
+    const sandboxPath = join(root, "sandbox");
+    writeFileSync(sandboxPath, "sandbox");
+    const workerConfig = { ...config(root), sandboxExecutable: sandboxPath };
+    const writer = buildS8BlenderSandboxCommand(workerConfig, root, join(root, "blender"), join(root, "writer.py"), join(root, "export_fbx_bin.py"), join(root, "patch-manifest.json"), join(root, "work"));
+    const validator = buildS8ValidatorSandboxCommand(workerConfig, join(root, "validator"), join(root, "work"));
+    for (const command of [writer, validator]) {
+      for (const flag of ["--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--disable-userns", "--assert-userns-disabled", "--die-with-parent", "--new-session", "--clearenv"]) {
+        assert.equal(command.args.filter((value) => value === flag).length, 1, `${flag} must appear exactly once`);
+      }
+      for (const [option, value] of [["--uid", "65534"], ["--gid", "65534"], ["--cap-drop", "ALL"], ["--proc", "/proc"], ["--dev", "/dev"], ["--tmpfs", "/tmp"], ["--chdir", "/work"]] as const) {
+        assert.equal(command.args.filter((argument, index) => argument === option && command.args[index + 1] === value).length, 1, `${option} ${value} must appear exactly once`);
+      }
+      assert.equal(command.args.filter((value) => value === "--setenv" || value.startsWith("--setenv=")).length, 0);
+      const bindPairs = command.args.flatMap((option, index, values) => option.includes("bind") ? [{ option, source: values[index + 1], destination: values[index + 2] }] : []);
+      const broadRuntimePaths = new Set(["/", "/usr", "/lib", "/lib64", "/etc"]);
+      assert.equal(bindPairs.some(({ source, destination }) => broadRuntimePaths.has(source ?? "") || broadRuntimePaths.has(destination ?? "")), false);
+      const identityBinds = bindPairs.filter(({ source, destination }) => source === destination);
+      assert.ok(identityBinds.every(({ option }) => option === "--ro-bind"));
+      assert.deepEqual(identityBinds.map(({ source }) => source), [...S8_SYSTEM_RUNTIME_BIND_PATHS]);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

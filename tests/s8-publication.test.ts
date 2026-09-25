@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import { S8ExportService, type S8ExportAdapters, type S8NativeValidationResult } from "../src/lib/s8";
 import type { S8SemanticResult, S8UfbxReadback } from "../src/lib/s8-fbx-semantic";
-import { type S8RunnerEvidence, type S8WriterResult } from "../src/lib/s8-fbx-worker";
+import { canonicalS8RunnerReceiptBytes, type S8RunnerEvidence, type S8WriterResult } from "../src/lib/s8-fbx-worker";
 import { JsonRepository, PrivateObjectStore } from "../src/lib/store";
-import { S8_LIMITS, S8_PROCESS_RUNNER_PIN, s8Sha256 } from "../src/lib/s8-fbx-profile";
+import { S8_LIMITS, S8_PROCESS_RUNNER_PIN, s8Sha256, s8StableName } from "../src/lib/s8-fbx-profile";
+import { jcs, sha256 } from "../src/lib/utils";
 import type { S6ToS7Handoff, S7ToS8Handoff, S8Artifact, UUID } from "../src/lib/types";
 
 const projectId = "11111111-1111-4111-8111-111111111111" as UUID;
@@ -57,7 +58,7 @@ function runnerEvidence(kind: "writer" | "validator"): S8RunnerEvidence {
   const stdoutBytes = validator ? S8_LIMITS.readbackBytes : S8_LIMITS.stdoutBytes;
   const runnerSha256 = validator ? "b".repeat(64) : "a".repeat(64);
   const cpuSeconds = Math.ceil(timeoutMs / 1000) + 1;
-  return {
+  const evidence: Omit<S8RunnerEvidence, "verifiedByCaller"> = {
     schemaVersion: S8_PROCESS_RUNNER_PIN.protocol,
     protocol: S8_PROCESS_RUNNER_PIN.protocol,
     policyId: S8_PROCESS_RUNNER_PIN.policy,
@@ -67,7 +68,21 @@ function runnerEvidence(kind: "writer" | "validator"): S8RunnerEvidence {
     runnerParentVerification: { status: "PASS", mismatchCode: null },
     runnerBinary: { selfSha256: runnerSha256 },
     result: { code: 0, name: "S8_RUNNER_SUCCESS", terminationClass: "target-exit-zero", targetExit: 0, targetSignal: null, elapsedMs: 1, stdoutBytes: 0, stderrBytes: 0, setupStage: null, evidenceCode: null },
-    verifiedByCaller: { schemaVersion: "s8-runner-caller-verification-v1", status: "VERIFIED_BY_CALLER", preLaunchSha256: runnerSha256, postLaunchSha256: runnerSha256, runnerReportedSelfSha256: runnerSha256, receiptSha256: "c".repeat(64) },
+  };
+  return {
+    ...evidence,
+    verifiedByCaller: {
+      schemaVersion: "s8-runner-caller-verification-v2",
+      status: "VERIFIED_BY_CALLER",
+      preLaunchSha256: runnerSha256,
+      postLaunchSha256: runnerSha256,
+      runnerReportedSelfSha256: runnerSha256,
+      outerExitStatus: 0,
+      outerSignal: null,
+      observedStdoutBytes: 0,
+      observedStderrBytes: 0,
+      receiptSha256: s8Sha256(canonicalS8RunnerReceiptBytes(evidence as unknown as S8RunnerEvidence)),
+    },
   };
 }
 
@@ -81,6 +96,7 @@ type FixtureOptions = {
   omitWriterEvidence?: boolean;
   omitValidatorEvidence?: boolean;
   omitValidatorIdentity?: boolean;
+  nativeReadback?: S8UfbxReadback;
 };
 
 function serviceFixture(options: FixtureOptions = {}) {
@@ -91,7 +107,15 @@ function serviceFixture(options: FixtureOptions = {}) {
   });
   const objects = new PrivateObjectStore(join(root, "objects"));
   const { s6, s7 } = sources();
-  const nativeReadback: S8UfbxReadback = { schemaVersion: "s8-ufbx-readback-v1", fbxVersion: 7400, unitMeters: 0.001, warningCount: 0, source: { revisionId, revisionHash: hash, s6ValidationHash: hash, s6HandoffDigest: hash }, materials: [], nodes: [] };
+  const identityMatrix = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0];
+  const nativeReadback: S8UfbxReadback = options.nativeReadback ?? {
+    schemaVersion: "s8-ufbx-readback-v1", fbxVersion: 7400, unitMeters: 0.001, warningCount: 0,
+    source: { revisionId, revisionHash: hash, s6ValidationHash: hash, s6HandoffDigest: hash }, materials: [],
+    nodes: [
+      { name: "SWZ_ROOT", parent: null, effectiveScale: [1, 1, 1], nodeToParent: identityMatrix, nodeToWorld: identityMatrix, mesh: null },
+      { name: s8StableName(0, "object-1"), parent: "SWZ_ROOT", sourceObjectId: "object-1", identityKey: "object-1", effectiveScale: [1, 1, 1], nodeToParent: identityMatrix, nodeToWorld: identityMatrix, mesh: null },
+    ],
+  };
   const adapters: S8ExportAdapters = {
     writer: (payloadBytes) => {
       const artifact = Buffer.alloc(32, 7);
@@ -120,6 +144,17 @@ function rejects(options: FixtureOptions, key: string): void {
   }
 }
 
+function replacePublicationReceipt(fixture: ReturnType<typeof serviceFixture>, artifact: S8Artifact, value: Record<string, unknown>): void {
+  const bytes = Buffer.from(jcs(value), "utf8");
+  const key = `${artifact.privateFinalPrefix}/publication-receipt.json`;
+  fixture.objects.remove(key);
+  fixture.objects.put(key, bytes);
+  fixture.repository.transact((state) => {
+    const persisted = state.s8Artifacts!.find((item: S8Artifact) => item.artifactId === artifact.artifactId)!;
+    persisted.objectHashes!.publicationReceiptSha256 = s8Sha256(bytes);
+  });
+}
+
 test("S8 publication binds caller-verified v2 evidence and reuses the immutable graph", () => {
   const fixture = serviceFixture();
   try {
@@ -127,6 +162,14 @@ test("S8 publication binds caller-verified v2 evidence and reuses the immutable 
     assert.equal(first.export.status, "committed");
     assert.equal(first.export.publicationPhase, "commit");
     assert.equal("privateFinalPrefix" in first.export, false);
+    const artifact = fixture.repository.state().s8Artifacts!.find((value: S8Artifact) => value.artifactId === first.export.artifactId)!;
+    const publication = JSON.parse(fixture.objects.read(`${artifact.privateFinalPrefix}/publication-receipt.json`).toString("utf8")) as { identity: { runner: { writer: S8RunnerEvidence } } };
+    const persistedWriterEvidence = publication.identity.runner.writer;
+    assert.equal(persistedWriterEvidence.verifiedByCaller.schemaVersion, "s8-runner-caller-verification-v2");
+    assert.equal(persistedWriterEvidence.verifiedByCaller.outerExitStatus, persistedWriterEvidence.result.code);
+    assert.equal(persistedWriterEvidence.verifiedByCaller.observedStdoutBytes, persistedWriterEvidence.result.stdoutBytes);
+    assert.equal(persistedWriterEvidence.verifiedByCaller.observedStderrBytes, persistedWriterEvidence.result.stderrBytes);
+    assert.equal(persistedWriterEvidence.verifiedByCaller.receiptSha256, s8Sha256(canonicalS8RunnerReceiptBytes(persistedWriterEvidence)));
     const downloaded = fixture.service.download(projectId, first.export.artifactId);
     assert.equal(downloaded.bytes.length, 32);
     const replay = fixture.service.createExport(projectId, "idempotency-key", "77777777-7777-4777-8777-777777777777");
@@ -180,6 +223,44 @@ test("S8 publication rejects every missing or malformed caller evidence layer", 
   rejects({ validatorEvidence: seccompMissing }, "seccomp-missing");
 });
 
+test("initial publication rejects missing or mismatched physical provenance and root provenance", () => {
+  const baseline = serviceFixture();
+  let validReadback: S8UfbxReadback;
+  try {
+    const created = baseline.service.createExport(projectId, "provenance-positive", "77777777-7777-4777-8777-777777777777");
+    assert.equal(created.export.status, "committed");
+    const artifact = baseline.repository.state().s8Artifacts!.find((value: S8Artifact) => value.artifactId === created.export.artifactId)!;
+    validReadback = JSON.parse(baseline.objects.read(`${artifact.privateFinalPrefix}/native-readback.json`).toString("utf8")) as S8UfbxReadback;
+  } finally {
+    rmSync(baseline.root, { recursive: true, force: true });
+  }
+
+  const invalidReadbacks: S8UfbxReadback[] = [];
+  for (const [property, value] of [
+    ["sourceObjectId", undefined], ["sourceObjectId", "wrong-source"],
+    ["identityKey", undefined], ["identityKey", "wrong-identity"],
+  ] as const) {
+    const readback = structuredClone(validReadback!);
+    const physical = readback.nodes[1]! as unknown as Record<string, unknown>;
+    if (value === undefined) delete physical[property];
+    else physical[property] = value;
+    invalidReadbacks.push(readback);
+  }
+  for (const property of ["sourceObjectId", "identityKey"]) {
+    const readback = structuredClone(validReadback!);
+    Object.defineProperty(readback.nodes[0], property, { value: undefined, enumerable: true, configurable: true });
+    invalidReadbacks.push(readback);
+  }
+  for (const [index, nativeReadback] of invalidReadbacks.entries()) {
+    const fixture = serviceFixture({ nativeReadback });
+    try {
+      assert.throws(() => fixture.service.createExport(projectId, `bad-provenance-${index}`, "88888888-8888-4888-8888-888888888888"), /S8_SOURCE_IDENTITY_MISMATCH/);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("S8 download re-hashes immutable bytes before serving", () => {
   const fixture = serviceFixture();
   try {
@@ -189,6 +270,63 @@ test("S8 download re-hashes immutable bytes before serving", () => {
     fixture.objects.remove(finalKey);
     fixture.objects.put(finalKey, Buffer.alloc(32, 8));
     assert.throws(() => fixture.service.download(projectId, created.export.artifactId), /S8_PUBLICATION_OBJECT_MISMATCH/);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("reuse rejects legacy and copied-only caller verification evidence", () => {
+  for (const mode of ["missing", "copied-status-only"] as const) {
+    const fixture = serviceFixture();
+    try {
+      const created = fixture.service.createExport(projectId, `legacy-evidence-${mode}`, "88888888-8888-4888-8888-888888888888");
+      const artifact = fixture.repository.state().s8Artifacts!.find((item: S8Artifact) => item.artifactId === created.export.artifactId)!;
+      const publication = JSON.parse(fixture.objects.read(`${artifact.privateFinalPrefix}/publication-receipt.json`).toString("utf8")) as Record<string, unknown>;
+      const identity = publication.identity as { runner: { writer: Record<string, unknown> } };
+      if (mode === "missing") delete identity.runner.writer.verifiedByCaller;
+      else identity.runner.writer.verifiedByCaller = { schemaVersion: "s8-runner-caller-verification-v2", status: "VERIFIED_BY_CALLER" };
+      replacePublicationReceipt(fixture, artifact, publication);
+      assert.throws(() => fixture.service.download(projectId, created.export.artifactId), /S8_REUSE_FINGERPRINT_INVALID/);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("reuse revalidates persisted native provenance against current accepted S6", () => {
+  const fixture = serviceFixture();
+  try {
+    const created = fixture.service.createExport(projectId, "persisted-provenance-key", "88888888-8888-4888-8888-888888888888");
+    const artifact = fixture.repository.state().s8Artifacts!.find((item: S8Artifact) => item.artifactId === created.export.artifactId)!;
+    const nativeKey = `${artifact.privateFinalPrefix}/native-readback.json`;
+    const native = JSON.parse(fixture.objects.read(nativeKey).toString("utf8")) as S8UfbxReadback;
+    (native.nodes[1] as unknown as Record<string, unknown>).identityKey = "wrong-accepted-s6-identity";
+    const nativeBytes = Buffer.from(jcs(native), "utf8");
+    const nativeHash = s8Sha256(nativeBytes);
+    const publication = JSON.parse(fixture.objects.read(`${artifact.privateFinalPrefix}/publication-receipt.json`).toString("utf8")) as Record<string, unknown>;
+    const identity = publication.identity as { fingerprintVersion: string; receiptHashes: { native: string } };
+    const objects = publication.objects as { nativeReadbackSha256: string };
+    identity.receiptHashes.native = nativeHash;
+    objects.nativeReadbackSha256 = nativeHash;
+    const immutableReuseFingerprint = sha256(jcs({ fingerprintVersion: identity.fingerprintVersion, identity }));
+    publication.immutableReuseFingerprint = immutableReuseFingerprint;
+    const receipt = fixture.repository.state().s8ValidationReceipts!.find((item) => item.receiptId === artifact.validationReceiptId)!;
+    fixture.repository.transact((state) => {
+      const persisted = state.s8Artifacts!.find((item: S8Artifact) => item.artifactId === artifact.artifactId)!;
+      persisted.objectHashes!.nativeReadbackSha256 = nativeHash;
+      persisted.immutableReuseFingerprint = immutableReuseFingerprint;
+      const persistedReceipt = state.s8ValidationReceipts!.find((item) => item.receiptId === receipt.receiptId)!;
+      persistedReceipt.nativeReadbackHash = nativeHash;
+      persistedReceipt.immutableReuseFingerprint = immutableReuseFingerprint;
+      const { receiptHash: _oldHash, ...body } = persistedReceipt;
+      persistedReceipt.receiptHash = sha256(jcs(body));
+      persisted.validationReceiptHash = persistedReceipt.receiptHash;
+      publication.validationReceiptHash = persistedReceipt.receiptHash;
+    });
+    fixture.objects.remove(nativeKey);
+    fixture.objects.put(nativeKey, nativeBytes);
+    replacePublicationReceipt(fixture, artifact, publication);
+    assert.throws(() => fixture.service.download(projectId, created.export.artifactId), /S8_REUSE_FINGERPRINT_INVALID/);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }

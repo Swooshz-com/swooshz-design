@@ -107,6 +107,26 @@ function identityMatrix(value: S8Mat4, field: string): void {
   for (let index = 0; index < 16; index += 1) if (value[index] !== expected[index]) fail("S8_ROOT_IDENTITY_INVALID", `${field}.${index}`);
 }
 
+export function assertS8ReadbackProvenance(s6: S6ToS7Handoff, readback: S8UfbxReadback): void {
+  if (!readback || typeof readback !== "object" || !Array.isArray(readback.nodes)) fail("S8_NATIVE_READBACK_INVALID");
+  const roots = readback.nodes.filter((node) => node && typeof node === "object" && node.name === "SWZ_ROOT");
+  if (roots.length !== 1) fail("S8_OBJECT_SET_MISMATCH");
+  const root = roots[0] as unknown as Record<string, unknown>;
+  if (Object.hasOwn(root, "sourceObjectId") || Object.hasOwn(root, "identityKey")) fail("S8_SOURCE_IDENTITY_MISMATCH", "nodes.SWZ_ROOT");
+
+  const sorted = s6.objects.slice().sort((left, right) => Buffer.compare(Buffer.from(left.objectId, "utf8"), Buffer.from(right.objectId, "utf8")));
+  for (const [index, source] of sorted.entries()) {
+    if (typeof source.identityKey !== "string" || source.identityKey.length === 0) fail("S8_SOURCE_IDENTITY_MISMATCH", `objects.${source.objectId}.identityKey`);
+    const expectedName = s8StableName(index, source.objectId);
+    const matches = readback.nodes.filter((node) => node && typeof node === "object" && node.name === expectedName);
+    if (matches.length !== 1) fail("S8_OBJECT_SET_MISMATCH", `nodes.${expectedName}`);
+    const physical = matches[0] as unknown as Record<string, unknown>;
+    if (!Object.hasOwn(physical, "sourceObjectId") || physical.sourceObjectId !== source.objectId || !Object.hasOwn(physical, "identityKey") || physical.identityKey !== source.identityKey) {
+      fail("S8_SOURCE_IDENTITY_MISMATCH", `nodes.${expectedName}`);
+    }
+  }
+}
+
 function bounds(points: readonly S8Vec3[]): { min: S8Vec3; max: S8Vec3 } {
   if (points.length === 0) fail("S8_MESH_INVALID");
   return {
@@ -133,6 +153,7 @@ export function compareS8UfbxReadback(s6: S6ToS7Handoff, s7: S7ToS8Handoff, read
   const expectedNames = new Set(["SWZ_ROOT", ...names.values()]);
   if (observed.size !== expectedNames.size || [...expectedNames].some((name) => !observed.has(name))) fail("S8_OBJECT_SET_MISMATCH");
   const observedRoot = observed.get("SWZ_ROOT")!;
+  assertS8ReadbackProvenance(s6, readback);
   if (observedRoot.parent !== null || observedRoot.mesh !== null || observedRoot.effectiveScale.some((value) => value !== 1)) fail("S8_ROOT_IDENTITY_INVALID");
   identityMatrix(ufbxMatrixToRowMajor(observedRoot.nodeToParent), "root.nodeToParent");
   identityMatrix(ufbxMatrixToRowMajor(observedRoot.nodeToWorld), "root.nodeToWorld");
@@ -151,7 +172,6 @@ export function compareS8UfbxReadback(s6: S6ToS7Handoff, s7: S7ToS8Handoff, read
     const node = observed.get(name)!;
     const expectedParentName = sourceObject.parentObjectId === null ? "SWZ_ROOT" : names.get(sourceObject.parentObjectId);
     if (!expectedParentName || node.parent !== expectedParentName || node.mesh === null) fail("S8_HIERARCHY_IDENTITY_MISMATCH", `nodes.${name}.parent`);
-    if (node.sourceObjectId !== undefined && node.sourceObjectId !== sourceObject.objectId) fail("S8_SOURCE_IDENTITY_MISMATCH", `nodes.${name}.sourceObjectId`);
     if (node.effectiveScale.length !== 3 || node.effectiveScale.some((value) => value !== 1)) fail("S8_EXACT_SCALE_INVALID", `nodes.${name}.effectiveScale`);
     const transformOracle = oracle.get(sourceObject.objectId)!;
     const observedLocal = ufbxMatrixToRowMajor(node.nodeToParent);

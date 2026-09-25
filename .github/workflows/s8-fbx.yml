@@ -514,10 +514,79 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if git grep -I -n -E '(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' -- .; then
-            echo "credential-like material detected in tracked files" >&2
+          secret_pattern='(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+          tracked_secret_scan() {
+            local git_bin="$1" repo="$2" scan_stdout="$3" scan_stderr="$4" raw_status
+            [[ -n "$git_bin" && -x "$git_bin" ]] || return 2
+            if "$git_bin" -C "$repo" grep -I -n -E "$secret_pattern" -- . >"$scan_stdout" 2>"$scan_stderr"; then
+              raw_status=0
+            else
+              raw_status=$?
+            fi
+            case "$raw_status" in
+              0) return 1 ;;
+              1) return 0 ;;
+              *) return 2 ;;
+            esac
+          }
+          scan_root="$(mktemp -d)"
+          trap 'rm -rf -- "$scan_root"' EXIT
+          synthetic_secret="ghp_$(/usr/bin/printf 'A%.0s' {1..24})"
+          test_repo="$scan_root/tracked"
+          /usr/bin/mkdir -p -- "$test_repo"
+          /usr/bin/git -C "$test_repo" init -q
+          /usr/bin/printf '%s\n' "$synthetic_secret" > "$test_repo/payload.txt"
+          /usr/bin/git -C "$test_repo" add -- payload.txt
+          assert_scan_status() {
+            local expected="$1" git_bin="$2" repo="$3" label="$4" result
+            if tracked_secret_scan "$git_bin" "$repo" "$scan_root/$label.raw.stdout" "$scan_root/$label.raw.stderr" >"$scan_root/$label.stdout" 2>"$scan_root/$label.stderr"; then
+              result=0
+            else
+              result=$?
+            fi
+            [[ "$result" == "$expected" ]] || { /usr/bin/printf 'SECRET_SCAN_REGRESSION_FAILED:%s\n' "$label" >&2; exit 1; }
+            [[ ! -s "$scan_root/$label.stdout" && ! -s "$scan_root/$label.stderr" ]] || { /usr/bin/printf 'SECRET_SCAN_OUTPUT_NOT_SUPPRESSED:%s\n' "$label" >&2; exit 1; }
+            if /usr/bin/grep -F -- "$synthetic_secret" "$scan_root/$label.stdout" "$scan_root/$label.stderr" >/dev/null 2>&1; then
+              /usr/bin/printf 'SECRET_SCAN_MATCH_BYTES_LEAKED:%s\n' "$label" >&2
+              exit 1
+            fi
+          }
+          git_bin="$(command -v git || true)"
+          assert_scan_status 1 "$git_bin" "$test_repo" match
+          if ! /usr/bin/grep -F -- "$synthetic_secret" "$scan_root/match.raw.stdout" >/dev/null 2>&1; then
+            /usr/bin/printf 'SECRET_SCAN_SYNTHETIC_MATCH_NOT_OBSERVED\n' >&2
             exit 1
           fi
+          clean_repo="$scan_root/clean"
+          /usr/bin/mkdir -p -- "$clean_repo"
+          /usr/bin/git -C "$clean_repo" init -q
+          /usr/bin/printf 'ordinary tracked content\n' > "$clean_repo/payload.txt"
+          /usr/bin/git -C "$clean_repo" add -- payload.txt
+          assert_scan_status 0 "$git_bin" "$clean_repo" clean
+          fake_git="$scan_root/fake-git"
+          cat > "$fake_git" <<'SH'
+          #!/bin/sh
+          printf '%s\n' "${S8_SECRET_SCANNER_TEST_BYTES:-}"
+          exit "${S8_SECRET_SCANNER_TEST_STATUS:-2}"
+          SH
+          /usr/bin/chmod 0700 -- "$fake_git"
+          export S8_SECRET_SCANNER_TEST_BYTES="$synthetic_secret"
+          export S8_SECRET_SCANNER_TEST_STATUS=0
+          assert_scan_status 1 "$fake_git" "$clean_repo" status-zero
+          S8_SECRET_SCANNER_TEST_STATUS=1 assert_scan_status 0 "$fake_git" "$clean_repo" status-one
+          S8_SECRET_SCANNER_TEST_STATUS=2 assert_scan_status 2 "$fake_git" "$clean_repo" status-two
+          S8_SECRET_SCANNER_TEST_STATUS=128 assert_scan_status 2 "$fake_git" "$clean_repo" status-128
+          assert_scan_status 2 "$scan_root/missing-git" "$clean_repo" unavailable
+          if tracked_secret_scan "$git_bin" "$GITHUB_WORKSPACE" "$scan_root/repository.raw.stdout" "$scan_root/repository.raw.stderr" >"$scan_root/repository.stdout" 2>"$scan_root/repository.stderr"; then
+            scan_result=0
+          else
+            scan_result=$?
+          fi
+          case "$scan_result" in
+            0) /usr/bin/printf 'TRACKED_SECRET_SCAN=PASS\n' ;;
+            1) /usr/bin/printf 'credential-like material detected in tracked files\n' >&2; exit 1 ;;
+            *) /usr/bin/printf 'ENVIRONMENT_CHECK_SYSTEM_HOLD:TRACKED_SECRET_SCANNER_UNAVAILABLE_OR_FAILED\n' >&2; exit 1 ;;
+          esac
       - name: Static boundary proof
         shell: bash
         run: |
@@ -5449,6 +5518,7 @@ jobs:
           source_manifest="$temp_root/source.manifest"
           staged_manifest="$temp_root/staged.manifest"
           post_run_manifest="$temp_root/post-run.manifest"
+          /usr/bin/python3 scripts/s8/s8_runtime_sensitivity.py --manifest-self-test || fail_hold "MANIFEST_FAILURE_REGRESSION_FAILED"
           /usr/bin/install -d -m 0700 -- "$source_layout/runtime" "$source_layout/native" "$source_layout/writer" "$source_layout/support" || fail_hold "SOURCE_LAYOUT_CREATE_FAILED"
 
           test -x /usr/local/bin/cmake || fail_hold "HOSTED_CMAKE_PATH_INVALID"
@@ -5492,30 +5562,13 @@ jobs:
           /usr/bin/find -P "$source_layout" -type f -perm /111 -exec /usr/bin/chmod 0555 {} +
           /usr/bin/find -P "$source_layout" -type f ! -perm /111 -exec /usr/bin/chmod 0444 {} +
 
-          manifest_surfaces() {
-            local base="$1"
-            shift
-            {
-              local surface
-              for surface in "$@"; do
-                while IFS= read -r -d '' manifest_path; do
-                  relative_path="${manifest_path#"$base"/}"
-                  manifest_mode="$(stat -c '%a' -- "$manifest_path")"
-                  manifest_size="$(stat -c '%s' -- "$manifest_path")"
-                  manifest_sha="$(sha256sum -- "$manifest_path" | awk '{print $1}')"
-                  printf 'F\t%s\t%s\t%s\t%s\n' "$relative_path" "$manifest_mode" "$manifest_size" "$manifest_sha"
-                done < <(/usr/bin/find -P "$base/$surface" -type f -print0)
-                while IFS= read -r -d '' manifest_path; do
-                  relative_path="${manifest_path#"$base"/}"
-                  printf 'L\t%s\t%s\n' "$relative_path" "$(readlink -- "$manifest_path")"
-                done < <(/usr/bin/find -P "$base/$surface" -type l -print0)
-              done
-            } | LC_ALL=C /usr/bin/sort
-          }
-
-          manifest_surfaces "$source_layout" runtime native writer support > "$source_manifest" || fail_hold "SOURCE_MANIFEST_FAILED"
-          [[ -s "$source_manifest" ]] || fail_hold "SOURCE_MANIFEST_EMPTY"
-          source_manifest_sha="$(sha256sum -- "$source_manifest" | awk '{print $1}')"
+          if ! source_manifest_output="$(/usr/bin/python3 scripts/s8/s8_runtime_sensitivity.py --manifest-create "$source_layout" "$source_manifest" 2>"$temp_root/source-manifest.stderr")"; then
+            fail_hold "SOURCE_MANIFEST_FAILED"
+          fi
+          [[ "$source_manifest_output" == $'MANIFEST_ACQUISITION=PASS\nMANIFEST_SHA256='* ]] || fail_hold "SOURCE_MANIFEST_OUTPUT_INVALID"
+          source_manifest_sha="${source_manifest_output##*$'\n'}"
+          [[ "${source_manifest_sha#MANIFEST_SHA256=}" =~ ^[0-9a-f]{64}$ ]] || fail_hold "SOURCE_MANIFEST_HASH_INVALID"
+          source_manifest_sha="${source_manifest_sha#MANIFEST_SHA256=}"
           blender_pre_stage_sha="$(sha256sum -- "$blender_source/blender" | awk '{print $1}')"
           runner_pre_stage_sha="$(sha256sum -- "$temp_root/s8-runner/s8-process-runner" | awk '{print $1}')"
           validator_pre_stage_sha="$(sha256sum -- "$temp_root/s8-validator/s8-fbx-validator" | awk '{print $1}')"
@@ -5551,9 +5604,15 @@ jobs:
             fail_hold "RUNTIME_CODE_FILE_WRITABLE"
           fi
 
-          manifest_surfaces "$carrier" runtime native writer support > "$staged_manifest" || fail_hold "STAGED_MANIFEST_FAILED"
-          staged_manifest_sha="$(sha256sum -- "$staged_manifest" | awk '{print $1}')"
-          cmp --silent "$source_manifest" "$staged_manifest" || fail_hold "SOURCE_STAGED_MANIFEST_MISMATCH"
+          if ! staged_manifest_output="$(/usr/bin/python3 scripts/s8/s8_runtime_sensitivity.py --manifest-create "$carrier" "$staged_manifest" 2>"$temp_root/staged-manifest.stderr")"; then
+            fail_hold "STAGED_MANIFEST_FAILED"
+          fi
+          [[ "$staged_manifest_output" == $'MANIFEST_ACQUISITION=PASS\nMANIFEST_SHA256='* ]] || fail_hold "STAGED_MANIFEST_OUTPUT_INVALID"
+          staged_manifest_sha="${staged_manifest_output##*$'\n'}"
+          [[ "${staged_manifest_sha#MANIFEST_SHA256=}" =~ ^[0-9a-f]{64}$ ]] || fail_hold "STAGED_MANIFEST_HASH_INVALID"
+          staged_manifest_sha="${staged_manifest_sha#MANIFEST_SHA256=}"
+          /usr/bin/python3 scripts/s8/s8_runtime_sensitivity.py --manifest-compare "$source_manifest" "$staged_manifest" >"$temp_root/source-staged-compare.stdout" 2>"$temp_root/source-staged-compare.stderr" || fail_hold "SOURCE_STAGED_MANIFEST_MISMATCH"
+          /usr/bin/grep -Fx 'MANIFEST_EQUALITY=PASS' "$temp_root/source-staged-compare.stdout" >/dev/null || fail_hold "SOURCE_STAGED_MANIFEST_COMPARE_OUTPUT_INVALID"
           blender_staged_sha="$(sha256sum -- "$carrier/runtime/blender-5.2.2-linux-x64/blender" | awk '{print $1}')"
           runner_staged_sha="$(sha256sum -- "$carrier/native/s8-process-runner" | awk '{print $1}')"
           validator_staged_sha="$(sha256sum -- "$carrier/native/s8-fbx-validator" | awk '{print $1}')"
@@ -9289,6 +9348,194 @@ jobs:
           admit_work_for_use || fail_hold "WORK_POST_CANDIDATE_ADMISSION_FAILED"
           printf 'NATIVE_RUNNER_ADMISSION_RESULT=PASS\nPINNED_BLENDER_RESULT=PASS\nPRIVATE_EXPORTER_RESULT=PASS\nNATIVE_VALIDATOR_RESULT=PASS\nBLENDER_SEMANTIC_QUALIFICATION=PASS\n'
 
+          admit_work_for_use || fail_hold "WORK_BEFORE_APPLICATION_BOUNDARY_PROOF_FAILED"
+          app_sandbox="$temp_root/s8-observed-bwrap"
+          app_argv_audit="$temp_root/s8-application-bwrap-argv.log"
+          app_proof="$temp_root/s8-application-boundary-proof.mts"
+          app_argv_q="$(printf '%q' "$app_argv_audit")"
+          {
+            printf '%s\n' '#!/usr/bin/bash' '{'
+            printf '%s\n' "  printf '%s\\n' 'S8APP_BWRAP_BEGIN'"
+            printf '%s\n' '  printf "%s\\n" "$@"'
+            printf '%s\n' "  printf '%s\\n' 'S8APP_BWRAP_END'"
+            printf '} >> %s\n' "$app_argv_q"
+            printf '%s\n' 'exec /usr/bin/sudo -n /usr/bin/bwrap "$@"'
+          } > "$app_sandbox"
+          /usr/bin/chmod 0700 -- "$app_sandbox"
+          cat > "$app_proof" <<'TS'
+          import { createHash } from "node:crypto";
+          import { readFileSync } from "node:fs";
+          import { join, resolve } from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          const workspace = process.env.GITHUB_WORKSPACE!;
+          const carrier = process.env.S8_APP_CARRIER!;
+          const work = process.env.S8_APP_WORK!;
+          const argvAudit = process.env.S8_APP_ARGV_AUDIT!;
+          const load = (path: string) => import(pathToFileURL(join(workspace, path)).href);
+          const [{ buildS8WriterPayload }, { runS8BlenderWriter, runS8NativeValidator, S8_SYSTEM_RUNTIME_BIND_PATHS }, { compareS8UfbxReadback }] = await Promise.all([
+            load("src/lib/s8-fbx-payload.ts"), load("src/lib/s8-fbx-worker.ts"), load("src/lib/s8-fbx-semantic.ts"),
+          ]);
+          const hash = "a".repeat(64);
+          const projectId = "11111111-1111-4111-8111-111111111111";
+          const revisionId = "22222222-2222-4222-8222-222222222222";
+          const object = {
+            objectId: "object-1", identityKey: "object-1", parentObjectId: null,
+            objectType: "box", role: "furniture", label: "Box",
+            geometry: { kind: "rect_prism", dimensionsMm: { widthMm: 100, depthMm: 100, heightMm: 100 }, geometryState: "exact", localAnchor: "floor" },
+            footprint: { kind: "rectangle", widthMm: 100, depthMm: 100 },
+            transform: { positionMm: { xMm: 0, yMm: 0, zMm: 0 }, rotationMd: { xMd: 0, yMd: 0, zMd: 0 } },
+            boundsMm: { widthMm: 100, depthMm: 100, heightMm: 100 },
+            zoneIds: [], requirementIds: [], materialIds: [], unknownIds: [],
+            provenance: { kind: "user_confirmed_design_decision", sourceRef: "g3-runtime-proof", sourceFingerprint: hash, acceptedByUser: true, note: null },
+          };
+          const s6 = {
+            schemaVersion: "s6-to-s7-handoff-v1", projectId, acceptedRevisionId: revisionId, acceptedRevisionHash: hash,
+            sourceS5Fingerprint: hash, spatialSchemaVersion: "s6-spatial-model-v1", units: "millimetres",
+            coordinateConvention: { version: "booth-local-right-handed-v1", units: "millimetres", handedness: "right-handed", origin: "north-west-floor-corner", xAxis: "east", yAxis: "up", zAxis: "south" },
+            booth: { widthMm: 1000, depthMm: 1000, openSides: ["north"], maxHeightMm: 1000, heightState: "known" },
+            objects: [object], hierarchy: [{ objectId: object.objectId, parentObjectId: null }], zones: [], requirements: [], materials: [], assumptions: [], unknowns: [],
+            validationReceipt: { receiptId: "33333333-3333-4333-8333-333333333333", validationHash: hash, outcome: "pass" },
+            eligibility: { currentAccepted: true, sourceCurrent: true, stale: false },
+          };
+          const s7 = {
+            schemaVersion: "s7-to-s8-handoff-v1", projectId, sourceRevisionId: revisionId, sourceRevisionHash: hash, sourceS5Fingerprint: hash,
+            s7ArtifactId: "44444444-4444-4444-8444-444444444444", s7ArtifactHash: hash, s7ArtifactByteSize: 1,
+            manifestId: "55555555-5555-4555-8555-555555555555", manifestHash: hash, readbackReceiptId: "66666666-6666-4666-8666-666666666666", readbackHash: hash,
+            dxfVersion: "s7-dxf-r2000-ascii-v1", worldToPlanVersion: "s7-world-to-plan-v1", coordinateConvention: "booth-local-right-handed-v1",
+            dxfIsNot3DAuthority: true, s8MustReadAcceptedS6Model: true,
+          };
+          const prepared = buildS8WriterPayload(s6, s7);
+          const runtimeRoot = join(carrier, "runtime", "blender-5.2.2-linux-x64");
+          const blender = join(runtimeRoot, "blender");
+          const workerConfig = {
+            blenderRuntimeRoot: runtimeRoot, blenderExecutable: blender,
+            writerScript: join(carrier, "writer", "writer.py"), privateWorkRoot: work,
+            processRunnerExecutable: join(carrier, "native", "s8-process-runner"),
+            sandboxExecutable: process.env.S8_APP_SANDBOX!,
+            nativeValidatorExecutable: join(carrier, "native", "s8-fbx-validator"),
+            blenderExecutableSha256: createHash("sha256").update(readFileSync(blender)).digest("hex"),
+          };
+          process.env.PATH = "/s8-hostile-path";
+          process.env.HOME = "/s8-hostile-home";
+          process.env.LD_PRELOAD = "/s8-hostile-ld-preload.so";
+          process.env.LD_LIBRARY_PATH = "/s8-hostile-library-path";
+          process.env.PYTHONPATH = "/s8-hostile-python-path";
+          process.env.PYTHONHOME = "/s8-hostile-python-home";
+          process.env.G3_SYNTHETIC_CREDENTIAL = `ghp_${"A".repeat(24)}`;
+
+          const written = runS8BlenderWriter(prepared.bytes, workerConfig);
+          if (written.artifact.length <= 27) throw new Error("application writer did not return a real FBX");
+          const native = runS8NativeValidator(written.artifact, workerConfig);
+          if (!native.runnerEvidence || !native.validatorIdentity) throw new Error("application validator receipt is missing");
+          const semantic = compareS8UfbxReadback(s6, s7, native.readback);
+          if (semantic.outcome !== "pass") throw new Error("application semantic readback rejected the FBX");
+
+          const lines = readFileSync(argvAudit, "utf8").trim().split("\n");
+          const invocations: string[][] = [];
+          let current: string[] | undefined;
+          for (const line of lines) {
+            if (line === "S8APP_BWRAP_BEGIN") { if (current) throw new Error("nested bwrap audit frame"); current = []; }
+            else if (line === "S8APP_BWRAP_END") { if (!current) throw new Error("unmatched bwrap audit frame"); invocations.push(current); current = undefined; }
+            else { if (!current) throw new Error("unframed bwrap argument"); current.push(line); }
+          }
+          if (current || invocations.length !== 2) throw new Error("application did not launch writer and validator exactly once");
+          const allowedRuntime = [...S8_SYSTEM_RUNTIME_BIND_PATHS].sort();
+          let explicitSetenvCount = 0;
+          for (const args of invocations) {
+            explicitSetenvCount += args.filter((value) => value === "--setenv" || value.startsWith("--setenv=")).length;
+            for (const required of ["--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--disable-userns", "--assert-userns-disabled", "--die-with-parent", "--new-session", "--clearenv"]) {
+              if (args.filter((value) => value === required).length !== 1) throw new Error(`application bwrap boundary option count invalid: ${required}`);
+            }
+            for (const [option, value] of [["--uid", "65534"], ["--gid", "65534"], ["--cap-drop", "ALL"], ["--proc", "/proc"], ["--dev", "/dev"], ["--tmpfs", "/tmp"], ["--chdir", "/work"]] as const) {
+              if (args.filter((argument, index) => argument === option && args[index + 1] === value).length !== 1) throw new Error(`application bwrap boundary argument invalid: ${option}`);
+            }
+            const identityBinds: Array<{ option: string; source: string; destination: string }> = [];
+            for (let index = 0; index < args.length; index += 1) {
+              const option = args[index]!;
+              if (!option.includes("bind")) continue;
+              const source = args[index + 1];
+              const destination = args[index + 2];
+              for (const path of [source, destination]) {
+                if (path && ["/", "/usr", "/lib", "/lib64", "/etc"].includes(resolve(path))) throw new Error("broad runtime bind detected");
+              }
+              if (source === destination) identityBinds.push({ option, source: source!, destination: destination! });
+            }
+            if (identityBinds.some(({ option }) => option !== "--ro-bind") || JSON.stringify(identityBinds.map(({ source }) => source).sort()) !== JSON.stringify(allowedRuntime)) throw new Error("system runtime bind allowlist mismatch");
+          }
+          if (explicitSetenvCount !== 0) throw new Error("application setenv count is not zero");
+          console.log("APPLICATION_GENERATED_WRITER=PASS");
+          console.log("APPLICATION_GENERATED_VALIDATOR=PASS");
+          console.log("APPLICATION_SEMANTIC_READBACK=PASS");
+          console.log("APPLICATION_EXPLICIT_SETENV_COUNT=0");
+          console.log("APPLICATION_UID_GID=65534:65534");
+          console.log("APPLICATION_CAP_DROP=ALL");
+          console.log("BWRAP_CLEAR_ENV_REQUIRED=PASS");
+          console.log("FINAL_RUNTIME_ALLOWLIST_PROOF=PASS");
+          console.log("BROAD_RUNTIME_BINDS_ABSENT=YES");
+          TS
+          export S8_APP_CARRIER="$carrier"
+          export S8_APP_WORK="$carrier/work"
+          export S8_APP_ARGV_AUDIT="$app_argv_audit"
+          export S8_APP_SANDBOX="$app_sandbox"
+          /usr/bin/pnpm exec tsx "$app_proof" >"$temp_root/application-proof.stdout" 2>"$temp_root/application-proof.stderr" &
+          app_proof_pid=$!
+          set +e
+          /usr/bin/sudo -n /usr/bin/python3 - "$app_proof_pid" "$temp_root/application-target-env.status" <<'PY'
+          import os
+          import pathlib
+          import sys
+          import time
+
+          application_pid = int(sys.argv[1])
+          status_path = pathlib.Path(sys.argv[2])
+          observed = set()
+          error = False
+          while True:
+              try:
+                  process_state = (pathlib.Path("/proc") / str(application_pid) / "stat").read_text(encoding="ascii").rsplit(")", 1)[1].strip().split()[0]
+                  if process_state == "Z":
+                      break
+              except FileNotFoundError:
+                  break
+              try:
+                  os.kill(application_pid, 0)
+              except ProcessLookupError:
+                  break
+              for entry in pathlib.Path("/proc").iterdir():
+                  if not entry.name.isdigit():
+                      continue
+                  try:
+                      command = (entry / "cmdline").read_bytes()
+                      kind = "writer" if b"/runtime/blender-root/blender\0" in command else "validator" if b"/runtime/validator\0" in command else None
+                      if kind is None:
+                          continue
+                      variables = [item for item in (entry / "environ").read_bytes().split(b"\0") if item]
+                      keys = {item.split(b"=", 1)[0] for item in variables}
+                      if len(variables) != 1 or keys != {b"PWD"} or b"PWD=/work" not in variables:
+                          error = True
+                      observed.add(kind)
+                  except (FileNotFoundError, ProcessLookupError, PermissionError):
+                      continue
+              time.sleep(0.003)
+          status_path.write_text("PASS\n" if not error and observed == {"writer", "validator"} else "FAIL\n", encoding="ascii")
+          if error or observed != {"writer", "validator"}:
+              raise SystemExit(1)
+          PY
+          target_env_status=$?
+          wait "$app_proof_pid"
+          app_proof_status=$?
+          set -e
+          if (( app_proof_status != 0 )); then
+            /usr/bin/cat -- "$temp_root/application-proof.stderr" >&2
+            exit "$app_proof_status"
+          fi
+          (( target_env_status == 0 )) || fail_hold "APPLICATION_TARGET_ENVIRONMENT_PROOF_FAILED"
+          /usr/bin/grep -Fx 'PASS' "$temp_root/application-target-env.status" >/dev/null || fail_hold "APPLICATION_TARGET_ENVIRONMENT_STATUS_INVALID"
+          /usr/bin/cat -- "$temp_root/application-proof.stdout"
+          printf 'TARGET_ENV_KEYS=PWD\nPARENT_SECRET_HOSTILE_ENV_LEAKAGE=NO\nPRODUCTION_BOUNDARY_PROOF=PASS\n'
+          admit_work_for_use || fail_hold "WORK_AFTER_APPLICATION_BOUNDARY_PROOF_FAILED"
+
           [[ "$all_launched_children_reaped" == 1 && ${#tracked_children[@]} == 0 ]] || fail_hold "CANDIDATE_CHILD_REAP_WITNESS_MISSING"
           admit_iproute2_snapshot post_candidate_reap || fail_hold "IPROUTE2_ADMISSION_FAILED_POST_CANDIDATE_REAP"
           admit_root_and_carrier || fail_hold "BEFORE_SEMANTIC_READBACK_IDENTITY_FAILED"
@@ -9473,9 +9720,15 @@ jobs:
           admit_root_and_carrier || fail_hold "BEFORE_POST_RUN_MANIFEST_IDENTITY_FAILED"
           mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_BEFORE_POST_RUN_MANIFEST_FAILED"
           admit_work_for_use || fail_hold "WORK_BEFORE_POST_RUN_MANIFEST_FAILED"
-          manifest_surfaces "$carrier" runtime native writer support > "$post_run_manifest" || fail_amendment "POST_RUN_MANIFEST_FAILED"
-          post_run_manifest_sha="$(sha256sum -- "$post_run_manifest" | awk '{print $1}')"
-          cmp --silent "$staged_manifest" "$post_run_manifest" || fail_amendment "POST_RUN_MANIFEST_MISMATCH"
+          if ! post_run_manifest_output="$(/usr/bin/python3 scripts/s8/s8_runtime_sensitivity.py --manifest-create "$carrier" "$post_run_manifest" 2>"$temp_root/post-run-manifest.stderr")"; then
+            fail_amendment "POST_RUN_MANIFEST_FAILED"
+          fi
+          [[ "$post_run_manifest_output" == $'MANIFEST_ACQUISITION=PASS\nMANIFEST_SHA256='* ]] || fail_amendment "POST_RUN_MANIFEST_OUTPUT_INVALID"
+          post_run_manifest_sha="${post_run_manifest_output##*$'\n'}"
+          [[ "${post_run_manifest_sha#MANIFEST_SHA256=}" =~ ^[0-9a-f]{64}$ ]] || fail_amendment "POST_RUN_MANIFEST_HASH_INVALID"
+          post_run_manifest_sha="${post_run_manifest_sha#MANIFEST_SHA256=}"
+          /usr/bin/python3 scripts/s8/s8_runtime_sensitivity.py --manifest-compare "$staged_manifest" "$post_run_manifest" >"$temp_root/post-run-compare.stdout" 2>"$temp_root/post-run-compare.stderr" || fail_amendment "POST_RUN_MANIFEST_MISMATCH"
+          /usr/bin/grep -Fx 'MANIFEST_EQUALITY=PASS' "$temp_root/post-run-compare.stdout" >/dev/null || fail_amendment "POST_RUN_MANIFEST_COMPARE_OUTPUT_INVALID"
           blender_post_run_sha="$(sha256sum -- "$carrier/runtime/blender-5.2.2-linux-x64/blender" | awk '{print $1}')"
           runner_post_run_sha="$(sha256sum -- "$carrier/native/s8-process-runner" | awk '{print $1}')"
           validator_post_run_sha="$(sha256sum -- "$carrier/native/s8-fbx-validator" | awk '{print $1}')"

@@ -1,13 +1,13 @@
 import { AppError, type S6ToS7Handoff, type S7ToS8Handoff, type S8Artifact, type S8ExportJob, type S8IdempotencyRecord, type S8SourceStamp, type S8ValidationReceipt, type Timestamp, type UUID } from "./types";
 import { buildS8WriterPayload, canonicalS8SourceJson, type S8WriterPayload } from "./s8-fbx-payload";
-import { compareS8UfbxReadback, type S8SemanticResult, type S8UfbxReadback } from "./s8-fbx-semantic";
+import { assertS8ReadbackProvenance, compareS8UfbxReadback, type S8SemanticResult, type S8UfbxReadback } from "./s8-fbx-semantic";
 import { S8_BLENDER_PIN, S8_EXPORTER_PATCH_PIN, S8_EXPORTER_SETTINGS, S8_FBX_PROFILE, S8_LIMITS, S8_PROCESS_RUNNER_PIN, S8_PROTOCOL_VERSION, S8_RESOURCE_TABLE, S8_REUSE_FINGERPRINT_VERSION, S8_SEMANTIC_VERSION, S8_UFBX_PIN, S8_VALIDATOR_PIN, S8_WRITER_RECEIPT_VERSION, s8Sha256 } from "./s8-fbx-profile";
 import { getS8Collections, sameS8Source, s8FinalPrefix, s8ObjectKey, s8ResourceLimitsHash, s8StagingPrefix, S8_OBJECT_NAMES, S8_STALE_CLAIM_MS } from "./s8-fbx-persistence";
 import { JsonRepository, PrivateObjectStore } from "./store";
 import { jcs, newUuid, nowUtc, sha256, uuidV4Pattern } from "./utils";
 import { S6WorkflowService } from "./s6";
 import { S7CadService } from "./s7-cad";
-import { runS8BlenderWriter, runS8NativeValidator, type S8CallerVerification, type S8NativeValidatorResult, type S8RunnerEvidence, type S8WorkerConfig, type S8WriterReceipt, type S8WriterResult } from "./s8-fbx-worker";
+import { canonicalS8RunnerReceiptBytes, runS8BlenderWriter, runS8NativeValidator, type S8CallerVerification, type S8NativeValidatorResult, type S8RunnerEvidence, type S8WorkerConfig, type S8WriterReceipt, type S8WriterResult } from "./s8-fbx-worker";
 
 export type S8PreparedExport = {
   profile: typeof S8_FBX_PROFILE;
@@ -151,7 +151,9 @@ function receiptHashWithoutHash(value: S8ValidationReceipt | Omit<S8ValidationRe
 
 function callerEnvelope(value: S8RunnerEvidence): S8CallerVerification {
   const envelope = value.verifiedByCaller;
-  if (!envelope || envelope.status !== "VERIFIED_BY_CALLER" || envelope.schemaVersion !== "s8-runner-caller-verification-v1" || !HEX64.test(envelope.preLaunchSha256) || envelope.preLaunchSha256 !== envelope.postLaunchSha256 || envelope.postLaunchSha256 !== envelope.runnerReportedSelfSha256 || envelope.runnerReportedSelfSha256 !== value.runnerBinary?.selfSha256 || !HEX64.test(envelope.receiptSha256)) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  const envelopeKeys = ["schemaVersion", "status", "preLaunchSha256", "postLaunchSha256", "runnerReportedSelfSha256", "outerExitStatus", "outerSignal", "observedStdoutBytes", "observedStderrBytes", "receiptSha256"];
+  if (!envelope || Object.keys(envelope).length !== envelopeKeys.length || envelopeKeys.some((key) => !Object.hasOwn(envelope, key)) || envelope.status !== "VERIFIED_BY_CALLER" || envelope.schemaVersion !== "s8-runner-caller-verification-v2" || !HEX64.test(envelope.preLaunchSha256) || envelope.preLaunchSha256 !== envelope.postLaunchSha256 || envelope.postLaunchSha256 !== envelope.runnerReportedSelfSha256 || envelope.runnerReportedSelfSha256 !== value.runnerBinary?.selfSha256 || envelope.outerExitStatus !== value.result?.code || envelope.outerSignal !== null || !Number.isSafeInteger(envelope.observedStdoutBytes) || envelope.observedStdoutBytes !== value.result?.stdoutBytes || !Number.isSafeInteger(envelope.observedStderrBytes) || envelope.observedStderrBytes !== value.result?.stderrBytes || !HEX64.test(envelope.receiptSha256)) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if (s8Sha256(canonicalS8RunnerReceiptBytes(value)) !== envelope.receiptSha256) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   return envelope;
 }
 
@@ -165,7 +167,7 @@ function assertRunnerEvidence(value: unknown, expected: RunnerExpectation): S8Ru
   const cpu = Math.ceil(expected.timeoutMs / 1000) + 1;
   if (!requested || requested.rlimitAsBytes !== expected.addressSpaceBytes || requested.rlimitFsizeBytes !== expected.fileBytes || requested.rlimitCpuSeconds !== cpu || requested.rlimitNproc !== 64 || requested.wallTimeoutMs !== expected.timeoutMs || requested.stdoutBytes !== expected.stdoutBytes || requested.stderrBytes !== expected.stderrBytes || requested.maxChildren !== expected.maxChildren) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   if (!applied || !observed || applied.rlimitAsBytes !== requested.rlimitAsBytes || applied.rlimitFsizeBytes !== requested.rlimitFsizeBytes || applied.rlimitCpuSeconds !== requested.rlimitCpuSeconds || applied.rlimitNproc !== requested.rlimitNproc || applied.noNewPrivs !== 1 || applied.seccompMode !== 2 || observed.rlimitAsBytes !== applied.rlimitAsBytes || observed.rlimitFsizeBytes !== applied.rlimitFsizeBytes || observed.rlimitCpuSeconds !== applied.rlimitCpuSeconds || observed.rlimitNproc !== applied.rlimitNproc || observed.noNewPrivs !== 1 || observed.seccompMode !== 2) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
-  if (evidence.runnerParentVerification?.status !== "PASS" || evidence.runnerParentVerification.mismatchCode !== null || evidence.result?.code !== 0 || !HEX64.test(evidence.runnerBinary?.selfSha256 ?? "")) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
+  if (evidence.runnerParentVerification?.status !== "PASS" || evidence.runnerParentVerification.mismatchCode !== null || evidence.result?.code !== 0 || evidence.result.name !== "S8_RUNNER_SUCCESS" || evidence.result.terminationClass !== "target-exit-zero" || evidence.result.targetExit !== 0 || evidence.result.targetSignal !== null || evidence.result.setupStage !== null || evidence.result.evidenceCode !== null || !Number.isSafeInteger(evidence.result.stdoutBytes) || evidence.result.stdoutBytes < 0 || evidence.result.stdoutBytes > expected.stdoutBytes || !Number.isSafeInteger(evidence.result.stderrBytes) || evidence.result.stderrBytes < 0 || evidence.result.stderrBytes > expected.stderrBytes || !HEX64.test(evidence.runnerBinary?.selfSha256 ?? "")) fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
   callerEnvelope(evidence);
   return evidence;
 }
@@ -433,6 +435,7 @@ export class S8ExportService {
       if (jcs(publication.writer) !== jcs(writer)) fail(409, "S8_REUSE_FINGERPRINT_INVALID");
       const native = parseJson(stored.get("native-readback.json")!, "S8_REUSE_FINGERPRINT_INVALID");
       if (native.schemaVersion !== "s8-ufbx-readback-v1") fail(409, "S8_REUSE_FINGERPRINT_INVALID");
+      assertS8ReadbackProvenance(current.s6, native as unknown as S8UfbxReadback);
       const semantic = parseJson(stored.get("semantic-validation-receipt.json")!, "S8_REUSE_FINGERPRINT_INVALID");
       if (semantic.schemaVersion !== "s8-semantic-validation-receipt-v2" || semantic.outcome !== "pass") fail(409, "S8_REUSE_FINGERPRINT_INVALID");
       const receipt = getS8Collections(this.repository.state()).receipts.find((item) => item.receiptId === artifact.validationReceiptId);
@@ -502,7 +505,11 @@ export class S8ExportService {
       if (nativeReadbackBytes.length === 0 || nativeReadbackBytes.length > S8_LIMITS.readbackBytes) fail(422, "S8_NATIVE_READBACK_LIMIT");
       const parsedReadback = parseJson(nativeReadbackBytes, "S8_NATIVE_READBACK_INVALID");
       if (parsedReadback.schemaVersion !== "s8-ufbx-readback-v1" || native.readback.schemaVersion !== "s8-ufbx-readback-v1") fail(422, "S8_NATIVE_READBACK_INVALID");
-      const semantic = this.semanticValidator(source.s6, source.s7, native.readback);
+      assertS8ReadbackProvenance(source.s6, native.readback);
+      if (jcs(parsedReadback) !== jcs(native.readback)) fail(422, "S8_NATIVE_READBACK_INVALID");
+      const admittedReadback = parsedReadback as unknown as S8UfbxReadback;
+      assertS8ReadbackProvenance(source.s6, admittedReadback);
+      const semantic = this.semanticValidator(source.s6, source.s7, admittedReadback);
       if (semantic.outcome !== "pass") fail(422, "S8_SEMANTIC_VALIDATION_FAILED");
       const semanticBytes = jsonBytes({ schemaVersion: "s8-semantic-validation-receipt-v2", source: job.source, outcome: semantic.outcome, result: semantic }, S8_LIMITS.readbackBytes, "S8_SEMANTIC_RECEIPT_LIMIT");
       const nativeReadbackHash = s8Sha256(nativeReadbackBytes);

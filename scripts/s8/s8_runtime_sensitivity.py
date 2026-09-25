@@ -6,10 +6,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 from typing import NoReturn
 
 
@@ -18,6 +21,378 @@ POSITION_SCALE = 1_000_000
 RUNNER_TIMEOUT_MS = 300_000
 RUNNER_STDOUT_BYTES = 1_048_576
 RUNNER_STDERR_BYTES = 1_048_576
+MANIFEST_SURFACES = ("runtime", "native", "writer", "support")
+MANIFEST_REQUIRED_FILES = (
+    "runtime/blender-5.2.2-linux-x64/blender",
+    "native/s8-process-runner",
+    "native/s8-fbx-validator",
+    "writer/writer.py",
+    "writer/export_fbx_bin.py",
+    "writer/patch-manifest.json",
+    "support/blender_validate.py",
+    "support/blender_reopen_validate.py",
+)
+MANIFEST_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class ManifestError(ValueError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _manifest_signature(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _manifest_lstat(path: pathlib.Path) -> os.stat_result:
+    try:
+        return os.lstat(path)
+    except OSError as error:
+        raise ManifestError("MANIFEST_STAT_FAILED") from error
+
+
+def _manifest_scandir_names(path: pathlib.Path) -> list[str]:
+    try:
+        with os.scandir(path) as entries:
+            return [entry.name for entry in entries]
+    except OSError as error:
+        raise ManifestError("MANIFEST_ENUMERATION_FAILED") from error
+
+
+def _manifest_readlink(path: pathlib.Path) -> str:
+    try:
+        return os.readlink(path)
+    except OSError as error:
+        raise ManifestError("MANIFEST_READLINK_FAILED") from error
+
+
+def _manifest_hash_file(path: pathlib.Path, before: os.stat_result) -> str:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if _manifest_signature(opened) != _manifest_signature(before):
+            raise ManifestError("MANIFEST_FILE_IDENTITY_CHANGED")
+        hasher = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            hasher.update(chunk)
+        after = os.fstat(descriptor)
+        if _manifest_signature(after) != _manifest_signature(before):
+            raise ManifestError("MANIFEST_FILE_CHANGED_DURING_HASH")
+        digest = hasher.hexdigest()
+        if not MANIFEST_SHA256.fullmatch(digest):
+            raise ManifestError("MANIFEST_DIGEST_MALFORMED")
+        return digest
+    except ManifestError:
+        raise
+    except OSError as error:
+        raise ManifestError("MANIFEST_HASH_FAILED") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _manifest_text(value: str) -> str:
+    if not value or any(character in value for character in "\t\r\n\x00"):
+        raise ManifestError("MANIFEST_FORMAT_FAILED")
+    return value
+
+
+def _manifest_sort_key(value: str) -> bytes:
+    try:
+        return value.encode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise ManifestError("MANIFEST_FORMAT_FAILED") from error
+
+
+def _format_manifest_record(kind: str, relative_path: str, mode: str, *fields: str) -> bytes:
+    safe_path = _manifest_text(relative_path)
+    if safe_path.startswith("/") or "\\" in safe_path or any(part in {"", ".", ".."} for part in safe_path.split("/")):
+        raise ManifestError("MANIFEST_FORMAT_FAILED")
+    if not re.fullmatch(r"0[0-7]{3}", mode):
+        raise ManifestError("MANIFEST_FORMAT_FAILED")
+    safe_fields = [_manifest_text(field) for field in fields]
+    try:
+        return ("\t".join((kind, safe_path, mode, *safe_fields)) + "\n").encode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise ManifestError("MANIFEST_FORMAT_FAILED") from error
+
+
+def _manifest_tool(command: list[str], payload: bytes | None = None) -> tuple[int, bytes, bytes]:
+    try:
+        result = subprocess.run(
+            command,
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"LC_ALL": "C"},
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ManifestError("MANIFEST_TOOL_LAUNCH_FAILED") from error
+    return result.returncode, result.stdout or b"", result.stderr or b""
+
+
+def _validate_manifest_bytes(value: bytes) -> None:
+    if not value or not value.endswith(b"\n"):
+        raise ManifestError("MANIFEST_EMPTY_OR_TRUNCATED")
+    lines = value.splitlines(keepends=True)
+    if not lines or lines != sorted(lines):
+        raise ManifestError("MANIFEST_SORT_INVALID")
+    paths: set[str] = set()
+    present_surfaces: set[str] = set()
+    present_files: set[str] = set()
+    for line in lines:
+        if not line.endswith(b"\n") or line.count(b"\t") < 2:
+            raise ManifestError("MANIFEST_RECORD_TRUNCATED")
+        try:
+            fields = line[:-1].decode("utf-8", errors="strict").split("\t")
+        except UnicodeDecodeError as error:
+            raise ManifestError("MANIFEST_RECORD_MALFORMED") from error
+        kind, relative_path, mode, *details = fields
+        if kind not in {"D", "F", "L"} or not relative_path or relative_path.startswith("/") or "\\" in relative_path or any(part in {"", ".", ".."} for part in relative_path.split("/")):
+            raise ManifestError("MANIFEST_RECORD_MALFORMED")
+        if not re.fullmatch(r"0[0-7]{3}", mode):
+            raise ManifestError("MANIFEST_RECORD_MALFORMED")
+        if relative_path in paths:
+            raise ManifestError("MANIFEST_DUPLICATE_RECORD")
+        paths.add(relative_path)
+        surface = relative_path.split("/", 1)[0]
+        if surface not in MANIFEST_SURFACES:
+            raise ManifestError("MANIFEST_UNEXPECTED_SURFACE")
+        present_surfaces.add(surface)
+        if kind == "D":
+            if details:
+                raise ManifestError("MANIFEST_RECORD_MALFORMED")
+        elif kind == "F":
+            if len(details) != 2 or not re.fullmatch(r"0|[1-9][0-9]*", details[0]) or not MANIFEST_SHA256.fullmatch(details[1]):
+                raise ManifestError("MANIFEST_DIGEST_OR_METADATA_MALFORMED")
+            present_files.add(relative_path)
+        else:
+            if len(details) != 1:
+                raise ManifestError("MANIFEST_RECORD_MALFORMED")
+            _manifest_text(details[0])
+            present_files.add(relative_path)
+    if present_surfaces != set(MANIFEST_SURFACES):
+        raise ManifestError("MANIFEST_REQUIRED_SURFACE_MISSING")
+    if not set(MANIFEST_REQUIRED_FILES).issubset(present_files):
+        raise ManifestError("MANIFEST_REQUIRED_FILE_MISSING")
+
+
+def create_complete_manifest(base_value: str, output_value: str, *, sort_tool: str = "/usr/bin/sort") -> bytes:
+    base = pathlib.Path(base_value)
+    output = pathlib.Path(output_value)
+    records: list[bytes] = []
+
+    def walk(path: pathlib.Path, relative_path: str) -> None:
+        before = _manifest_lstat(path)
+        mode = f"{stat.S_IMODE(before.st_mode):04o}"
+        if stat.S_ISLNK(before.st_mode):
+            target = _manifest_readlink(path)
+            after = _manifest_lstat(path)
+            if _manifest_signature(before) != _manifest_signature(after):
+                raise ManifestError("MANIFEST_LINK_CHANGED")
+            records.append(_format_manifest_record("L", relative_path, mode, target))
+            return
+        if stat.S_ISDIR(before.st_mode):
+            first_names = _manifest_scandir_names(path)
+            second_names = _manifest_scandir_names(path)
+            after = _manifest_lstat(path)
+            if _manifest_signature(before) != _manifest_signature(after) or sorted(first_names) != sorted(second_names):
+                raise ManifestError("MANIFEST_ENUMERATION_PARTIAL_OR_CHANGED")
+            records.append(_format_manifest_record("D", relative_path, mode))
+            for name in sorted(first_names, key=_manifest_sort_key):
+                _manifest_text(name)
+                walk(path / name, f"{relative_path}/{name}")
+            return
+        if stat.S_ISREG(before.st_mode):
+            digest = _manifest_hash_file(path, before)
+            after = _manifest_lstat(path)
+            if _manifest_signature(before) != _manifest_signature(after):
+                raise ManifestError("MANIFEST_FILE_CHANGED_DURING_HASH")
+            records.append(_format_manifest_record("F", relative_path, mode, str(before.st_size), digest))
+            return
+        raise ManifestError("MANIFEST_ENTRY_TYPE_UNSUPPORTED")
+
+    for surface in MANIFEST_SURFACES:
+        root = base / surface
+        root_info = _manifest_lstat(root)
+        if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+            raise ManifestError("MANIFEST_REQUIRED_SURFACE_MISSING")
+        walk(root, surface)
+
+    formatted = b"".join(records)
+    if not formatted:
+        raise ManifestError("MANIFEST_EMPTY_OR_TRUNCATED")
+    sort_status, sorted_bytes, _sort_error = _manifest_tool([sort_tool], formatted)
+    if sort_status != 0:
+        raise ManifestError("MANIFEST_SORT_FAILED")
+    _validate_manifest_bytes(sorted_bytes)
+    try:
+        with output.open("xb") as stream:
+            stream.write(sorted_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as error:
+        raise ManifestError("MANIFEST_FORMAT_WRITE_FAILED") from error
+    return sorted_bytes
+
+
+def _read_complete_manifest(path_value: str) -> bytes:
+    path = pathlib.Path(path_value)
+    before = _manifest_lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ManifestError("MANIFEST_FILE_INVALID")
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if _manifest_signature(before) != _manifest_signature(opened):
+            raise ManifestError("MANIFEST_FILE_IDENTITY_CHANGED")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _manifest_signature(opened) != _manifest_signature(after):
+            raise ManifestError("MANIFEST_FILE_CHANGED_DURING_READ")
+        value = b"".join(chunks)
+    except ManifestError:
+        raise
+    except OSError as error:
+        raise ManifestError("MANIFEST_READ_FAILED") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _validate_manifest_bytes(value)
+    return value
+
+
+def manifest_sha256(path_value: str) -> str:
+    value = _read_complete_manifest(path_value)
+    digest = hashlib.sha256(value).hexdigest()
+    if not MANIFEST_SHA256.fullmatch(digest):
+        raise ManifestError("MANIFEST_DIGEST_MALFORMED")
+    return digest
+
+
+def compare_complete_manifests(left_value: str, right_value: str, *, compare_tool: str = "/usr/bin/cmp") -> bool:
+    left = _read_complete_manifest(left_value)
+    right = _read_complete_manifest(right_value)
+    if not left or not right:
+        raise ManifestError("MANIFEST_EMPTY_OR_TRUNCATED")
+    compare_status, _stdout, _stderr = _manifest_tool([compare_tool, "--silent", left_value, right_value])
+    if compare_status == 0:
+        return True
+    if compare_status == 1:
+        return False
+    raise ManifestError("MANIFEST_COMPARISON_FAILED")
+
+
+def _manifest_test_fixture(base: pathlib.Path) -> None:
+    for surface in MANIFEST_SURFACES:
+        (base / surface).mkdir(parents=True)
+    required = (
+        "runtime/blender-5.2.2-linux-x64/blender",
+        "native/s8-process-runner",
+        "native/s8-fbx-validator",
+        "writer/writer.py",
+        "writer/export_fbx_bin.py",
+        "writer/patch-manifest.json",
+        "support/blender_validate.py",
+        "support/blender_reopen_validate.py",
+    )
+    for relative_path in required:
+        path = base / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"pinned")
+    (base / "runtime" / "runtime-link").symlink_to("blender-5.2.2-linux-x64/blender")
+
+
+def manifest_failure_regression() -> None:
+    from unittest import mock
+
+    with tempfile.TemporaryDirectory(prefix="s8-manifest-regression-") as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "source"
+        staged = root / "staged"
+        source.mkdir()
+        staged.mkdir()
+        _manifest_test_fixture(source)
+        _manifest_test_fixture(staged)
+        source_manifest = root / "source.manifest"
+        staged_manifest = root / "staged.manifest"
+        valid = create_complete_manifest(str(source), str(source_manifest))
+        create_complete_manifest(str(staged), str(staged_manifest))
+        if not compare_complete_manifests(str(source_manifest), str(staged_manifest)):
+            raise ManifestError("MANIFEST_EQUAL_POSITIVE_FAILED")
+        if manifest_sha256(str(source_manifest)) != hashlib.sha256(valid).hexdigest():
+            raise ManifestError("MANIFEST_HASH_POSITIVE_FAILED")
+
+        (staged / "writer" / "writer.py").write_bytes(b"drift")
+        drift_manifest = root / "drift.manifest"
+        create_complete_manifest(str(staged), str(drift_manifest))
+        if compare_complete_manifests(str(source_manifest), str(drift_manifest)):
+            raise ManifestError("MANIFEST_DRIFT_NEGATIVE_FAILED")
+
+        def rejected(call, expected_code: str) -> None:
+            try:
+                call()
+            except ManifestError as error:
+                if error.code != expected_code:
+                    raise ManifestError("MANIFEST_REGRESSION_WRONG_FAILURE") from error
+            else:
+                raise ManifestError("MANIFEST_REGRESSION_ACCEPTED_FAILURE")
+
+        rejected(lambda: _validate_manifest_bytes(b""), "MANIFEST_EMPTY_OR_TRUNCATED")
+        rejected(lambda: _validate_manifest_bytes(valid.splitlines(keepends=True)[0]), "MANIFEST_REQUIRED_SURFACE_MISSING")
+        duplicate_lines = valid.splitlines(keepends=True)
+        duplicate_line = duplicate_lines[0]
+        duplicate_lines.insert(1, duplicate_line)
+        rejected(lambda: _validate_manifest_bytes(b"".join(duplicate_lines)), "MANIFEST_DUPLICATE_RECORD")
+        malformed_digest = re.sub(rb"(?m)^(F\t[^\t]+\t[0-7]{4}\t[0-9]+\t)[0-9a-f]{64}$", rb"\1BAD", valid, count=1)
+        rejected(lambda: _validate_manifest_bytes(malformed_digest), "MANIFEST_DIGEST_OR_METADATA_MALFORMED")
+        rejected(lambda: _validate_manifest_bytes(valid[:-1]), "MANIFEST_EMPTY_OR_TRUNCATED")
+        rejected(lambda: _manifest_sort_key("invalid-\udcff"), "MANIFEST_FORMAT_FAILED")
+        rejected(lambda: _format_manifest_record("L", "runtime/link", "0777", "invalid-\udcff"), "MANIFEST_FORMAT_FAILED")
+
+        with mock.patch(__name__ + "._manifest_scandir_names", side_effect=ManifestError("MANIFEST_ENUMERATION_FAILED")):
+            rejected(lambda: create_complete_manifest(str(source), str(root / "enum.manifest")), "MANIFEST_ENUMERATION_FAILED")
+        partial_calls = {"native": 0}
+        def partial_enumeration(path: pathlib.Path) -> list[str]:
+            if path == source / "native":
+                partial_calls["native"] += 1
+                if partial_calls["native"] == 1:
+                    return []
+            return _manifest_scandir_names(path)
+        with mock.patch(__name__ + "._manifest_scandir_names", side_effect=partial_enumeration):
+            rejected(lambda: create_complete_manifest(str(source), str(root / "partial.manifest")), "MANIFEST_ENUMERATION_PARTIAL_OR_CHANGED")
+        with mock.patch(__name__ + "._manifest_lstat", side_effect=ManifestError("MANIFEST_STAT_FAILED")):
+            rejected(lambda: create_complete_manifest(str(source), str(root / "stat.manifest")), "MANIFEST_STAT_FAILED")
+        with mock.patch(__name__ + "._manifest_readlink", side_effect=ManifestError("MANIFEST_READLINK_FAILED")):
+            rejected(lambda: create_complete_manifest(str(source), str(root / "link.manifest")), "MANIFEST_READLINK_FAILED")
+        with mock.patch(__name__ + "._manifest_hash_file", side_effect=ManifestError("MANIFEST_HASH_FAILED")):
+            rejected(lambda: create_complete_manifest(str(source), str(root / "hash.manifest")), "MANIFEST_HASH_FAILED")
+        with mock.patch(__name__ + "._format_manifest_record", side_effect=ManifestError("MANIFEST_FORMAT_FAILED")):
+            rejected(lambda: create_complete_manifest(str(source), str(root / "format.manifest")), "MANIFEST_FORMAT_FAILED")
+        with mock.patch(__name__ + "._manifest_tool", return_value=(2, b"", b"sort failed")):
+            rejected(lambda: create_complete_manifest(str(source), str(root / "sort.manifest")), "MANIFEST_SORT_FAILED")
+        with mock.patch(__name__ + "._manifest_tool", return_value=(2, b"", b"cmp failed")):
+            rejected(lambda: compare_complete_manifests(str(source_manifest), str(staged_manifest)), "MANIFEST_COMPARISON_FAILED")
+
+        incomplete_a = root / "incomplete-a"
+        incomplete_b = root / "incomplete-b"
+        incomplete_a.mkdir()
+        incomplete_b.mkdir()
+        rejected(lambda: create_complete_manifest(str(incomplete_a), str(root / "failed-a.manifest")), "MANIFEST_STAT_FAILED")
+        rejected(lambda: create_complete_manifest(str(incomplete_b), str(root / "failed-b.manifest")), "MANIFEST_STAT_FAILED")
 
 
 def fail(code: str, classification: str = "CANDIDATE_FAILURE") -> NoReturn:
@@ -563,15 +938,49 @@ def receipt_payload(output: bytes, label: str) -> bytes:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--blender", required=True)
-    parser.add_argument("--writer", required=True)
-    parser.add_argument("--runner", required=True)
-    parser.add_argument("--sandbox", required=True)
-    parser.add_argument("--validator", required=True)
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--blender")
+    parser.add_argument("--writer")
+    parser.add_argument("--runner")
+    parser.add_argument("--sandbox")
+    parser.add_argument("--validator")
+    parser.add_argument("--output-dir")
     parser.add_argument("--import-script")
     parser.add_argument("--reopen-script")
+    parser.add_argument("--manifest-create", nargs=2, metavar=("BASE", "OUTPUT"))
+    parser.add_argument("--manifest-compare", nargs=2, metavar=("LEFT", "RIGHT"))
+    parser.add_argument("--manifest-hash")
+    parser.add_argument("--manifest-self-test", action="store_true")
     args = parser.parse_args()
+
+    manifest_modes = sum((args.manifest_create is not None, args.manifest_compare is not None, args.manifest_hash is not None, args.manifest_self_test))
+    if manifest_modes > 1:
+        parser.error("choose one manifest operation")
+    try:
+        if args.manifest_self_test:
+            manifest_failure_regression()
+            print("MANIFEST_FAILURE_REGRESSION=PASS")
+            return
+        if args.manifest_create is not None:
+            manifest_bytes = create_complete_manifest(*args.manifest_create)
+            print("MANIFEST_ACQUISITION=PASS")
+            print(f"MANIFEST_SHA256={hashlib.sha256(manifest_bytes).hexdigest()}")
+            return
+        if args.manifest_compare is not None:
+            if compare_complete_manifests(*args.manifest_compare):
+                print("MANIFEST_EQUALITY=PASS")
+                return
+            print("MANIFEST_EQUALITY=DRIFT")
+            raise SystemExit(1)
+        if args.manifest_hash is not None:
+            print(f"MANIFEST_SHA256={manifest_sha256(args.manifest_hash)}")
+            return
+    except ManifestError as error:
+        print(f"S8_MANIFEST_FAIL:{error.code}", file=sys.stderr)
+        raise SystemExit(2) from error
+
+    required_runtime_args = (args.blender, args.writer, args.runner, args.sandbox, args.validator, args.output_dir)
+    if any(value is None for value in required_runtime_args):
+        parser.error("runtime mode requires blender, writer, runner, sandbox, validator, and output-dir")
 
     blender = regular(args.blender, "BLENDER")
     writer = regular(args.writer, "WRITER")

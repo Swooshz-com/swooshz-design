@@ -47,7 +47,7 @@ function exactReadback(s6: S6ToS7Handoff, s7: S7ToS8Handoff): S8UfbxReadback {
   for (const object of sorted) {
     const transform = oracle.get(object.objectId)!;
     const mesh = buildS8Mesh(object.geometry);
-    nodes.push({ name: names.get(object.objectId)!, parent: object.parentObjectId === null ? "SWZ_ROOT" : names.get(object.parentObjectId)!, effectiveScale: [1, 1, 1], nodeToParent: ufbxMatrix(transform.localMatrix), nodeToWorld: ufbxMatrix(transform.worldMatrix), mesh: { vertices: mesh.verticesMm.map((value) => [...value] as [number, number, number]), triangles: mesh.triangles.map((value) => [...value] as [number, number, number]), cornerNormals: mesh.cornerNormals.map((value) => [...value] as [number, number, number]), materialNames: [] } });
+    nodes.push({ name: names.get(object.objectId)!, parent: object.parentObjectId === null ? "SWZ_ROOT" : names.get(object.parentObjectId)!, sourceObjectId: object.objectId, identityKey: object.identityKey, effectiveScale: [1, 1, 1], nodeToParent: ufbxMatrix(transform.localMatrix), nodeToWorld: ufbxMatrix(transform.worldMatrix), mesh: { vertices: mesh.verticesMm.map((value) => [...value] as [number, number, number]), triangles: mesh.triangles.map((value) => [...value] as [number, number, number]), cornerNormals: mesh.cornerNormals.map((value) => [...value] as [number, number, number]), materialNames: [] } });
   }
   return { schemaVersion: "s8-ufbx-readback-v1", fbxVersion: 7400, unitMeters: 0.001, warningCount: 0, source: { revisionId: s6.acceptedRevisionId, revisionHash: s6.acceptedRevisionHash, s6ValidationHash: s6.validationReceipt.validationHash, s6HandoffDigest: s8Sha256(canonicalS8SourceJson(s6)) }, materials: [], nodes };
 }
@@ -67,4 +67,31 @@ test("root identity and homogeneous rows are fail-closed", () => {
   const rootShifted = exactReadback(s6, s7);
   rootShifted.nodes[0]!.nodeToWorld[9] = 0.01;
   assert.throws(() => compareS8UfbxReadback(s6, s7, rootShifted), /S8_ROOT_IDENTITY_INVALID/);
+});
+
+test("physical provenance is required and the root rejects either provenance property", () => {
+  const { s6, s7 } = sources();
+  const correct = exactReadback(s6, s7);
+  assert.doesNotThrow(() => compareS8UfbxReadback(s6, s7, correct));
+
+  for (const [property, value] of [
+    ["sourceObjectId", undefined],
+    ["sourceObjectId", "wrong-source"],
+    ["identityKey", undefined],
+    ["identityKey", "wrong-identity"],
+  ] as const) {
+    const invalid = structuredClone(correct);
+    const physical = invalid.nodes.find((node) => node.name !== "SWZ_ROOT")! as unknown as Record<string, unknown>;
+    if (value === undefined) delete physical[property];
+    else physical[property] = value;
+    assert.throws(() => compareS8UfbxReadback(s6, s7, invalid), /S8_SOURCE_IDENTITY_MISMATCH/);
+  }
+
+  for (const property of ["sourceObjectId", "identityKey"]) {
+    for (const value of [undefined, null, ""]) {
+      const invalid = structuredClone(correct);
+      Object.defineProperty(invalid.nodes[0], property, { value, enumerable: true, configurable: true });
+      assert.throws(() => compareS8UfbxReadback(s6, s7, invalid), /S8_SOURCE_IDENTITY_MISMATCH/);
+    }
+  }
 });
