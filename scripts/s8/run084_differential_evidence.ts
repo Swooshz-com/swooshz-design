@@ -856,6 +856,7 @@ function sandboxValidator(
 function sandboxEnvironmentNegativeControl(runner: string, surfaces: string[], envKeys: string[]): boolean {
   const root = `${tmpdir()}/run084-environment-probe-${process.pid}-${Date.now()}`;
   mkdirSync(root, { mode: 0o700 });
+  chmodSync(root, 0o755);
   const args: string[] = [
     "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
     "--disable-userns", "--assert-userns-disabled", "--uid", "65534", "--gid", "65534", "--cap-drop", "ALL",
