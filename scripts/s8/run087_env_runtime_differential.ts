@@ -587,10 +587,13 @@ function main(): void {
 
   const carrierHead = gitValue(["rev-parse", "HEAD"]), carrierTree = gitValue(["rev-parse", "HEAD^{tree}"]);
   const productTree = gitValue(["rev-parse", PRODUCT_HEAD + "^{tree}"]), firstParent = gitValue(["rev-parse", "HEAD^"]);
+  const carrierCommitCount = gitValue(["rev-list", "--count", PRODUCT_HEAD + "..HEAD"]);
+  const firstParentCommitCount = gitValue(["rev-list", "--first-parent", "--count", PRODUCT_HEAD + "..HEAD"]);
   const productMergeBase = gitValue(["merge-base", PRODUCT_HEAD, "HEAD"]);
   const changed = gitValue(["diff", "--name-only", PRODUCT_HEAD, "HEAD"]).split(/\r?\n/u).filter(Boolean).sort();
   const allowed = [".github/workflows/s8-run087-env-runtime-differential.yml", "scripts/s8/run087_env_runtime_differential.ts"].sort();
-  if (productTree !== PRODUCT_TREE || firstParent !== PRODUCT_HEAD || productMergeBase !== PRODUCT_HEAD || !same(changed, allowed)) throw new Error("CARRIER_BINDING_INVALID");
+  if (productTree !== PRODUCT_TREE || productMergeBase !== PRODUCT_HEAD || carrierCommitCount === "0"
+    || carrierCommitCount !== firstParentCommitCount || !same(changed, allowed)) throw new Error("CARRIER_BINDING_INVALID");
 
   const source = fixture(), built = buildS8WriterPayload(source.s6, source.s7);
   const uidResult = run("/usr/bin/id", ["-u"]), gidResult = run("/usr/bin/id", ["-g"]);
@@ -728,7 +731,9 @@ function main(): void {
   emit("EVIDENCE_CARRIER_HEAD", carrierHead); emit("EVIDENCE_CARRIER_TREE", carrierTree);
   emit("EVIDENCE_WORKFLOW_RUN", process.env.GITHUB_RUN_ID ?? "local"); emit("EVIDENCE_WORKFLOW_JOB", "run087-env-runtime");
   emit("EVIDENCE_WORKFLOW_ATTEMPT", process.env.GITHUB_RUN_ATTEMPT ?? "local");
-  emit("CARRIER_FIRST_PARENT", firstParent); emit("CARRIER_ALLOWED_PATHS_ONLY", same(changed, allowed) ? "YES" : "NO");
+  emit("CARRIER_FIRST_PARENT", firstParent); emit("CARRIER_COMMIT_COUNT", carrierCommitCount);
+  emit("CARRIER_LINEAR_HISTORY", carrierCommitCount !== "0" && carrierCommitCount === firstParentCommitCount ? "YES" : "NO");
+  emit("CARRIER_ALLOWED_PATHS_ONLY", same(changed, allowed) ? "YES" : "NO");
   emit("CARRIER_PRODUCT_HEAD_MERGE_BASE", productMergeBase); emit("CONTINUING_OWNER", "S8 #29 / PR #47");
   emit("ACTUAL_APPLICATION_FUNCTIONS", "buildS8WriterPayload,runS8BlenderWriter,runS8NativeValidator");
   emit("ACTUAL_APPLICATION_PAYLOAD_SHA256", built.sha256); emit("ACTUAL_APPLICATION_PAYLOAD_BYTES", built.bytes.length);
