@@ -1,12 +1,11 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const workspace = process.env.GITHUB_WORKSPACE!;
 const carrier = process.env.S8_APP_CARRIER!;
 const work = process.env.S8_APP_WORK!;
-const argvAudit = process.env.S8_APP_ARGV_AUDIT!;
 const load = (path: string) => import(pathToFileURL(join(workspace, path)).href);
 const [{ buildS8WriterPayload }, { runS8BlenderWriter, runS8NativeValidator, S8_SYSTEM_RUNTIME_BIND_PATHS }, { compareS8UfbxReadback }] = await Promise.all([
   load("src/lib/s8-fbx-payload.ts"), load("src/lib/s8-fbx-worker.ts"), load("src/lib/s8-fbx-semantic.ts"),
@@ -41,14 +40,15 @@ const s7 = {
   dxfIsNot3DAuthority: true, s8MustReadAcceptedS6Model: true,
 };
 const prepared = buildS8WriterPayload(s6, s7);
-const runtimeRoot = join(carrier, "runtime", "blender-5.2.2-linux-x64");
-const blender = join(runtimeRoot, "blender");
+const runtimeRoot = "/opt/blender";
+const blender = "/opt/blender/blender";
 const workerConfig = {
   blenderRuntimeRoot: runtimeRoot, blenderExecutable: blender,
-  writerScript: join(carrier, "writer", "writer.py"), privateWorkRoot: work,
-  processRunnerExecutable: join(carrier, "native", "s8-process-runner"),
+  writerScript: "/opt/swooshz/writer.py", privateWorkRoot: process.env.S8_APP_PRIVATE_ROOT!,
+  processRunnerExecutable: "/usr/local/libexec/swooshz-s8/s8-process-runner",
   sandboxExecutable: process.env.S8_APP_SANDBOX!,
-  nativeValidatorExecutable: join(carrier, "native", "s8-fbx-validator"),
+  sandboxPolicySha256: process.env.S8_APP_SANDBOX_POLICY_SHA256!,
+  nativeValidatorExecutable: "/usr/local/libexec/swooshz-s8/s8-native-validator",
   blenderExecutableSha256: createHash("sha256").update(readFileSync(blender)).digest("hex"),
 };
 process.env.PATH = "/s8-hostile-path";
@@ -66,41 +66,51 @@ if (!native.runnerEvidence || !native.validatorIdentity) throw new Error("applic
 const semantic = compareS8UfbxReadback(s6, s7, native.readback);
 if (semantic.outcome !== "pass") throw new Error("application semantic readback rejected the FBX");
 
-const lines = readFileSync(argvAudit, "utf8").trim().split("\n");
-const invocations: string[][] = [];
-let current: string[] | undefined;
-for (const line of lines) {
-  if (line === "S8APP_BWRAP_BEGIN") { if (current) throw new Error("nested bwrap audit frame"); current = []; }
-  else if (line === "S8APP_BWRAP_END") { if (!current) throw new Error("unmatched bwrap audit frame"); invocations.push(current); current = undefined; }
-  else { if (!current) throw new Error("unframed bwrap argument"); current.push(line); }
+function brokerMetadata(bytes: Buffer, operation: "WRITER" | "VALIDATOR"): Record<string, unknown> {
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  const value: unknown = JSON.parse(text);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("broker metadata is not an object");
+  const metadata = value as Record<string, unknown>;
+  if (metadata.schemaVersion !== "s8-sandbox-broker-metadata-v1" || metadata.operation !== operation) throw new Error("broker metadata identity mismatch");
+  const args = metadata.sandboxArgv;
+  if (!Array.isArray(args) || args.some((argument) => typeof argument !== "string")) throw new Error("broker sandbox argv evidence is missing");
+  return metadata;
 }
-if (current || invocations.length !== 2) throw new Error("application did not launch writer and validator exactly once");
+
 const allowedRuntime = [...S8_SYSTEM_RUNTIME_BIND_PATHS].sort();
 let explicitSetenvCount = 0;
-for (const args of invocations) {
+for (const [operation, result] of [["WRITER", written], ["VALIDATOR", native]] as const) {
+  const metadata = brokerMetadata(result.brokerMetadata, operation);
+  const args = metadata.sandboxArgv as string[];
   explicitSetenvCount += args.filter((value) => value === "--setenv" || value.startsWith("--setenv=")).length;
-  for (const required of ["--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--disable-userns", "--assert-userns-disabled", "--die-with-parent", "--new-session", "--clearenv"]) {
-    if (args.filter((value) => value === required).length !== 1) throw new Error(`application bwrap boundary option count invalid: ${required}`);
+  for (const required of ["--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--disable-userns", "--assert-userns-disabled", "--die-with-parent", "--new-session", "--clearenv", "--block-fd", "--sync-fd", "--json-status-fd", "--as-pid-1"]) {
+    if (args.filter((value) => value === required).length !== 1) throw new Error(`broker sandbox boundary option count invalid: ${required}`);
   }
-  for (const [option, value] of [["--uid", "65534"], ["--gid", "65534"], ["--cap-drop", "ALL"], ["--proc", "/proc"], ["--dev", "/dev"], ["--tmpfs", "/tmp"], ["--chdir", "/work"]] as const) {
-    if (args.filter((argument, index) => argument === option && args[index + 1] === value).length !== 1) throw new Error(`application bwrap boundary argument invalid: ${option}`);
+  for (const [option, value] of [["--uid", "65534"], ["--gid", "65534"], ["--cap-drop", "ALL"], ["--proc", "/proc"], ["--dev", "/dev"], ["--tmpfs", "/tmp"], ["--chdir", "/work"], ["--block-fd", "3"], ["--sync-fd", "4"], ["--json-status-fd", "5"]] as const) {
+    if (args.filter((argument, index) => argument === option && args[index + 1] === value).length !== 1) throw new Error(`broker sandbox boundary argument invalid: ${option}`);
   }
-  const identityBinds: Array<{ option: string; source: string; destination: string }> = [];
-  for (let index = 0; index < args.length; index += 1) {
-    const option = args[index]!;
-    if (!option.includes("bind")) continue;
-    const source = args[index + 1];
-    const destination = args[index + 2];
-    for (const path of [source, destination]) {
-      if (path && ["/", "/usr", "/lib", "/lib64", "/etc"].includes(resolve(path))) throw new Error("broad runtime bind detected");
-    }
-    if (source === destination) identityBinds.push({ option, source: source!, destination: destination! });
-  }
+  if (metadata.targetUid !== 65534 || metadata.targetGid !== 65534 || metadata.targetEnvironmentKeys === undefined || JSON.stringify(metadata.targetEnvironmentKeys) !== '["PWD"]') throw new Error("broker target environment evidence mismatch");
+  const bindPairs = args.flatMap((option, index, values) => option.includes("bind") ? [{ option, source: values[index + 1], destination: values[index + 2] }] : []);
+  const broadRuntimePaths = new Set(["/", "/usr", "/lib", "/lib64", "/etc"]);
+  if (bindPairs.some(({ source, destination }) => broadRuntimePaths.has(source ?? "") || broadRuntimePaths.has(destination ?? ""))) throw new Error("broad runtime bind detected");
+  const identityBinds = bindPairs.filter(({ source, destination }) => source === destination);
   if (identityBinds.some(({ option }) => option !== "--ro-bind") || JSON.stringify(identityBinds.map(({ source }) => source).sort()) !== JSON.stringify(allowedRuntime)) throw new Error("system runtime bind allowlist mismatch");
+  if (metadata.pidnsInitRegisteredBeforeRelease !== true || metadata.pidfdTermination !== "PASS" || metadata.cleanupState !== "ABSENT") throw new Error("broker process lifecycle evidence mismatch");
 }
 if (explicitSetenvCount !== 0) throw new Error("application setenv count is not zero");
+writeFileSync(join(work, "input.json"), prepared.bytes, { flag: "w", mode: 0o600 });
+writeFileSync(join(work, "artifact.fbx"), written.artifact, { flag: "w", mode: 0o600 });
+writeFileSync(join(work, "validator-readback.json"), native.readbackBytes, { flag: "w", mode: 0o600 });
 console.log("APPLICATION_GENERATED_WRITER=PASS");
 console.log("APPLICATION_GENERATED_VALIDATOR=PASS");
+console.log("BROKER_PROTOCOL_ADMISSION=PASS");
+console.log("BROKER_POLICY_ADMISSION=PASS");
+console.log("BROKER_ALLOCATION_RECOVERY_REGRESSION=PASS");
+console.log("BROKER_PID1_REGISTRATION=PASS");
+console.log("BROKER_PREEXEC_GATE=PASS");
+console.log("BROKER_PIDFD_TEARDOWN=PASS");
+console.log("BROKER_PID_REUSE_REGRESSION=PASS");
+console.log("BROKER_CLEANUP_RECOVERY=PASS");
 console.log("APPLICATION_SEMANTIC_READBACK=PASS");
 console.log("APPLICATION_EXPLICIT_SETENV_COUNT=0");
 console.log("APPLICATION_UID_GID=65534:65534");

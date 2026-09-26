@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { buildS8BlenderSandboxCommand, buildS8ValidatorSandboxCommand, parseS8RunnerReceipt, runS8NativeValidator, S8_SYSTEM_RUNTIME_BIND_PATHS, type S8RunnerLimits, type S8WorkerConfig } from "../src/lib/s8-fbx-worker";
+import { canonicalS8ConfigBytes, createS8BrokerRequest, parseS8BrokerResponse, parseS8RunnerReceipt, runS8NativeValidator, validateS8BrokerResponseIdentity, type S8RunnerLimits, type S8WorkerConfig } from "../src/lib/s8-fbx-worker";
 import { readS8RuntimeConfig } from "../src/lib/s8-fbx-config";
 
 type MutableReceipt = {
@@ -55,7 +55,8 @@ function config(root: string): S8WorkerConfig {
     writerScript: join(root, "writer.py"),
     privateWorkRoot: root,
     processRunnerExecutable: join(root, "runner"),
-    sandboxExecutable: join(root, "sandbox"),
+    sandboxExecutable: "/usr/local/libexec/swooshz-s8/s8-sandbox",
+    sandboxPolicySha256: runnerHash,
     nativeValidatorExecutable: join(root, "validator"),
     blenderExecutableSha256: runnerHash,
   };
@@ -73,6 +74,12 @@ test("worker refuses to run without the native Linux process boundary", () => {
 
 test("partial runtime configuration fails closed instead of selecting a fallback", () => {
   assert.throws(() => readS8RuntimeConfig({ S8_BLENDER_RUNTIME_ROOT: "C:/runtime" }), /S8_RUNTIME_CONFIG_INVALID/);
+  assert.throws(() => readS8RuntimeConfig({
+    S8_BLENDER_RUNTIME_ROOT: "/opt/blender", S8_BLENDER_EXECUTABLE: "/opt/blender/blender", S8_WRITER_SCRIPT: "/opt/swooshz/writer.py",
+    S8_PRIVATE_WORK_ROOT: "/var/lib/swooshz/s8", S8_PROCESS_RUNNER_EXECUTABLE: "/usr/local/libexec/swooshz-s8/s8-process-runner",
+    S8_SANDBOX_EXECUTABLE: "/usr/local/libexec/swooshz-s8/s8-sandbox", S8_SANDBOX_POLICY_SHA256: "A".repeat(64),
+    S8_NATIVE_VALIDATOR_EXECUTABLE: "/usr/local/libexec/swooshz-s8/s8-native-validator", S8_BLENDER_EXECUTABLE_SHA256: "1".repeat(64),
+  }), /S8_RUNTIME_CONFIG_INVALID/);
 });
 
 test("strict v2 caller parsing accepts only canonical, fully evidenced receipts", () => {
@@ -214,31 +221,112 @@ test("native runner internal failures accept only its exact internal mismatch se
   }), runnerLimits, runnerHash, runnerHash, { status: 76, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
 });
 
-test("application sandbox argv uses only the accepted read-only runtime binds and cleared environment", () => {
-  assert.equal(S8_SYSTEM_RUNTIME_BIND_PATHS.length, 27);
-  assert.equal(new Set(S8_SYSTEM_RUNTIME_BIND_PATHS).size, 27);
-  const root = mkdtempSync(join(tmpdir(), "s8-sandbox-"));
+test("broker request uses the fixed binary protocol and binds payload, policy, and canonical config", () => {
+  const root = mkdtempSync(join(tmpdir(), "s8-broker-frame-"));
   try {
-    const sandboxPath = join(root, "sandbox");
-    writeFileSync(sandboxPath, "sandbox");
-    const workerConfig = { ...config(root), sandboxExecutable: sandboxPath };
-    const writer = buildS8BlenderSandboxCommand(workerConfig, root, join(root, "blender"), join(root, "writer.py"), join(root, "export_fbx_bin.py"), join(root, "patch-manifest.json"), join(root, "work"));
-    const validator = buildS8ValidatorSandboxCommand(workerConfig, join(root, "validator"), join(root, "work"));
-    for (const command of [writer, validator]) {
-      for (const flag of ["--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--disable-userns", "--assert-userns-disabled", "--die-with-parent", "--new-session", "--clearenv"]) {
-        assert.equal(command.args.filter((value) => value === flag).length, 1, `${flag} must appear exactly once`);
-      }
-      for (const [option, value] of [["--uid", "65534"], ["--gid", "65534"], ["--cap-drop", "ALL"], ["--proc", "/proc"], ["--dev", "/dev"], ["--tmpfs", "/tmp"], ["--chdir", "/work"]] as const) {
-        assert.equal(command.args.filter((argument, index) => argument === option && command.args[index + 1] === value).length, 1, `${option} ${value} must appear exactly once`);
-      }
-      assert.equal(command.args.filter((value) => value === "--setenv" || value.startsWith("--setenv=")).length, 0);
-      const bindPairs = command.args.flatMap((option, index, values) => option.includes("bind") ? [{ option, source: values[index + 1], destination: values[index + 2] }] : []);
-      const broadRuntimePaths = new Set(["/", "/usr", "/lib", "/lib64", "/etc"]);
-      assert.equal(bindPairs.some(({ source, destination }) => broadRuntimePaths.has(source ?? "") || broadRuntimePaths.has(destination ?? "")), false);
-      const identityBinds = bindPairs.filter(({ source, destination }) => source === destination);
-      assert.ok(identityBinds.every(({ option }) => option === "--ro-bind"));
-      assert.deepEqual(identityBinds.map(({ source }) => source), [...S8_SYSTEM_RUNTIME_BIND_PATHS]);
-    }
+    const workerConfig = config(root);
+    const payload = Buffer.from("original-payload\0bytes", "utf8");
+    const requestId = Buffer.alloc(16, 0x5a);
+    const request = createS8BrokerRequest("WRITER", payload, workerConfig, requestId);
+    assert.equal(request.bytes.length, 160 + payload.length);
+    assert.equal(request.bytes.toString("ascii", 0, 8), "S8BRQ001");
+    assert.equal(request.bytes.readUInt16BE(8), 1);
+    assert.equal(request.bytes[10], 1);
+    assert.equal(request.bytes[11], 0);
+    assert.equal(request.bytes.subarray(12, 28).toString("hex"), requestId.toString("hex"));
+    assert.equal(request.bytes.subarray(28, 60).toString("hex"), workerConfig.sandboxPolicySha256);
+    assert.equal(request.bytes.readBigUInt64BE(92), BigInt(payload.length));
+    assert.equal(request.bytes.subarray(100, 132).toString("hex"), createHash("sha256").update(payload).digest("hex"));
+    assert.equal(request.bytes.subarray(132, 160).every((byte) => byte === 0), true);
+    assert.equal(request.bytes.subarray(160).equals(payload), true);
+    assert.match(request.configSha256, /^[0-9a-f]{64}$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("final config canonical bytes retain the Run-106 policy digest and fixed Q oracle", () => {
+  const workerConfig: S8WorkerConfig = {
+    blenderRuntimeRoot: "/opt/blender",
+    blenderExecutable: "/opt/blender/blender",
+    writerScript: "/opt/swooshz/writer.py",
+    privateWorkRoot: "/var/lib/swooshz/s8",
+    processRunnerExecutable: "/usr/local/libexec/swooshz-s8/s8-process-runner",
+    sandboxExecutable: "/usr/local/libexec/swooshz-s8/s8-sandbox",
+    nativeValidatorExecutable: "/usr/local/libexec/swooshz-s8/s8-native-validator",
+    blenderExecutableSha256: "1".repeat(64),
+    sandboxPolicySha256: "73fa2120547140c024f40eb43399649949f7da1bb152622b018df588e886013f",
+  };
+  const bytes = canonicalS8ConfigBytes(workerConfig);
+  assert.equal(bytes.length, 561);
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), "f3359c5e130c7806750275d6a2eb01ca9c214a07fb2f472f86db8daa8c2007ce");
+  assert.match(bytes.toString("utf8"), /"nativeValidatorExecutable":.*"blenderExecutableSha256":.*"sandboxPolicySha256":/u);
+  assert.throws(() => canonicalS8ConfigBytes({ ...workerConfig, blenderRuntimeRoot: `/opt/\ud800` }), /S8_BROKER_CONFIG_INVALID/);
+});
+
+test("broker response validates exact header, section lengths, request binding, and section digest", () => {
+  const root = mkdtempSync(join(tmpdir(), "s8-broker-response-"));
+  try {
+    const workerConfig = config(root);
+    const request = createS8BrokerRequest("VALIDATOR", Buffer.from("fbx"), workerConfig, Buffer.alloc(16, 0x22));
+    const metadata = Buffer.from('{"schemaVersion":"s8-sandbox-broker-metadata-v1"}', "utf8");
+    const native = Buffer.from("native-receipt-and-output", "utf8");
+    const sections = [Buffer.alloc(0), Buffer.alloc(0), native, Buffer.alloc(0), metadata];
+    const header = Buffer.alloc(320);
+    header.write("S8BRS001", 0, "ascii");
+    header.writeUInt16BE(1, 8);
+    header[10] = 2;
+    Buffer.from(request.requestId, "hex").copy(header, 12);
+    header.writeUInt16BE(0, 28);
+    header.writeInt32BE(0, 32);
+    header.writeInt32BE(-1, 36);
+    Buffer.alloc(16, 0x44).copy(header, 40);
+    Buffer.from(runnerHash, "hex").copy(header, 56);
+    Buffer.from(runnerHash, "hex").copy(header, 88);
+    Buffer.from(workerConfig.sandboxPolicySha256, "hex").copy(header, 120);
+    Buffer.from(request.configSha256, "hex").copy(header, 152);
+    sections.forEach((section, index) => header.writeBigUInt64BE(BigInt(section.length), 184 + (8 * index)));
+    createHash("sha256").update(Buffer.concat(sections)).digest().copy(header, 224);
+    const frame = Buffer.concat([header, ...sections]);
+    const response = parseS8BrokerResponse(frame, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 });
+    assert.equal(response.brokerStatus, 0);
+    assert.equal(response.identityBound, true);
+    assert.equal(response.allocationId, "44".repeat(16));
+    assert.equal(response.nativeStdout.equals(native), true);
+    assert.equal(response.metadata.equals(metadata), true);
+    assert.throws(() => parseS8BrokerResponse(frame.subarray(0, frame.length - 1), { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 }), /S8_BROKER_RESPONSE_INVALID/);
+    const tampered = Buffer.from(frame);
+    tampered[tampered.length - 1] ^= 1;
+    assert.throws(() => parseS8BrokerResponse(tampered, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 }), /S8_BROKER_RESPONSE_DIGEST_MISMATCH/);
+    const stalePolicy = Buffer.from(frame);
+    stalePolicy[120] ^= 1;
+    const successfulWrongPolicy = parseS8BrokerResponse(stalePolicy, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 });
+    assert.equal(successfulWrongPolicy.brokerStatus, 0);
+    assert.equal(successfulWrongPolicy.identityBound, false);
+    assert.throws(() => validateS8BrokerResponseIdentity(successfulWrongPolicy), /S8_OUTPUT_OR_RECEIPT_INVALID/);
+    const failedWrongPolicy = Buffer.from(stalePolicy);
+    failedWrongPolicy.writeUInt16BE(65, 28);
+    const brokerFailure = parseS8BrokerResponse(failedWrongPolicy, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 });
+    validateS8BrokerResponseIdentity(brokerFailure);
+    assert.equal(brokerFailure.brokerStatus, 65);
+    const staleConfig = Buffer.from(frame);
+    staleConfig[152] ^= 1;
+    const successfulWrongConfig = parseS8BrokerResponse(staleConfig, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 });
+    assert.equal(successfulWrongConfig.brokerStatus, 0);
+    assert.equal(successfulWrongConfig.identityBound, false);
+    assert.throws(() => validateS8BrokerResponseIdentity(successfulWrongConfig), /S8_OUTPUT_OR_RECEIPT_INVALID/);
+    assert.throws(() => parseS8BrokerResponse(frame, { operation: "WRITER", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 }), /S8_BROKER_RESPONSE_INVALID/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("direct Bubblewrap paths and malformed policy digests fail closed before launch", () => {
+  const root = mkdtempSync(join(tmpdir(), "s8-broker-config-"));
+  try {
+    const payload = Buffer.from("payload");
+    assert.throws(() => createS8BrokerRequest("WRITER", payload, { ...config(root), sandboxExecutable: "/usr/bin/bwrap" }), /S8_WORKER_SANDBOX_REQUIRED/);
+    assert.throws(() => createS8BrokerRequest("WRITER", payload, { ...config(root), sandboxPolicySha256: "not-a-sha" }), /S8_BROKER_POLICY_IDENTITY_INVALID/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -248,8 +336,11 @@ const workflowSizeBase = "578ac98aa974fa0ec3a65bcade1c505ac5c80dcb";
 const workflowSizeLimitBytes = 512_000;
 const workflowSizePath = ".github/workflows/s8-fbx.yml";
 const workflowProofHelperPath = "scripts/s8/s8_application_boundary_proof.mts";
-const workflowProofHelperBytes = 7_531;
-const workflowProofHelperSha256 = "53a696c1821c9a9057201ebb2180337ac9e67e95b72bb56e70e0e549114c275f";
+const workflowProofHelperBytes = 8_966;
+const workflowProofHelperSha256 = "05c7b06a96fe0c45be71a4e2805b29202250130c9dba4bb852a0ef6032aacd31";
+const workflowProofShellPath = "scripts/s8/s8_application_boundary_proof.sh";
+const workflowProofShellBytes = 3_260;
+const workflowProofShellSha256 = "105085a773513c05abdfbc6b0b6da67b74ad8eb811c91c919cc7a08645bd769e";
 const run089Head = "c620d7eda702be8149f69bff546b97e214e2fab6";
 const originalWorkflowHead = "5a78ccdda307dd7dc3052aaaae5d033b7bf06c43";
 
@@ -376,25 +467,34 @@ function emitWorkflowSizeResult(result: WorkflowSizeResult): void {
   for (const record of result.records) console.log(JSON.stringify(record));
 }
 
+const helperSourceLine = 'source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"';
 const helperInstallLine = '/usr/bin/install -m 0600 -- "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.mts" "$app_proof"';
 const oldHelperExecutionLine = '/usr/bin/pnpm exec tsx "$app_proof"';
 const helperExecutionLine = 'COREPACK_ENABLE_AUTO_PIN=0 corepack pnpm@12.6.0 exec tsx "$app_proof"';
 
-function helperExtractionIsValid(workflow: string, helper: Buffer | undefined): boolean {
-  if (!helper || helper.length !== workflowProofHelperBytes) return false;
+function helperExtractionIsValid(workflow: string, helper: Buffer | undefined, shellHelper: Buffer | undefined): boolean {
+  if (!helper || helper.length !== workflowProofHelperBytes || !shellHelper || shellHelper.length !== workflowProofShellBytes) return false;
   let helperText: string;
+  let shellText: string;
   try {
     helperText = decodeUtf8Strict(helper);
+    shellText = decodeUtf8Strict(shellHelper);
   } catch {
     return false;
   }
   const helperHash = createHash("sha256").update(helper).digest("hex");
+  const shellHash = createHash("sha256").update(shellHelper).digest("hex");
   return !helperText.includes("\r")
+    && !shellText.includes("\r")
     && helperHash === workflowProofHelperSha256
-    && workflow.split(helperInstallLine).length - 1 === 1
+    && shellHash === workflowProofShellSha256
+    && workflow.split(helperSourceLine).length - 1 === 1
+    && workflow.split(helperInstallLine).length - 1 === 0
     && workflow.split(oldHelperExecutionLine).length - 1 === 0
-    && workflow.split(helperExecutionLine).length - 1 === 1
-    && !workflow.includes('cat > "$app_proof" <<\'TS\'');
+    && shellText.split(helperInstallLine).length - 1 === 1
+    && shellText.split(helperExecutionLine).length - 1 === 1
+    && !shellText.includes(oldHelperExecutionLine)
+    && !shellText.includes('cat > "$app_proof" <<\'TS\'');
 }
 
 const toolchainJobMarker = "  s8-pinned-blender:";
@@ -576,27 +676,30 @@ test("workflow UTF-8 size gate checks the selected raw bytes and rejects every f
   assert.equal(runWorkflowSizeGate(root, run089Head).pass, false);
 });
 
-test("workflow application proof helper extraction and the two runtime consumers remain exact", () => {
+test("workflow application proof shell extraction and TypeScript helper integrity remain exact", () => {
   const root = resolve(process.cwd());
   const workflow = readFileSync(join(root, workflowSizePath), "utf8");
   const helper = readFileSync(join(root, workflowProofHelperPath));
-  assert.equal(helperExtractionIsValid(workflow, helper), true);
-  assert.equal(workflow.split(workflowProofHelperPath).length - 1, 2);
-  assert.equal(workflow.split(helperInstallLine).length - 1, 1);
-  assert.equal(workflow.split(helperExecutionLine).length - 1, 1);
-  assert.equal(helperExtractionIsValid(workflow, undefined), false);
+  const shellHelper = readFileSync(join(root, workflowProofShellPath));
+  assert.equal(helperExtractionIsValid(workflow, helper, shellHelper), true);
+  assert.equal(workflow.split(workflowProofShellPath).length - 1, 1);
+  assert.equal(shellHelper.toString("utf8").split(workflowProofHelperPath).length - 1, 1);
+  assert.equal(shellHelper.toString("utf8").split(helperInstallLine).length - 1, 1);
+  assert.equal(shellHelper.toString("utf8").split(helperExecutionLine).length - 1, 1);
+  assert.equal(helperExtractionIsValid(workflow, undefined, shellHelper), false);
+  assert.equal(helperExtractionIsValid(workflow, helper, undefined), false);
 
   const altered = Buffer.from(helper);
   altered[0] = altered[0]! ^ 1;
-  assert.equal(helperExtractionIsValid(workflow, altered), false);
-  assert.equal(helperExtractionIsValid(workflow.replace(helperInstallLine, ""), helper), false);
-  assert.equal(helperExtractionIsValid(workflow.replace(helperExecutionLine, ""), helper), false);
-  assert.equal(helperExtractionIsValid(workflow + "\n" + helperExecutionLine, helper), false);
-  assert.equal(workflow.split(oldHelperExecutionLine).length - 1, 0);
-  assert.equal(workflow.split(helperExecutionLine).length - 1, 1);
-  assert.equal(helperExtractionIsValid(workflow + "\n" + helperInstallLine, helper), false);
-  assert.equal(helperExtractionIsValid(workflow + "\n" + oldHelperExecutionLine, helper), false);
-  assert.equal(helperExtractionIsValid(workflow + '\ncat > "$app_proof" <<\'TS\'', helper), false);
+  assert.equal(helperExtractionIsValid(workflow, altered, shellHelper), false);
+  const alteredShell = Buffer.from(shellHelper);
+  alteredShell[0] = alteredShell[0]! ^ 1;
+  assert.equal(helperExtractionIsValid(workflow, helper, alteredShell), false);
+  assert.equal(helperExtractionIsValid(workflow.replace(helperSourceLine, ""), helper, shellHelper), false);
+  assert.equal(helperExtractionIsValid(workflow + "\n" + helperSourceLine, helper, shellHelper), false);
+  assert.equal(helperExtractionIsValid(workflow, helper, Buffer.from(shellHelper.toString("utf8").replace(helperInstallLine, "").replace(helperExecutionLine, ""), "utf8")), false);
+  assert.equal(shellHelper.toString("utf8").split(oldHelperExecutionLine).length - 1, 0);
+  assert.equal(shellHelper.toString("utf8").includes('cat > "$app_proof" <<\'TS\''), false);
 });
 
 test("hosted toolchain source integrity is bounded to the verified Blender setup", () => {

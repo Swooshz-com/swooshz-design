@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+if [ "$#" -ne 0 ]; then
+  exit 64
+fi
+exec /usr/bin/sudo -n -- /usr/local/libexec/swooshz-s8/s8-sandbox-broker --stdio-v1

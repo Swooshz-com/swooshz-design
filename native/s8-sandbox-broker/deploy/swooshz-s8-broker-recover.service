@@ -1,0 +1,15 @@
+[Unit]
+Description=Recover interrupted Swooshz S8 broker allocations
+After=local-fs.target
+Before=swooshz-s8-broker-recover.timer
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/libexec/swooshz-s8/s8-sandbox-broker --recover-v1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/swooshz/s8

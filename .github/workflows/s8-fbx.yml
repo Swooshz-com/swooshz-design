@@ -593,23 +593,25 @@ jobs:
           set -euo pipefail
           workflow=.github/workflows/s8-fbx.yml
           helper=scripts/s8/s8_application_boundary_proof.mts
+          shell_helper=scripts/s8/s8_application_boundary_proof."sh"
           test -f "$helper"
-          if grep -nE '(^|[[:space:]])(sysctl|apparmor_parser|aa-enforce|aa-disable)([[:space:]]|$)' "$workflow" "$helper"; then
+          test -f "$shell_helper"
+          if grep -nE '(^|[[:space:]])(sysctl|apparmor_parser|aa-enforce|aa-disable)([[:space:]]|$)' "$workflow" "$helper" "$shell_helper"; then
             echo 'global policy mutation detected' >&2
             exit 1
           fi
           trigger_deferral='--no-'triggers
           trigger_unpack='dpkg[[:space:]]+--'unpack
           trigger_config='dpkg[[:space:]]+--'configure'[[:space:]]+--no'
-          if grep -nE -- "$trigger_deferral|$trigger_unpack|$trigger_config" "$workflow" "$helper"; then
+          if grep -nE -- "$trigger_deferral|$trigger_unpack|$trigger_config" "$workflow" "$helper" "$shell_helper"; then
             echo 'trigger deferral or suppression detected' >&2
             exit 1
           fi
-          if grep -nE '(^|[[:space:]])(cp|install|mv|ln)[[:space:]].*(/usr/bin/bwrap|bwrap-staged)' "$workflow" "$helper"; then
+          if grep -nE '(^|[[:space:]])(cp|install|mv|ln)[[:space:]].*(/usr/bin/bwrap|bwrap-staged)' "$workflow" "$helper" "$shell_helper"; then
             echo 'staged alternate bwrap path detected' >&2
             exit 1
           fi
-          if grep -nE '(^|[;&|])[[:space:]]*(exec[[:space:]]+)?/usr/bin/bwrap([[:space:]]|$)' "$workflow" "$helper"; then
+          if grep -nE '(^|[;&|])[[:space:]]*(exec[[:space:]]+)?/usr/bin/bwrap([[:space:]]|$)' "$workflow" "$helper" "$shell_helper"; then
             echo 'non-root bwrap execution accepted' >&2
             exit 1
           fi
@@ -9378,84 +9380,7 @@ jobs:
           admit_work_for_use || fail_hold "WORK_POST_CANDIDATE_ADMISSION_FAILED"
           printf 'NATIVE_RUNNER_ADMISSION_RESULT=PASS\nPINNED_BLENDER_RESULT=PASS\nPRIVATE_EXPORTER_RESULT=PASS\nNATIVE_VALIDATOR_RESULT=PASS\nBLENDER_SEMANTIC_QUALIFICATION=PASS\n'
 
-          admit_work_for_use || fail_hold "WORK_BEFORE_APPLICATION_BOUNDARY_PROOF_FAILED"
-          app_sandbox="$temp_root/s8-observed-bwrap"
-          app_argv_audit="$temp_root/s8-application-bwrap-argv.log"
-          app_proof="$temp_root/s8-application-boundary-proof.mts"
-          app_argv_q="$(printf '%q' "$app_argv_audit")"
-          {
-            printf '%s\n' '#!/usr/bin/bash' '{'
-            printf '%s\n' "  printf '%s\\n' 'S8APP_BWRAP_BEGIN'"
-            printf '%s\n' '  printf "%s\\n" "$@"'
-            printf '%s\n' "  printf '%s\\n' 'S8APP_BWRAP_END'"
-            printf '} >> %s\n' "$app_argv_q"
-            printf '%s\n' 'exec /usr/bin/sudo -n /usr/bin/bwrap "$@"'
-          } > "$app_sandbox"
-          /usr/bin/chmod 0700 -- "$app_sandbox"
-          /usr/bin/install -m 0600 -- "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.mts" "$app_proof"
-          export S8_APP_CARRIER="$carrier"
-          export S8_APP_WORK="$carrier/work"
-          export S8_APP_ARGV_AUDIT="$app_argv_audit"
-          export S8_APP_SANDBOX="$app_sandbox"
-          COREPACK_ENABLE_AUTO_PIN=0 corepack pnpm@12.6.0 exec tsx "$app_proof" >"$temp_root/application-proof.stdout" 2>"$temp_root/application-proof.stderr" &
-          app_proof_pid=$!
-          set +e
-          /usr/bin/sudo -n /usr/bin/python3 - "$app_proof_pid" "$temp_root/application-target-env.status" <<'PY'
-          import os
-          import pathlib
-          import sys
-          import time
-
-          application_pid = int(sys.argv[1])
-          status_path = pathlib.Path(sys.argv[2])
-          observed = set()
-          error = False
-          while True:
-              try:
-                  process_state = (pathlib.Path("/proc") / str(application_pid) / "stat").read_text(encoding="ascii").rsplit(")", 1)[1].strip().split()[0]
-                  if process_state == "Z":
-                      break
-              except FileNotFoundError:
-                  break
-              try:
-                  os.kill(application_pid, 0)
-              except ProcessLookupError:
-                  break
-              for entry in pathlib.Path("/proc").iterdir():
-                  if not entry.name.isdigit():
-                      continue
-                  try:
-                      command = (entry / "cmdline").read_bytes()
-                      kind = "writer" if b"/runtime/blender-root/blender\0" in command else "validator" if b"/runtime/validator\0" in command else None
-                      if kind is None:
-                          continue
-                      variables = [item for item in (entry / "environ").read_bytes().split(b"\0") if item]
-                      keys = {item.split(b"=", 1)[0] for item in variables}
-                      if len(variables) != 1 or keys != {b"PWD"} or b"PWD=/work" not in variables:
-                          error = True
-                      observed.add(kind)
-                  except (FileNotFoundError, ProcessLookupError, PermissionError):
-                      continue
-              time.sleep(0.003)
-          status_path.write_text("PASS\n" if not error and observed == {"writer", "validator"} else "FAIL\n", encoding="ascii")
-          if error or observed != {"writer", "validator"}:
-              raise SystemExit(1)
-          PY
-          target_env_status=$?
-          wait "$app_proof_pid"
-          app_proof_status=$?
-          set -e
-          if (( app_proof_status == 126 || app_proof_status == 127 )); then
-            printf 'FAILURE_CLASS=HOSTED_TOOLCHAIN_HOLD\nTOOLCHAIN_STAGE=APPLICATION_PROOF_LAUNCH\nAPPLICATION_PROOF_LAUNCH_STATUS=%s\n' "$app_proof_status" >&2
-          fi
-          if (( app_proof_status != 0 )); then
-            /usr/bin/cat -- "$temp_root/application-proof.stderr" >&2
-            exit "$app_proof_status"
-          fi
-          (( target_env_status == 0 )) || fail_hold "APPLICATION_TARGET_ENVIRONMENT_PROOF_FAILED"
-          /usr/bin/grep -Fx 'PASS' "$temp_root/application-target-env.status" >/dev/null || fail_hold "APPLICATION_TARGET_ENVIRONMENT_STATUS_INVALID"
-          /usr/bin/cat -- "$temp_root/application-proof.stdout"
-          printf 'TARGET_ENV_KEYS=PWD\nPARENT_SECRET_HOSTILE_ENV_LEAKAGE=NO\nPRODUCTION_BOUNDARY_PROOF=PASS\n'
+          source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"
           admit_work_for_use || fail_hold "WORK_AFTER_APPLICATION_BOUNDARY_PROOF_FAILED"
 
           [[ "$all_launched_children_reaped" == 1 && ${#tracked_children[@]} == 0 ]] || fail_hold "CANDIDATE_CHILD_REAP_WITNESS_MISSING"
