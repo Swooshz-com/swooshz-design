@@ -221,6 +221,55 @@ print("HOSTED_BROKER_JOURNAL_CLEANUP=PASS")
 '''
 
 
+HOSTED_BROKER_WIRE_PRELOAD_SCRIPT = r'''
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const originalSpawnSync = childProcess.spawnSync;
+childProcess.spawnSync = function (command, args, options) {
+  const result = originalSpawnSync.call(this, command, args, options);
+  if (command === "/usr/local/libexec/swooshz-s8/s8-sandbox") {
+    const bytes = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
+    const stderr = Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(result.stderr ?? "");
+    const detail = { stdoutBytes: bytes.length, status: result.status, signal: result.signal, error: result.error?.code ?? null, stderrBytes: stderr.length };
+    if (stderr.length !== 0) detail.stderrText = stderr.subarray(0, 512).toString("utf8").replace(/[\r\n\t]+/g, " ");
+    if (bytes.length < 320) detail.stdoutPrefixHex = bytes.subarray(0, 32).toString("hex");
+    if (bytes.length >= 320) {
+      const lengths = [184, 192, 200, 208, 216].map((offset) => Number(bytes.readBigUInt64BE(offset)));
+      detail.magic = bytes.toString("ascii", 0, 8);
+      detail.version = bytes.readUInt16BE(8);
+      detail.operation = bytes[10];
+      detail.flags = bytes[11];
+      detail.brokerStatus = bytes.readUInt16BE(28);
+      detail.reserved = bytes.readUInt16BE(30);
+      detail.nativeExit = bytes.readInt32BE(32);
+      detail.nativeSignal = bytes.readInt32BE(36);
+      detail.reservedBytesNonzero = bytes.subarray(256, 320).some((value) => value !== 0);
+      detail.lengths = lengths;
+      detail.declaredBytes = 320 + lengths.reduce((sum, value) => sum + value, 0);
+    }
+    process.stderr.write(`S8_BROKER_WIRE_DIAGNOSTIC=${JSON.stringify(detail)}\n`);
+  }
+  return result;
+};
+syncBuiltinESMExports();
+'''
+
+
+def hosted_write_broker_wire_preload(temp_root):
+    target = Path(temp_root) / "broker-wire-preload.mjs"
+    try:
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as output:
+            output.write(HOSTED_BROKER_WIRE_PRELOAD_SCRIPT)
+            output.flush()
+            os.fsync(output.fileno())
+    except OSError as error:
+        raise HostedDeploymentFailure("HOSTED_BROKER_WIRE_PRELOAD_CREATE_FAILED") from error
+    metadata = target.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode), metadata.st_nlink) != (os.getuid(), os.getgid(), 0o600, 1):
+        raise HostedDeploymentFailure("HOSTED_BROKER_WIRE_PRELOAD_IDENTITY_INVALID")
+
+
 def hosted_protected_state(path, *, digest=False):
     path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
@@ -761,6 +810,7 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
         if hosted_file_digest(HOSTED_POLICY_PATH, 0o600) != policy_file_hash:
             raise HostedDeploymentFailure("HOSTED_POLICY_INSTALL_HASH_MISMATCH")
         hosted_sudo(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_POLICY_ADMISSION_FAILED")
+        hosted_write_broker_wire_preload(temp_root)
         print("BROKER_BUILD=PASS")
         print("BROKER_TESTS=PASS")
         print("HOSTED_BROKER_BUILD_WIRING=PASS")
@@ -1198,6 +1248,7 @@ def valid_hosted_protected_harness(deployment):
             "hosted_file_digest(HOSTED_POLICY_PATH, 0o600) != policy_file_hash",
             "hosted_verify_private_root_acl(runner_uid)",
             "hosted_verify_opt_product_paths()",
+            "hosted_write_broker_wire_preload(temp_root)",
         ),
     }
     for name, tokens in required.items():
@@ -1258,6 +1309,7 @@ def valid_hosted_binding(workflow, deployment, proof_helper, worker, broker, pro
         return False
     if any(token not in workflow for token in (
         '--hosted-cleanup "$temp_root"',
+        'export NODE_OPTIONS="--import=$temp_root/broker-wire-preload.mjs"',
         "if (( all_launched_children_reaped == 1 ))",
         "broker_deployment_attempted=0",
         "TEMP_CLEANUP_RESULT=DEFERRED_BROKER_DEPLOYMENT_RESIDUE",
@@ -1298,6 +1350,7 @@ def valid_hosted_binding(workflow, deployment, proof_helper, worker, broker, pro
         "policy_tmp, policy_h, config_q, policy_file_hash = hosted_policy(",
         "hosted_install(temp_root, policy_tmp, HOSTED_POLICY_PATH, 0o600)",
         'hosted_sudo(str(HOSTED_BROKER), "--recover-v1"',
+        "hosted_write_broker_wire_preload(temp_root)",
         'print("BROKER_RECOVER=PASS")',
         'print("BROKER_POLICY_ADMISSION=PASS")',
         'print("HOSTED_POLICY_H=" + policy_h)',
