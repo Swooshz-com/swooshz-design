@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import ast
+from contextlib import redirect_stderr
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -31,18 +33,22 @@ class HostedDeploymentFailure(RuntimeError):
     pass
 
 
-def hosted_run(args, label, *, cwd=None, log_path=None):
-    result = subprocess.run(args, cwd=cwd, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+def hosted_run(args, label, *, cwd=None, log_path=None, separate_stderr=False):
+    result = subprocess.run(args, cwd=cwd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT)
     if log_path is not None:
         Path(log_path).write_bytes(result.stdout)
     if result.returncode != 0:
         detail = result.stdout.decode("utf-8", errors="replace")[-12000:]
-        raise HostedDeploymentFailure(label + ("\n" + detail if detail else ""))
+        error = HostedDeploymentFailure(label + ("\n" + detail if detail else ""))
+        error.returncode = result.returncode
+        error.captured_stdout = result.stdout
+        error.captured_stderr = result.stderr if separate_stderr else b""
+        raise error
     return result.stdout.decode("utf-8", errors="strict")
 
 
-def hosted_sudo(*args, label="HOSTED_SUDO_COMMAND_FAILED"):
-    return hosted_run(["/usr/bin/sudo", "-n", *args], label)
+def hosted_sudo(*args, label="HOSTED_SUDO_COMMAND_FAILED", separate_stderr=False):
+    return hosted_run(["/usr/bin/sudo", "-n", *args], label, separate_stderr=separate_stderr)
 
 
 def hosted_canonical(value):
@@ -179,6 +185,308 @@ def hosted_file_digest(path, mode):
     if (state["kind"], state["uid"], state["gid"], state["mode"], state["nlink"]) != ("regular", 0, 0, mode, 1):
         raise HostedDeploymentFailure("HOSTED_DEPLOYED_FILE_IDENTITY_INVALID:" + str(path))
     return state["sha256"]
+
+
+HOSTED_BROKER_STATUS = {
+    0: "SUCCESS", 64: "PROTOCOL_INVALID", 65: "CALLER_OR_POLICY_INVALID",
+    66: "ROOT_OR_DEPLOYMENT_INVALID", 67: "JOURNAL_INVALID",
+    68: "ALLOCATION_OR_INPUT_ADMISSION_FAILED", 69: "LAUNCH_OR_STATUS_INVALID",
+    70: "NATIVE_OPERATION_FAILED", 71: "OUTPUT_OR_RECEIPT_INVALID",
+    72: "CLEANUP_HOLD", 73: "RECOVERY_IDENTITY_UNKNOWN_HOLD",
+    74: "RECOVERY_LAUNCH_IDENTITY_UNKNOWN_HOLD",
+    75: "RECOVERY_PIDNS_INIT_IDENTITY_HOLD",
+    76: "RECOVERY_PROCESS_TREE_NOT_QUIESCENT_HOLD",
+    77: "RECOVERY_RETRY_LIMIT_HOLD", 78: "BUSY", 79: "BROKER_INTERNAL",
+    124: "OPERATION_TIMEOUT",
+}
+
+
+HOSTED_BROKER_DIAGNOSTIC_SCRIPT = r'''
+import errno
+import hashlib
+import json
+import os
+import re
+import stat
+import struct
+import sys
+
+expected_h, expected_q, runner_uid, runner_gid, runtime_paths_json, status_text = sys.argv[1:]
+runtime_paths = json.loads(runtime_paths_json)
+diagnostic_status = int(status_text)
+policy_path = "/etc/swooshz/s8-broker-v1.json"
+root_path = "/var/lib/swooshz/s8"
+result = {"caller": {"uid": os.getuid(), "euid": os.geteuid(), "gid": os.getgid(), "egid": os.getegid(), "brokerCallerValid": (os.getuid(), os.geteuid(), os.getegid()) == (0, 0, 0), "allIdsRoot": (os.getuid(), os.geteuid(), os.getgid(), os.getegid()) == (0, 0, 0, 0)}}
+
+def parent_path(path):
+    current = "/"
+    try:
+        parts = path.split("/")
+        if not path.startswith("/") or any(part in ("", ".", "..") for part in parts[1:]):
+            return {"valid": False, "reason": "NONCANONICAL"}
+        for part in [""] + parts[1:-1]:
+            current = os.path.join(current, part)
+            metadata = os.lstat(current)
+            if not stat.S_ISDIR(metadata.st_mode) or (metadata.st_uid, metadata.st_gid) != (0, 0) or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+                return {"valid": False, "path": current, "uid": metadata.st_uid, "gid": metadata.st_gid, "mode": format(stat.S_IMODE(metadata.st_mode), "04o"), "kind": "directory" if stat.S_ISDIR(metadata.st_mode) else "other"}
+    except OSError as error:
+        return {"valid": False, "path": current, "errno": error.errno}
+    return {"valid": True}
+
+def file_state(path, mode, expected_digest=None, maximum=None):
+    record = {"path": path, "parentPath": parent_path(path)}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            before = os.fstat(fd)
+            record.update(kind="regular" if stat.S_ISREG(before.st_mode) else "other", uid=before.st_uid, gid=before.st_gid, mode=format(stat.S_IMODE(before.st_mode), "04o"), nlink=before.st_nlink, size=before.st_size)
+            record["identityValid"] = stat.S_ISREG(before.st_mode) and (before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode), before.st_nlink) == (0, 0, mode, 1)
+            if maximum is not None:
+                record["sizeValid"] = 0 <= before.st_size <= maximum
+            if expected_digest is not None and stat.S_ISREG(before.st_mode):
+                digest = hashlib.sha256()
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                after = os.fstat(fd)
+                record["stable"] = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                record["hashMatch"] = digest.hexdigest() == expected_digest
+        finally:
+            os.close(fd)
+    except OSError as error:
+        record["errno"] = error.errno
+    return record
+
+def pairs_unique(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate_key")
+        value[key] = item
+    return value
+
+policy_record = file_state(policy_path, 0o600, maximum=16384)
+policy = None
+try:
+    fd = os.open(policy_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        parts = []
+        remaining = 16385
+        while remaining:
+            chunk = os.read(fd, min(4096, remaining))
+            if not chunk:
+                break
+            parts.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(parts)
+        policy_record["bytesBounded"] = len(raw) <= 16384 and len(raw) == os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+    if policy_record["bytesBounded"]:
+        policy = json.loads(raw.decode("ascii"), object_pairs_hook=pairs_unique)
+        config = policy["config"]
+        policy_keys = ("schemaVersion", "protocolVersion", "hostUid", "hostGid", "config", "privateRootDevice", "privateRootInode", "launcherSha256", "brokerSha256", "bubblewrapSha256", "runnerSha256", "validatorSha256", "writerSha256", "privateExporterSha256", "patchManifestSha256")
+        config_keys = ("blenderRuntimeRoot", "blenderExecutable", "writerScript", "privateWorkRoot", "processRunnerExecutable", "sandboxExecutable", "nativeValidatorExecutable", "blenderExecutableSha256", "sandboxPolicySha256")
+        canonical = json.dumps(policy, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        preimage = dict(policy)
+        preimage["config"] = {key: value for key, value in config.items() if key != "sandboxPolicySha256"}
+        computed_h = hashlib.sha256(json.dumps(preimage, ensure_ascii=True, separators=(",", ":")).encode("ascii")).hexdigest()
+        computed_q = hashlib.sha256(json.dumps(config, ensure_ascii=True, separators=(",", ":")).encode("ascii")).hexdigest()
+        policy_record.update(
+            canonicalBytes=raw == canonical,
+            schemaOrder=tuple(policy) == policy_keys and tuple(config) == config_keys,
+            schemaNames=policy.get("schemaVersion") == "s8-sandbox-broker-policy-v1" and policy.get("protocolVersion") == "s8-sandbox-broker-v1",
+            schemaScalars=(
+                type(policy.get("hostUid")) is int and 1 <= policy["hostUid"] <= 4294967294
+                and type(policy.get("hostGid")) is int and 0 <= policy["hostGid"] <= 4294967294
+                and all(isinstance(policy.get(key), str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", policy[key]) for key in ("privateRootDevice", "privateRootInode"))
+                and all(isinstance(policy.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", policy[key]) for key in ("launcherSha256", "brokerSha256", "bubblewrapSha256", "runnerSha256", "validatorSha256", "writerSha256", "privateExporterSha256", "patchManifestSha256"))
+                and all(isinstance(config.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", config[key]) for key in ("blenderExecutableSha256", "sandboxPolicySha256"))
+            ),
+            hostIdsMatch=policy.get("hostUid") == int(runner_uid) and policy.get("hostGid") == int(runner_gid),
+            fixedPathsMatch=config.get("blenderRuntimeRoot") == "/opt/blender" and config.get("blenderExecutable") == "/opt/blender/blender" and config.get("writerScript") == "/opt/swooshz/writer.py" and config.get("privateWorkRoot") == root_path and config.get("processRunnerExecutable") == "/usr/local/libexec/swooshz-s8/s8-process-runner" and config.get("sandboxExecutable") == "/usr/local/libexec/swooshz-s8/s8-sandbox" and config.get("nativeValidatorExecutable") == "/usr/local/libexec/swooshz-s8/s8-native-validator",
+            hSelfBound=config.get("sandboxPolicySha256") == computed_h,
+            hMatchesGenerated=computed_h == expected_h,
+            qMatchesGenerated=computed_q == expected_q,
+        )
+except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError) as error:
+    policy_record["parseError"] = type(error).__name__
+    policy = None
+result["policy"] = policy_record
+
+def acl_entries(fd, name):
+    try:
+        data = os.getxattr(fd, name)
+    except OSError as error:
+        return {"absent": error.errno in (errno.ENODATA, errno.ENOTSUP, getattr(errno, "ENOATTR", errno.ENODATA)), "errno": error.errno}
+    if len(data) < 4 or len(data) > 4 + 8 * 16 or (len(data) - 4) % 8 or struct.unpack_from("<I", data)[0] != 2:
+        return {"malformed": True, "size": len(data)}
+    entries = [list(struct.unpack_from("<HHI", data, offset)) for offset in range(4, len(data), 8)]
+    return {"entries": entries}
+
+root_record = {"path": root_path, "parentPath": parent_path(root_path)}
+try:
+    fd = os.open(root_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(fd)
+        root_record.update(kind="directory" if stat.S_ISDIR(metadata.st_mode) else "other", uid=metadata.st_uid, gid=metadata.st_gid, mode=format(stat.S_IMODE(metadata.st_mode), "04o"), device=metadata.st_dev, inode=metadata.st_ino)
+        root_record["identityValid"] = stat.S_ISDIR(metadata.st_mode) and (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) == (0, 0, 0o710)
+        if policy is not None:
+            root_record["bindingMatch"] = str(metadata.st_dev) == policy.get("privateRootDevice") and str(metadata.st_ino) == policy.get("privateRootInode")
+        access = acl_entries(fd, "system.posix_acl_access")
+        default = acl_entries(fd, "system.posix_acl_default")
+        root_record["accessAcl"] = access
+        root_record["defaultAcl"] = default
+        if "entries" in access:
+            expected_broker = [[1, 7, 4294967295], [2, 1, int(runner_uid)], [4, 0, 4294967295], [16, 1, 4294967295], [32, 0, 4294967295]]
+            expected_harness = [[1, 7, 4294967295], [2, 1, int(runner_uid)], [4, 1, 4294967295], [16, 1, 4294967295], [32, 0, 4294967295]]
+            root_record["brokerAclMatch"] = access["entries"] == expected_broker and default.get("absent") is True
+            root_record["harnessAclMatch"] = sorted(access["entries"]) == sorted(expected_harness) and default.get("absent") is True
+    finally:
+        os.close(fd)
+except OSError as error:
+    root_record["errno"] = error.errno
+result["privateRoot"] = root_record
+
+if policy is not None:
+    config = policy["config"]
+    bindings = (
+        ("launcher", "/usr/local/libexec/swooshz-s8/s8-sandbox", "launcherSha256", 0o755),
+        ("broker", "/usr/local/libexec/swooshz-s8/s8-sandbox-broker", "brokerSha256", 0o755),
+        ("bwrap", "/usr/bin/bwrap", "bubblewrapSha256", 0o755),
+        ("runner", "/usr/local/libexec/swooshz-s8/s8-process-runner", "runnerSha256", 0o755),
+        ("validator", "/usr/local/libexec/swooshz-s8/s8-native-validator", "validatorSha256", 0o755),
+        ("blender", config["blenderExecutable"], "blenderExecutableSha256", 0o755),
+        ("writer", config["writerScript"], "writerSha256", 0o644),
+        ("exporter", "/opt/swooshz/export_fbx_bin.py", "privateExporterSha256", 0o644),
+        ("patchManifest", "/opt/swooshz/patch-manifest.json", "patchManifestSha256", 0o644),
+    )
+    result["bindings"] = {label: file_state(path, mode, policy.get(key)) for label, path, key, mode in bindings}
+else:
+    result["bindings"] = "POLICY_UNAVAILABLE"
+
+runtime = {}
+for path in runtime_paths:
+    record = {"exists": os.path.exists(path), "realpath": os.path.realpath(path)}
+    record["parentPath"] = parent_path(record["realpath"])
+    try:
+        metadata = os.stat(record["realpath"])
+        record.update(regular=stat.S_ISREG(metadata.st_mode), rootOwned=(metadata.st_uid, metadata.st_gid) == (0, 0), noGroupOtherWrite=not bool(metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)), noSuidSgid=not bool(metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)))
+    except OSError as error:
+        record["errno"] = error.errno
+    runtime[path] = record
+result["systemRuntimePaths"] = runtime
+
+boot = {"path": "/proc/sys/kernel/random/boot_id"}
+try:
+    fd = os.open(boot["path"], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        data = os.read(fd, 65)
+        boot["regular"] = stat.S_ISREG(os.fstat(fd).st_mode)
+        boot["readableValid"] = bool(re.fullmatch(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\n?", data))
+    finally:
+        os.close(fd)
+except OSError as error:
+    boot["errno"] = error.errno
+result["bootId"] = boot
+
+journal = {"path": root_path + "/.journal"}
+try:
+    fd = os.open(journal["path"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(fd)
+        journal.update(kind="directory" if stat.S_ISDIR(metadata.st_mode) else "other", uid=metadata.st_uid, gid=metadata.st_gid, mode=format(stat.S_IMODE(metadata.st_mode), "04o"))
+        journal["identityValid"] = stat.S_ISDIR(metadata.st_mode) and (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) == (0, 0, 0o700)
+        journal["accessAcl"] = acl_entries(fd, "system.posix_acl_access")
+        journal["defaultAcl"] = acl_entries(fd, "system.posix_acl_default")
+        journal["aclValid"] = journal["accessAcl"].get("absent") is True and journal["defaultAcl"].get("absent") is True
+        names = os.listdir(fd)
+        journal["entryCounts"] = {"lock": names.count(".lock"), "next": names.count(".next"), "record": sum(bool(re.fullmatch(r"[0-9a-f]{32}\.json", name)) for name in names), "unexpected": sum(name not in (".lock", ".next") and not re.fullmatch(r"[0-9a-f]{32}\.json", name) for name in names)}
+        if diagnostic_status in (67, 72, 73, 74, 75, 76, 77, 78):
+            summaries = []
+            record_names = sorted(name for name in names if re.fullmatch(r"[0-9a-f]{32}\.json", name))
+            for name in record_names[:8]:
+                summary = {}
+                try:
+                    record_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                    try:
+                        record_meta = os.fstat(record_fd)
+                        raw_record = os.read(record_fd, 16385)
+                        summary["identityValid"] = stat.S_ISREG(record_meta.st_mode) and (record_meta.st_uid, record_meta.st_gid, stat.S_IMODE(record_meta.st_mode), record_meta.st_nlink) == (0, 0, 0o600, 1)
+                        summary["bytesBounded"] = len(raw_record) <= 16384 and len(raw_record) == record_meta.st_size
+                    finally:
+                        os.close(record_fd)
+                    if summary["bytesBounded"]:
+                        record = json.loads(raw_record.decode("ascii"), object_pairs_hook=pairs_unique)
+                        launch = record.get("launch", {})
+                        cleanup = record.get("cleanup", {})
+                        record_root = record.get("root", {})
+                        state = record.get("state")
+                        summary.update(
+                            state=state if isinstance(state, str) and re.fullmatch(r"[A-Z_]{1,32}", state) else "INVALID",
+                            monitorBound=isinstance(launch.get("monitor"), dict),
+                            initBound=isinstance(launch.get("init"), dict),
+                            cleanupAttempts=cleanup.get("attemptCount") if type(cleanup.get("attemptCount")) is int else "INVALID",
+                            rootBootMatch=bool(boot.get("readableValid") and record_root.get("bootId") == data.decode("ascii").strip()),
+                            policyIdentityMatch=record.get("policyIdentity") == expected_h,
+                            configIdentityMatch=record.get("configIdentity") == expected_q,
+                        )
+                except (OSError, ValueError, TypeError, KeyError, UnicodeError, AttributeError) as error:
+                    summary["error"] = type(error).__name__
+                summaries.append(summary)
+            journal["recordSummaries"] = summaries
+            journal["recordSummariesTruncated"] = len(record_names) > len(summaries)
+        lock = {"present": ".lock" in names}
+        if lock["present"]:
+            lock_fd = os.open(".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                lock_meta = os.fstat(lock_fd)
+                lock.update(regular=stat.S_ISREG(lock_meta.st_mode), uid=lock_meta.st_uid, gid=lock_meta.st_gid, mode=format(stat.S_IMODE(lock_meta.st_mode), "04o"), nlink=lock_meta.st_nlink)
+                lock["identityValid"] = stat.S_ISREG(lock_meta.st_mode) and (lock_meta.st_uid, lock_meta.st_gid, stat.S_IMODE(lock_meta.st_mode), lock_meta.st_nlink) == (0, 0, 0o600, 1)
+            finally:
+                os.close(lock_fd)
+        journal["lock"] = lock
+    finally:
+        os.close(fd)
+except OSError as error:
+    journal["errno"] = error.errno
+result["journal"] = journal
+
+print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+'''
+
+
+def hosted_broker_runtime_paths(broker_source):
+    match = re.search(r"static const char \*const system_runtime_paths\[\] = \{(.*?)\n\};", broker_source, re.DOTALL)
+    if match is None:
+        raise HostedDeploymentFailure("HOSTED_BROKER_RUNTIME_PATH_LIST_UNAVAILABLE")
+    paths = ast.literal_eval("[" + match.group(1) + "]")
+    if not isinstance(paths, list) or not paths or len(paths) != len(set(paths)) or any(not isinstance(path, str) or not path.startswith("/") for path in paths):
+        raise HostedDeploymentFailure("HOSTED_BROKER_RUNTIME_PATH_LIST_INVALID")
+    return paths
+
+
+def hosted_report_broker_admission(error, policy_h, config_q, runner_uid, runner_gid, broker_source_path):
+    status = getattr(error, "returncode", None)
+    print("HOSTED_BROKER_ADMISSION_RETURN_CODE=" + str(status), file=sys.stderr)
+    print("HOSTED_BROKER_ADMISSION_STATUS=" + HOSTED_BROKER_STATUS.get(status, "UNDEFINED"), file=sys.stderr)
+    for name, output in (("STDOUT", getattr(error, "captured_stdout", b"")), ("STDERR", getattr(error, "captured_stderr", b""))):
+        bounded = output[-4096:]
+        print("HOSTED_BROKER_ADMISSION_" + name + "=" + ("EMPTY" if not output else json.dumps(bounded.decode("utf-8", errors="replace"), ensure_ascii=True)), file=sys.stderr)
+        print("HOSTED_BROKER_ADMISSION_" + name + "_TRUNCATED=" + ("YES" if len(output) > len(bounded) else "NO"), file=sys.stderr)
+    try:
+        paths = hosted_broker_runtime_paths(Path(broker_source_path).read_text(encoding="ascii"))
+        snapshot = hosted_sudo("/usr/bin/python3", "-c", HOSTED_BROKER_DIAGNOSTIC_SCRIPT, policy_h, config_q, str(runner_uid), str(runner_gid), json.dumps(paths, separators=(",", ":")), str(status), label="HOSTED_BROKER_DIAGNOSTIC_PROBE_FAILED")
+        if len(snapshot) > 16384:
+            raise ValueError("oversize")
+        report = json.loads(snapshot)
+        if not isinstance(report, dict) or set(report) != {"caller", "policy", "privateRoot", "bindings", "systemRuntimePaths", "bootId", "journal"}:
+            raise ValueError("shape")
+        print("HOSTED_BROKER_ADMISSION_PREDICATES=" + json.dumps(report, ensure_ascii=True, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+    except Exception as probe_error:
+        print("HOSTED_BROKER_ADMISSION_PREDICATES_UNAVAILABLE=" + type(probe_error).__name__, file=sys.stderr)
 
 
 HOSTED_ACL_ENTRY = re.compile(r"(?:(default)\s*:\s*)?(user|group|mask|other)\s*:\s*([^:]*)\s*:\s*([r-][w-][x-])(?:\s*#\s*effective\s*:\s*([r-][w-][x-]))?")
@@ -527,7 +835,11 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
         hosted_install(temp_root, policy_tmp, HOSTED_POLICY_PATH, 0o600)
         if hosted_file_digest(HOSTED_POLICY_PATH, 0o600) != policy_file_hash:
             raise HostedDeploymentFailure("HOSTED_POLICY_INSTALL_HASH_MISMATCH")
-        hosted_sudo(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_POLICY_ADMISSION_FAILED")
+        try:
+            hosted_sudo(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_POLICY_ADMISSION_FAILED", separate_stderr=True)
+        except HostedDeploymentFailure as error:
+            hosted_report_broker_admission(error, policy_h, config_q, int(runner_uid), int(runner_gid), workspace / "native/s8-sandbox-broker/src/broker.c")
+            raise
         print("BROKER_BUILD=PASS")
         print("BROKER_TESTS=PASS")
         print("HOSTED_BROKER_BUILD_WIRING=PASS")
@@ -577,6 +889,79 @@ if hosted_cli():
 if len(sys.argv) != 3:
     raise SystemExit("BROKER_CONTRACT_ARGUMENTS_INVALID")
 contract, production = sys.argv[1:]
+
+
+def assert_hosted_broker_diagnostic_regressions():
+    compile(HOSTED_BROKER_DIAGNOSTIC_SCRIPT, "<read-only-broker-diagnostic>", "exec")
+    if any(forbidden in HOSTED_BROKER_DIAGNOSTIC_SCRIPT for forbidden in ("os.O_WRONLY", "os.O_RDWR", "os.O_CREAT", "os.chmod", "os.chown", "os.mkdir", "os.unlink", "os.remove", "os.rename", "os.replace", "subprocess.")):
+        raise SystemExit("HOSTED_BROKER_DIAGNOSTIC_NOT_READ_ONLY")
+    expected = {
+        65: "CALLER_OR_POLICY_INVALID", 66: "ROOT_OR_DEPLOYMENT_INVALID", 67: "JOURNAL_INVALID",
+        73: "RECOVERY_IDENTITY_UNKNOWN_HOLD", 74: "RECOVERY_LAUNCH_IDENTITY_UNKNOWN_HOLD",
+        75: "RECOVERY_PIDNS_INIT_IDENTITY_HOLD", 76: "RECOVERY_PROCESS_TREE_NOT_QUIESCENT_HOLD",
+        77: "RECOVERY_RETRY_LIMIT_HOLD", 78: "BUSY", 79: "BROKER_INTERNAL", 124: "OPERATION_TIMEOUT",
+    }
+    if any(HOSTED_BROKER_STATUS.get(code) != name for code, name in expected.items()):
+        raise SystemExit("HOSTED_BROKER_STATUS_MAPPING_INVALID")
+    paths = hosted_broker_runtime_paths((Path(__file__).resolve().parents[1] / "src/broker.c").read_text(encoding="ascii"))
+    if len(paths) != 27 or paths[-1] != "/etc/passwd":
+        raise SystemExit("HOSTED_BROKER_RUNTIME_PATHS_INVALID")
+    original_run = subprocess.run
+    args = ["/usr/bin/sudo", "-n", str(HOSTED_BROKER), "--recover-v1"]
+    seen = []
+    response = [subprocess.CompletedProcess(args, 66, b"", b"")]
+
+    def fake_run(command, *, cwd, check, stdout, stderr):
+        seen.append((command, cwd, check, stdout, stderr))
+        return response[0]
+
+    try:
+        subprocess.run = fake_run
+        try:
+            hosted_run(args, "HOSTED_BROKER_POLICY_ADMISSION_FAILED", separate_stderr=True)
+        except HostedDeploymentFailure as error:
+            if (str(error), error.returncode, error.captured_stdout, error.captured_stderr) != ("HOSTED_BROKER_POLICY_ADMISSION_FAILED", 66, b"", b""):
+                raise SystemExit("HOSTED_BROKER_EMPTY_FAILURE_LOST_STATUS")
+            captured_error = error
+        else:
+            raise SystemExit("HOSTED_BROKER_EMPTY_FAILURE_ACCEPTED")
+        response[0] = subprocess.CompletedProcess(args, 65, b"bounded stdout", b"bounded stderr")
+        try:
+            hosted_run(args, "HOSTED_BROKER_POLICY_ADMISSION_FAILED", separate_stderr=True)
+        except HostedDeploymentFailure as nonempty_error:
+            if (nonempty_error.returncode, nonempty_error.captured_stdout, nonempty_error.captured_stderr) != (65, b"bounded stdout", b"bounded stderr"):
+                raise SystemExit("HOSTED_BROKER_CAPTURED_OUTPUT_OR_STATUS_LOST")
+        else:
+            raise SystemExit("HOSTED_BROKER_NONEMPTY_FAILURE_ACCEPTED")
+    finally:
+        subprocess.run = original_run
+    if seen != [(args, None, False, subprocess.PIPE, subprocess.PIPE)] * 2:
+        raise SystemExit("HOSTED_BROKER_DIAGNOSTIC_CHANGED_INVOCATION")
+
+    original_sudo = hosted_sudo
+    probes = []
+    report = {key: {} for key in ("caller", "policy", "privateRoot", "bindings", "systemRuntimePaths", "bootId", "journal")}
+
+    def fake_sudo(*command, label):
+        probes.append((command, label))
+        return json.dumps(report, separators=(",", ":"))
+
+    try:
+        globals()["hosted_sudo"] = fake_sudo
+        output = io.StringIO()
+        with redirect_stderr(output):
+            hosted_report_broker_admission(captured_error, "a" * 64, "b" * 64, 1001, 1001, Path(__file__).resolve().parents[1] / "src/broker.c")
+        rendered = output.getvalue()
+        if "HOSTED_BROKER_ADMISSION_RETURN_CODE=66" not in rendered or "HOSTED_BROKER_ADMISSION_STATUS=ROOT_OR_DEPLOYMENT_INVALID" not in rendered or "HOSTED_BROKER_ADMISSION_STDOUT=EMPTY" not in rendered or "HOSTED_BROKER_ADMISSION_STDERR=EMPTY" not in rendered or "HOSTED_BROKER_ADMISSION_PREDICATES=" not in rendered:
+            raise SystemExit("HOSTED_BROKER_DIAGNOSTIC_MARKERS_INVALID")
+        if len(probes) != 1 or probes[0][0][:3] != ("/usr/bin/python3", "-c", HOSTED_BROKER_DIAGNOSTIC_SCRIPT) or probes[0][1] != "HOSTED_BROKER_DIAGNOSTIC_PROBE_FAILED":
+            raise SystemExit("HOSTED_BROKER_DIAGNOSTIC_ROUTE_INVALID")
+    finally:
+        globals()["hosted_sudo"] = original_sudo
+    print("HOSTED_BROKER_DIAGNOSTIC_REGRESSIONS=PASS")
+
+
+assert_hosted_broker_diagnostic_regressions()
 
 
 def assert_hosted_probe_regressions():
