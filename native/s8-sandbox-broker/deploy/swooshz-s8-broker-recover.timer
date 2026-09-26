@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry bounded Swooshz S8 broker recovery
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=swooshz-s8-broker-recover.service
+
+[Install]
+WantedBy=timers.target
