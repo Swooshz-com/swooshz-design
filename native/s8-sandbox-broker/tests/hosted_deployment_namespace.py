@@ -403,7 +403,7 @@ def run_inner_workload(args):
     run_mount(["--make-rprivate", "/"], "mount_propagation_private")
     _, initial_private_mounts = mount_table()
     propagation_is_private(initial_private_mounts)
-    emit("MOUNT_PROPAGATION=RECURSIVELY_PRIVATE")
+    emit("MOUNT_PROPAGATION", "RECURSIVELY_PRIVATE")
 
     source_state = stat_identity(HOSTEDTOOLCACHE)
     if source_state != outer["toolcache"]["identity"]:
@@ -494,13 +494,13 @@ def run_inner_workload(args):
     emit("HOSTED_CALLER_UID", actual_uid)
     emit("HOSTED_CALLER_GID", actual_gid)
     emit("HOSTED_CALLER_GROUPS", ",".join(str(group) for group in inner_groups))
-    emit("HOSTED_CALLER_IDENTITY=PASS")
+    emit("HOSTED_CALLER_IDENTITY", "PASS")
     caller_node_version = checked(prefix + [actual_toolchain["path"], "--version"], stage="caller_toolchain", env=identity_env, timeout=5).strip()
     caller_node_exec = checked(prefix + [actual_toolchain["path"], "-p", "process.execPath"], stage="caller_toolchain", env=identity_env, timeout=5).strip()
     if caller_node_version != actual_toolchain["version"] or str(Path(caller_node_exec).resolve(strict=True)) != actual_toolchain["path"]:
         raise MechanismDefect("caller_toolchain", "HOSTED_CALLER_NODE_IDENTITY_INVALID")
     emit("NODE_TOOLCHAIN_CALLER_UID", actual_uid)
-    emit("NODE_TOOLCHAIN_EXECUTION=PASS")
+    emit("NODE_TOOLCHAIN_EXECUTION", "PASS")
 
     workflow = subprocess.Popen(
         prefix + ["/usr/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", str(script)],
@@ -520,7 +520,7 @@ def run_inner_workload(args):
     current_mount_text, current_mounts = mount_table()
     mounts_unchanged = current_mount_text == namespace_expected_mountinfo
     if not mounts_unchanged:
-        emit("INNER_UNEXPECTED_MOUNTS=YES")
+        emit("INNER_UNEXPECTED_MOUNTS", "YES")
     survivors = namespace_processes(inner_ns["mnt"], exclude_pid=os.getpid())
     emit("INNER_NAMESPACE_SURVIVING_PROCESS_COUNT", len(survivors))
     if survivors:
@@ -535,9 +535,9 @@ def run_inner_workload(args):
         for path in (Path("/var/lib/swooshz/s8"), Path("/opt/blender"), Path("/opt/swooshz")):
             if path.exists() or path.is_symlink():
                 raise HarnessFailure("normal_teardown", "PRODUCT_RESIDUE_REMAINS:" + str(path))
-        emit("INNER_PRODUCT_RESIDUE=ABSENT")
+        emit("INNER_PRODUCT_RESIDUE", "ABSENT")
     else:
-        emit("INNER_PRODUCT_LIFECYCLE=NOT_COMPLETE")
+        emit("INNER_PRODUCT_LIFECYCLE", "NOT_COMPLETE")
 
     # Only detach mounts created by this harness, after its caller and workflow children are gone.
     owned_opt_mount = opt_info["mount"]["mount_id"]
@@ -558,10 +558,10 @@ def run_inner_workload(args):
     if restored != outer["opt"]["identity"] or restored_mount["mount_id"] != outer["opt"]["mount"]["mount_id"]:
         raise HarnessFailure("normal_teardown", "INNER_OPT_DID_NOT_RESTORE_OUTER_IDENTITY")
     if workflow_status != 0:
-        emit("ROUTE_B_PRODUCTION_LIFECYCLE=HOLD")
+        emit("ROUTE_B_PRODUCTION_LIFECYCLE", "HOLD")
         return 80
-    emit("INNER_MOUNT_TEARDOWN=PASS")
-    emit("ROUTE_B_PRODUCTION_LIFECYCLE=PASS")
+    emit("INNER_MOUNT_TEARDOWN", "PASS")
+    emit("ROUTE_B_PRODUCTION_LIFECYCLE", "PASS")
     return 0
 
 
@@ -890,9 +890,11 @@ def run_hosted_step(workflow_script):
         emit("HARNESS_TEMP_CLEANUP", "HOLD")
         return 5
     if not namespace_ready:
-        emit("ROUTE_B_CAPABILITY_UNAVAILABLE", "YES")
-        emit("FAILED_OPERATION", "ROOT_MOUNT_NAMESPACE_OR_DISTINCT_OPT")
-        return 6 if status == 0 else status
+        if "ROUTE_B_CAPABILITY_UNAVAILABLE=YES" in output_markers or "ROUTE_B_MECHANISM_DEFECT=YES" in output_markers:
+            return status if status != 0 else 6
+        emit("ROUTE_B_EVIDENCE_HOLD", "INNER_NAMESPACE_SETUP_INCOMPLETE")
+        emit("HOSTED_STEP_EXIT", status)
+        return status if status != 0 else 6
     if status != 0:
         emit("ROUTE_B_EVIDENCE_HOLD", "PRODUCTION_LIFECYCLE_OR_HARNESS_STEP_FAILED")
         emit("HOSTED_STEP_EXIT", status)
@@ -924,6 +926,11 @@ def run_inner_cli(args):
         emit("ROUTE_B_EVIDENCE_HOLD", error.stage)
         emit("TEARDOWN_DETAIL", error.detail)
         return 92
+    except Exception as error:
+        emit("ROUTE_B_MECHANISM_DEFECT", "YES")
+        emit("FAILED_OPERATION", "INNER_UNHANDLED_EXCEPTION")
+        emit("MECHANISM_DETAIL", type(error).__name__)
+        return 93
 
 
 def run_negative_child_cli(args):

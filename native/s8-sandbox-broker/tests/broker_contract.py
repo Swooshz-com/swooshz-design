@@ -1304,6 +1304,14 @@ def valid_hosted_namespace_binding(workflow, deployment, namespace):
         ast.parse(deployment)
     except SyntaxError:
         return False
+    if any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "emit"
+        and len(node.args) != 2
+        for node in ast.walk(namespace_ast)
+    ):
+        return False
     workflow_wrapper = 'hosted_deployment_namespace.py" --hosted-namespace-run "$0"'
     if workflow.count(workflow_wrapper) != 1 or workflow.count('S8_MOUNT_NAMESPACE_ACTIVE:-0') != 1:
         return False
@@ -1317,6 +1325,7 @@ def valid_hosted_namespace_binding(workflow, deployment, namespace):
         '"/usr/bin/unshare", "--mount", "--fork"',
         '"/usr/bin/unshare", "--kill-child=TERM", "--mount", "--fork"',
         'run_mount(["--make-rprivate", "/"]',
+        'emit("MOUNT_PROPAGATION", "RECURSIVELY_PRIVATE")',
         'run_mount(["--rbind", str(HOSTEDTOOLCACHE), str(staged_toolcache)]',
         '"-t", "tmpfs", "-o", "size=4g,mode=0755,uid=0,gid=0,nosuid,nodev"',
         'emit("ROUTE_B_OPT_MOUNT_PROVEN", "PASS")',
@@ -1366,7 +1375,7 @@ def valid_hosted_namespace_binding(workflow, deployment, namespace):
         'inner_ns["user"] != outer["namespaces"]["user"]',
         'inner_ns["pid"] != outer["namespaces"]["pid"]',
         'prefix + ["/usr/bin/bash"',
-        'emit("HOSTED_CALLER_IDENTITY=PASS")',
+        'emit("HOSTED_CALLER_IDENTITY", "PASS")',
     )):
         return False
     required_deployment = (
