@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ast
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 
 
 HOSTED_POLICY_PATH = Path("/etc/swooshz/s8-broker-v1.json")
@@ -47,10 +49,83 @@ def hosted_canonical(value):
     return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii")
 
 
-def hosted_identity(path, *, privileged=False):
-    command = ["/usr/bin/stat", "-c", "%d:%i:%u:%g:%a", "--", str(path)]
-    value = hosted_sudo(*command, label="HOSTED_IDENTITY_READ_FAILED") if privileged else hosted_run(command, "HOSTED_IDENTITY_READ_FAILED")
-    return value.strip()
+HOSTED_PATH_STATE_SCRIPT = r'''
+import hashlib
+import json
+import os
+import stat
+import sys
+
+operation, path = sys.argv[1:]
+if operation not in ("state", "digest") or not path.startswith("/") or ".." in path.split("/"):
+    raise SystemExit("HOSTED_PATH_PROBE_ARGUMENT_INVALID")
+parts = [part for part in path.split("/") if part]
+if not parts:
+    raise SystemExit("HOSTED_PATH_PROBE_ROOT_INVALID")
+directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    try:
+        for part in parts[:-1]:
+            next_directory = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            os.close(directory)
+            directory = next_directory
+        metadata = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        if operation == "digest":
+            raise
+        print(json.dumps({"state": "absent"}, separators=(",", ":")))
+        raise SystemExit(0)
+    kind = "regular" if stat.S_ISREG(metadata.st_mode) else "directory" if stat.S_ISDIR(metadata.st_mode) else "symlink" if stat.S_ISLNK(metadata.st_mode) else "other"
+    result = {"state": "present", "kind": kind, "device": metadata.st_dev, "inode": metadata.st_ino, "uid": metadata.st_uid, "gid": metadata.st_gid, "mode": stat.S_IMODE(metadata.st_mode), "nlink": metadata.st_nlink}
+    if operation == "digest":
+        if kind != "regular":
+            raise SystemExit("HOSTED_PATH_PROBE_NOT_REGULAR")
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_gid, opened.st_nlink) != (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid, metadata.st_gid, metadata.st_nlink):
+                raise SystemExit("HOSTED_PATH_PROBE_IDENTITY_CHANGED")
+            digest = hashlib.sha256()
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+            after = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+            if (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid, after.st_nlink) != (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid, metadata.st_gid, metadata.st_nlink):
+                raise SystemExit("HOSTED_PATH_PROBE_IDENTITY_CHANGED")
+            result["sha256"] = digest.hexdigest()
+        finally:
+            os.close(descriptor)
+    print(json.dumps(result, separators=(",", ":")))
+finally:
+    os.close(directory)
+'''
+
+
+def hosted_protected_state(path, *, digest=False):
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise HostedDeploymentFailure("HOSTED_PATH_PROBE_ARGUMENT_INVALID")
+    output = hosted_sudo("/usr/bin/python3", "-c", HOSTED_PATH_STATE_SCRIPT, "digest" if digest else "state", str(path), label="HOSTED_PATH_PROBE_FAILED:" + str(path))
+    try:
+        state = json.loads(output)
+    except (ValueError, TypeError) as error:
+        raise HostedDeploymentFailure("HOSTED_PATH_PROBE_OUTPUT_INVALID:" + str(path)) from error
+    if state == {"state": "absent"} and not digest:
+        return None
+    keys = {"state", "kind", "device", "inode", "uid", "gid", "mode", "nlink"} | ({"sha256"} if digest else set())
+    if not isinstance(state, dict) or set(state) != keys or state["state"] != "present" or state["kind"] not in {"regular", "directory", "symlink", "other"}:
+        raise HostedDeploymentFailure("HOSTED_PATH_PROBE_OUTPUT_INVALID:" + str(path))
+    if any(type(state[key]) is not int or state[key] < 0 for key in ("device", "inode", "uid", "gid", "mode", "nlink")) or state["mode"] > 0o7777 or state["nlink"] == 0:
+        raise HostedDeploymentFailure("HOSTED_PATH_PROBE_OUTPUT_INVALID:" + str(path))
+    if digest and (state["kind"] != "regular" or not isinstance(state["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", state["sha256"])):
+        raise HostedDeploymentFailure("HOSTED_PATH_PROBE_OUTPUT_INVALID:" + str(path))
+    return state
+
+
+def hosted_identity(state):
+    return f'{state["device"]}:{state["inode"]}:{state["uid"]}:{state["gid"]}:{state["mode"]:o}'
 
 
 def hosted_ledger(temp_root):
@@ -64,19 +139,21 @@ def hosted_append_ledger(temp_root, row):
 
 
 def hosted_record_directory(temp_root, path):
-    hosted_append_ledger(temp_root, {"kind": "D", "identity": hosted_identity(path, privileged=True), "path": str(path)})
+    state = hosted_protected_state(path)
+    if state is None or state["kind"] != "directory" or (state["uid"], state["gid"]) != (0, 0):
+        raise HostedDeploymentFailure("HOSTED_DIRECTORY_IDENTITY_INVALID:" + str(path))
+    hosted_append_ledger(temp_root, {"kind": "D", "identity": hosted_identity(state), "path": str(path)})
 
 
 def hosted_record_file(temp_root, path):
-    identity = hosted_identity(path, privileged=True)
-    digest = hosted_sudo("/usr/bin/sha256sum", "--", str(path), label="HOSTED_FILE_HASH_FAILED").split()[0]
-    if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise HostedDeploymentFailure("HOSTED_FILE_HASH_INVALID")
-    hosted_append_ledger(temp_root, {"kind": "F", "identity": identity, "digest": digest, "path": str(path)})
+    state = hosted_protected_state(path, digest=True)
+    if state["kind"] != "regular" or (state["uid"], state["gid"], state["nlink"]) != (0, 0, 1):
+        raise HostedDeploymentFailure("HOSTED_FILE_IDENTITY_INVALID:" + str(path))
+    hosted_append_ledger(temp_root, {"kind": "F", "identity": hosted_identity(state), "digest": state["sha256"], "path": str(path)})
 
 
 def hosted_create_directory(temp_root, path, mode):
-    if path.exists() or path.is_symlink():
+    if hosted_protected_state(path) is not None:
         raise HostedDeploymentFailure("HOSTED_DIRECTORY_NOT_FRESH:" + str(path))
     hosted_sudo("/usr/bin/mkdir", "-m", format(mode, "04o"), "--", str(path), label="HOSTED_DIRECTORY_CREATE_FAILED")
     try:
@@ -87,6 +164,8 @@ def hosted_create_directory(temp_root, path, mode):
 
 
 def hosted_install(temp_root, source, target, mode):
+    if hosted_protected_state(target) is not None:
+        raise HostedDeploymentFailure("HOSTED_FILE_NOT_FRESH:" + str(target))
     hosted_sudo("/usr/bin/install", "-o", "root", "-g", "root", "-m", format(mode, "04o"), "--", str(source), str(target), label="HOSTED_FILE_INSTALL_FAILED:" + str(target))
     try:
         hosted_record_file(temp_root, target)
@@ -96,25 +175,15 @@ def hosted_install(temp_root, source, target, mode):
 
 
 def hosted_file_digest(path, mode):
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode), metadata.st_nlink) != (0, 0, mode, 1):
-            raise HostedDeploymentFailure("HOSTED_DEPLOYED_FILE_IDENTITY_INVALID:" + str(path))
-        digest = hashlib.sha256()
-        while True:
-            block = os.read(descriptor, 1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-        return digest.hexdigest()
-    finally:
-        os.close(descriptor)
+    state = hosted_protected_state(path, digest=True)
+    if (state["kind"], state["uid"], state["gid"], state["mode"], state["nlink"]) != ("regular", 0, 0, mode, 1):
+        raise HostedDeploymentFailure("HOSTED_DEPLOYED_FILE_IDENTITY_INVALID:" + str(path))
+    return state["sha256"]
 
 
 def hosted_policy(temp_root, runner_uid, runner_gid):
-    root_stat = HOSTED_PRIVATE_ROOT.lstat()
-    if not stat.S_ISDIR(root_stat.st_mode) or (root_stat.st_uid, root_stat.st_gid, stat.S_IMODE(root_stat.st_mode)) != (0, 0, 0o710):
+    root_state = hosted_protected_state(HOSTED_PRIVATE_ROOT)
+    if root_state is None or (root_state["kind"], root_state["uid"], root_state["gid"], root_state["mode"]) != ("directory", 0, 0, 0o710):
         raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_IDENTITY_INVALID")
     config = {
         "blenderRuntimeRoot": "/opt/blender",
@@ -132,8 +201,8 @@ def hosted_policy(temp_root, runner_uid, runner_gid):
         "hostUid": runner_uid,
         "hostGid": runner_gid,
         "config": config,
-        "privateRootDevice": str(root_stat.st_dev),
-        "privateRootInode": str(root_stat.st_ino),
+        "privateRootDevice": str(root_state["device"]),
+        "privateRootInode": str(root_state["inode"]),
         "launcherSha256": hosted_file_digest(HOSTED_LAUNCHER, 0o755),
         "brokerSha256": hosted_file_digest(HOSTED_BROKER, 0o755),
         "bubblewrapSha256": hosted_file_digest(Path("/usr/bin/bwrap"), 0o755),
@@ -202,20 +271,23 @@ def hosted_cleanup(temp_root):
     if rows is None:
         return
     journal = HOSTED_PRIVATE_ROOT / ".journal"
-    if journal.exists() or journal.is_symlink():
-        if not HOSTED_BROKER.is_file() or HOSTED_BROKER.is_symlink() or not HOSTED_POLICY_PATH.is_file() or HOSTED_POLICY_PATH.is_symlink():
+    journal_state = hosted_protected_state(journal)
+    if journal_state is not None:
+        broker_state = hosted_protected_state(HOSTED_BROKER)
+        policy_state = hosted_protected_state(HOSTED_POLICY_PATH)
+        if broker_state is None or broker_state["kind"] != "regular" or policy_state is None or policy_state["kind"] != "regular":
             raise HostedDeploymentFailure("HOSTED_RECOVERY_INPUTS_INVALID")
         hosted_sudo(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_RECOVERY_FAILED")
-        journal_meta = journal.lstat()
-        if not stat.S_ISDIR(journal_meta.st_mode) or (journal_meta.st_uid, journal_meta.st_gid, stat.S_IMODE(journal_meta.st_mode)) != (0, 0, 0o700):
+        journal_state = hosted_protected_state(journal)
+        if journal_state is None or (journal_state["kind"], journal_state["uid"], journal_state["gid"], journal_state["mode"]) != ("directory", 0, 0, 0o700):
             raise HostedDeploymentFailure("HOSTED_JOURNAL_IDENTITY_INVALID")
         extra = hosted_sudo("/usr/bin/find", "-P", str(journal), "-mindepth", "1", "-maxdepth", "1", "!", "-name", ".lock", "-print", "-quit", label="HOSTED_JOURNAL_INSPECTION_FAILED").strip()
         if extra:
             raise HostedDeploymentFailure("HOSTED_JOURNAL_UNEXPECTED_CONTENT")
         lock = journal / ".lock"
-        if lock.exists() or lock.is_symlink():
-            lock_meta = lock.lstat()
-            if not stat.S_ISREG(lock_meta.st_mode) or (lock_meta.st_uid, lock_meta.st_gid, stat.S_IMODE(lock_meta.st_mode), lock_meta.st_nlink) != (0, 0, 0o600, 1):
+        lock_state = hosted_protected_state(lock)
+        if lock_state is not None:
+            if (lock_state["kind"], lock_state["uid"], lock_state["gid"], lock_state["mode"], lock_state["nlink"]) != ("regular", 0, 0, 0o600, 1):
                 raise HostedDeploymentFailure("HOSTED_JOURNAL_LOCK_IDENTITY_INVALID")
             hosted_sudo("/usr/bin/rm", "-f", "--", str(lock), label="HOSTED_JOURNAL_LOCK_CLEANUP_FAILED")
         hosted_sudo("/usr/bin/rmdir", "--", str(journal), label="HOSTED_JOURNAL_CLEANUP_FAILED")
@@ -224,13 +296,13 @@ def hosted_cleanup(temp_root):
         target = Path(row["path"])
         if row["kind"] != "F":
             continue
-        if target.is_symlink() or not target.is_file() or hosted_identity(target, privileged=True) != row["identity"]:
+        state = hosted_protected_state(target, digest=True)
+        if state["kind"] != "regular" or hosted_identity(state) != row["identity"]:
             raise HostedDeploymentFailure("HOSTED_FILE_CLEANUP_IDENTITY_INVALID:" + str(target))
-        digest = hosted_sudo("/usr/bin/sha256sum", "--", str(target), label="HOSTED_FILE_CLEANUP_HASH_FAILED").split()[0]
-        if digest != row["digest"]:
+        if state["sha256"] != row["digest"]:
             raise HostedDeploymentFailure("HOSTED_FILE_CLEANUP_HASH_INVALID:" + str(target))
         hosted_sudo("/usr/bin/rm", "-f", "--", str(target), label="HOSTED_FILE_CLEANUP_FAILED")
-        if target.exists() or target.is_symlink():
+        if hosted_protected_state(target) is not None:
             raise HostedDeploymentFailure("HOSTED_FILE_REMAINS:" + str(target))
 
     mounts = hosted_run(["/usr/bin/findmnt", "--noheadings", "--raw", "--output", "TARGET"], "HOSTED_MOUNT_INSPECTION_FAILED").splitlines()
@@ -238,7 +310,8 @@ def hosted_cleanup(temp_root):
         target = Path(row["path"])
         if row["kind"] != "D":
             continue
-        if target.is_symlink() or not target.is_dir() or hosted_identity(target, privileged=True) != row["identity"]:
+        state = hosted_protected_state(target)
+        if state is None or state["kind"] != "directory" or hosted_identity(state) != row["identity"]:
             raise HostedDeploymentFailure("HOSTED_DIRECTORY_CLEANUP_IDENTITY_INVALID:" + str(target))
         if any(mount == str(target) or mount.startswith(str(target).rstrip("/") + "/") for mount in mounts):
             raise HostedDeploymentFailure("HOSTED_NESTED_MOUNT_REFUSED:" + str(target))
@@ -246,7 +319,7 @@ def hosted_cleanup(temp_root):
             hosted_sudo("/usr/bin/rm", "-rf", "--", str(target), label="HOSTED_RUNTIME_CLEANUP_FAILED")
         else:
             hosted_sudo("/usr/bin/rmdir", "--", str(target), label="HOSTED_DIRECTORY_CLEANUP_FAILED")
-        if target.exists() or target.is_symlink():
+        if hosted_protected_state(target) is not None:
             raise HostedDeploymentFailure("HOSTED_DIRECTORY_REMAINS:" + str(target))
     hosted_ledger(temp_root).unlink()
     print("BROKER_DEPLOYMENT_CLEANUP=PASS")
@@ -287,12 +360,12 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
             "/usr/local/libexec/swooshz-s8", "/etc/swooshz", "/var/lib/swooshz/s8", "/opt/blender", "/opt/swooshz",
             str(HOSTED_POLICY_PATH), str(HOSTED_SUDOERS), str(HOSTED_SERVICE), str(HOSTED_TIMER), str(HOSTED_LAUNCHER), str(HOSTED_BROKER), str(HOSTED_RUNNER), str(HOSTED_VALIDATOR),
         )]
-        if any(path.exists() or path.is_symlink() for path in absent):
+        if any(hosted_protected_state(path) is not None for path in absent):
             raise HostedDeploymentFailure("HOSTED_DEPLOYMENT_PATH_NOT_FRESH")
         for parent in (Path("/usr/local/libexec"), Path("/var/lib/swooshz")):
-            if parent.exists() or parent.is_symlink():
-                parent_meta = parent.lstat()
-                if not stat.S_ISDIR(parent_meta.st_mode) or parent.is_symlink() or (parent_meta.st_uid, parent_meta.st_gid, stat.S_IMODE(parent_meta.st_mode)) != (0, 0, 0o755):
+            parent_state = hosted_protected_state(parent)
+            if parent_state is not None:
+                if (parent_state["kind"], parent_state["uid"], parent_state["gid"], parent_state["mode"]) != ("directory", 0, 0, 0o755):
                     raise HostedDeploymentFailure("HOSTED_DEPLOYMENT_PARENT_IDENTITY_INVALID:" + str(parent))
             else:
                 hosted_create_directory(temp_root, parent, 0o755)
@@ -300,7 +373,7 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
         hosted_create_directory(temp_root, HOSTED_RUNTIME, 0o755)
         hosted_create_directory(temp_root, HOSTED_WRITER_ROOT, 0o755)
         hosted_create_directory(temp_root, HOSTED_PRIVATE_ROOT, 0o710)
-        if not Path("/etc/swooshz").exists() and not Path("/etc/swooshz").is_symlink():
+        if hosted_protected_state(Path("/etc/swooshz")) is None:
             hosted_create_directory(temp_root, Path("/etc/swooshz"), 0o755)
 
         acl = f"u::rwx,u:{runner_uid}:--x,g::--x,m::--x,o::---"
@@ -334,11 +407,11 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
         sudoers_tmp.write_text(sudoers_source.replace("@S8_HOST_USER@", runner_name), encoding="ascii")
         sudoers_tmp.chmod(0o600)
         hosted_install(temp_root, sudoers_tmp, HOSTED_SUDOERS, 0o440)
-        hosted_run(["/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS)], "HOSTED_SUDOERS_VALIDATION_FAILED")
+        hosted_sudo("/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS), label="HOSTED_SUDOERS_VALIDATION_FAILED")
 
         policy_tmp, policy_h, config_q, policy_file_hash = hosted_policy(temp_root, int(runner_uid), int(runner_gid))
         hosted_install(temp_root, policy_tmp, HOSTED_POLICY_PATH, 0o600)
-        if hosted_sudo("/usr/bin/sha256sum", "--", str(HOSTED_POLICY_PATH), label="HOSTED_POLICY_HASH_READ_FAILED").split()[0] != policy_file_hash:
+        if hosted_file_digest(HOSTED_POLICY_PATH, 0o600) != policy_file_hash:
             raise HostedDeploymentFailure("HOSTED_POLICY_INSTALL_HASH_MISMATCH")
         hosted_sudo(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_POLICY_ADMISSION_FAILED")
         print("BROKER_BUILD=PASS")
@@ -390,6 +463,72 @@ if hosted_cli():
 if len(sys.argv) != 3:
     raise SystemExit("BROKER_CONTRACT_ARGUMENTS_INVALID")
 contract, production = sys.argv[1:]
+
+
+def assert_hosted_probe_regressions():
+    original_sudo = hosted_sudo
+    try:
+        with tempfile.TemporaryDirectory(prefix="s8-hosted-path-probe-") as temporary:
+            root = Path(temporary)
+            regular = root / "regular"
+            regular.write_bytes(b"hosted-probe-control")
+            directory = root / "directory"
+            directory.mkdir()
+            link = root / "link"
+            link.symlink_to(regular)
+            broken = root / "broken"
+            broken.symlink_to(root / "missing")
+
+            def local_sudo(*args, label):
+                if args[:3] != ("/usr/bin/python3", "-c", HOSTED_PATH_STATE_SCRIPT):
+                    raise SystemExit("HOSTED_PATH_PROBE_ROUTE_INVALID")
+                return hosted_run(list(args), label)
+
+            globals()["hosted_sudo"] = local_sudo
+            if hosted_protected_state(root / "missing") is not None:
+                raise SystemExit("HOSTED_PATH_PROBE_ABSENCE_INVALID")
+            file_state = hosted_protected_state(regular, digest=True)
+            if file_state["kind"] != "regular" or file_state["sha256"] != hashlib.sha256(b"hosted-probe-control").hexdigest():
+                raise SystemExit("HOSTED_PATH_PROBE_FILE_INVALID")
+            if hosted_protected_state(directory)["kind"] != "directory":
+                raise SystemExit("HOSTED_PATH_PROBE_DIRECTORY_INVALID")
+            if hosted_protected_state(link)["kind"] != "symlink" or hosted_protected_state(broken)["kind"] != "symlink":
+                raise SystemExit("HOSTED_PATH_PROBE_SYMLINK_INVALID")
+            try:
+                hosted_protected_state(link / "child")
+            except HostedDeploymentFailure:
+                pass
+            else:
+                raise SystemExit("HOSTED_PATH_PROBE_PARENT_SYMLINK_ACCEPTED")
+
+            def denied_sudo(*args, label):
+                raise HostedDeploymentFailure("HOSTED_PATH_PROBE_PERMISSION_DENIED")
+
+            globals()["hosted_sudo"] = denied_sudo
+            try:
+                hosted_protected_state(root / "missing")
+            except HostedDeploymentFailure as error:
+                if str(error) != "HOSTED_PATH_PROBE_PERMISSION_DENIED":
+                    raise
+            else:
+                raise SystemExit("HOSTED_PATH_PROBE_PERMISSION_AS_ABSENCE")
+
+            def malformed_sudo(*args, label):
+                return '{"state":"absent","uncertain":true}\n'
+
+            globals()["hosted_sudo"] = malformed_sudo
+            try:
+                hosted_protected_state(root / "missing")
+            except HostedDeploymentFailure:
+                pass
+            else:
+                raise SystemExit("HOSTED_PATH_PROBE_MALFORMED_ACCEPTED")
+    finally:
+        globals()["hosted_sudo"] = original_sudo
+    print("HOSTED_PROTECTED_PATH_PROBE_REGRESSIONS=PASS")
+
+
+assert_hosted_probe_regressions()
 
 
 def invoke(args, payload=b""):
@@ -482,7 +621,88 @@ broker_path = repo_root / "native/s8-sandbox-broker/src/broker.c"
 deployment_path = Path(__file__).resolve()
 
 
+def valid_hosted_protected_harness(deployment):
+    try:
+        tree = ast.parse(deployment)
+        probe_source = deployment.split("HOSTED_PATH_STATE_SCRIPT = r'''", 1)[1].split("'''", 1)[0]
+        probe = ast.parse(probe_source)
+    except (SyntaxError, IndexError):
+        return False
+    if probe_source.count("os.O_NOFOLLOW") != 3 or probe_source.count("follow_symlinks=False") != 2:
+        return False
+    probe_handlers = [node for node in ast.walk(probe) if isinstance(node, ast.ExceptHandler)]
+    if len(probe_handlers) != 1 or not isinstance(probe_handlers[0].type, ast.Name) or probe_handlers[0].type.id != "FileNotFoundError":
+        return False
+    if any(token not in deployment for token in (
+        'os.O_NOFOLLOW | os.O_CLOEXEC',
+        'follow_symlinks=False',
+        'hosted_sudo("/usr/bin/python3", "-c", HOSTED_PATH_STATE_SCRIPT',
+        'hosted_protected_state(path, digest=True)',
+        'hosted_sudo("/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS)',
+    )):
+        return False
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    protected_receivers = {
+        "hosted_record_directory": {"path"},
+        "hosted_record_file": {"path"},
+        "hosted_create_directory": {"path"},
+        "hosted_install": {"target"},
+        "hosted_file_digest": {"path"},
+        "hosted_policy": {"HOSTED_PRIVATE_ROOT"},
+        "hosted_cleanup": {"journal", "lock", "target", "HOSTED_BROKER", "HOSTED_POLICY_PATH"},
+        "hosted_deploy": {"path", "parent", "HOSTED_SUDOERS"},
+    }
+    forbidden_methods = {"exists", "is_file", "is_dir", "is_symlink", "lstat", "stat", "open", "read_bytes", "read_text"}
+    for name, receivers in protected_receivers.items():
+        function = functions.get(name)
+        if function is None:
+            return False
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "os" and node.func.attr in {"open", "stat", "lstat", "access"} and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id in receivers:
+                return False
+            if node.func.attr not in forbidden_methods:
+                continue
+            receiver = node.func.value
+            if isinstance(receiver, ast.Name) and receiver.id in receivers:
+                return False
+            if name == "hosted_deploy" and isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name) and receiver.func.id == "Path" and receiver.args and isinstance(receiver.args[0], ast.Constant) and receiver.args[0].value == "/etc/swooshz":
+                return False
+    required = {
+        "hosted_record_directory": ("state = hosted_protected_state(path)",),
+        "hosted_record_file": ("state = hosted_protected_state(path, digest=True)",),
+        "hosted_create_directory": ("hosted_protected_state(path) is not None",),
+        "hosted_install": ("hosted_protected_state(target) is not None",),
+        "hosted_file_digest": ("hosted_protected_state(path, digest=True)",),
+        "hosted_policy": ("root_state = hosted_protected_state(HOSTED_PRIVATE_ROOT)",),
+        "hosted_cleanup": (
+            "journal_state = hosted_protected_state(journal)",
+            "broker_state = hosted_protected_state(HOSTED_BROKER)",
+            "policy_state = hosted_protected_state(HOSTED_POLICY_PATH)",
+            "lock_state = hosted_protected_state(lock)",
+            "state = hosted_protected_state(target, digest=True)",
+            "if hosted_protected_state(target) is not None:",
+            "state = hosted_protected_state(target)",
+        ),
+        "hosted_deploy": (
+            "if any(hosted_protected_state(path) is not None for path in absent):",
+            "parent_state = hosted_protected_state(parent)",
+            'hosted_protected_state(Path("/etc/swooshz")) is None',
+            'hosted_sudo("/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS)',
+            "hosted_file_digest(HOSTED_POLICY_PATH, 0o600) != policy_file_hash",
+        ),
+    }
+    for name, tokens in required.items():
+        source = ast.get_source_segment(deployment, functions[name])
+        if source is None or any(token not in source for token in tokens):
+            return False
+    return True
+
+
 def valid_hosted_binding(workflow, deployment, proof_helper, worker, broker, proof_bytes, helper_bytes):
+    if not valid_hosted_protected_harness(deployment):
+        return False
     pinned_helpers = (
         (proof_bytes, 8966, "05c7b06a96fe0c45be71a4e2805b29202250130c9dba4bb852a0ef6032aacd31"),
         (helper_bytes, 3260, "105085a773513c05abdfbc6b0b6da67b74ad8eb811c91c919cc7a08645bd769e"),
@@ -578,12 +798,12 @@ def valid_hosted_binding(workflow, deployment, proof_helper, worker, broker, pro
     if any(position < 0 for position in positions) or positions != sorted(positions):
         return False
     policy_tokens = (
-        "root_stat = HOSTED_PRIVATE_ROOT.lstat()",
+        "root_state = hosted_protected_state(HOSTED_PRIVATE_ROOT)",
         '"privateWorkRoot": str(HOSTED_PRIVATE_ROOT)',
         '"sandboxExecutable": str(HOSTED_LAUNCHER)',
         '"blenderExecutableSha256": hosted_file_digest(HOSTED_RUNTIME / "blender", 0o755)',
-        '"privateRootDevice": str(root_stat.st_dev)',
-        '"privateRootInode": str(root_stat.st_ino)',
+        '"privateRootDevice": str(root_state["device"])',
+        '"privateRootInode": str(root_state["inode"])',
         '"launcherSha256": hosted_file_digest(HOSTED_LAUNCHER, 0o755)',
         '"brokerSha256": hosted_file_digest(HOSTED_BROKER, 0o755)',
         '"runnerSha256": hosted_file_digest(HOSTED_RUNNER, 0o755)',
@@ -720,6 +940,12 @@ negative_controls = {
     "WORKER_RESPONSE_HQ_MISMATCH": (workflow_source, deployment_source, proof_bytes, helper_bytes, worker_source.replace("validateS8BrokerResponseIdentity(response);", "/* identity validation removed */", 1), broker_source),
     "BROKER_REQUEST_HQ_MISMATCH": (workflow_source, deployment_source, proof_bytes, helper_bytes, worker_source, broker_source.replace("constant_equal(request->config_sha256, expected_config, sizeof(expected_config))", "constant_equal(request->policy_sha256, expected_config, sizeof(expected_config))", 1)),
     "PINNED_HELPER_BYTES_MISMATCH": (workflow_source, deployment_source, proof_bytes[:-1] + bytes([proof_bytes[-1] ^ 1]), helper_bytes, worker_source, broker_source),
+    "UNPRIVILEGED_PREFLIGHT": (workflow_source, deployment_source.replace("hosted_protected_state(path) is not None for path in absent", "path.exists() or path.is_symlink() for path in absent", 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "UNPRIVILEGED_CLEANUP": (workflow_source, deployment_source.replace('if row["kind"] != "F":\n            continue\n        state = hosted_protected_state(target, digest=True)', 'if row["kind"] != "F":\n            continue\n        state = target.lstat()', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "UNPRIVILEGED_VISUDO": (workflow_source, deployment_source.replace('hosted_sudo("/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS), label="HOSTED_SUDOERS_VALIDATION_FAILED")', 'hosted_run(["/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS)], "HOSTED_SUDOERS_VALIDATION_FAILED")', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "PERMISSION_AS_ABSENCE": (workflow_source, deployment_source.replace("except FileNotFoundError:", "except OSError:", 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "NOFOLLOW_REMOVED": (workflow_source, deployment_source.replace('os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC', 'os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "UNPRIVILEGED_DIGEST": (workflow_source, deployment_source.replace('state = hosted_protected_state(path, digest=True)', 'state = os.open(path, os.O_RDONLY)', 1), proof_bytes, helper_bytes, worker_source, broker_source),
 }
 for label, candidate in negative_controls.items():
     if hosted_binding_accepts(candidate):
