@@ -363,7 +363,11 @@ if policy is not None:
         ("exporter", "/opt/swooshz/export_fbx_bin.py", "privateExporterSha256", 0o644),
         ("patchManifest", "/opt/swooshz/patch-manifest.json", "patchManifestSha256", 0o644),
     )
-    result["bindings"] = {label: file_state(path, mode, policy.get(key)) for label, path, key, mode in bindings}
+    result["bindings"] = {}
+    for label, path, key, mode in bindings:
+        expected_digest = config.get(key) if label == "blender" else policy.get(key)
+        result["bindings"][label] = file_state(path, mode, expected_digest)
+        result["bindings"][label]["expectedDigestPresent"] = expected_digest is not None
 else:
     result["bindings"] = "POLICY_UNAVAILABLE"
 
@@ -893,6 +897,8 @@ contract, production = sys.argv[1:]
 
 def assert_hosted_broker_diagnostic_regressions():
     compile(HOSTED_BROKER_DIAGNOSTIC_SCRIPT, "<read-only-broker-diagnostic>", "exec")
+    if 'expected_digest = config.get(key) if label == "blender" else policy.get(key)' not in HOSTED_BROKER_DIAGNOSTIC_SCRIPT or '"expectedDigestPresent"' not in HOSTED_BROKER_DIAGNOSTIC_SCRIPT:
+        raise SystemExit("HOSTED_BROKER_BLENDER_DIGEST_DIAGNOSTIC_MISSING")
     if any(forbidden in HOSTED_BROKER_DIAGNOSTIC_SCRIPT for forbidden in ("os.O_WRONLY", "os.O_RDWR", "os.O_CREAT", "os.chmod", "os.chown", "os.mkdir", "os.unlink", "os.remove", "os.rename", "os.replace", "subprocess.")):
         raise SystemExit("HOSTED_BROKER_DIAGNOSTIC_NOT_READ_ONLY")
     expected = {
