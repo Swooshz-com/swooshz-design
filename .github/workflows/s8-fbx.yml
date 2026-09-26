@@ -676,11 +676,12 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/s8-validator" --output-on-failure
           "$RUNNER_TEMP/s8-validator/s8-fbx-validator" --self-test
 
-  # This job proves the hosted process boundary, then exercises the candidate
-  # broker through the fixed application launcher and admitted deployment policy.
+  # This job proves the hosted process boundary and route-B /opt namespace, then
+  # exercises the unchanged broker through the fixed application paths.
   s8-pinned-blender:
     name: S8 pinned Blender hosted sandbox amendment
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       S8_RUNNER_LABEL: ubuntu-24.04
     steps:
@@ -727,6 +728,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           export LC_ALL=C
+          if [[ "${S8_MOUNT_NAMESPACE_ACTIVE:-0}" != "1" ]]; then
+            /usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/hosted_deployment_namespace.py" --hosted-namespace-run "$0"
+            exit $?
+          fi
 
           candidate_started=0
           failure_reported=0
@@ -9413,7 +9418,9 @@ jobs:
           [[ "$(/usr/bin/grep -Fx -c 'CONFIG_DIGEST_INCLUDES_POLICY_DIGEST=YES' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_CONFIG_POLICY_DIGEST_BINDING_MISSING"
           export S8_APP_PRIVATE_ROOT S8_APP_SANDBOX_POLICY_SHA256 S8_APP_CONFIG_SHA256 S8_APP_SANDBOX
           # RUN107_HOSTED_BROKER_DEPLOYMENT_END
+          export NODE_OPTIONS="--import=$temp_root/broker-wire-preload.mjs"
           source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"
+          unset NODE_OPTIONS
           printf 'APPLICATION_PRIVATE_ROOT_BINDING=PASS\nAPPLICATION_POLICY_H_BINDING=PASS\nAPPLICATION_CONFIG_Q_BINDING=PASS\nAPPLICATION_SANDBOX_BINDING=PASS\nSAME_POLICY_SNAPSHOT_BINDING=PASS\n'
           admit_work_for_use || fail_hold "WORK_AFTER_APPLICATION_BOUNDARY_PROOF_FAILED"
 
