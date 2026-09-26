@@ -9418,7 +9418,41 @@ jobs:
           [[ "$(/usr/bin/grep -Fx -c 'CONFIG_DIGEST_INCLUDES_POLICY_DIGEST=YES' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_CONFIG_POLICY_DIGEST_BINDING_MISSING"
           export S8_APP_PRIVATE_ROOT S8_APP_SANDBOX_POLICY_SHA256 S8_APP_CONFIG_SHA256 S8_APP_SANDBOX
           # RUN107_HOSTED_BROKER_DEPLOYMENT_END
+          /usr/bin/cat >"$temp_root/broker-wire-preload.mjs" <<'JS'
+          import childProcess from "node:child_process";
+          import { syncBuiltinESMExports } from "node:module";
+          const originalSpawnSync = childProcess.spawnSync;
+          childProcess.spawnSync = function (command, args, options) {
+            const result = originalSpawnSync.call(this, command, args, options);
+            if (command === "/usr/local/libexec/swooshz-s8/s8-sandbox") {
+              const bytes = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
+              const stderr = Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(result.stderr ?? "");
+              const detail = { stdoutBytes: bytes.length, status: result.status, signal: result.signal, error: result.error?.code ?? null, stderrBytes: stderr.length };
+              if (stderr.length !== 0) detail.stderrText = stderr.subarray(0, 512).toString("utf8").replace(/[\r\n\t]+/g, " ");
+              if (bytes.length < 320) detail.stdoutPrefixHex = bytes.subarray(0, 32).toString("hex");
+              if (bytes.length >= 320) {
+                const lengths = [184, 192, 200, 208, 216].map((offset) => Number(bytes.readBigUInt64BE(offset)));
+                detail.magic = bytes.toString("ascii", 0, 8);
+                detail.version = bytes.readUInt16BE(8);
+                detail.operation = bytes[10];
+                detail.flags = bytes[11];
+                detail.brokerStatus = bytes.readUInt16BE(28);
+                detail.reserved = bytes.readUInt16BE(30);
+                detail.nativeExit = bytes.readInt32BE(32);
+                detail.nativeSignal = bytes.readInt32BE(36);
+                detail.reservedBytesNonzero = bytes.subarray(256, 320).some((value) => value !== 0);
+                detail.lengths = lengths;
+                detail.declaredBytes = 320 + lengths.reduce((sum, value) => sum + value, 0);
+              }
+              process.stderr.write(`S8_BROKER_WIRE_DIAGNOSTIC=${JSON.stringify(detail)}\n`);
+            }
+            return result;
+          };
+          syncBuiltinESMExports();
+          JS
+          export NODE_OPTIONS="--import=$temp_root/broker-wire-preload.mjs"
           source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"
+          unset NODE_OPTIONS
           printf 'APPLICATION_PRIVATE_ROOT_BINDING=PASS\nAPPLICATION_POLICY_H_BINDING=PASS\nAPPLICATION_CONFIG_Q_BINDING=PASS\nAPPLICATION_SANDBOX_BINDING=PASS\nSAME_POLICY_SNAPSHOT_BINDING=PASS\n'
           admit_work_for_use || fail_hold "WORK_AFTER_APPLICATION_BOUNDARY_PROOF_FAILED"
 

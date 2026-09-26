@@ -524,7 +524,8 @@ def run_inner_workload(args):
     survivors = namespace_processes(inner_ns["mnt"], exclude_pid=os.getpid())
     emit("INNER_NAMESPACE_SURVIVING_PROCESS_COUNT", len(survivors))
     if survivors:
-        raise HarnessFailure("normal_teardown", "INNER_NAMESPACE_CHILDREN_REMAIN:" + ",".join(str(pid) for pid in survivors[:8]))
+        details = ",".join(namespace_process_detail(pid) for pid in survivors[:8])
+        raise HarnessFailure("normal_teardown", "INNER_NAMESPACE_CHILDREN_REMAIN:" + details)
     if not mounts_unchanged:
         raise HarnessFailure("normal_teardown", "INNER_UNEXPECTED_MOUNTS_REMAIN")
 
@@ -583,6 +584,21 @@ def namespace_processes(mnt_identity, *, exclude_pid=None):
         if identity == mnt_identity:
             result.append(int(entry.name))
     return sorted(result)
+
+
+def namespace_process_detail(pid):
+    process = Path("/proc") / str(pid)
+    try:
+        fields = (process / "stat").read_text(encoding="ascii").rsplit(")", 1)[1].strip().split()
+        comm = (process / "comm").read_text(encoding="ascii").strip().replace(":", "_")
+        executable = Path(os.readlink(process / "exe")).name.replace(":", "_")
+        if len(fields) < 2:
+            raise ValueError("PROCESS_STAT_FIELDS_INVALID")
+        return f"{pid}:comm={comm}:exe={executable}:state={fields[0]}:ppid={fields[1]}"
+    except (FileNotFoundError, ProcessLookupError):
+        return f"{pid}:exited_during_probe"
+    except (OSError, UnicodeError, ValueError, IndexError):
+        return f"{pid}:identity_unavailable"
 
 
 def namespace_process_check(mnt_identity):

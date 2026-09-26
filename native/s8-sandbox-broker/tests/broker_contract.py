@@ -104,6 +104,123 @@ finally:
 '''
 
 
+HOSTED_JOURNAL_CLEANUP_SCRIPT = r'''
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+expected_path, expected_device, expected_inode = sys.argv[1:]
+if expected_path != "/var/lib/swooshz/s8/.journal" or not expected_device.isdecimal() or not expected_inode.isdecimal():
+    raise SystemExit("HOSTED_JOURNAL_CLEANUP_ARGUMENT_INVALID")
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+parent = os.open("/", directory_flags)
+journal = -1
+try:
+    for part in ("var", "lib", "swooshz", "s8"):
+        child = os.open(part, directory_flags, dir_fd=parent)
+        os.close(parent)
+        parent = child
+    parent_state = os.fstat(parent)
+    if (parent_state.st_uid, parent_state.st_gid, stat.S_IMODE(parent_state.st_mode)) != (0, 0, 0o710):
+        raise SystemExit("HOSTED_JOURNAL_PARENT_IDENTITY_INVALID")
+    journal = os.open(".journal", directory_flags, dir_fd=parent)
+    journal_state = os.fstat(journal)
+    if (journal_state.st_dev, journal_state.st_ino, journal_state.st_uid, journal_state.st_gid, stat.S_IMODE(journal_state.st_mode)) != (int(expected_device), int(expected_inode), 0, 0, 0o700):
+        raise SystemExit("HOSTED_JOURNAL_IDENTITY_CHANGED")
+
+    entries = []
+    for name in sorted(os.listdir(journal)):
+        if name != "lock" and not re.fullmatch(r"[0-9a-f]{32}\.json", name):
+            raise SystemExit("HOSTED_JOURNAL_UNEXPECTED_CONTENT")
+        before = os.stat(name, dir_fd=journal, follow_symlinks=False)
+        identity = (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid, before.st_nlink, before.st_size)
+        if not stat.S_ISREG(before.st_mode) or (before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode), before.st_nlink) != (0, 0, 0o600, 1) or before.st_size > 16384:
+            raise SystemExit("HOSTED_JOURNAL_ENTRY_IDENTITY_INVALID")
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=journal)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_gid, opened.st_nlink, opened.st_size) != identity:
+                raise SystemExit("HOSTED_JOURNAL_ENTRY_IDENTITY_CHANGED")
+            chunks = []
+            total = 0
+            while True:
+                block = os.read(descriptor, min(4096, 16385 - total))
+                if not block:
+                    break
+                chunks.append(block)
+                total += len(block)
+                if total > 16384:
+                    raise SystemExit("HOSTED_JOURNAL_ENTRY_OVERSIZE")
+            content = b"".join(chunks)
+            after = os.stat(name, dir_fd=journal, follow_symlinks=False)
+            if (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid, after.st_nlink, after.st_size) != identity:
+                raise SystemExit("HOSTED_JOURNAL_ENTRY_IDENTITY_CHANGED")
+        finally:
+            os.close(descriptor)
+
+        if name == "lock":
+            if content:
+                raise SystemExit("HOSTED_JOURNAL_LOCK_CONTENT_INVALID")
+        else:
+            try:
+                record = json.loads(content.decode("ascii"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise SystemExit("HOSTED_JOURNAL_RECORD_INVALID") from error
+            if not isinstance(record, dict) or not content.endswith(b"\n"):
+                raise SystemExit("HOSTED_JOURNAL_RECORD_INVALID")
+            canonical = json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n"
+            checksum = record.get("recordSha256")
+            preimage = dict(record)
+            preimage.pop("recordSha256", None)
+            checksum_preimage = json.dumps(preimage, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n"
+            if canonical != content or not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum) or hashlib.sha256(checksum_preimage).hexdigest() != checksum:
+                raise SystemExit("HOSTED_JOURNAL_RECORD_CHECKSUM_INVALID")
+            leaf = record.get("leaf")
+            cleanup = record.get("cleanup")
+            if (
+                record.get("schemaVersion") != "s8-sandbox-broker-journal-v1"
+                or record.get("protocolVersion") != "s8-sandbox-broker-v1"
+                or record.get("allocationId") != name[:-5]
+                or record.get("operation") not in {"WRITER", "VALIDATOR"}
+                or record.get("basename") != "s8-" + name[:-5]
+                or record.get("state") != "ABSENT"
+                or not isinstance(leaf, dict)
+                or leaf.get("state") != "ABSENT"
+                or not isinstance(cleanup, dict)
+                or cleanup.get("state") != "ABSENT"
+            ):
+                raise SystemExit("HOSTED_JOURNAL_RECORD_NOT_TERMINAL")
+            try:
+                os.stat(record["basename"], dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise SystemExit("HOSTED_JOURNAL_ALLOCATION_REMAINS")
+        entries.append((name, identity))
+
+    for name, identity in entries:
+        current = os.stat(name, dir_fd=journal, follow_symlinks=False)
+        if (current.st_dev, current.st_ino, current.st_mode, current.st_uid, current.st_gid, current.st_nlink, current.st_size) != identity:
+            raise SystemExit("HOSTED_JOURNAL_ENTRY_IDENTITY_CHANGED")
+        os.unlink(name, dir_fd=journal)
+    os.fsync(journal)
+    if os.listdir(journal):
+        raise SystemExit("HOSTED_JOURNAL_UNEXPECTED_CONTENT")
+    os.close(journal)
+    journal = -1
+    os.rmdir(".journal", dir_fd=parent)
+    os.fsync(parent)
+finally:
+    if journal >= 0:
+        os.close(journal)
+    os.close(parent)
+print("HOSTED_BROKER_JOURNAL_CLEANUP=PASS")
+'''
+
+
 def hosted_protected_state(path, *, digest=False):
     path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
@@ -511,16 +628,12 @@ def hosted_cleanup(temp_root):
         journal_state = hosted_protected_state(journal)
         if journal_state is None or (journal_state["kind"], journal_state["uid"], journal_state["gid"], journal_state["mode"]) != ("directory", 0, 0, 0o700):
             raise HostedDeploymentFailure("HOSTED_JOURNAL_IDENTITY_INVALID")
-        extra = hosted_sudo("/usr/bin/find", "-P", str(journal), "-mindepth", "1", "-maxdepth", "1", "!", "-name", ".lock", "-print", "-quit", label="HOSTED_JOURNAL_INSPECTION_FAILED").strip()
-        if extra:
-            raise HostedDeploymentFailure("HOSTED_JOURNAL_UNEXPECTED_CONTENT")
-        lock = journal / ".lock"
-        lock_state = hosted_protected_state(lock)
-        if lock_state is not None:
-            if (lock_state["kind"], lock_state["uid"], lock_state["gid"], lock_state["mode"], lock_state["nlink"]) != ("regular", 0, 0, 0o600, 1):
-                raise HostedDeploymentFailure("HOSTED_JOURNAL_LOCK_IDENTITY_INVALID")
-            hosted_sudo("/usr/bin/rm", "-f", "--", str(lock), label="HOSTED_JOURNAL_LOCK_CLEANUP_FAILED")
-        hosted_sudo("/usr/bin/rmdir", "--", str(journal), label="HOSTED_JOURNAL_CLEANUP_FAILED")
+        hosted_sudo(
+            "/usr/bin/python3", "-c", HOSTED_JOURNAL_CLEANUP_SCRIPT, str(journal),
+            str(journal_state["device"]), str(journal_state["inode"]), label="HOSTED_JOURNAL_CLEANUP_FAILED",
+        )
+        if hosted_protected_state(journal) is not None:
+            raise HostedDeploymentFailure("HOSTED_JOURNAL_REMAINS")
 
     for row in reversed(rows):
         target = Path(row["path"])
@@ -1016,7 +1129,7 @@ def valid_hosted_protected_harness(deployment):
         "hosted_file_digest": {"path"},
         "hosted_verify_private_root_acl": {"HOSTED_PRIVATE_ROOT"},
         "hosted_policy": {"HOSTED_PRIVATE_ROOT"},
-        "hosted_cleanup": {"journal", "lock", "target", "HOSTED_BROKER", "HOSTED_POLICY_PATH"},
+        "hosted_cleanup": {"journal", "target", "HOSTED_BROKER", "HOSTED_POLICY_PATH"},
         "hosted_deploy": {"path", "parent", "HOSTED_SUDOERS"},
     }
     forbidden_methods = {"exists", "is_file", "is_dir", "is_symlink", "lstat", "stat", "open", "read_bytes", "read_text"}
@@ -1070,7 +1183,8 @@ def valid_hosted_protected_harness(deployment):
             "policy_state = hosted_protected_state(HOSTED_POLICY_PATH)",
             'hosted_sudo(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_RECOVERY_FAILED")',
             'print("BROKER_RECOVERY_CLEANUP=PASS")',
-            "lock_state = hosted_protected_state(lock)",
+            "HOSTED_JOURNAL_CLEANUP_SCRIPT",
+            "hosted_protected_state(journal) is not None",
             "state = hosted_protected_state(target, digest=True)",
             "if hosted_protected_state(target) is not None:",
             "state = hosted_protected_state(target)",
