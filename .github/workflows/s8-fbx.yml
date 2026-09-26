@@ -676,9 +676,8 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/s8-validator" --output-on-failure
           "$RUNNER_TEMP/s8-validator/s8-fbx-validator" --self-test
 
-  # This job is the accepted Option-B environment amendment. It intentionally
-  # keeps the native runner and candidate qualification inside the hosted
-  # Bubblewrap boundary; no product or native source is changed here.
+  # This job proves the hosted process boundary, then exercises the candidate
+  # broker through the fixed application launcher and admitted deployment policy.
   s8-pinned-blender:
     name: S8 pinned Blender hosted sandbox amendment
     runs-on: ubuntu-24.04
@@ -745,6 +744,7 @@ jobs:
           tracked_children=()
           temp_created=0
           provision_created=0
+          broker_deployment_attempted=0
           carrier_parent="/"
           run_id="${GITHUB_RUN_ID-}"
           run_attempt="${GITHUB_RUN_ATTEMPT-}"
@@ -2220,6 +2220,14 @@ jobs:
             else
               printf 'CHILDREN_REAPED=YES\n'
             fi
+            if (( broker_deployment_attempted == 1 )); then
+              if (( all_launched_children_reaped == 1 )) && /usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/broker_contract.py" --hosted-cleanup "$temp_root"; then
+                broker_deployment_attempted=0
+              else
+                printf 'BROKER_DEPLOYMENT_CLEANUP=FAIL\nPRODUCTION_DEPLOYMENT_ABSENT=NO\n' >&2
+                cleanup_failed=1
+              fi
+            fi
             if (( carrier_created_by_attempt == 1 )); then
               if (( carrier_identity_recorded == 1 && carrier_identity_poisoned == 0 && identity_poisoned == 0 && all_launched_children_reaped == 1 )); then
                 if delete_carrier_exact; then
@@ -2249,7 +2257,7 @@ jobs:
               fi
             fi
             if (( temp_created == 1 )); then
-              if (( all_launched_children_reaped == 1 )); then
+              if (( all_launched_children_reaped == 1 && broker_deployment_attempted == 0 )); then
                 if remove_temp_exact; then
                   temp_created=0
                 else
@@ -2257,7 +2265,11 @@ jobs:
                   cleanup_failed=1
                 fi
               else
-                printf 'TEMP_CLEANUP_RESULT=DEFERRED_UNRESOLVED_CHILD\n' >&2
+                if (( broker_deployment_attempted == 1 )); then
+                  printf 'TEMP_CLEANUP_RESULT=DEFERRED_BROKER_DEPLOYMENT_RESIDUE\n' >&2
+                else
+                  printf 'TEMP_CLEANUP_RESULT=DEFERRED_UNRESOLVED_CHILD\n' >&2
+                fi
                 cleanup_failed=1
               fi
             fi
@@ -9380,7 +9392,29 @@ jobs:
           admit_work_for_use || fail_hold "WORK_POST_CANDIDATE_ADMISSION_FAILED"
           printf 'NATIVE_RUNNER_ADMISSION_RESULT=PASS\nPINNED_BLENDER_RESULT=PASS\nPRIVATE_EXPORTER_RESULT=PASS\nNATIVE_VALIDATOR_RESULT=PASS\nBLENDER_SEMANTIC_QUALIFICATION=PASS\n'
 
+          # RUN107_HOSTED_BROKER_DEPLOYMENT_BEGIN
+          broker_deployment_attempted=1
+          if ! broker_deployment_output="$(/usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/broker_contract.py" --hosted-deploy "$carrier" "$temp_root" "$runner_uid" "$runner_gid")"; then
+            fail_amendment "HOSTED_COMBINED_BROKER_DEPLOYMENT_FAILED"
+          fi
+          printf '%s\n' "$broker_deployment_output"
+          [[ "$(/usr/bin/grep -c '^S8_APP_PRIVATE_ROOT=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_PRIVATE_ROOT_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX_POLICY_SHA256=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_POLICY_H_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_CONFIG_SHA256=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_CONFIG_Q_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_SANDBOX_BINDING_INVALID"
+          S8_APP_PRIVATE_ROOT="$(/usr/bin/awk -F= '$1 == "S8_APP_PRIVATE_ROOT" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
+          S8_APP_SANDBOX_POLICY_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX_POLICY_SHA256" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
+          S8_APP_CONFIG_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_CONFIG_SHA256" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
+          S8_APP_SANDBOX="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
+          [[ "$S8_APP_PRIVATE_ROOT" == /var/lib/swooshz/s8 && "$S8_APP_SANDBOX" == /usr/local/libexec/swooshz-s8/s8-sandbox ]] || fail_amendment "APPLICATION_DEPLOYMENT_PATH_BINDING_INVALID"
+          [[ "$S8_APP_SANDBOX_POLICY_SHA256" =~ ^[0-9a-f]{64}$ && "$S8_APP_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail_amendment "APPLICATION_DEPLOYMENT_DIGEST_INVALID"
+          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_POLICY_H" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")" == "$S8_APP_SANDBOX_POLICY_SHA256" ]] || fail_amendment "APPLICATION_POLICY_SNAPSHOT_MISMATCH"
+          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_CONFIG_Q" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")" == "$S8_APP_CONFIG_SHA256" ]] || fail_amendment "APPLICATION_CONFIG_SNAPSHOT_MISMATCH"
+          [[ "$(/usr/bin/grep -Fx -c 'CONFIG_DIGEST_INCLUDES_POLICY_DIGEST=YES' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_CONFIG_POLICY_DIGEST_BINDING_MISSING"
+          export S8_APP_PRIVATE_ROOT S8_APP_SANDBOX_POLICY_SHA256 S8_APP_CONFIG_SHA256 S8_APP_SANDBOX
+          # RUN107_HOSTED_BROKER_DEPLOYMENT_END
           source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"
+          printf 'APPLICATION_PRIVATE_ROOT_BINDING=PASS\nAPPLICATION_POLICY_H_BINDING=PASS\nAPPLICATION_CONFIG_Q_BINDING=PASS\nAPPLICATION_SANDBOX_BINDING=PASS\nSAME_POLICY_SNAPSHOT_BINDING=PASS\n'
           admit_work_for_use || fail_hold "WORK_AFTER_APPLICATION_BOUNDARY_PROOF_FAILED"
 
           [[ "$all_launched_children_reaped" == 1 && ${#tracked_children[@]} == 0 ]] || fail_hold "CANDIDATE_CHILD_REAP_WITNESS_MISSING"
