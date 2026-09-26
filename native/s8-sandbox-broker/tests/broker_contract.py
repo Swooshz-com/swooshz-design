@@ -181,6 +181,125 @@ def hosted_file_digest(path, mode):
     return state["sha256"]
 
 
+HOSTED_ACL_ENTRY = re.compile(r"(?:(default)\s*:\s*)?(user|group|mask|other)\s*:\s*([^:]*)\s*:\s*([r-][w-][x-])(?:\s*#\s*effective\s*:\s*([r-][w-][x-]))?")
+
+
+def hosted_parse_acl(text, *, default):
+    entries, issues = {}, []
+    if not isinstance(text, str) or len(text) > 4096:
+        return entries, ["OUTPUT_INVALID_OR_OVERSIZE"]
+    lines = text.splitlines()
+    if len(lines) > 32:
+        return entries, ["TOO_MANY_LINES"]
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if len(line) > 256:
+            issues.append("LINE_OVERSIZE")
+            continue
+        if re.fullmatch(r"#\s*(?:file|owner|group|flags):[^\r\n]*", line):
+            continue
+        match = HOSTED_ACL_ENTRY.fullmatch(line)
+        if match is None:
+            issues.append("MALFORMED_LINE")
+            continue
+        prefix, tag, qualifier, rights, effective = match.groups()
+        qualifier = qualifier.strip()
+        if (prefix is not None and not default) or (qualifier and (tag not in {"user", "group"} or not re.fullmatch(r"[0-9]{1,10}", qualifier))):
+            issues.append("INVALID_ENTRY")
+            continue
+        key = tag + ":" + qualifier
+        if key in entries:
+            issues.append("DUPLICATE_ENTRY")
+            continue
+        entries[key] = (rights, effective)
+    return entries, issues
+
+
+def hosted_acl_effective(rights, mask):
+    return "".join(permission if permission == mask[index] else "-" for index, permission in enumerate(rights))
+
+
+def hosted_acl_diagnostic(access, defaults, state, issues, effective_mismatch, reason, *, identity_match):
+    def normalized(entries):
+        return [key + ":" + rights + ("#effective:" + effective if effective is not None else "") for key, (rights, effective) in sorted(entries.items())]
+
+    diagnostic = {
+        "reason": reason,
+        "access": normalized(access),
+        "default": normalized(defaults),
+        "uid": state["uid"] if state is not None else "UNAVAILABLE",
+        "gid": state["gid"] if state is not None else "UNAVAILABLE",
+        "mode": format(state["mode"], "04o") if state is not None else "UNAVAILABLE",
+        "kind": state["kind"] if state is not None else "UNAVAILABLE",
+        "identityMatch": identity_match,
+        "effectiveMismatch": sorted(set(effective_mismatch))[:32],
+        "parseIssues": sorted(set(issues))[:8],
+    }
+    return json.dumps(diagnostic, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after):
+    access, access_issues = hosted_parse_acl(access_text, default=False)
+    defaults, default_issues = hosted_parse_acl(default_text, default=True)
+    expected = {"user:": "rwx", "user:" + str(runner_uid): "--x", "group:": "--x", "mask:": "--x", "other:": "---"}
+    access_rights = {key: rights for key, (rights, _) in access.items()}
+    mask = access_rights.get("mask:")
+    effective_mismatch = []
+    for key, (rights, reported) in access.items():
+        masked = key.startswith("group:") or (key.startswith("user:") and key != "user:")
+        derived = hosted_acl_effective(rights, mask) if masked and mask is not None else rights
+        if reported is not None and reported != derived:
+            effective_mismatch.append(key + ":REPORTED")
+        if key in expected and derived != expected[key]:
+            effective_mismatch.append(key + ":INTENDED")
+    identity_match = (
+        before is not None and after is not None
+        and (before["device"], before["inode"]) == (after["device"], after["inode"])
+        and all((state["kind"], state["uid"], state["gid"], state["mode"]) == ("directory", 0, 0, 0o710) for state in (before, after))
+    )
+    if access_issues or default_issues or access_rights != expected or defaults or effective_mismatch or not identity_match:
+        diagnostic = hosted_acl_diagnostic(access, defaults, after, access_issues + default_issues, effective_mismatch, "SEMANTIC_MISMATCH", identity_match=identity_match)
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_INVALID:" + diagnostic)
+
+
+def hosted_verify_private_root_acl(runner_uid):
+    try:
+        before = hosted_protected_state(HOSTED_PRIVATE_ROOT)
+    except HostedDeploymentFailure as error:
+        diagnostic = hosted_acl_diagnostic({}, {}, None, ["PRE_PROBE_FAILED"], [], "PRIVILEGED_IDENTITY_READ_FAILED", identity_match=False)
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_IDENTITY_READ_FAILED:" + diagnostic) from error
+    if before is None or (before["kind"], before["uid"], before["gid"], before["mode"]) != ("directory", 0, 0, 0o710):
+        diagnostic = hosted_acl_diagnostic({}, {}, before, [], [], "PRE_APPLY_IDENTITY_INVALID", identity_match=False)
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_INVALID:" + diagnostic)
+    acl = f"u::rwx,u:{runner_uid}:--x,g::--x,m::--x,o::---"
+    try:
+        hosted_sudo("/usr/bin/setfacl", "--no-mask", "--set", acl, "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_CREATE_FAILED")
+    except HostedDeploymentFailure as error:
+        diagnostic = hosted_acl_diagnostic({}, {}, before, ["SETFACL_FAILED"], [], "PRIVILEGED_WRITE_FAILED", identity_match=False)
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_CREATE_FAILED:" + diagnostic) from error
+    try:
+        access_text = hosted_sudo("/usr/bin/getfacl", "--numeric", "--omit-header", "--absolute-names", "--physical", "--all-effective", "--access", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_ACCESS_READ_FAILED")
+    except HostedDeploymentFailure as error:
+        diagnostic = hosted_acl_diagnostic({}, {}, before, ["ACCESS_READ_FAILED"], [], "PRIVILEGED_READ_FAILED", identity_match=False)
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_READ_FAILED:" + diagnostic) from error
+    try:
+        default_text = hosted_sudo("/usr/bin/getfacl", "--numeric", "--omit-header", "--absolute-names", "--physical", "--all-effective", "--default", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_DEFAULT_READ_FAILED")
+    except HostedDeploymentFailure as error:
+        access, issues = hosted_parse_acl(access_text, default=False)
+        diagnostic = hosted_acl_diagnostic(access, {}, before, issues + ["DEFAULT_READ_FAILED"], [], "PRIVILEGED_READ_FAILED", identity_match=False)
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_READ_FAILED:" + diagnostic) from error
+    try:
+        after = hosted_protected_state(HOSTED_PRIVATE_ROOT)
+    except HostedDeploymentFailure as error:
+        access, access_issues = hosted_parse_acl(access_text, default=False)
+        defaults, default_issues = hosted_parse_acl(default_text, default=True)
+        diagnostic = hosted_acl_diagnostic(access, defaults, None, access_issues + default_issues + ["POST_PROBE_FAILED"], [], "PRIVILEGED_IDENTITY_READ_FAILED", identity_match=False)
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_IDENTITY_READ_FAILED:" + diagnostic) from error
+    hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after)
+
+
 def hosted_policy(temp_root, runner_uid, runner_gid):
     root_state = hosted_protected_state(HOSTED_PRIVATE_ROOT)
     if root_state is None or (root_state["kind"], root_state["uid"], root_state["gid"], root_state["mode"]) != ("directory", 0, 0, 0o710):
@@ -376,12 +495,7 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
         if hosted_protected_state(Path("/etc/swooshz")) is None:
             hosted_create_directory(temp_root, Path("/etc/swooshz"), 0o755)
 
-        acl = f"u::rwx,u:{runner_uid}:--x,g::--x,m::--x,o::---"
-        hosted_sudo("/usr/bin/setfacl", "--no-mask", "--set", acl, "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_CREATE_FAILED")
-        acl_text = hosted_sudo("/usr/bin/getfacl", "--numeric", "--omit-header", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_READ_FAILED").strip()
-        expected_acl = f"user::rwx\nuser:{runner_uid}:--x\ngroup::--x\nmask::--x\nother::---"
-        if acl_text != expected_acl:
-            raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_INVALID")
+        hosted_verify_private_root_acl(runner_uid)
 
         source_runtime = carrier / "runtime/blender-5.2.2-linux-x64"
         hosted_sudo("/usr/bin/cp", "-a", "--no-dereference", "--", str(source_runtime) + "/.", str(HOSTED_RUNTIME) + "/", label="HOSTED_RUNTIME_COPY_FAILED")
@@ -531,6 +645,134 @@ def assert_hosted_probe_regressions():
 assert_hosted_probe_regressions()
 
 
+def assert_hosted_acl_regressions():
+    runner_uid = "1001"
+    state = {"state": "present", "kind": "directory", "device": 17, "inode": 23, "uid": 0, "gid": 0, "mode": 0o710, "nlink": 2}
+    exact = "user::rwx\nuser:1001:--x\ngroup::--x\nmask::--x\nother::---\n"
+    reordered = "# file: omitted-by-header-option\n  other : : ---\r\nmask::--x\r\ngroup::--x  #effective:--x\r\nuser:1001:--x\t#effective:--x\r\nuser::rwx\r\n"
+    hosted_verify_acl_semantics(exact, "", runner_uid, state, state)
+    hosted_verify_acl_semantics(reordered, "  \n", runner_uid, state, state)
+    print("HOSTED_ACL_SEMANTIC_POSITIVE_CONTROLS=PASS")
+
+    changed_mode = dict(state, mode=0o750)
+    changed_inode = dict(state, inode=24)
+    invalid = {
+        "EXTRA_NAMED_USER": (exact + "user:2002:--x\n", "", runner_uid, state, state),
+        "EXTRA_NAMED_GROUP": (exact + "group:2002:--x\n", "", runner_uid, state, state),
+        "WRONG_RUNNER_UID": (exact.replace("user:1001", "user:1002"), "", runner_uid, state, state),
+        "WRONG_MASK": (exact.replace("mask::--x", "mask::r-x"), "", runner_uid, state, state),
+        "WRONG_GROUP": (exact.replace("group::--x", "group::r-x"), "", runner_uid, state, state),
+        "WRONG_OTHER": (exact.replace("other::---", "other::--x"), "", runner_uid, state, state),
+        "DEFAULT_ACL": (exact, "default:user::rwx\ndefault:group::--x\n", runner_uid, state, state),
+        "EFFECTIVE_RIGHTS": (exact.replace("user:1001:--x", "user:1001:--x\t#effective:---"), "", runner_uid, state, state),
+        "MALFORMED_OUTPUT": (exact + "unrecognized:private-data\n", "", runner_uid, state, state),
+        "DUPLICATE_ENTRY": (exact + "user::rwx\n", "", runner_uid, state, state),
+        "WRONG_ROOT_MODE": (exact, "", runner_uid, state, changed_mode),
+        "CHANGED_ROOT_IDENTITY": (exact, "", runner_uid, state, changed_inode),
+    }
+    for label, args in invalid.items():
+        try:
+            hosted_verify_acl_semantics(*args)
+        except HostedDeploymentFailure as error:
+            marker, diagnostic_text = str(error).split(":", 1)
+            diagnostic = json.loads(diagnostic_text)
+            if marker != "HOSTED_PRIVATE_ROOT_ACL_INVALID" or not isinstance(diagnostic["access"], list) or not isinstance(diagnostic["default"], list) or diagnostic["uid"] != 0 or diagnostic["gid"] != 0 or len(diagnostic_text) > 4096 or "private-data" in diagnostic_text:
+                raise SystemExit("HOSTED_ACL_DIAGNOSTIC_INVALID:" + label)
+        else:
+            raise SystemExit("HOSTED_ACL_NEGATIVE_CONTROL_ACCEPTED:" + label)
+        print("HOSTED_ACL_NEGATIVE_CONTROL_" + label + "=PASS")
+
+    original_sudo, original_probe = hosted_sudo, hosted_protected_state
+    calls = []
+    try:
+        def fake_probe(path):
+            if path != HOSTED_PRIVATE_ROOT:
+                raise SystemExit("HOSTED_ACL_PROBE_TARGET_INVALID")
+            calls.append("probe")
+            return dict(state)
+
+        def fake_sudo(*args, label):
+            calls.append(args)
+            if args[0] == "/usr/bin/setfacl":
+                return ""
+            if args[0] == "/usr/bin/getfacl" and "--access" in args:
+                return reordered
+            if args[0] == "/usr/bin/getfacl" and "--default" in args:
+                return ""
+            raise SystemExit("HOSTED_ACL_PRIVILEGED_ROUTE_INVALID")
+
+        globals()["hosted_protected_state"] = fake_probe
+        globals()["hosted_sudo"] = fake_sudo
+        hosted_verify_private_root_acl(runner_uid)
+        if len(calls) != 5 or calls[0] != "probe" or calls[-1] != "probe" or calls[1][0] != "/usr/bin/setfacl" or "--no-mask" not in calls[1] or "--access" not in calls[2] or "--default" not in calls[3] or any("--physical" not in args or "--absolute-names" not in args for args in calls[2:4]):
+            raise SystemExit("HOSTED_ACL_PRIVILEGED_ROUTE_INVALID")
+
+        def denied_read(*args, label):
+            if args[0] == "/usr/bin/getfacl":
+                raise HostedDeploymentFailure("PRIVATE_UNTRUSTED_TOOL_OUTPUT")
+            return ""
+
+        globals()["hosted_sudo"] = denied_read
+        try:
+            hosted_verify_private_root_acl(runner_uid)
+        except HostedDeploymentFailure as error:
+            if not str(error).startswith("HOSTED_PRIVATE_ROOT_ACL_READ_FAILED:") or "PRIVATE_UNTRUSTED_TOOL_OUTPUT" in str(error):
+                raise SystemExit("HOSTED_ACL_READ_FAILURE_DIAGNOSTIC_INVALID")
+        else:
+            raise SystemExit("HOSTED_ACL_PRIVILEGED_READ_FAILURE_ACCEPTED")
+
+        def denied_default(*args, label):
+            if "--default" in args:
+                raise HostedDeploymentFailure("PRIVATE_UNTRUSTED_TOOL_OUTPUT")
+            return reordered if "--access" in args else ""
+
+        globals()["hosted_sudo"] = denied_default
+        try:
+            hosted_verify_private_root_acl(runner_uid)
+        except HostedDeploymentFailure as error:
+            if not str(error).startswith("HOSTED_PRIVATE_ROOT_ACL_READ_FAILED:") or "PRIVATE_UNTRUSTED_TOOL_OUTPUT" in str(error) or "user:1001:--x" not in str(error):
+                raise SystemExit("HOSTED_ACL_DEFAULT_READ_DIAGNOSTIC_INVALID")
+        else:
+            raise SystemExit("HOSTED_ACL_PRIVILEGED_DEFAULT_READ_FAILURE_ACCEPTED")
+
+        probe_calls = [0]
+
+        def denied_post_probe(path):
+            probe_calls[0] += 1
+            if probe_calls[0] == 2:
+                raise HostedDeploymentFailure("HOSTED_PATH_PROBE_FAILED")
+            return dict(state)
+
+        globals()["hosted_sudo"] = fake_sudo
+        globals()["hosted_protected_state"] = denied_post_probe
+        try:
+            hosted_verify_private_root_acl(runner_uid)
+        except HostedDeploymentFailure as error:
+            if not str(error).startswith("HOSTED_PRIVATE_ROOT_ACL_IDENTITY_READ_FAILED:") or "HOSTED_PATH_PROBE_FAILED" in str(error) or "user:1001:--x" not in str(error):
+                raise SystemExit("HOSTED_ACL_POST_PROBE_DIAGNOSTIC_INVALID")
+        else:
+            raise SystemExit("HOSTED_ACL_POST_PROBE_FAILURE_ACCEPTED")
+
+        def denied_probe(path):
+            raise HostedDeploymentFailure("HOSTED_PATH_PROBE_FAILED")
+
+        globals()["hosted_protected_state"] = denied_probe
+        try:
+            hosted_verify_private_root_acl(runner_uid)
+        except HostedDeploymentFailure as error:
+            if not str(error).startswith("HOSTED_PRIVATE_ROOT_ACL_IDENTITY_READ_FAILED:") or "HOSTED_PATH_PROBE_FAILED" in str(error):
+                raise SystemExit("HOSTED_ACL_PROBE_FAILURE_DIAGNOSTIC_INVALID")
+        else:
+            raise SystemExit("HOSTED_ACL_PRIVILEGED_PROBE_FAILURE_ACCEPTED")
+    finally:
+        globals()["hosted_sudo"] = original_sudo
+        globals()["hosted_protected_state"] = original_probe
+    print("HOSTED_ACL_PRIVILEGED_ROUTE_REGRESSIONS=PASS")
+
+
+assert_hosted_acl_regressions()
+
+
 def invoke(args, payload=b""):
     return subprocess.run(
         [production, *args], input=payload, check=False, capture_output=True, timeout=5
@@ -648,6 +890,7 @@ def valid_hosted_protected_harness(deployment):
         "hosted_create_directory": {"path"},
         "hosted_install": {"target"},
         "hosted_file_digest": {"path"},
+        "hosted_verify_private_root_acl": {"HOSTED_PRIVATE_ROOT"},
         "hosted_policy": {"HOSTED_PRIVATE_ROOT"},
         "hosted_cleanup": {"journal", "lock", "target", "HOSTED_BROKER", "HOSTED_POLICY_PATH"},
         "hosted_deploy": {"path", "parent", "HOSTED_SUDOERS"},
@@ -675,6 +918,26 @@ def valid_hosted_protected_harness(deployment):
         "hosted_create_directory": ("hosted_protected_state(path) is not None",),
         "hosted_install": ("hosted_protected_state(target) is not None",),
         "hosted_file_digest": ("hosted_protected_state(path, digest=True)",),
+        "hosted_verify_private_root_acl": (
+            "before = hosted_protected_state(HOSTED_PRIVATE_ROOT)",
+            'hosted_sudo("/usr/bin/setfacl", "--no-mask", "--set", acl',
+            'access_text = hosted_sudo("/usr/bin/getfacl"',
+            '"--all-effective", "--access"',
+            'default_text = hosted_sudo("/usr/bin/getfacl"',
+            '"--all-effective", "--default"',
+            "after = hosted_protected_state(HOSTED_PRIVATE_ROOT)",
+            "hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after)",
+        ),
+        "hosted_verify_acl_semantics": (
+            '"user:": "rwx"',
+            '"user:" + str(runner_uid): "--x"',
+            '"group:": "--x"',
+            '"mask:": "--x"',
+            '"other:": "---"',
+            "if reported is not None and reported != derived:",
+            'effective_mismatch.append(key + ":REPORTED")',
+            "access_rights != expected or defaults or effective_mismatch or not identity_match",
+        ),
         "hosted_policy": ("root_state = hosted_protected_state(HOSTED_PRIVATE_ROOT)",),
         "hosted_cleanup": (
             "journal_state = hosted_protected_state(journal)",
@@ -691,6 +954,7 @@ def valid_hosted_protected_harness(deployment):
             'hosted_protected_state(Path("/etc/swooshz")) is None',
             'hosted_sudo("/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS)',
             "hosted_file_digest(HOSTED_POLICY_PATH, 0o600) != policy_file_hash",
+            "hosted_verify_private_root_acl(runner_uid)",
         ),
     }
     for name, tokens in required.items():
@@ -778,7 +1042,7 @@ def valid_hosted_binding(workflow, deployment, proof_helper, worker, broker, pro
         'hosted_run(["/usr/local/bin/ctest", "--test-dir", str(build)',
         'broker_build = build / "s8-sandbox-broker"',
         "hosted_create_directory(temp_root, HOSTED_PRIVATE_ROOT, 0o710)",
-        'hosted_sudo("/usr/bin/setfacl"',
+        "hosted_verify_private_root_acl(runner_uid)",
         "hosted_install(temp_root, broker_build, HOSTED_BROKER, 0o755)",
         'hosted_install(temp_root, workspace / "native/s8-sandbox-broker/deploy/s8-sandbox", HOSTED_LAUNCHER, 0o755)',
         'hosted_install(temp_root, workspace / "native/s8-sandbox-broker/deploy/swooshz-s8-broker-recover.service"',
@@ -915,6 +1179,11 @@ print("APPLICATION_BOUNDARY_HELPER_BYTES=PASS")
 print("APPLICATION_WORKER_BROKER_HQ_BINDING=PASS")
 print("HOSTED_POLICY_ROOT_BINDING=PASS")
 
+acl_deploy_line = next(line for line in deployment_source.splitlines() if line.strip() == "hosted_verify_private_root_acl(runner_uid)")
+acl_access_line = next(line for line in deployment_source.splitlines() if "access_text = hosted_sudo(" in line)
+acl_default_line = next(line for line in deployment_source.splitlines() if "default_text = hosted_sudo(" in line)
+acl_post_probe_line = next(line for line in deployment_source.splitlines() if line.strip() == "after = hosted_protected_state(HOSTED_PRIVATE_ROOT)")
+
 negative_controls = {
     "NO_DEPLOYMENT": (workflow_source.replace("--hosted-deploy", "--hosted-diagnostic", 1), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
     "NO_PRIVATE_ROOT": ("\n".join(line for line in workflow_source.splitlines() if 'S8_APP_PRIVATE_ROOT="$(/usr/bin/awk' not in line), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
@@ -946,6 +1215,12 @@ negative_controls = {
     "PERMISSION_AS_ABSENCE": (workflow_source, deployment_source.replace("except FileNotFoundError:", "except OSError:", 1), proof_bytes, helper_bytes, worker_source, broker_source),
     "NOFOLLOW_REMOVED": (workflow_source, deployment_source.replace('os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC', 'os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC', 1), proof_bytes, helper_bytes, worker_source, broker_source),
     "UNPRIVILEGED_DIGEST": (workflow_source, deployment_source.replace('state = hosted_protected_state(path, digest=True)', 'state = os.open(path, os.O_RDONLY)', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "RAW_TEXT_ACL": (workflow_source, deployment_source.replace(acl_deploy_line, '        if hosted_sudo("/usr/bin/getfacl", "--access", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_READ_FAILED").strip() != "user::rwx":\n            raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_INVALID")', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "UNPRIVILEGED_ACL_READ": (workflow_source, deployment_source.replace(acl_access_line, '        access_text = HOSTED_PRIVATE_ROOT.read_text(encoding="ascii")', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "NO_DEFAULT_ACL_READ": (workflow_source, deployment_source.replace(acl_default_line, '        default_text = ""', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "NO_POST_ACL_IDENTITY": (workflow_source, deployment_source.replace(acl_post_probe_line, '    after = before', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "EFFECTIVE_RIGHTS_BYPASS": (workflow_source, deployment_source.replace('if reported is not None and reported != derived:', 'if False:', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "DEFAULT_ACL_ACCEPTED": (workflow_source, deployment_source.replace('or defaults or effective_mismatch', 'or False or effective_mismatch', 1), proof_bytes, helper_bytes, worker_source, broker_source),
 }
 for label, candidate in negative_controls.items():
     if hosted_binding_accepts(candidate):
