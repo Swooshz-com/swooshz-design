@@ -367,6 +367,7 @@ def hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, a
     if access_issues or default_issues or access_rights != expected or defaults or effective_mismatch or not identity_match:
         diagnostic = hosted_acl_diagnostic(access, defaults, after, access_issues + default_issues, effective_mismatch, "SEMANTIC_MISMATCH", identity_match=identity_match)
         raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_INVALID:" + diagnostic)
+    return access, defaults
 
 
 def hosted_verify_private_root_acl(runner_uid):
@@ -402,7 +403,7 @@ def hosted_verify_private_root_acl(runner_uid):
         defaults, default_issues = hosted_parse_acl(default_text, default=True)
         diagnostic = hosted_acl_diagnostic(access, defaults, None, access_issues + default_issues + ["POST_PROBE_FAILED"], [], "PRIVILEGED_IDENTITY_READ_FAILED", identity_match=False)
         raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_IDENTITY_READ_FAILED:" + diagnostic) from error
-    hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after)
+    access, defaults = hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after)
     return {"identity": after, "access": access, "defaults": defaults}
 
 
@@ -823,7 +824,9 @@ def assert_hosted_acl_regressions():
 
         globals()["hosted_protected_state"] = fake_probe
         globals()["hosted_sudo"] = fake_sudo
-        hosted_verify_private_root_acl(runner_uid)
+        verified = hosted_verify_private_root_acl(runner_uid)
+        if verified["identity"] != state or not isinstance(verified["access"], dict) or verified["defaults"]:
+            raise SystemExit("HOSTED_ACL_VERIFIED_RECORDS_INVALID")
         if len(calls) != 5 or calls[0] != "probe" or calls[-1] != "probe" or calls[1][0] != "/usr/bin/setfacl" or "--no-mask" not in calls[1] or "--access" not in calls[2] or "--default" not in calls[3] or any("--physical" not in args or "--absolute-names" not in args for args in calls[2:4]):
             raise SystemExit("HOSTED_ACL_PRIVILEGED_ROUTE_INVALID")
 
