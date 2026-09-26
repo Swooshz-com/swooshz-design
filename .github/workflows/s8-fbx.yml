@@ -676,11 +676,12 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/s8-validator" --output-on-failure
           "$RUNNER_TEMP/s8-validator/s8-fbx-validator" --self-test
 
-  # This job proves the hosted process boundary, then exercises the candidate
-  # broker through the fixed application launcher and admitted deployment policy.
+  # This job proves the hosted process boundary and route-B /opt namespace, then
+  # exercises the unchanged broker through the fixed application paths.
   s8-pinned-blender:
     name: S8 pinned Blender hosted sandbox amendment
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       S8_RUNNER_LABEL: ubuntu-24.04
     steps:
@@ -727,6 +728,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           export LC_ALL=C
+          if [[ "${S8_MOUNT_NAMESPACE_ACTIVE:-0}" != "1" ]]; then
+            /usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/hosted_deployment_namespace.py" --hosted-namespace-run "$0"
+            exit $?
+          fi
 
           candidate_started=0
           failure_reported=0
