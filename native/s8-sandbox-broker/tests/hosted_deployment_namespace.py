@@ -2486,6 +2486,7 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt
         emit_to_stdout("FIXTURE_DIAGNOSTIC=" + safe_failure(failure.category) + "\n")
         raise failure
     holder_nsfd = None
+    namespace_number = None
     events = []
     control_closed = False
     stage_cleanup_attempted = False
@@ -2522,8 +2523,15 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt
         if failure is not None:
             raise failure
         ready = [event for event in events if event.get("kind") == "ready"]
-        if ready[0]["mountNamespace"] != namespace_number:
+        ready_event = ready[0]
+        namespace_number = ready_event["mountNamespace"]
+        if (
+            ready_event.get("pid") != owned.pid
+            or not owned.identity_valid()
+            or namespace_identity(owned.pid, "mnt")["number"] != namespace_number
+        ):
             raise SupervisorFailure("FIXTURE_HOLDER_IDENTITY_CHANGED")
+        owned.mount_id = namespace_number
         if cancel_stage is not None:
             validate_toolchain_preservation_events(events, namespace_number, stage_root)
         holder_nsfd = os.open(f"/proc/{owned.pid}/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
@@ -2765,17 +2773,25 @@ def root_supervise(args):
         holder_failure = holder_emitted_failure(events)
         if holder_failure is not None:
             raise holder_failure
-        validate_toolchain_preservation_events(events, holder.mount_id, stage_root)
         ready = [event for event in events if event.get("kind") == "stage" and event.get("name") == "NAMESPACE_READY"]
         barriers = [(index, event) for index, event in enumerate(events) if event.get("kind") == "barrier"]
         ready_index = next((index for index, event in enumerate(events) if event.get("kind") == "stage" and event.get("name") == "NAMESPACE_READY"), -1)
         if len(ready) != 1 or len(barriers) != 1 or barriers[0][0] < ready_index or not exact_barrier_event(barriers[0][1]):
             raise SupervisorFailure("NAMESPACE_HOLDER_BARRIER_INVALID")
-        if ready[0].get("mountNamespace") != holder_namespace:
+        ready_namespace = ready[0].get("mountNamespace")
+        if (
+            type(ready_namespace) is not int
+            or ready_namespace <= 0
+            or ready[0].get("pid") != holder.pid
+            or not holder.identity_valid()
+        ):
             raise SupervisorFailure("NAMESPACE_HOLDER_IDENTITY_CHANGED")
         actual = namespace_identity(holder.pid, "mnt")
-        if actual["number"] != holder_namespace:
+        if actual["number"] != ready_namespace:
             raise SupervisorFailure("NAMESPACE_HOLDER_IDENTITY_CHANGED")
+        holder_namespace = ready_namespace
+        holder.mount_id = holder_namespace
+        validate_toolchain_preservation_events(events, holder_namespace, stage_root)
         namespace_fd = os.open(f"/proc/{holder.pid}/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
         if holder.process.poll() is not None:
             raise SupervisorFailure("NAMESPACE_HOLDER_REAPED_BEFORE_RELEASE")

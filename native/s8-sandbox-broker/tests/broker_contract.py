@@ -1208,7 +1208,7 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "create_inner_toolchain_parent_directories": ("HOSTED_TOOLCHAIN_DESTINATION_PARENT_NOT_FRESH", "validate_inner_opt_child", "os.chmod(path, 0o755)"),
         "run_toolchain_preservation_controls": ("HOSTED_TOOLCHAIN_CONTROL_MINIMAL_SUBTREE_SELECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_SOURCE_SUBTREE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_BROAD_OPT_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_UNRELATED_TOOLCACHE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_DESTINATION_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_IDENTITY_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_HASH_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRITABLE_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_RETAINED_NAMESPACE_REFERENCE_BLOCKS_TEARDOWN"),
         "validate_fixture_diagnostic_controls": ("run_route_b_opt_controls(expect)", "run_toolchain_preservation_controls(expect)"),
-        "run_fixture": ("validate_toolchain_preservation_events(events, namespace_number, stage_root)", "cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)", "FIXTURE_NAMESPACE_REFERENCE_REMAINS_AFTER_FAILURE"),
+        "run_fixture": ("validate_toolchain_preservation_events(events, namespace_number, stage_root)", 'namespace_number = ready_event["mountNamespace"]', 'ready_event.get("pid") != owned.pid', 'namespace_identity(owned.pid, "mnt")["number"] != namespace_number', "owned.mount_id = namespace_number", "cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)", "FIXTURE_NAMESPACE_REFERENCE_REMAINS_AFTER_FAILURE"),
         "validate_outer_opt_snapshot": ("OUTER_OPT_DEVICE_CHANGED", "OUTER_OPT_INODE_CHANGED", "OUTER_OPT_UID_CHANGED", "OUTER_OPT_GID_CHANGED", "OUTER_OPT_MODE_CHANGED", "OUTER_OPT_ACCESS_ACL_CHANGED", "OUTER_OPT_DEFAULT_ACL_CHANGED", "OUTER_OPT_MOUNT_VIEW_CHANGED", "OUTER_OPT_CHILDREN_CHANGED"),
         "validate_inner_opt_mount": ("ROUTE_B_OPT_FILESYSTEM_NOT_DISTINCT", "ROUTE_B_OPT_OWNER_INVALID", "ROUTE_B_OPT_MODE_INVALID", "ROUTE_B_OPT_MOUNT_IDENTITY_INVALID", "ROUTE_B_OPT_MOUNT_STATE_INVALID", "ROUTE_B_OPT_DEFAULT_ACL_INVALID"),
         "validate_inner_opt_child": ("ROUTE_B_OPT_CHILD_IDENTITY_INVALID", "ROUTE_B_OPT_CHILD_MODE_INVALID", "ROUTE_B_OPT_CHILD_DEFAULT_ACL_INVALID"),
@@ -1250,7 +1250,7 @@ def valid_hosted_protected_harness(deployment, supervisor):
         return False
     root = body(sup, supervisor, "root_supervise")
     root_requirements = (
-        "workspace != Path(__file__).resolve().parents[3]", "run_namespace_regressions(workspace, temp_root, ledger, outer_ids, outer_opt, args.uid, args.gid, args.node, args.corepack)", "ledger_path=ledger, outer_ids=outer_ids, outer_opt=outer_opt", "holder_events(result_read, 90 * 60, events", "validate_toolchain_preservation_events(events, holder.mount_id, stage_root)", "cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)",
+        "workspace != Path(__file__).resolve().parents[3]", "run_namespace_regressions(workspace, temp_root, ledger, outer_ids, outer_opt, args.uid, args.gid, args.node, args.corepack)", "ledger_path=ledger, outer_ids=outer_ids, outer_opt=outer_opt", "holder_events(result_read, 90 * 60, events", "validate_toolchain_preservation_events(events, holder_namespace, stage_root)", 'ready[0].get("pid") != holder.pid', 'namespace_identity(holder.pid, "mnt")', "holder_namespace = ready_namespace", "holder.mount_id = holder_namespace", "cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)",
         "cancel_event=ROOT_CANCEL_EVENT", "namespace_disappeared(holder_namespace",
         "current_host_ids() != outer_ids or opt_snapshot() != outer_opt", "cleanup_events = [event for event in events if event.get(\"kind\") == \"deploymentCleanup\"]",
         'not cleanup_events[0]["clean"]', "remove_supervisor_state(state, ledger)",
@@ -1456,6 +1456,8 @@ negative_controls = {
     "TOOLCHAIN_READONLY_BIND_REMOVED": mutate_control(2, replace_once(supervisor_source, "remount,bind,ro,nosuid,nodev", "remount,bind,rw,nosuid,nodev")),
     "TOOLCHAIN_EXECUTABLE_IDENTITY_BINDING_REMOVED": mutate_control(2, replace_once(supervisor_source, "validate_toolchain_identity(node_identity, toolchain_identity(node))", "pass")),
     "TOOLCHAIN_NO_BIND_REGRESSION_REMOVED": mutate_control(2, replace_once(supervisor_source, "validate_unpreserved_toolchain_missing(node_missing, corepack_missing)", "pass")),
+    "NO_FIXTURE_READY_NAMESPACE_BINDING": mutate_control(2, replace_once(supervisor_source, 'namespace_number = ready_event["mountNamespace"]', "namespace_number = owned.mount_id")),
+    "NO_PRODUCTION_READY_NAMESPACE_BINDING": mutate_control(2, replace_once(supervisor_source, "holder_namespace = ready_namespace", "holder_namespace = holder.mount_id")),
     "TOOLCACHE_PRODUCT_AUTHORITY_ADDED_TO_WORKER": mutate_control(6, worker_source + '\nconst productMountAllowlist = ["/opt/hostedtoolcache"];'),
     "TOOLCACHE_PRODUCT_AUTHORITY_ADDED_TO_BROKER": mutate_control(7, broker_source + "\n/* /opt/hostedtoolcache */\n"),
     "NO_RECOVERY_CLEANUP_GATE": mutate_control(2, supervisor_source.replace('not cleanup_events[0]["clean"]', "False")),
