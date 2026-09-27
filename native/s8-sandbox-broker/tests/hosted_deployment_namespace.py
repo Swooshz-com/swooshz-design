@@ -53,6 +53,15 @@ class Cancelled(SupervisorFailure):
     pass
 
 
+FIXTURE_BARRIER_EVENT = {
+    "kind": "barrier",
+    "childrenQuiescent": True,
+    "holderReaped": False,
+    "outerStateRevalidated": False,
+    "complete": False,
+}
+
+
 def request_root_cancel(signum, frame):
     ROOT_CANCEL_EVENT.set()
 
@@ -203,7 +212,7 @@ def launch_owned(argv, *, owner, ledger_path, mount_id=None, cwd=None, env=None,
         actual_mount_id = namespace_identity(process.pid, "mnt")["number"]
         owned = OwnedProcess(process, owner, ledger_path, actual_mount_id, start_identity, pidfd)
         pidfd = None
-    except Exception:
+    except Exception as primary_error:
         cleanup_error = None
         try:
             if process.poll() is None:
@@ -253,8 +262,11 @@ def launch_owned(argv, *, owner, ledger_path, mount_id=None, cwd=None, env=None,
                 except OSError as error:
                     cleanup_error = cleanup_error or error
         if cleanup_error is not None:
-            raise SupervisorFailure("OWNED_PROCESS_LAUNCH_CLEANUP_FAILED") from cleanup_error
-        raise
+            try:
+                primary_error.cleanup_failure = cleanup_error
+            except Exception:
+                pass
+        raise primary_error
     if mount_id is not None and actual_mount_id != mount_id:
         terminate_owned(owned)
         raise SupervisorFailure("OWNED_PROCESS_MOUNT_NAMESPACE_INVALID")
@@ -971,6 +983,62 @@ def control_reader(fd, cancel_event, release_event):
             release_event.set()
 
 
+def prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, result_fd, cancel_event, release_event):
+    workload = None
+    primary_failure = None
+    cleanup_failure = None
+    try:
+        private_opt_mount(None, Path(ledger_path), mount_ns["number"])
+        runner = host_uid_gid(uid, gid)
+        fixture_log = Path(temp_root) / ".namespace-state" / (mode + ".log")
+        fixture_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": runner.pw_dir, "USER": runner.pw_name, "LOGNAME": runner.pw_name, "LC_ALL": "C"}
+        fixture_code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('S8_CANCELLATION_CHILD_READY', flush=True); time.sleep(3600)"
+        workload = launch_owned_to_log(
+            app_identity_command(uid, gid, ["/usr/bin/python3", "-c", fixture_code]), log_path=fixture_log,
+            owner=f"namespace-holder:{os.getpid()}:{mode}-workload",
+            ledger_path=ledger_path, mount_id=mount_ns["number"], cwd=workspace, env=fixture_env,
+        )
+        require_process_identity(workload, uid, gid)
+        ready_deadline = time.monotonic() + 5.0
+        while time.monotonic() < ready_deadline:
+            if b"S8_CANCELLATION_CHILD_READY\n" in fixture_log.read_bytes():
+                break
+            if workload.process.poll() is not None:
+                raise SupervisorFailure("CANCELLATION_FIXTURE_CHILD_EXITED_EARLY")
+            time.sleep(0.01)
+        else:
+            raise SupervisorFailure("CANCELLATION_FIXTURE_CHILD_NOT_READY")
+        if workload.signal(signal.SIGTERM, workload.start_identity + ":mismatch") or workload.process.poll() is not None:
+            raise SupervisorFailure("CANCELLATION_FIXTURE_IDENTITY_MISMATCH_FALSE_GREEN")
+        stage = "OPT_MOUNTED" if mode == "fixture-opt-cancel" else "APPLICATION_RUNNING"
+        emit(result_fd, "stage", name=stage, mountNamespace=mount_ns["number"])
+        while not cancel_event.wait(0.05):
+            if release_event.is_set():
+                raise SupervisorFailure("CANCELLATION_FIXTURE_RELEASED_WITHOUT_CANCEL")
+        result = terminate_owned(workload, grace=0.1)
+        if result != -signal.SIGKILL or workload.terminal != result:
+            raise SupervisorFailure("TERM_RESISTANT_CHILD_TEARDOWN_INVALID")
+        emit(result_fd, "stage", name="CANCELLED_CHILD_REAPED", status=result)
+        emit(result_fd, "output", text="TERM_RESISTANT_OWNED_CHILD=PASS\nPID_IDENTITY_MISMATCH_REFUSED=PASS\n")
+        active = active_namespace_children(mount_ns["number"], exclude={os.getpid(), int(os.environ.get("S8_ROOT_SUPERVISOR_PID", "0"))})
+        if active:
+            raise SupervisorFailure("CANCELLATION_FIXTURE_CHILDREN_REMAIN")
+    except Exception as error:
+        primary_failure = error
+
+    if workload is not None and workload.terminal is None:
+        try:
+            if workload.process.poll() is None:
+                terminate_owned(workload)
+            else:
+                workload.wait(0)
+        except Exception as error:
+            cleanup_failure = error
+
+    if primary_failure is not None or cleanup_failure is not None:
+        raise FixtureSetupFailure("CANCELLATION_STAGE_SETUP_FAILURE", primary_failure, cleanup_failure)
+
+
 def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, control_fd, result_fd, ledger_path, outer_user_ns, outer_pid_ns, mode):
     global CURRENT_RESULT_FD, CURRENT_CANCEL_EVENT
     CURRENT_RESULT_FD = result_fd
@@ -987,69 +1055,34 @@ def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, contro
     pid_ns = namespace_identity(os.getpid(), "pid")
     mount_ns = namespace_identity(os.getpid(), "mnt")
     if mode == "fixture":
-        if user_ns["number"] != outer_user_ns or pid_ns["number"] != outer_pid_ns:
-            emit(result_fd, "failure", reason="FIXTURE_USER_OR_PID_NAMESPACE_CHANGED")
-            return 2
-        supervised_command(["/usr/bin/mount", "--make-rprivate", "/"], label="FIXTURE_PRIVATE_PROPAGATION_FAILED", timeout=10)
-        mount_namespace_private()
-        emit(result_fd, "ready", pid=os.getpid(), mountNamespace=mount_ns["number"], userNamespace=user_ns["number"], pidNamespace=pid_ns["number"])
-        emit(result_fd, "barrier", childrenQuiescent=True, holderReaped=False, outerStateRevalidated=False, complete=False)
-        os.close(result_fd)
+        try:
+            if user_ns["number"] != outer_user_ns or pid_ns["number"] != outer_pid_ns:
+                raise SupervisorFailure("FIXTURE_USER_OR_PID_NAMESPACE_CHANGED")
+            supervised_command(["/usr/bin/mount", "--make-rprivate", "/"], label="FIXTURE_PRIVATE_PROPAGATION_FAILED", timeout=10)
+            mount_namespace_private()
+            emit(result_fd, "ready", pid=os.getpid(), mountNamespace=mount_ns["number"], userNamespace=user_ns["number"], pidNamespace=pid_ns["number"])
+            emit(result_fd, "barrier", childrenQuiescent=True, holderReaped=False, outerStateRevalidated=False, complete=False)
+            os.close(result_fd)
+        except Exception as error:
+            raise FixtureSetupFailure("NAMESPACE_SETUP_FAILURE", error) from error
         while not release_event.wait(0.05):
             if cancel_event.is_set():
                 return 143
         return 0
     if mode in {"fixture-opt-cancel", "fixture-application-cancel"}:
         if user_ns["number"] != outer_user_ns or pid_ns["number"] != outer_pid_ns:
-            emit(result_fd, "failure", reason="FIXTURE_USER_OR_PID_NAMESPACE_CHANGED")
-            return 2
+            raise SupervisorFailure("FIXTURE_USER_OR_PID_NAMESPACE_CHANGED")
         supervised_command(["/usr/bin/mount", "--make-rprivate", "/"], label="FIXTURE_PRIVATE_PROPAGATION_FAILED", timeout=10)
         mount_namespace_private()
-        private_opt_mount(None, Path(ledger_path), mount_ns["number"])
-        runner = host_uid_gid(uid, gid)
-        fixture_log = Path(temp_root) / ".namespace-state" / (mode + ".log")
-        fixture_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": runner.pw_dir, "USER": runner.pw_name, "LOGNAME": runner.pw_name, "LC_ALL": "C"}
-        fixture_code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('S8_CANCELLATION_CHILD_READY', flush=True); time.sleep(3600)"
-        workload = launch_owned_to_log(
-            app_identity_command(uid, gid, ["/usr/bin/python3", "-c", fixture_code]), log_path=fixture_log,
-            owner=f"namespace-holder:{os.getpid()}:{mode}-workload",
-            ledger_path=ledger_path, mount_id=mount_ns["number"], cwd=workspace, env=fixture_env,
-        )
         try:
-            require_process_identity(workload, uid, gid)
-            ready_deadline = time.monotonic() + 5.0
-            while time.monotonic() < ready_deadline:
-                if b"S8_CANCELLATION_CHILD_READY\n" in fixture_log.read_bytes():
-                    break
-                if workload.process.poll() is not None:
-                    raise SupervisorFailure("CANCELLATION_FIXTURE_CHILD_EXITED_EARLY")
-                time.sleep(0.01)
-            else:
-                raise SupervisorFailure("CANCELLATION_FIXTURE_CHILD_NOT_READY")
-            if workload.signal(signal.SIGTERM, workload.start_identity + ":mismatch") or workload.process.poll() is not None:
-                raise SupervisorFailure("CANCELLATION_FIXTURE_IDENTITY_MISMATCH_FALSE_GREEN")
-            stage = "OPT_MOUNTED" if mode == "fixture-opt-cancel" else "APPLICATION_RUNNING"
-            emit(result_fd, "stage", name=stage, mountNamespace=mount_ns["number"])
-            while not cancel_event.wait(0.05):
-                if release_event.is_set():
-                    raise SupervisorFailure("CANCELLATION_FIXTURE_RELEASED_WITHOUT_CANCEL")
-            result = terminate_owned(workload, grace=0.1)
-            if result != -signal.SIGKILL or workload.terminal != result:
-                raise SupervisorFailure("TERM_RESISTANT_CHILD_TEARDOWN_INVALID")
-            emit(result_fd, "stage", name="CANCELLED_CHILD_REAPED", status=result)
-            emit(result_fd, "output", text="TERM_RESISTANT_OWNED_CHILD=PASS\nPID_IDENTITY_MISMATCH_REFUSED=PASS\n")
-            active = active_namespace_children(mount_ns["number"], exclude={os.getpid(), int(os.environ.get("S8_ROOT_SUPERVISOR_PID", "0"))})
-            if active:
-                raise SupervisorFailure("CANCELLATION_FIXTURE_CHILDREN_REMAIN")
-        finally:
-            if workload.terminal is None:
-                if workload.process.poll() is None:
-                    terminate_owned(workload)
-                else:
-                    workload.wait(0)
-        emit(result_fd, "ready", pid=os.getpid(), mountNamespace=mount_ns["number"], userNamespace=user_ns["number"], pidNamespace=pid_ns["number"])
-        emit(result_fd, "barrier", childrenQuiescent=True, holderReaped=False, outerStateRevalidated=False, complete=False)
-        os.close(result_fd)
+            prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, result_fd, cancel_event, release_event)
+            emit(result_fd, "ready", pid=os.getpid(), mountNamespace=mount_ns["number"], userNamespace=user_ns["number"], pidNamespace=pid_ns["number"])
+            emit(result_fd, "barrier", childrenQuiescent=True, holderReaped=False, outerStateRevalidated=False, complete=False)
+            os.close(result_fd)
+        except FixtureSetupFailure:
+            raise
+        except Exception as error:
+            raise FixtureSetupFailure("CANCELLATION_STAGE_SETUP_FAILURE", error) from error
         while not release_event.wait(0.05):
             pass
         return 143
@@ -1086,7 +1119,10 @@ def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, contro
         application_proof(workspace, carrier, temp_root, node, corepack, uid, gid, policy_h, config_q, ledger_path, mount_ns["number"], cancel_event)
     except Exception as error:
         primary_error = error
-        emit(result_fd, "failure", reason=safe_failure(error))
+        emit(
+            result_fd, "failure", category="HOLDER_OPERATION_FAILURE",
+            reason=safe_failure(error), primaryFailure=safe_failure(error), cleanupFailure="NONE",
+        )
     finally:
         if not deployment_attempted:
             cleanup_passed = True
@@ -1101,7 +1137,13 @@ def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, contro
                 run_hosted_contract(workspace, carrier, temp_root, uid, gid, ledger_path, mount_ns["number"], "cleanup", cancel_event=threading.Event())
                 cleanup_passed = True
             except Exception as error:
-                emit(result_fd, "failure", reason="HOSTED_RECOVERY_CLEANUP_FAILED:" + safe_failure(error))
+                cleanup_reason = "HOSTED_RECOVERY_CLEANUP_FAILED:" + safe_failure(error)
+                emit(
+                    result_fd, "failure", category="HOLDER_CLEANUP_FAILURE",
+                    reason=cleanup_reason,
+                    primaryFailure=safe_failure(primary_error) if primary_error is not None else "NONE",
+                    cleanupFailure=safe_failure(error),
+                )
         try:
             supervisor_pid = int(os.environ.get("S8_ROOT_SUPERVISOR_PID", "0"))
             active = active_namespace_children(mount_ns["number"], exclude={os.getpid(), supervisor_pid})
@@ -1134,6 +1176,303 @@ def parse_one(output, key):
 def safe_failure(error):
     value = re.sub(r"[^A-Z0-9_.:-]+", "_", str(error).upper())[:200]
     return value or type(error).__name__.upper()
+
+
+class FixtureSetupFailure(SupervisorFailure):
+    def __init__(self, category, primary_failure, cleanup_failure=None):
+        self.category = category
+        self.primary_failure = primary_failure
+        self.cleanup_failure = cleanup_failure
+        primary, cleanup = failure_pair_labels(primary_failure, cleanup_failure)
+        detail = primary if primary != "NONE" else cleanup
+        super().__init__(category + ":" + detail)
+
+
+def holder_launch_failure(primary_failure, cleanup_failure=None):
+    if isinstance(primary_failure, FixtureSetupFailure):
+        cleanup_failure = cleanup_failure or primary_failure.cleanup_failure
+        primary_failure = primary_failure.primary_failure
+    return FixtureSetupFailure("HOLDER_LAUNCH_OR_SETUP_FAILURE", primary_failure, cleanup_failure)
+
+
+def launch_fixture_holder(launcher, *args, **kwargs):
+    try:
+        return launcher(*args, **kwargs)
+    except FixtureSetupFailure as error:
+        if error.category.startswith("HOLDER_LAUNCH_OR_SETUP_FAILURE"):
+            raise
+        raise holder_launch_failure(error) from error
+    except Exception as error:
+        raise holder_launch_failure(error, getattr(error, "cleanup_failure", None)) from error
+
+
+def failure_pair_labels(primary_failure, cleanup_failure=None):
+    nested_cleanups = []
+    if primary_failure is not None:
+        for attribute in ("cleanup_failure", "supervisor_cleanup_failure"):
+            nested_cleanup = getattr(primary_failure, attribute, None)
+            if nested_cleanup is not None and all(nested_cleanup is not existing for existing in nested_cleanups):
+                nested_cleanups.append(nested_cleanup)
+    if isinstance(primary_failure, FixtureSetupFailure):
+        if primary_failure.cleanup_failure is not None and all(primary_failure.cleanup_failure is not existing for existing in nested_cleanups):
+            nested_cleanups.append(primary_failure.cleanup_failure)
+        primary_failure = primary_failure.primary_failure
+    if primary_failure is None:
+        primary = "NONE"
+    else:
+        primary = safe_failure(primary_failure)
+    cleanups = nested_cleanups + ([cleanup_failure] if cleanup_failure is not None else [])
+    cleanup = "__AND__".join(safe_failure(item) for item in cleanups) if cleanups else "NONE"
+    return primary, cleanup
+
+
+def combined_failure(errors):
+    if not errors:
+        return None
+    if len(errors) == 1:
+        return errors[0]
+    return SupervisorFailure("__AND__".join(safe_failure(error) for error in errors))
+
+
+def append_cleanup_failure(existing, new_failure):
+    return new_failure if existing is None else combined_failure([existing, new_failure])
+
+
+def report_failure_pair(primary_failure, cleanup_failure=None):
+    primary, cleanup = failure_pair_labels(primary_failure, cleanup_failure)
+    emit_to_stdout("PRIMARY_FAILURE=" + primary + "\nCLEANUP_FAILURE=" + cleanup + "\n")
+
+
+def effective_failure(primary_failure, cleanup_failure):
+    return primary_failure if primary_failure is not None else cleanup_failure
+
+
+def emit_fixture_failure(result_fd, category, primary_failure, cleanup_failure=None):
+    primary, cleanup = failure_pair_labels(primary_failure, cleanup_failure)
+    reason = primary if primary != "NONE" else cleanup
+    emit(
+        result_fd, "failure", category=category, reason=reason,
+        primaryFailure=primary, cleanupFailure=cleanup,
+    )
+
+
+def bounded_holder_log_detail(log):
+    try:
+        log.flush()
+        with open(log.name, "rb") as reader:
+            reader.seek(0, os.SEEK_END)
+            size = reader.tell()
+            reader.seek(max(0, size - 8192), os.SEEK_SET)
+            content = reader.read(8192).decode("utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        return "DETAIL_UNAVAILABLE"
+    for line in reversed(content.splitlines()):
+        line = line.strip()
+        supervisor = re.search(r"SupervisorFailure:\s*([A-Z0-9_.:-]{1,160})$", line)
+        if supervisor:
+            return safe_failure(supervisor.group(1))
+        if "Operation not permitted" in line:
+            return "OPERATION_NOT_PERMITTED"
+        if "Permission denied" in line:
+            return "PERMISSION_DENIED"
+        if "No such file or directory" in line:
+            return "NO_SUCH_FILE_OR_DIRECTORY"
+        if "ModuleNotFoundError:" in line or "ImportError:" in line:
+            return "PYTHON_MODULE_IMPORT_FAILURE"
+        if "SyntaxError:" in line:
+            return "PYTHON_SYNTAX_ERROR"
+        if "PermissionError:" in line:
+            return "PERMISSION_ERROR"
+        if line.startswith("unshare:"):
+            return "UNSHARE_FAILED"
+    return "DETAIL_UNAVAILABLE"
+
+
+def fixture_event_failure(events, outer_ids, stream_state, *, holder_exit_status=None, holder_log=None, stream_failure=None):
+    if not isinstance(events, list) or stream_state not in {"eof", "timeout", "invalid"}:
+        return FixtureSetupFailure("HOLDER_LAUNCH_OR_SETUP_FAILURE", "FIXTURE_EVENT_READER_STATE_INVALID")
+    if any(not isinstance(event, dict) for event in events):
+        return FixtureSetupFailure("READY_EVENT_INVALID", "HOLDER_EVENT_SHAPE_INVALID")
+
+    failures = [event for event in events if event.get("kind") == "failure"]
+    if failures:
+        event = failures[0]
+        category = event.get("category")
+        reason = event.get("reason", "UNKNOWN")
+        cleanup = event.get("cleanupFailure")
+        event_category = "HOLDER_EMITTED_FAILURE_EVENT"
+        if isinstance(category, str) and category in {"NAMESPACE_SETUP_FAILURE", "CANCELLATION_STAGE_SETUP_FAILURE"}:
+            event_category += ":" + category
+        primary = event.get("primaryFailure")
+        if primary in (None, "NONE"):
+            primary = reason if cleanup in (None, "NONE") else None
+        cleanup_error = cleanup if cleanup not in (None, "NONE") else None
+        return FixtureSetupFailure(event_category, primary, cleanup_error)
+
+    ready = [(index, event) for index, event in enumerate(events) if event.get("kind") == "ready"]
+    barriers = [(index, event) for index, event in enumerate(events) if event.get("kind") == "barrier"]
+    if not ready:
+        detail = "READY_EVENT_MISSING"
+        if stream_state == "invalid":
+            detail += ":EVENT_STREAM_" + safe_failure(stream_failure or "INVALID_BEFORE_READY")
+        if holder_exit_status is not None:
+            detail += ":HOLDER_EXIT_STATUS_" + safe_failure(holder_exit_status)
+        if holder_log is not None:
+            detail += ":HOLDER_LOG_" + bounded_holder_log_detail(holder_log)
+        if stream_state == "eof":
+            return FixtureSetupFailure("EOF_BEFORE_REQUIRED_EVENTS", detail)
+        if stream_state == "timeout":
+            return FixtureSetupFailure("TIMEOUT_BEFORE_REQUIRED_EVENTS", detail)
+        return FixtureSetupFailure("READY_EVENT_INVALID", detail)
+
+    ready_event = ready[0][1]
+    required_ready_fields = {"kind", "pid", "mountNamespace", "userNamespace", "pidNamespace"}
+    if (
+        len(ready) != 1
+        or set(ready_event) != required_ready_fields
+        or any(type(ready_event.get(key)) is not int or ready_event[key] <= 0 for key in ("pid", "mountNamespace", "userNamespace", "pidNamespace"))
+        or ready_event.get("userNamespace") != outer_ids[0]["number"]
+        or ready_event.get("pidNamespace") != outer_ids[1]["number"]
+        or ready_event.get("mountNamespace") == outer_ids[2]["number"]
+    ):
+        return FixtureSetupFailure("READY_EVENT_INVALID", "FIXTURE_NAMESPACE_IDENTITY_INVALID")
+
+    if not barriers:
+        if stream_state == "eof":
+            return FixtureSetupFailure("EOF_BEFORE_REQUIRED_EVENTS", "BARRIER_EVENT_MISSING")
+        if stream_state == "timeout":
+            return FixtureSetupFailure("TIMEOUT_BEFORE_REQUIRED_EVENTS", "BARRIER_EVENT_MISSING")
+        detail = "EVENT_STREAM_" + safe_failure(stream_failure or "INVALID_AFTER_READY")
+        return FixtureSetupFailure("BARRIER_EVENT_INVALID", detail)
+
+    if (
+        len(barriers) != 1
+        or barriers[0][0] < ready[0][0]
+        or not exact_barrier_event(barriers[0][1])
+    ):
+        return FixtureSetupFailure("BARRIER_EVENT_INVALID", "FIXTURE_HOLDER_BARRIER_SHAPE_OR_ORDER_INVALID")
+    if stream_state == "invalid":
+        detail = "EVENT_STREAM_" + safe_failure(stream_failure or "INVALID_AFTER_BARRIER")
+        return FixtureSetupFailure("BARRIER_EVENT_INVALID", detail)
+    if stream_state == "timeout":
+        return FixtureSetupFailure("TIMEOUT_AFTER_REQUIRED_EVENTS", "FIXTURE_HOLDER_RESULT_STREAM_DID_NOT_CLOSE")
+    return None
+
+
+def exact_barrier_event(event):
+    return (
+        isinstance(event, dict)
+        and set(event) == set(FIXTURE_BARRIER_EVENT)
+        and all(type(event.get(key)) is bool for key in FIXTURE_BARRIER_EVENT if key != "kind")
+        and event == FIXTURE_BARRIER_EVENT
+    )
+
+
+def holder_emitted_failure(events):
+    failures = [event for event in events if isinstance(event, dict) and event.get("kind") == "failure"]
+    if not failures:
+        return None
+    first = failures[0]
+    category = "HOLDER_EMITTED_FAILURE_EVENT"
+    event_category = first.get("category")
+    if isinstance(event_category, str):
+        category += ":" + safe_failure(event_category)
+    primary = first.get("primaryFailure")
+    first_cleanup = first.get("cleanupFailure")
+    if primary is None:
+        primary = first.get("reason", "UNKNOWN")
+    elif primary == "NONE" and first_cleanup in (None, "NONE"):
+        primary = first.get("reason", "UNKNOWN")
+    elif primary == "NONE":
+        primary = None
+    cleanup = []
+    if first_cleanup not in (None, "NONE"):
+        cleanup.append(first_cleanup)
+    for event in failures[1:]:
+        cleanup_value = event.get("cleanupFailure")
+        if cleanup_value not in (None, "NONE"):
+            cleanup.append(cleanup_value)
+        elif event.get("primaryFailure") in (None, "NONE"):
+            cleanup.append(event.get("reason", "UNKNOWN"))
+        else:
+            cleanup.append(event.get("reason", event.get("primaryFailure", "UNKNOWN")))
+    return FixtureSetupFailure(category, primary, combined_failure(cleanup))
+
+
+def validate_fixture_diagnostic_controls():
+    outer_ids = ({"number": 101}, {"number": 202}, {"number": 303})
+    ready = {"kind": "ready", "pid": 404, "mountNamespace": 505, "userNamespace": 101, "pidNamespace": 202}
+    barrier = dict(FIXTURE_BARRIER_EVENT)
+
+    def expect(condition, marker):
+        if not condition:
+            raise SupervisorFailure("FIXTURE_DIAGNOSTIC_CONTROL_FAILED:" + marker)
+        emit_to_stdout(marker + "=PASS\n")
+
+    def fail_before_launch():
+        raise SupervisorFailure("UNSHARE_LAUNCH_FAILED")
+
+    try:
+        launch_fixture_holder(fail_before_launch)
+    except FixtureSetupFailure as launch_error:
+        expect(str(launch_error).startswith("HOLDER_LAUNCH_OR_SETUP_FAILURE:"), "FIXTURE_DIAGNOSTIC_LAUNCH_SETUP")
+    else:
+        raise SupervisorFailure("FIXTURE_DIAGNOSTIC_CONTROL_FAILED:FIXTURE_DIAGNOSTIC_LAUNCH_SETUP")
+    eof_before_ready = fixture_event_failure([], outer_ids, "eof")
+    expect(str(eof_before_ready).startswith("EOF_BEFORE_REQUIRED_EVENTS:READY_EVENT_MISSING"), "FIXTURE_DIAGNOSTIC_EOF_BEFORE_READY")
+    timeout_before_ready = fixture_event_failure([], outer_ids, "timeout")
+    expect(str(timeout_before_ready).startswith("TIMEOUT_BEFORE_REQUIRED_EVENTS:READY_EVENT_MISSING"), "FIXTURE_DIAGNOSTIC_TIMEOUT_BEFORE_READY")
+    invalid_stream_before_ready = fixture_event_failure(
+        [], outer_ids, "invalid", stream_failure=SupervisorFailure("NAMESPACE_HOLDER_EVENT_INVALID"),
+    )
+    expect(str(invalid_stream_before_ready).endswith("EVENT_STREAM_NAMESPACE_HOLDER_EVENT_INVALID"), "FIXTURE_DIAGNOSTIC_INVALID_STREAM_REASON")
+    with tempfile.TemporaryDirectory(prefix="s8-fixture-diagnostic-control-") as temp_dir:
+        log_path = Path(temp_dir) / "holder.log"
+        log_path.write_bytes(b"x" * 10000 + b"\nSupervisorFailure: NAMESPACE_SETUP_FAILED\n")
+
+        class LogReference:
+            name = str(log_path)
+
+            def flush(self):
+                return None
+
+        expect(bounded_holder_log_detail(LogReference()) == "NAMESPACE_SETUP_FAILED", "FIXTURE_DIAGNOSTIC_BOUNDED_LOG_REASON")
+        timeout_with_live_holder_log = fixture_event_failure([], outer_ids, "timeout", holder_log=LogReference())
+        expect(str(timeout_with_live_holder_log).endswith("HOLDER_LOG_NAMESPACE_SETUP_FAILED"), "FIXTURE_DIAGNOSTIC_TIMEOUT_LOG_REASON")
+        log_path.write_bytes(b"ModuleNotFoundError: No module named 'pwd'\n")
+        expect(bounded_holder_log_detail(LogReference()) == "PYTHON_MODULE_IMPORT_FAILURE", "FIXTURE_DIAGNOSTIC_STARTUP_IMPORT_FAILURE")
+    namespace_failure = fixture_event_failure(
+        [{"kind": "failure", "category": "NAMESPACE_SETUP_FAILURE", "reason": "MOUNT_SETUP_FAILED", "primaryFailure": "MOUNT_SETUP_FAILED", "cleanupFailure": "NONE"}],
+        outer_ids, "eof",
+    )
+    expect("HOLDER_EMITTED_FAILURE_EVENT:NAMESPACE_SETUP_FAILURE" in str(namespace_failure), "FIXTURE_DIAGNOSTIC_NAMESPACE_SETUP_FAILURE")
+    cancellation_failure = fixture_event_failure(
+        [{"kind": "failure", "category": "CANCELLATION_STAGE_SETUP_FAILURE", "reason": "WORKLOAD_SETUP_FAILED", "primaryFailure": "WORKLOAD_SETUP_FAILED", "cleanupFailure": "NONE"}],
+        outer_ids, "eof",
+    )
+    expect("HOLDER_EMITTED_FAILURE_EVENT:CANCELLATION_STAGE_SETUP_FAILURE" in str(cancellation_failure), "FIXTURE_DIAGNOSTIC_CANCELLATION_SETUP_FAILURE")
+    no_barrier = fixture_event_failure([ready], outer_ids, "eof")
+    expect(str(no_barrier).startswith("EOF_BEFORE_REQUIRED_EVENTS:BARRIER_EVENT_MISSING"), "FIXTURE_DIAGNOSTIC_READY_WITHOUT_BARRIER")
+    malformed_barrier = dict(barrier, holderReaped=0)
+    invalid_barrier = fixture_event_failure([ready, malformed_barrier], outer_ids, "eof")
+    expect(str(invalid_barrier).startswith("BARRIER_EVENT_INVALID:"), "FIXTURE_DIAGNOSTIC_MALFORMED_BARRIER")
+    invalid_ready = dict(ready, userNamespace=999)
+    expect(str(fixture_event_failure([invalid_ready, barrier], outer_ids, "eof")).startswith("READY_EVENT_INVALID:"), "FIXTURE_DIAGNOSTIC_INVALID_READY")
+    emitted_failure = fixture_event_failure(
+        [{"kind": "failure", "category": "CANCELLATION_STAGE_SETUP_FAILURE", "reason": "SETUP_FAILED", "primaryFailure": "SETUP_FAILED", "cleanupFailure": "CLEANUP_FAILED"}, ready],
+        outer_ids, "eof",
+    )
+    expect("HOLDER_EMITTED_FAILURE_EVENT" in str(emitted_failure), "FIXTURE_DIAGNOSTIC_FAILURE_BEFORE_BARRIER")
+    expect(fixture_event_failure([ready, barrier], outer_ids, "eof") is None, "FIXTURE_DIAGNOSTIC_EXACT_BARRIER_ACCEPTED")
+    primary, cleanup = failure_pair_labels(SupervisorFailure("ORIGINAL_FIXTURE_FAILURE"), SupervisorFailure("CLEANUP_FAILED"))
+    expect(primary == "ORIGINAL_FIXTURE_FAILURE" and cleanup == "CLEANUP_FAILED", "FIXTURE_DIAGNOSTIC_PRIMARY_PRESERVED")
+    original = SupervisorFailure("ORIGINAL_FIXTURE_FAILURE")
+    expect(effective_failure(original, SupervisorFailure("CLEANUP_FAILED")) is original, "FIXTURE_DIAGNOSTIC_CLEANUP_SECONDARY")
+    cleanup_only = holder_emitted_failure([
+        {"kind": "failure", "category": "HOLDER_CLEANUP_FAILURE", "reason": "CLEANUP_FAILED", "primaryFailure": "NONE", "cleanupFailure": "CLEANUP_FAILED"},
+    ])
+    primary, cleanup = failure_pair_labels(cleanup_only)
+    expect(primary == "NONE" and cleanup == "CLEANUP_FAILED", "FIXTURE_DIAGNOSTIC_CLEANUP_NOT_PROMOTED")
 
 
 def active_namespace_children(namespace_number, exclude=()):
@@ -1171,6 +1510,8 @@ def read_events_and_eof(fd, deadline, on_event, loop_check=None):
                 event = json.loads(line.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise SupervisorFailure("NAMESPACE_HOLDER_EVENT_INVALID") from error
+            if not isinstance(event, dict) or not isinstance(event.get("kind"), str):
+                raise SupervisorFailure("NAMESPACE_HOLDER_EVENT_INVALID")
             on_event(event)
 
 
@@ -1186,20 +1527,22 @@ def drain_until_eof(fd, deadline):
 
 
 def launch_holder(mode, *, workspace, carrier, temp_root, uid, gid, node, corepack, ledger_path, outer_ids):
-    control_read, control_write = make_pipe()
-    result_read, result_write = make_pipe()
-    args = [
-        "/usr/bin/unshare", "--mount", "--", sys.executable, str(Path(__file__).resolve()),
-        "--holder", "--mode", mode, "--workspace", str(workspace), "--carrier", str(carrier),
-        "--temp-root", str(temp_root), "--uid", str(uid), "--gid", str(gid), "--node", str(node),
-        "--corepack", str(corepack), "--control-fd", str(control_read), "--result-fd", str(result_write),
-        "--ledger", str(ledger_path), "--outer-user-ns", str(outer_ids[0]["number"]),
-        "--outer-pid-ns", str(outer_ids[1]["number"]), "--supervisor-pid", str(os.getpid()),
-    ]
-    minimal_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C", "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"}
-    log = open(Path(temp_root) / ".namespace-state" / ("holder-" + mode + ".log"), "wb", buffering=0)
+    control_read = control_write = result_read = result_write = None
+    log = None
     owned = None
     try:
+        control_read, control_write = make_pipe()
+        result_read, result_write = make_pipe()
+        args = [
+            "/usr/bin/unshare", "--mount", "--", sys.executable, str(Path(__file__).resolve()),
+            "--holder", "--mode", mode, "--workspace", str(workspace), "--carrier", str(carrier),
+            "--temp-root", str(temp_root), "--uid", str(uid), "--gid", str(gid), "--node", str(node),
+            "--corepack", str(corepack), "--control-fd", str(control_read), "--result-fd", str(result_write),
+            "--ledger", str(ledger_path), "--outer-user-ns", str(outer_ids[0]["number"]),
+            "--outer-pid-ns", str(outer_ids[1]["number"]), "--supervisor-pid", str(os.getpid()),
+        ]
+        minimal_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C", "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"}
+        log = open(Path(temp_root) / ".namespace-state" / ("holder-" + mode + ".log"), "wb", buffering=0)
         owned = launch_owned(args, owner=f"root-supervisor:{os.getpid()}:{mode}-holder", ledger_path=ledger_path, cwd=workspace, env=minimal_env, stdout=log, pass_fds=(control_read, result_write))
         os.close(control_read)
         control_read = None
@@ -1207,17 +1550,25 @@ def launch_holder(mode, *, workspace, carrier, temp_root, uid, gid, node, corepa
         result_write = None
         os.set_inheritable(control_write, False)
         return owned, control_write, result_read, log
-    except Exception:
+    except Exception as primary_failure:
+        cleanup_failure = getattr(primary_failure, "cleanup_failure", None)
         if owned is not None and owned.terminal is None:
-            terminate_owned(owned)
+            try:
+                terminate_owned(owned)
+            except Exception as error:
+                cleanup_failure = append_cleanup_failure(cleanup_failure, error)
         for descriptor in (control_read, result_write, control_write, result_read):
             if descriptor is not None:
                 try:
                     os.close(descriptor)
-                except OSError:
-                    pass
-        log.close()
-        raise
+                except OSError as error:
+                    cleanup_failure = append_cleanup_failure(cleanup_failure, error)
+        if log is not None:
+            try:
+                log.close()
+            except OSError as error:
+                cleanup_failure = append_cleanup_failure(cleanup_failure, error)
+        raise holder_launch_failure(primary_failure, cleanup_failure) from primary_failure
 
 
 def holder_events(fd, timeout, event_list, *, cancel_event=None, cancel_callback=None):
@@ -1269,31 +1620,53 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, uid, gid,
     if kind not in modes:
         raise SupervisorFailure("LIFECYCLE_FIXTURE_KIND_INVALID")
     mode, cancel_stage = modes[kind]
-    owned, control_write, result_read, log = launch_holder(
-        mode, workspace=workspace, carrier="/", temp_root=temp_root, uid=uid, gid=gid,
-        node="/usr/bin/python3", corepack="/usr/bin/python3", ledger_path=ledger_path, outer_ids=outer_ids,
-    )
+    try:
+        owned, control_write, result_read, log = launch_fixture_holder(
+            launch_holder,
+            mode, workspace=workspace, carrier="/", temp_root=temp_root, uid=uid, gid=gid,
+            node="/usr/bin/python3", corepack="/usr/bin/python3", ledger_path=ledger_path, outer_ids=outer_ids,
+        )
+    except Exception as error:
+        failure = error if isinstance(error, FixtureSetupFailure) else holder_launch_failure(error)
+        emit_to_stdout("FIXTURE_DIAGNOSTIC=" + safe_failure(failure.category) + "\n")
+        raise failure
     holder_nsfd = None
     namespace_number = None
     events = []
     control_closed = False
+    primary_failure = None
+    cleanup_errors = []
 
     def collect(event):
         events.append(event)
         if cancel_stage is not None and event.get("kind") == "stage" and event.get("name") == cancel_stage:
-            os.write(control_write, b"C")
+            try:
+                os.write(control_write, b"C")
+            except OSError as error:
+                raise FixtureSetupFailure("CANCELLATION_STAGE_SETUP_FAILURE", error) from error
 
     try:
-        read_events_and_eof(result_read, 20, collect)
-        failures = [event for event in events if event.get("kind") == "failure"]
-        if failures:
-            raise SupervisorFailure("FIXTURE_HOLDER_FAILURE:" + safe_failure(failures[0].get("reason", "UNKNOWN")))
+        stream_state = "eof"
+        try:
+            read_events_and_eof(result_read, 20, collect)
+        except Exception as error:
+            if isinstance(error, FixtureSetupFailure):
+                raise
+            stream_state = "timeout" if str(error) == "NAMESPACE_HOLDER_RESULT_TIMEOUT" else "invalid"
+            failure = fixture_event_failure(
+                events, outer_ids, stream_state,
+                holder_exit_status=owned.process.poll(), holder_log=log, stream_failure=error,
+            )
+            if failure is None:
+                failure = FixtureSetupFailure("READY_EVENT_INVALID", safe_failure(error))
+            raise failure from error
+        failure = fixture_event_failure(
+            events, outer_ids, stream_state,
+            holder_exit_status=owned.process.poll(), holder_log=log,
+        )
+        if failure is not None:
+            raise failure
         ready = [event for event in events if event.get("kind") == "ready"]
-        barriers = [event for event in events if event.get("kind") == "barrier"]
-        if len(ready) != 1 or len(barriers) != 1 or barriers[0] != {"kind": "barrier", "childrenQuiescent": True, "holderReaped": False, "outerStateRevalidated": False, "complete": False}:
-            raise SupervisorFailure("FIXTURE_HOLDER_BARRIER_INVALID")
-        if ready[0].get("userNamespace") != outer_ids[0]["number"] or ready[0].get("pidNamespace") != outer_ids[1]["number"] or ready[0].get("mountNamespace") == outer_ids[2]["number"]:
-            raise SupervisorFailure("FIXTURE_NAMESPACE_IDENTITY_INVALID")
         namespace_number = ready[0]["mountNamespace"]
         holder_nsfd = os.open(f"/proc/{owned.pid}/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
         if owned.process.poll() is not None:
@@ -1338,40 +1711,69 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, uid, gid,
             emit_to_stdout("CANCELLATION_AFTER_OPT_MOUNT=PASS\n")
         elif kind == "cancel-application":
             emit_to_stdout("CANCELLATION_DURING_APPLICATION=PASS\n")
-    except Exception:
+    except Exception as error:
+        primary_failure = error
+
+    if primary_failure is not None:
         if owned.process.poll() is None:
-            try:
-                os.write(control_write, b"CR")
-            except OSError:
-                pass
+            if not control_closed:
+                try:
+                    os.write(control_write, b"CR")
+                except OSError:
+                    pass
             try:
                 drain_until_eof(result_read, BROKER_TEARDOWN_SECONDS + ROOT_CLEANUP_SECONDS)
-            except SupervisorFailure:
-                pass
+            except Exception as error:
+                cleanup_errors.append(error)
             if owned.process.poll() is None:
                 try:
                     terminate_owned(owned)
-                except SupervisorFailure:
-                    pass
+                except Exception as error:
+                    cleanup_errors.append(error)
         if owned.terminal is None and owned.process.poll() is not None:
-            owned.wait(0)
-        if holder_nsfd is not None:
-            os.close(holder_nsfd)
-            holder_nsfd = None
-        if namespace_number is not None and not namespace_disappeared(namespace_number, NAMESPACE_VERIFY_SECONDS):
-            raise SupervisorFailure("FIXTURE_NAMESPACE_REFERENCE_REMAINS_AFTER_FAILURE")
-        raise
-    finally:
-        if not control_closed:
             try:
-                os.close(control_write)
-            except OSError:
-                pass
+                owned.wait(0)
+            except Exception as error:
+                cleanup_errors.append(error)
+        if holder_nsfd is not None:
+            try:
+                os.close(holder_nsfd)
+            except OSError as error:
+                cleanup_errors.append(error)
+            holder_nsfd = None
+        if namespace_number is not None:
+            try:
+                if not namespace_disappeared(namespace_number, NAMESPACE_VERIFY_SECONDS):
+                    cleanup_errors.append(SupervisorFailure("FIXTURE_NAMESPACE_REFERENCE_REMAINS_AFTER_FAILURE"))
+            except Exception as error:
+                cleanup_errors.append(error)
+
+    if not control_closed:
         try:
-            os.close(result_read)
-        except OSError:
-            pass
+            os.close(control_write)
+        except OSError as error:
+            cleanup_errors.append(error)
+    try:
+        os.close(result_read)
+    except OSError as error:
+        cleanup_errors.append(error)
+    try:
         log.close()
+    except OSError as error:
+        cleanup_errors.append(error)
+
+    cleanup_failure = combined_failure(cleanup_errors)
+    if primary_failure is not None:
+        if cleanup_failure is not None:
+            try:
+                primary_failure.supervisor_cleanup_failure = cleanup_failure
+            except Exception:
+                pass
+        if isinstance(primary_failure, FixtureSetupFailure):
+            emit_to_stdout("FIXTURE_DIAGNOSTIC=" + safe_failure(primary_failure.category) + "\n")
+        raise primary_failure
+    if cleanup_failure is not None:
+        raise FixtureSetupFailure("FIXTURE_CLEANUP_FAILURE", None, cleanup_failure)
 
 
 def run_owned_process_regressions(temp_root, ledger_path):
@@ -1432,6 +1834,7 @@ def prepare_state(temp_root):
 def root_supervise(args):
     if os.geteuid() != 0 or os.getuid() != 0:
         raise SupervisorFailure("OUTER_ROOT_SUPERVISOR_REQUIRED")
+    validate_fixture_diagnostic_controls()
     if not callable(getattr(os, "pidfd_open", None)) or not callable(getattr(signal, "pidfd_send_signal", None)):
         raise SupervisorFailure("PIDFD_UNAVAILABLE")
     probe_pidfd = os.pidfd_open(os.getpid(), 0)
@@ -1486,9 +1889,13 @@ def root_supervise(args):
         )
         holder_namespace = holder.mount_id
         holder_events(result_read, 90 * 60, events, cancel_event=ROOT_CANCEL_EVENT, cancel_callback=cancel_holder)
+        holder_failure = holder_emitted_failure(events)
+        if holder_failure is not None:
+            raise holder_failure
         ready = [event for event in events if event.get("kind") == "stage" and event.get("name") == "NAMESPACE_READY"]
-        barriers = [event for event in events if event.get("kind") == "barrier"]
-        if len(ready) != 1 or len(barriers) != 1 or barriers[0] != {"kind": "barrier", "childrenQuiescent": True, "holderReaped": False, "outerStateRevalidated": False, "complete": False}:
+        barriers = [(index, event) for index, event in enumerate(events) if event.get("kind") == "barrier"]
+        ready_index = next((index for index, event in enumerate(events) if event.get("kind") == "stage" and event.get("name") == "NAMESPACE_READY"), -1)
+        if len(ready) != 1 or len(barriers) != 1 or barriers[0][0] < ready_index or not exact_barrier_event(barriers[0][1]):
             raise SupervisorFailure("NAMESPACE_HOLDER_BARRIER_INVALID")
         if ready[0].get("mountNamespace") != holder_namespace:
             raise SupervisorFailure("NAMESPACE_HOLDER_IDENTITY_CHANGED")
@@ -1563,14 +1970,20 @@ def root_supervise(args):
                     try:
                         terminate_owned(holder)
                     except Exception as terminate_error:
-                        cleanup_error = SupervisorFailure("NAMESPACE_HOLDER_TEARDOWN_FAILED:" + safe_failure(terminate_error))
+                        cleanup_error = append_cleanup_failure(
+                            cleanup_error,
+                            SupervisorFailure("NAMESPACE_HOLDER_TEARDOWN_FAILED:" + safe_failure(terminate_error)),
+                        )
         if holder is not None and holder.terminal is None and holder.process.poll() is not None:
             try:
                 holder.wait(0)
             except Exception as error:
-                cleanup_error = cleanup_error or error
+                cleanup_error = append_cleanup_failure(cleanup_error, error)
         if namespace_fd is not None:
-            os.close(namespace_fd)
+            try:
+                os.close(namespace_fd)
+            except Exception as error:
+                cleanup_error = append_cleanup_failure(cleanup_error, error)
             namespace_fd = None
         if control_write is not None:
             try:
@@ -1583,7 +1996,10 @@ def root_supervise(args):
             except OSError:
                 pass
         if log is not None:
-            log.close()
+            try:
+                log.close()
+            except Exception as error:
+                cleanup_error = append_cleanup_failure(cleanup_error, error)
         try:
             if holder is not None and holder.terminal is None:
                 raise SupervisorFailure("NAMESPACE_HOLDER_TERMINAL_WITNESS_MISSING")
@@ -1611,14 +2027,17 @@ def root_supervise(args):
             if state is not None and state.exists():
                 remove_supervisor_state(state, ledger)
         except Exception as error:
-            cleanup_error = cleanup_error or error
+            cleanup_error = append_cleanup_failure(cleanup_error, error)
         for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
+            try:
+                signal.signal(sig, handler)
+            except Exception as error:
+                cleanup_error = append_cleanup_failure(cleanup_error, error)
+    if operation_error is not None or cleanup_error is not None:
+        report_failure_pair(operation_error, cleanup_error)
     if cleanup_error is not None:
         print("NAMESPACE_SUPERVISOR_STATE_CLEANUP=DEFERRED_UNRESOLVED", file=sys.stderr)
-        if operation_error is not None:
-            raise SupervisorFailure("SUPERVISOR_TEARDOWN_FAILED:" + safe_failure(cleanup_error)) from operation_error
-        raise cleanup_error
+        raise effective_failure(operation_error, cleanup_error)
     if operation_error is not None:
         raise operation_error
 
@@ -1661,7 +2080,18 @@ def holder_entry(args):
     os.environ["S8_ROOT_SUPERVISOR_PID"] = str(args.supervisor_pid)
     # This process entered only the mount namespace; user and PID namespaces
     # are checked against identities received from the root supervisor.
-    return inner_holder(Path(args.workspace), Path(args.carrier), Path(args.temp_root), args.uid, args.gid, args.node, args.corepack, control_fd, result_fd, Path(args.ledger), args.outer_user_ns, args.outer_pid_ns, args.mode)
+    try:
+        return inner_holder(Path(args.workspace), Path(args.carrier), Path(args.temp_root), args.uid, args.gid, args.node, args.corepack, control_fd, result_fd, Path(args.ledger), args.outer_user_ns, args.outer_pid_ns, args.mode)
+    except FixtureSetupFailure as error:
+        if args.mode in {"fixture", "fixture-opt-cancel", "fixture-application-cancel"}:
+            emit_fixture_failure(result_fd, error.category, error.primary_failure, error.cleanup_failure)
+            return 2
+        raise
+    except Exception as error:
+        if args.mode in {"fixture", "fixture-opt-cancel", "fixture-application-cancel"}:
+            emit_fixture_failure(result_fd, "NAMESPACE_SETUP_FAILURE", error)
+            return 2
+        raise
 
 
 def validate_workflow_semantic_readback(readback, payload):
@@ -1816,6 +2246,9 @@ def validate_workflow_semantic_readback_files(payload_path, readback_path):
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--validate-fixture-diagnostics":
+        validate_fixture_diagnostic_controls()
+        return
     if len(sys.argv) == 4 and sys.argv[1] == "--validate-semantic-readback":
         validate_workflow_semantic_readback_files(Path(sys.argv[2]), Path(sys.argv[3]))
         return
