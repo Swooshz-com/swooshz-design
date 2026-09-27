@@ -1092,6 +1092,26 @@ def valid_hosted_protected_harness(deployment, supervisor):
         return False
     dep = {node.name: node for node in deployment_tree.body if isinstance(node, ast.FunctionDef)}
     sup = {node.name: node for node in supervisor_tree.body if isinstance(node, ast.FunctionDef)}
+    def assignment_text(tree, source, name):
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+                return ast.get_source_segment(source, node)
+        return None
+
+    if assignment_text(deployment_tree, deployment, "HOSTED_RUNTIME") != 'HOSTED_RUNTIME = Path("/opt/blender")':
+        return False
+    if assignment_text(deployment_tree, deployment, "HOSTED_WRITER_ROOT") != 'HOSTED_WRITER_ROOT = Path("/opt/swooshz")':
+        return False
+    if assignment_text(supervisor_tree, supervisor, "ROUTE_B_PRODUCT_LEAF_NAMES") != 'ROUTE_B_PRODUCT_LEAF_NAMES = ("blender", "swooshz")':
+        return False
+    absence_assignment = next((
+        node for node in deployment_tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "HOSTED_DEPLOYMENT_ABSENCE_PATHS" for target in node.targets)
+    ), None)
+    absence_source = ast.get_source_segment(deployment, absence_assignment) if absence_assignment is not None else None
+    if absence_source is None or any(token not in absence_source for token in ('Path("/opt/blender")', 'Path("/opt/swooshz")')):
+        return False
     owned_class = next((node for node in supervisor_tree.body if isinstance(node, ast.ClassDef) and node.name == "OwnedProcess"), None)
     if owned_class is None:
         return False
@@ -1130,6 +1150,11 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "hosted_verify_deployment_absent": (
             "HOSTED_DEPLOYMENT_ABSENCE_PATHS", "HOSTED_DEPLOYMENT_RESIDUE_REMAINS",
         ),
+        "hosted_create_directory": (
+            "hosted_protected_state(path) is not None", 'hosted_root("/usr/bin/mkdir"',
+            "hosted_record_directory(temp_root, path)",
+            'hosted_root("/usr/bin/rmdir", "--", str(path)',
+        ),
         "hosted_verify_acl_semantics": (
             '"user:": "rwx"', '"user:" + str(runner_uid): "--x"', '"group:": "---"',
             '"mask:": "--x"', '"other:": "---"',
@@ -1144,10 +1169,18 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "hosted_cleanup": (
             'hosted_root(str(HOSTED_BROKER), "--recover-v1"', "hosted_load_ledger(temp_root)",
             "hosted_verify_private_root_acl(runner_uid)", "HOSTED_NESTED_MOUNT_REFUSED",
+            "for row in reversed(rows):", 'if row["kind"] != "D":',
+            'if str(target) == "/opt/blender":',
+            'hosted_root("/usr/bin/rm", "-rf", "--", str(target)',
+            'hosted_root("/usr/bin/rmdir", "--", str(target)',
+            "HOSTED_DIRECTORY_CLEANUP_IDENTITY_INVALID", "HOSTED_DIRECTORY_REMAINS",
             "hosted_verify_deployment_absent()", "PRODUCTION_DEPLOYMENT_ABSENT=YES",
         ),
         "hosted_deploy": (
             "if any(hosted_protected_state(path) is not None for path in absent):",
+            '"/opt/blender"', '"/opt/swooshz"', "HOSTED_DEPLOYMENT_PATH_NOT_FRESH",
+            "hosted_create_directory(temp_root, HOSTED_RUNTIME, 0o755)",
+            "hosted_create_directory(temp_root, HOSTED_WRITER_ROOT, 0o755)",
             'hosted_run_as_host_user(["/usr/local/bin/cmake", "-S"',
             'hosted_run_as_host_user(["/usr/local/bin/cmake", "--build"',
             'hosted_run_as_host_user(["/usr/local/bin/ctest", "--test-dir"',
@@ -1206,7 +1239,14 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "verify_toolchain": ("validate_toolchain_identity(expected[\"node\"], node_identity)", "validate_toolchain_identity(expected[\"corepack\"], corepack_identity)", "HOSTED_NODE_VERSION_INVALID", "HOSTED_PNPM_VERSION_INVALID", "12.6.0"),
         "validate_toolchain_staging_identity": ("HOSTED_TOOLCHAIN_STAGING_PATH_INVALID", "HOSTED_TOOLCHAIN_STAGING_IDENTITY_CHANGED", "expected_identity != observed_identity"),
         "validate_toolchain_bind": ("HOSTED_TOOLCHAIN_BIND_IDENTITY_MISMATCH", "HOSTED_TOOLCHAIN_BIND_DESTINATION_INVALID", "os.major", "os.minor", "ro", "nosuid", "nodev", "noexec"),
-        "private_opt_mount": ("mount_namespace_private()", "current_outer = opt_snapshot()", "validate_outer_opt_snapshot", "validate_inner_opt_mount", "validate_inner_opt_child", "/usr/bin/mount", "tmpfs", "/opt", "toolchain_identity(node)", "derive_toolchain_plan", "validate_unpreserved_toolchain_missing(node_missing, corepack_missing)", "--bind", "remount,bind,ro,nosuid,nodev", "validate_toolchain_bind", "verify_toolchain(node, corepack, workspace=workspace, expected=", "HOSTED_TOOLCHAIN_PREMOUNT_IDENTITY=PASS", "HOSTED_TOOLCHAIN_STAGING_BIND=PASS", "HOSTED_TOOLCHAIN_NO_PRESERVATION=REPRODUCED_MISSING", "HOSTED_TOOLCHAIN_INNER_BIND=READ_ONLY", "HOSTED_TOOLCHAIN_STAGING_UNMOUNT=PASS", "HOSTED_TOOLCHAIN_IDENTITY_CONTINUITY=PASS", "validate_toolchain_staging_identity(stage_target, staged_identity, post_mount_staging_identity)", "stagingIdentityAfterOverlay=post_mount_staging_identity"),
+        "private_opt_mount": ("mount_namespace_private()", "current_outer = opt_snapshot()", "validate_outer_opt_snapshot", "validate_inner_opt_mount", "/usr/bin/mount", "tmpfs", "/opt", "toolchain_identity(node)", "derive_toolchain_plan", "validate_unpreserved_toolchain_missing(node_missing, corepack_missing)", "--bind", "remount,bind,ro,nosuid,nodev", "validate_toolchain_bind", "verify_toolchain(node, corepack, workspace=workspace, expected=", "HOSTED_TOOLCHAIN_PREMOUNT_IDENTITY=PASS", "HOSTED_TOOLCHAIN_STAGING_BIND=PASS", "HOSTED_TOOLCHAIN_NO_PRESERVATION=REPRODUCED_MISSING", "HOSTED_TOOLCHAIN_INNER_BIND=READ_ONLY", "HOSTED_TOOLCHAIN_STAGING_UNMOUNT=PASS", "HOSTED_TOOLCHAIN_IDENTITY_CONTINUITY=PASS", "validate_toolchain_staging_identity(stage_target, staged_identity, post_mount_staging_identity)", "stagingIdentityAfterOverlay=post_mount_staging_identity", 'inner_identity["defaultAcl"] = default_acl', 'toolchain["innerOptIdentity"] = inner_identity'),
+        "route_b_path_identity": ("Path(path).lstat()", "stat.S_ISLNK", "metadata.st_ino", "metadata.st_dev", "metadata.st_uid", "metadata.st_gid"),
+        "route_b_product_leaf_paths": ("ROUTE_B_PRODUCT_LEAF_NAMES", "root / name"),
+        "validate_trusted_inner_opt_identity": ("ROUTE_B_INNER_OPT_IDENTITY_CHANGED", "defaultAcl", "system.posix_acl_default"),
+        "validate_product_leaf_absence_state": ("file_type is not None or is_mountpoint", "HOSTED_PRODUCT_LEAF_NOT_FRESH"),
+        "validate_product_leaves_absent": ("validate_trusted_inner_opt_identity", "route_b_product_leaf_paths", "route_b_path_identity", "mountinfo_rows", "validate_product_leaf_absence_state"),
+        "validate_product_leaf_identity": ("ROUTE_B_PRODUCT_LEAF_PATH_INVALID", "ROUTE_B_PRODUCT_LEAF_TYPE_INVALID", "ROUTE_B_PRODUCT_LEAF_DEVICE_INVALID", "ROUTE_B_PRODUCT_LEAF_OWNER_INVALID", "ROUTE_B_PRODUCT_LEAF_MODE_INVALID", "ROUTE_B_PRODUCT_LEAF_DEFAULT_ACL_INVALID", "0o755"),
+        "validate_product_leaves_deployed": ("validate_trusted_inner_opt_identity", "ROUTE_B_PRODUCT_LEAF_MOUNTPOINT_INVALID", "ROUTE_B_PRODUCT_LEAF_MISSING", "route_b_path_identity", "acl_state(", "validate_product_leaf_identity"),
         "create_toolchain_stage_root": ("tempfile.mkdtemp(prefix=\"toolchain-stage-\"", "0o700", "HOSTED_TOOLCHAIN_STAGE_PARENT_INVALID"),
         "cleanup_toolchain_stage_root": ("validate_toolchain_namespace_release(namespace_closed)", "HOSTED_TOOLCHAIN_STAGE_MOUNT_REFERENCE_REMAINS", "root.rmdir()"),
         "validate_toolchain_preservation_events": ("PREMOUNT_IDENTITY", "STAGING_BIND", "NO_BIND_NEGATIVE", "INNER_BIND", "STAGING_RELEASED", "CONTINUITY", "HOSTED_TOOLCHAIN_RESOURCE_LEDGER_INVALID", 'inner.get("stagingIdentityAfterOverlay") != staged_identity'),
@@ -1214,7 +1254,8 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "validate_unpreserved_toolchain_missing": ("HOSTED_TOOLCHAIN_NO_PRESERVATION_NEGATIVE_FALSE_GREEN",),
         "create_inner_toolchain_parent_directories": ("HOSTED_TOOLCHAIN_DESTINATION_PARENT_NOT_FRESH", "validate_inner_opt_child", "os.chmod(path, 0o755)"),
         "run_toolchain_preservation_controls": ("HOSTED_TOOLCHAIN_CONTROL_MINIMAL_SUBTREE_SELECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_SOURCE_SUBTREE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_BROAD_OPT_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_UNRELATED_TOOLCACHE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_DESTINATION_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_DIFFERENT_SOURCE_STAGE_PATHS_ACCEPTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_IDENTITY_CONTINUITY_ACCEPTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_DEVICE_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_INODE_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_UID_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_GID_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_MODE_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_STAGING_PATH_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_STAGING_ROLE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_IDENTITY_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_ORIGINAL_SOURCE_OBJECT_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_HASH_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRITABLE_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_RETAINED_NAMESPACE_REFERENCE_BLOCKS_TEARDOWN"),
-        "validate_fixture_diagnostic_controls": ("run_route_b_opt_controls(expect)", "run_toolchain_preservation_controls(expect)"),
+        "run_product_leaf_lifecycle_controls": ("HOSTED_PRODUCT_LEAF_CONTROL_EMPTY_INNER_OPT_ACCEPTED", "HOSTED_PRODUCT_LEAF_CONTROL_BLENDER_PREEXISTING_DIRECTORY_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_SWOOSHZ_PREEXISTING_DIRECTORY_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_FILE_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_SYMLINK_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_BROKEN_SYMLINK_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_SPECIAL_OBJECT_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_OTHER_OBJECT_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_MOUNTPOINT_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEPLOYED_BLENDER_ACCEPTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEPLOYED_SWOOSHZ_ACCEPTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_SYMLINK_DEPLOYMENT_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_DEVICE_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_UID_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_GID_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_MODE_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEFAULT_ACL_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_NONFIXED_PATH_REJECTED"),
+        "validate_fixture_diagnostic_controls": ("run_route_b_opt_controls(expect)", "run_product_leaf_lifecycle_controls(expect)", "run_toolchain_preservation_controls(expect)"),
         "run_fixture": ("validate_toolchain_preservation_events(events, namespace_number, stage_root)", 'namespace_number = ready_event["mountNamespace"]', 'ready_event.get("pid") != owned.pid', 'namespace_identity(owned.pid, "mnt")["number"] != namespace_number', "owned.mount_id = namespace_number", "cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)", "FIXTURE_NAMESPACE_REFERENCE_REMAINS_AFTER_FAILURE"),
         "validate_outer_opt_snapshot": ("OUTER_OPT_DEVICE_CHANGED", "OUTER_OPT_INODE_CHANGED", "OUTER_OPT_UID_CHANGED", "OUTER_OPT_GID_CHANGED", "OUTER_OPT_MODE_CHANGED", "OUTER_OPT_ACCESS_ACL_CHANGED", "OUTER_OPT_DEFAULT_ACL_CHANGED", "OUTER_OPT_MOUNT_VIEW_CHANGED", "OUTER_OPT_CHILDREN_CHANGED"),
         "validate_inner_opt_mount": ("ROUTE_B_OPT_FILESYSTEM_NOT_DISTINCT", "ROUTE_B_OPT_OWNER_INVALID", "ROUTE_B_OPT_MODE_INVALID", "ROUTE_B_OPT_MOUNT_IDENTITY_INVALID", "ROUTE_B_OPT_MOUNT_STATE_INVALID", "ROUTE_B_OPT_DEFAULT_ACL_INVALID"),
@@ -1233,6 +1274,11 @@ def valid_hosted_protected_harness(deployment, supervisor):
     verify_toolchain_body = body(sup, supervisor, "verify_toolchain")
     if (
         private_toolchain_mount is None
+        or '"/opt/blender"' in private_toolchain_mount
+        or '"/opt/swooshz"' in private_toolchain_mount
+        or "'blender'" in private_toolchain_mount
+        or "'swooshz'" in private_toolchain_mount
+        or "product_leaf" in private_toolchain_mount.lower()
         or private_toolchain_mount.count("remount,bind,ro,nosuid,nodev") != 2
         or private_toolchain_mount.count("validate_toolchain_bind(") != 2
         or verify_toolchain_body is None
@@ -1248,7 +1294,7 @@ def valid_hosted_protected_harness(deployment, supervisor):
         return False
     inner = body(sup, supervisor, "inner_holder")
     inner_order = (
-        '"--make-rprivate"', "private_opt_mount(outer_opt_reference, ledger_path", '"deploy", cancel_event=cancel_event)', "run_sudo_matrix(",
+        '"--make-rprivate"', "private_opt_mount(outer_opt_reference, ledger_path", 'validate_product_leaves_absent(Path("/opt"), inner_opt_identity)', '"deploy", cancel_event=cancel_event)', 'validate_product_leaves_deployed(Path("/opt"), inner_opt_identity)', "run_sudo_matrix(",
         "application_proof(", "active_before_recovery", "if active_before_recovery:", "UNKNOWN_NAMESPACE_PROCESS_REMAINS_BEFORE_RECOVERY",
         '"cleanup", cancel_event=threading.Event())',
     )
@@ -1444,6 +1490,7 @@ if not hosted_binding_accepts(positive_control):
 print("APPLICATION_BOUNDARY_HELPER_BYTES=PASS")
 print("APPLICATION_WORKER_BROKER_HQ_BINDING=PASS")
 print("HOSTED_POLICY_ROOT_BINDING=PASS")
+print("HOSTED_PRODUCT_LEAF_LIFECYCLE_STATIC_BINDING=PASS")
 
 def mutate_control(index, value):
     candidate = list(positive_control)
@@ -1533,6 +1580,13 @@ negative_controls = {
     "NO_HOSTED_CLEANUP_WITNESS": mutate_control(0, "\n".join(line for line in workflow_source.splitlines() if "ROUTE_B_BROKER_CLEANUP=" not in line)),
     "PRIVATE_ROOT_PARTIAL_SETUP_ROLLBACK_REMOVED": mutate_control(1, replace_once(deployment_source, "hosted_remove_incomplete_private_root(before)", "pass")),
     "CLEANUP_FIXED_PATH_ABSENCE_CHECK_REMOVED": mutate_control(1, replace_once(deployment_source, "hosted_verify_deployment_absent()", "pass")),
+    "DEPLOYMENT_LEAF_FRESHNESS_GATE_REMOVED": mutate_control(1, replace_once(deployment_source, 'raise HostedDeploymentFailure("HOSTED_DEPLOYMENT_PATH_NOT_FRESH")', 'raise HostedDeploymentFailure("HOSTED_DEPLOYMENT_PATH_FRESHNESS_DISABLED")')),
+    "DEPLOYMENT_PRODUCT_LEAF_ABSENCE_PATH_REMOVED": mutate_control(1, replace_once(deployment_source, 'Path("/opt/blender"),', 'Path("/opt/blender-disabled"),')),
+    "DEPLOYMENT_PRODUCT_RUNTIME_PATH_DRIFT": mutate_control(1, replace_once(deployment_source, 'HOSTED_RUNTIME = Path("/opt/blender")', 'HOSTED_RUNTIME = Path("/opt/blender-disabled")')),
+    "DEPLOYMENT_PRODUCT_WRITER_PATH_DRIFT": mutate_control(1, replace_once(deployment_source, 'HOSTED_WRITER_ROOT = Path("/opt/swooshz")', 'HOSTED_WRITER_ROOT = Path("/opt/swooshz-disabled")')),
+    "DEPLOYMENT_PRODUCT_LEAF_LEDGER_OWNERSHIP_REMOVED": mutate_control(1, replace_once(deployment_source, 'hosted_create_directory(temp_root, HOSTED_RUNTIME, 0o755)', 'hosted_create_directory(temp_root, HOSTED_RUNTIME, 0o755, record=False)')),
+    "DEPLOYMENT_PRODUCT_RUNTIME_CLEANUP_REMOVED": mutate_control(1, replace_once(deployment_source, 'hosted_root("/usr/bin/rm", "-rf", "--", str(target), label="HOSTED_RUNTIME_CLEANUP_FAILED")', "pass")),
+    "DEPLOYMENT_PRODUCT_WRITER_CLEANUP_REMOVED": mutate_control(1, replace_once(deployment_source, 'hosted_root("/usr/bin/rmdir", "--", str(target), label="HOSTED_DIRECTORY_CLEANUP_FAILED")', "pass")),
     "SUDOERS_NO_NOPASSWD": mutate_control(3, replace_once(sudoers_source, "NOPASSWD:", "PASSWD:")),
     "SUDOERS_NO_NOSETENV": mutate_control(3, replace_once(sudoers_source, "NOPASSWD: NOSETENV:", "NOPASSWD:")),
     "SUDOERS_NO_STAY_SETUID": mutate_control(3, replace_once(sudoers_source, "stay_setuid,", "")),
@@ -1549,6 +1603,8 @@ negative_controls = {
     "NO_APP_UID_ENV_PROOF": mutate_control(2, replace_once(supervisor_source, 'variables != [b"PWD=/work"]', "False")),
     "NO_OUTER_OPT_REVALIDATION": mutate_control(2, supervisor_source.replace("current_host_ids() != outer_ids or opt_snapshot() != outer_opt", "False")),
     "TOOLCHAIN_MINIMAL_SUBTREE_BINDING_REMOVED": mutate_control(2, replace_once(supervisor_source, "os.path.commonpath((str(node_path), str(corepack_path)))", "os.path.dirname(str(node_path))")),
+    "PRIVATE_OPT_PRODUCT_LEAF_PRECREATION": mutate_control(2, replace_once(supervisor_source, '    toolchain = verify_toolchain(node, corepack, workspace=workspace, expected={"node": node_identity, "corepack": corepack_identity})', '    toolchain = verify_toolchain(node, corepack, workspace=workspace, expected={"node": node_identity, "corepack": corepack_identity})\n    Path("/opt/blender").mkdir(mode=0o755)')),
+    "PRODUCT_LEAF_NAME_BINDING_DRIFT": mutate_control(2, replace_once(supervisor_source, 'ROUTE_B_PRODUCT_LEAF_NAMES = ("blender", "swooshz")', 'ROUTE_B_PRODUCT_LEAF_NAMES = ("blender", "swooshz-extra")')),
     "TOOLCHAIN_READONLY_BIND_REMOVED": mutate_control(2, replace_once(supervisor_source, "remount,bind,ro,nosuid,nodev", "remount,bind,rw,nosuid,nodev")),
     "TOOLCHAIN_EXECUTABLE_IDENTITY_BINDING_REMOVED": mutate_control(2, replace_once(supervisor_source, "validate_toolchain_identity(node_identity, toolchain_identity(node))", "pass")),
     "TOOLCHAIN_NO_BIND_REGRESSION_REMOVED": mutate_control(2, replace_once(supervisor_source, "validate_unpreserved_toolchain_missing(node_missing, corepack_missing)", "pass")),

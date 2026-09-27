@@ -31,6 +31,7 @@ HOSTED_LAUNCHER = "/usr/local/libexec/swooshz-s8/s8-sandbox"
 HOSTED_PRIVATE_ROOT = "/var/lib/swooshz/s8"
 HOSTED_SUDOERS = "/etc/sudoers.d/swooshz-s8-broker"
 HOSTED_NODE_TOOLCACHE_ROOT = Path("/opt/hostedtoolcache/node")
+ROUTE_B_PRODUCT_LEAF_NAMES = ("blender", "swooshz")
 APP_PROOF_RELATIVE = "scripts/s8/s8_application_boundary_proof.mts"
 APP_HELPER_RELATIVE = "scripts/s8/s8_application_boundary_proof.sh"
 APP_PROOF_BYTES = 8966
@@ -861,6 +862,116 @@ def validate_inner_opt_child(identity, inner_device, default_acl):
     return True
 
 
+def route_b_path_identity(path):
+    metadata = Path(path).lstat()
+    if stat.S_ISLNK(metadata.st_mode):
+        file_type = "symlink"
+    elif stat.S_ISDIR(metadata.st_mode):
+        file_type = "directory"
+    elif stat.S_ISREG(metadata.st_mode):
+        file_type = "file"
+    elif stat.S_ISFIFO(metadata.st_mode):
+        file_type = "fifo"
+    else:
+        file_type = "other"
+    return {
+        "fileType": file_type,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def route_b_product_leaf_paths(inner_root):
+    root = Path(inner_root)
+    if not root.is_absolute() or root == Path("/"):
+        raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_ROOT_INVALID")
+    return tuple(root / name for name in ROUTE_B_PRODUCT_LEAF_NAMES)
+
+
+def validate_trusted_inner_opt_identity(inner_root, expected_identity):
+    current = route_b_path_identity(inner_root)
+    identity_fields = ("fileType", "device", "inode", "uid", "gid", "mode")
+    if any(current[field] != expected_identity.get(field) for field in identity_fields):
+        raise SupervisorFailure("ROUTE_B_INNER_OPT_IDENTITY_CHANGED")
+    default_acl = acl_state(
+        Path(inner_root), "system.posix_acl_default",
+        failure_category="ROUTE_B_OPT_ACL_STATE_UNREADABLE",
+    )
+    if default_acl is not None or expected_identity.get("defaultAcl") is not None:
+        raise SupervisorFailure("ROUTE_B_OPT_DEFAULT_ACL_INVALID")
+    return True
+
+
+def validate_product_leaf_absence_state(path, file_type, is_mountpoint):
+    if file_type is not None or is_mountpoint:
+        raise SupervisorFailure("HOSTED_PRODUCT_LEAF_NOT_FRESH:" + str(path))
+    return True
+
+
+def validate_product_leaves_absent(inner_root, expected_inner_identity, *, mounted_paths=None):
+    root = Path(inner_root)
+    validate_trusted_inner_opt_identity(root, expected_inner_identity)
+    mountpoints = (
+        {row["mountpoint"] for row in mountinfo_rows()}
+        if mounted_paths is None else set(mounted_paths)
+    )
+    for path in route_b_product_leaf_paths(root):
+        try:
+            identity = route_b_path_identity(path)
+        except FileNotFoundError:
+            file_type = None
+        except OSError as error:
+            raise SupervisorFailure("HOSTED_PRODUCT_LEAF_STATE_UNREADABLE:" + str(path)) from error
+        else:
+            file_type = identity["fileType"]
+        validate_product_leaf_absence_state(path, file_type, str(path) in mountpoints)
+    return True
+
+
+def validate_product_leaf_identity(path, inner_root, expected_inner_identity, identity, default_acl):
+    leaf_path = Path(path)
+    if leaf_path not in route_b_product_leaf_paths(inner_root):
+        raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_PATH_INVALID")
+    if identity.get("fileType") != "directory":
+        raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_TYPE_INVALID")
+    if identity.get("device") != expected_inner_identity.get("device"):
+        raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_DEVICE_INVALID")
+    if (identity.get("uid"), identity.get("gid")) != (0, 0):
+        raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_OWNER_INVALID")
+    if identity.get("mode") != 0o755:
+        raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_MODE_INVALID")
+    if default_acl is not None:
+        raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_DEFAULT_ACL_INVALID")
+    return True
+
+
+def validate_product_leaves_deployed(inner_root, expected_inner_identity, *, mounted_paths=None):
+    root = Path(inner_root)
+    validate_trusted_inner_opt_identity(root, expected_inner_identity)
+    mountpoints = (
+        {row["mountpoint"] for row in mountinfo_rows()}
+        if mounted_paths is None else set(mounted_paths)
+    )
+    for path in route_b_product_leaf_paths(root):
+        if str(path) in mountpoints:
+            raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_MOUNTPOINT_INVALID")
+        try:
+            identity = route_b_path_identity(path)
+        except FileNotFoundError as error:
+            raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_MISSING") from error
+        except OSError as error:
+            raise SupervisorFailure("ROUTE_B_PRODUCT_LEAF_STATE_UNREADABLE") from error
+        default_acl = acl_state(
+            path, "system.posix_acl_default",
+            failure_category="ROUTE_B_PRODUCT_LEAF_ACL_STATE_UNREADABLE",
+        )
+        validate_product_leaf_identity(path, root, expected_inner_identity, identity, default_acl)
+    return True
+
+
 def create_toolchain_stage_root(temp_root):
     state_dir = Path(temp_root) / ".namespace-state"
     metadata = state_dir.lstat()
@@ -1532,16 +1643,10 @@ def private_opt_mount(outer_opt_reference, ledger_path, mount_id, node, corepack
 
     supervised_command(["/usr/bin/mount", "-t", "tmpfs", "-o", "size=4G,mode=0755,nosuid,nodev", "tmpfs", "/opt"], label="ROUTE_B_OPT_MOUNT_FAILED", timeout=20)
     inner_path = Path("/opt")
-    metadata = inner_path.lstat()
     rows = [row for row in mountinfo_rows() if row["mountpoint"] == "/opt"]
     default_acl = acl_state(inner_path, "system.posix_acl_default", failure_category="ROUTE_B_OPT_ACL_STATE_UNREADABLE")
-    inner_identity = {
-        "fileType": "directory" if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode) else "other",
-        "device": metadata.st_dev,
-        "uid": metadata.st_uid,
-        "gid": metadata.st_gid,
-        "mode": stat.S_IMODE(metadata.st_mode),
-    }
+    inner_identity = route_b_path_identity(inner_path)
+    inner_identity["defaultAcl"] = default_acl
     validate_inner_opt_mount(inner_identity, outer_device, rows, default_acl)
 
     missing = []
@@ -1581,22 +1686,7 @@ def private_opt_mount(outer_opt_reference, ledger_path, mount_id, node, corepack
     toolchain = verify_toolchain(node, corepack, workspace=workspace, expected={"node": node_identity, "corepack": corepack_identity})
     emit(result_fd, "toolchainPreservation", phase="CONTINUITY", mountNamespace=mount_id, node=toolchain["node"], corepack=toolchain["corepack"], nodeVersion=toolchain["nodeVersion"], pnpmVersion=toolchain["pnpmVersion"])
     emit_to_stdout("HOSTED_TOOLCHAIN_IDENTITY_CONTINUITY=PASS\nHOSTED_TOOLCHAIN_CONTINUITY=PASS\nHOSTED_TOOLCACHE_PRODUCT_AUTHORITY=ABSENT\n")
-
-    Path("/opt/blender").mkdir(mode=0o755)
-    Path("/opt/swooshz").mkdir(mode=0o755)
-    for path in (Path("/opt/blender"), Path("/opt/swooshz")):
-        os.chown(path, 0, 0)
-        os.chmod(path, 0o755)
-        child = path.lstat()
-        child_default_acl = acl_state(path, "system.posix_acl_default", failure_category="ROUTE_B_OPT_ACL_STATE_UNREADABLE")
-        child_identity = {
-            "fileType": "directory" if stat.S_ISDIR(child.st_mode) and not stat.S_ISLNK(child.st_mode) else "other",
-            "device": child.st_dev,
-            "uid": child.st_uid,
-            "gid": child.st_gid,
-            "mode": stat.S_IMODE(child.st_mode),
-        }
-        validate_inner_opt_child(child_identity, metadata.st_dev, child_default_acl)
+    toolchain["innerOptIdentity"] = inner_identity
     emit_to_stdout("ROUTE_B_INNER_OPT=ROOT_ROOT_0755\nROUTE_B_OPT_FILESYSTEM=DISTINCT_TMPFS\n")
     return toolchain
 
@@ -1751,9 +1841,14 @@ def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, contro
         require_not_cancelled(cancel_event, "AFTER_TOOLCHAIN")
         create_namespace_sudoers(temp_root, ledger_path, mount_ns["number"])
         require_not_cancelled(cancel_event, "BEFORE_BROKER_DEPLOYMENT")
+        inner_opt_identity = toolchain["innerOptIdentity"]
+        validate_product_leaves_absent(Path("/opt"), inner_opt_identity)
+        emit_to_stdout("HOSTED_PRODUCT_LEAVES_ABSENT_BEFORE_DEPLOY=YES\n")
         deployment_attempted = True
         emit(result_fd, "stage", name="BROKER_DEPLOYMENT_ATTEMPTED")
         deployment_output = run_hosted_contract(workspace, carrier, temp_root, uid, gid, ledger_path, mount_ns["number"], "deploy", cancel_event=cancel_event)
+        validate_product_leaves_deployed(Path("/opt"), inner_opt_identity)
+        emit_to_stdout("ROUTE_B_PRODUCT_LEAF_DEPLOYMENT_IDENTITY=PASS\n")
         policy_h = parse_one(deployment_output, "HOSTED_POLICY_H")
         config_q = parse_one(deployment_output, "HOSTED_CONFIG_Q")
         emit(result_fd, "stage", name="DEPLOYED", policyH=policy_h, configQ=config_q)
@@ -2163,6 +2258,98 @@ def run_route_b_opt_controls(expect):
     )
 
 
+def run_product_leaf_lifecycle_controls(expect):
+    def expect_failure(operation, reason, marker):
+        try:
+            operation()
+        except SupervisorFailure as error:
+            expect(str(error) == reason, marker)
+        else:
+            expect(False, marker)
+
+    with tempfile.TemporaryDirectory(prefix="s8-product-leaf-control-") as temp_dir:
+        inner_root = Path(temp_dir) / "opt"
+        inner_root.mkdir(mode=0o755)
+        os.chmod(inner_root, 0o755)
+        inner_identity = route_b_path_identity(inner_root)
+        inner_identity["defaultAcl"] = None
+        expect(
+            validate_product_leaves_absent(inner_root, inner_identity, mounted_paths=set()),
+            "HOSTED_PRODUCT_LEAF_CONTROL_EMPTY_INNER_OPT_ACCEPTED",
+        )
+
+        for name, marker in (
+            ("blender", "HOSTED_PRODUCT_LEAF_CONTROL_BLENDER_PREEXISTING_DIRECTORY_REJECTED"),
+            ("swooshz", "HOSTED_PRODUCT_LEAF_CONTROL_SWOOSHZ_PREEXISTING_DIRECTORY_REJECTED"),
+        ):
+            path = inner_root / name
+            path.mkdir(mode=0o755)
+            expect_failure(
+                lambda path=path: validate_product_leaves_absent(inner_root, inner_identity, mounted_paths=set()),
+                "HOSTED_PRODUCT_LEAF_NOT_FRESH:" + str(path),
+                marker,
+            )
+            path.rmdir()
+
+        for name, file_type, marker in (
+            ("blender", "file", "HOSTED_PRODUCT_LEAF_CONTROL_FILE_REJECTED"),
+            ("blender", "symlink", "HOSTED_PRODUCT_LEAF_CONTROL_SYMLINK_REJECTED"),
+            ("swooshz", "symlink", "HOSTED_PRODUCT_LEAF_CONTROL_BROKEN_SYMLINK_REJECTED"),
+            ("swooshz", "fifo", "HOSTED_PRODUCT_LEAF_CONTROL_SPECIAL_OBJECT_REJECTED"),
+            ("swooshz", "other", "HOSTED_PRODUCT_LEAF_CONTROL_OTHER_OBJECT_REJECTED"),
+        ):
+            path = inner_root / name
+            expect_failure(
+                lambda path=path, file_type=file_type: validate_product_leaf_absence_state(path, file_type, False),
+                "HOSTED_PRODUCT_LEAF_NOT_FRESH:" + str(path),
+                marker,
+            )
+
+        mounted_leaf = inner_root / "blender"
+        expect_failure(
+            lambda: validate_product_leaves_absent(inner_root, inner_identity, mounted_paths={str(mounted_leaf)}),
+            "HOSTED_PRODUCT_LEAF_NOT_FRESH:" + str(mounted_leaf),
+            "HOSTED_PRODUCT_LEAF_CONTROL_MOUNTPOINT_REJECTED",
+        )
+
+        for name, marker in (
+            ("blender", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEPLOYED_BLENDER_ACCEPTED"),
+            ("swooshz", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEPLOYED_SWOOSHZ_ACCEPTED"),
+        ):
+            path = inner_root / name
+            deployed_identity = {
+                "fileType": "directory", "device": inner_identity["device"], "inode": 10,
+                "uid": 0, "gid": 0, "mode": 0o755,
+            }
+            expect(
+                validate_product_leaf_identity(path, inner_root, inner_identity, deployed_identity, None),
+                marker,
+            )
+        for field, value, reason, marker in (
+            ("fileType", "symlink", "ROUTE_B_PRODUCT_LEAF_TYPE_INVALID", "ROUTE_B_PRODUCT_LEAF_CONTROL_SYMLINK_DEPLOYMENT_REJECTED"),
+            ("device", inner_identity["device"] + 1, "ROUTE_B_PRODUCT_LEAF_DEVICE_INVALID", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_DEVICE_REJECTED"),
+            ("uid", 1, "ROUTE_B_PRODUCT_LEAF_OWNER_INVALID", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_UID_REJECTED"),
+            ("gid", 1, "ROUTE_B_PRODUCT_LEAF_OWNER_INVALID", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_GID_REJECTED"),
+            ("mode", 0o775, "ROUTE_B_PRODUCT_LEAF_MODE_INVALID", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_MODE_REJECTED"),
+        ):
+            changed = dict(deployed_identity, **{field: value})
+            expect_failure(
+                lambda changed=changed: validate_product_leaf_identity(inner_root / "blender", inner_root, inner_identity, changed, None),
+                reason,
+                marker,
+            )
+        expect_failure(
+            lambda: validate_product_leaf_identity(inner_root / "blender", inner_root, inner_identity, deployed_identity, "010203"),
+            "ROUTE_B_PRODUCT_LEAF_DEFAULT_ACL_INVALID",
+            "ROUTE_B_PRODUCT_LEAF_CONTROL_DEFAULT_ACL_REJECTED",
+        )
+        expect_failure(
+            lambda: validate_product_leaf_identity(inner_root / "other", inner_root, inner_identity, deployed_identity, None),
+            "ROUTE_B_PRODUCT_LEAF_PATH_INVALID",
+            "ROUTE_B_PRODUCT_LEAF_CONTROL_NONFIXED_PATH_REJECTED",
+        )
+
+
 def run_toolchain_preservation_controls(expect):
     def expect_failure(operation, reason, marker):
         try:
@@ -2298,6 +2485,7 @@ def validate_fixture_diagnostic_controls():
         emit_to_stdout(marker + "=PASS\n")
 
     run_route_b_opt_controls(expect)
+    run_product_leaf_lifecycle_controls(expect)
     run_toolchain_preservation_controls(expect)
 
     def fail_before_launch():
