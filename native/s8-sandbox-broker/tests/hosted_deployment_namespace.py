@@ -2486,7 +2486,6 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt
         emit_to_stdout("FIXTURE_DIAGNOSTIC=" + safe_failure(failure.category) + "\n")
         raise failure
     holder_nsfd = None
-    namespace_number = None
     events = []
     control_closed = False
     stage_cleanup_attempted = False
