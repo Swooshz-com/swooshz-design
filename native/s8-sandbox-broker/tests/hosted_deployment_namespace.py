@@ -481,6 +481,20 @@ def toolchain_directory_identity(path):
     }
 
 
+def validate_toolchain_staging_identity(stage_path, expected_identity, observed_identity):
+    expected_path = str(Path(stage_path))
+    if (
+        not isinstance(expected_identity, dict)
+        or not isinstance(observed_identity, dict)
+        or expected_identity.get("path") != expected_path
+        or observed_identity.get("path") != expected_path
+    ):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_PATH_INVALID")
+    if expected_identity != observed_identity:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_IDENTITY_CHANGED")
+    return True
+
+
 def validate_toolchain_bind(plan, source_identity, target_identity, mount_rows, *, destination=None):
     expected_destination = Path(plan["destination"])
     actual_destination = expected_destination if destination is None else Path(destination)
@@ -977,6 +991,8 @@ def validate_toolchain_preservation_events(events, namespace_number, stage_root)
         raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_BIND_FLAGS_INVALID")
     if negative.get("nodeMissing") is not True or negative.get("corepackMissing") is not True:
         raise SupervisorFailure("HOSTED_TOOLCHAIN_NO_PRESERVATION_CONTROL_MISSING")
+    if inner.get("stagingPath") != str(expected_stage) or inner.get("stagingIdentityAfterOverlay") != staged_identity:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_IDENTITY_CONTINUITY_INVALID")
     destination_identity = inner.get("destinationIdentity", {})
     if inner.get("destination") != plan["destination"] or inner.get("sourceIdentity") != source_identity or any(source_identity.get(field) != destination_identity.get(field) for field in ("device", "inode", "uid", "gid", "mode")):
         raise SupervisorFailure("HOSTED_TOOLCHAIN_INNER_RESOURCE_INVALID")
@@ -1528,9 +1544,9 @@ def private_opt_mount(outer_opt_reference, ledger_path, mount_id, node, corepack
     emit(result_fd, "toolchainPreservation", phase="NO_BIND_NEGATIVE", mountNamespace=mount_id, nodeMissing=node_missing, corepackMissing=corepack_missing)
     emit_to_stdout("HOSTED_TOOLCHAIN_NO_PRESERVATION=REPRODUCED_MISSING\n")
 
+    post_mount_staging_identity = toolchain_directory_identity(stage_target)
+    validate_toolchain_staging_identity(stage_target, staged_identity, post_mount_staging_identity)
     destination = create_inner_toolchain_parent_directories(plan["destination"])
-    if toolchain_directory_identity(stage_target) != source_identity:
-        raise SupervisorFailure("HOSTED_TOOLCHAIN_SOURCE_IDENTITY_CHANGED")
     supervised_command(["/usr/bin/mount", "--bind", str(stage_target), str(destination)], label="HOSTED_TOOLCHAIN_INNER_BIND_FAILED", timeout=20)
     supervised_command(["/usr/bin/mount", "-o", "remount,bind,ro,nosuid,nodev", str(destination)], label="HOSTED_TOOLCHAIN_INNER_READONLY_FAILED", timeout=20)
     destination_identity = toolchain_directory_identity(destination)
@@ -1540,7 +1556,7 @@ def private_opt_mount(outer_opt_reference, ledger_path, mount_id, node, corepack
     destination_evidence = toolchain_bind_evidence(destination_row)
     if not all(destination_evidence[key] for key in ("readOnly", "executable", "nosuid", "nodev")):
         raise SupervisorFailure("HOSTED_TOOLCHAIN_INNER_BIND_FLAGS_INVALID")
-    emit(result_fd, "toolchainPreservation", phase="INNER_BIND", mountNamespace=mount_id, destination=str(destination), sourceIdentity=source_identity, destinationIdentity=destination_identity, mount=destination_evidence)
+    emit(result_fd, "toolchainPreservation", phase="INNER_BIND", mountNamespace=mount_id, destination=str(destination), stagingPath=str(stage_target), stagingIdentityAfterOverlay=post_mount_staging_identity, sourceIdentity=source_identity, destinationIdentity=destination_identity, mount=destination_evidence)
     emit_to_stdout("HOSTED_TOOLCHAIN_INNER_BIND=READ_ONLY\n")
 
     supervised_command(["/usr/bin/umount", "--", str(stage_target)], label="HOSTED_TOOLCHAIN_STAGING_UNMOUNT_FAILED", timeout=20)
@@ -2163,6 +2179,39 @@ def run_toolchain_preservation_controls(expect):
         "device": f"{os.major(2049)}:{os.minor(2049)}", "mountOptions": ["ro", "nosuid", "nodev", "relatime"],
     }
     expect(validate_toolchain_bind(target_plan, source_identity, target_identity, [mount]), "HOSTED_TOOLCHAIN_CONTROL_READONLY_EXECUTABLE_BIND_ACCEPTED")
+    expect(
+        source_identity["path"] != target_identity["path"]
+        and validate_toolchain_bind(target_plan, source_identity, target_identity, [mount]),
+        "HOSTED_TOOLCHAIN_CONTROL_DIFFERENT_SOURCE_STAGE_PATHS_ACCEPTED",
+    )
+    expect(
+        validate_toolchain_staging_identity(target_identity["path"], target_identity, dict(target_identity)),
+        "HOSTED_TOOLCHAIN_CONTROL_STAGING_IDENTITY_CONTINUITY_ACCEPTED",
+    )
+    for field, marker in (
+        ("device", "HOSTED_TOOLCHAIN_CONTROL_STAGING_DEVICE_CHANGE_REJECTED"),
+        ("inode", "HOSTED_TOOLCHAIN_CONTROL_STAGING_INODE_CHANGE_REJECTED"),
+        ("uid", "HOSTED_TOOLCHAIN_CONTROL_STAGING_UID_CHANGE_REJECTED"),
+        ("gid", "HOSTED_TOOLCHAIN_CONTROL_STAGING_GID_CHANGE_REJECTED"),
+        ("mode", "HOSTED_TOOLCHAIN_CONTROL_STAGING_MODE_CHANGE_REJECTED"),
+    ):
+        changed_post_mount_identity = dict(target_identity, **{field: target_identity[field] ^ 1})
+        expect_failure(
+            lambda: validate_toolchain_staging_identity(target_identity["path"], target_identity, changed_post_mount_identity),
+            "HOSTED_TOOLCHAIN_STAGING_IDENTITY_CHANGED",
+            marker,
+        )
+    expect_failure(
+        lambda: validate_toolchain_staging_identity(source_identity["path"], target_identity, target_identity),
+        "HOSTED_TOOLCHAIN_STAGING_PATH_INVALID",
+        "HOSTED_TOOLCHAIN_CONTROL_WRONG_STAGING_PATH_REJECTED",
+    )
+    wrong_stage_role = dict(target_identity, path=source_identity["path"])
+    expect_failure(
+        lambda: validate_toolchain_staging_identity(target_identity["path"], target_identity, wrong_stage_role),
+        "HOSTED_TOOLCHAIN_STAGING_PATH_INVALID",
+        "HOSTED_TOOLCHAIN_CONTROL_WRONG_STAGING_ROLE_REJECTED",
+    )
     expect_failure(
         lambda: derive_toolchain_plan(node, corepack, source="/opt/hostedtoolcache"),
         "HOSTED_TOOLCHAIN_SOURCE_NOT_MINIMAL",
@@ -2189,6 +2238,12 @@ def run_toolchain_preservation_controls(expect):
         lambda: validate_toolchain_bind(target_plan, source_identity, changed_target, [mount]),
         "HOSTED_TOOLCHAIN_BIND_IDENTITY_MISMATCH",
         "HOSTED_TOOLCHAIN_CONTROL_SOURCE_IDENTITY_CHANGE_REJECTED",
+    )
+    changed_source = dict(source_identity, inode=21)
+    expect_failure(
+        lambda: validate_toolchain_bind(target_plan, changed_source, target_identity, [mount]),
+        "HOSTED_TOOLCHAIN_BIND_IDENTITY_MISMATCH",
+        "HOSTED_TOOLCHAIN_CONTROL_WRONG_ORIGINAL_SOURCE_OBJECT_REJECTED",
     )
     changed_node = dict(node, sha256="c" * 64)
     expect_failure(
