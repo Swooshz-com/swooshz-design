@@ -30,6 +30,7 @@ HOSTED_BROKER = "/usr/local/libexec/swooshz-s8/s8-sandbox-broker"
 HOSTED_LAUNCHER = "/usr/local/libexec/swooshz-s8/s8-sandbox"
 HOSTED_PRIVATE_ROOT = "/var/lib/swooshz/s8"
 HOSTED_SUDOERS = "/etc/sudoers.d/swooshz-s8-broker"
+HOSTED_NODE_TOOLCACHE_ROOT = Path("/opt/hostedtoolcache/node")
 APP_PROOF_RELATIVE = "scripts/s8/s8_application_boundary_proof.mts"
 APP_HELPER_RELATIVE = "scripts/s8/s8_application_boundary_proof.sh"
 APP_PROOF_BYTES = 9086
@@ -403,24 +404,139 @@ def toolchain_identity(path):
     return {"requested": str(requested), "resolved": str(resolved), "device": metadata.st_dev, "inode": metadata.st_ino, "mode": stat.S_IMODE(metadata.st_mode), "size": metadata.st_size, "sha256": sha256_file(resolved)}
 
 
+def validate_toolchain_identity(expected, actual):
+    required = {"requested", "resolved", "device", "inode", "mode", "size", "sha256"}
+    if not isinstance(expected, dict) or not isinstance(actual, dict) or set(expected) != required or set(actual) != required:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_IDENTITY_INVALID")
+    if any(type(value[field]) is not int or value[field] < 0 for value in (expected, actual) for field in ("device", "inode", "mode", "size")):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_IDENTITY_INVALID")
+    if any(not isinstance(value[field], str) for value in (expected, actual) for field in ("requested", "resolved")):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_IDENTITY_INVALID")
+    if any(not re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) for value in (expected, actual)):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_IDENTITY_INVALID")
+    if expected != actual:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_IDENTITY_CHANGED")
+    return True
+
+
+def hosted_node_toolcache_installation(path):
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_PATH_NOT_ABSOLUTE")
+    try:
+        parts = resolved.relative_to(HOSTED_NODE_TOOLCACHE_ROOT).parts
+    except ValueError as error:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_SOURCE_OUTSIDE_NODE_TOOLCACHE") from error
+    if len(parts) < 4 or not re.fullmatch(r"22\.[0-9]+\.[0-9]+", parts[0]) or parts[1] != "x64":
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_NODE_INSTALLATION_INVALID")
+    return HOSTED_NODE_TOOLCACHE_ROOT / parts[0] / parts[1]
+
+
+def derive_toolchain_plan(node_identity, corepack_identity, *, source=None, destination=None):
+    try:
+        node_path = Path(node_identity["resolved"])
+        corepack_path = Path(corepack_identity["resolved"])
+    except (KeyError, TypeError) as error:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_IDENTITY_INVALID") from error
+    node_installation = hosted_node_toolcache_installation(node_path)
+    corepack_installation = hosted_node_toolcache_installation(corepack_path)
+    if node_installation != corepack_installation:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_INSTALLATION_MISMATCH")
+    try:
+        minimal_source = Path(os.path.commonpath((str(node_path), str(corepack_path))))
+    except ValueError as error:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_SOURCE_INVALID") from error
+    if not minimal_source.is_absolute() or minimal_source == Path("/opt"):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_SOURCE_TOO_BROAD")
+    try:
+        minimal_source.relative_to(node_installation)
+    except ValueError as error:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_SOURCE_OUTSIDE_NODE_INSTALLATION") from error
+    selected_source = minimal_source if source is None else Path(source)
+    if selected_source != minimal_source:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_SOURCE_NOT_MINIMAL")
+    selected_destination = minimal_source if destination is None else Path(destination)
+    if selected_destination != minimal_source:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_DESTINATION_INVALID")
+    return {
+        "installation": str(node_installation),
+        "source": str(minimal_source),
+        "destination": str(minimal_source),
+        "node": node_identity,
+        "corepack": corepack_identity,
+    }
+
+
+def toolchain_directory_identity(path):
+    target = Path(path)
+    try:
+        metadata = target.lstat()
+    except OSError as error:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_DIRECTORY_UNAVAILABLE") from error
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_DIRECTORY_INVALID")
+    return {
+        "path": str(target), "device": metadata.st_dev, "inode": metadata.st_ino,
+        "uid": metadata.st_uid, "gid": metadata.st_gid, "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def validate_toolchain_bind(plan, source_identity, target_identity, mount_rows, *, destination=None):
+    expected_destination = Path(plan["destination"])
+    actual_destination = expected_destination if destination is None else Path(destination)
+    if actual_destination != expected_destination or target_identity.get("path") != str(expected_destination):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_BIND_DESTINATION_INVALID")
+    if source_identity.get("path") != plan["source"] or any(
+        source_identity.get(field) != target_identity.get(field)
+        for field in ("device", "inode", "uid", "gid", "mode")
+    ):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_BIND_IDENTITY_MISMATCH")
+    matching = [row for row in mount_rows if row.get("mountpoint") == str(expected_destination)]
+    if len(matching) != 1:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_BIND_MOUNT_MISSING_OR_AMBIGUOUS")
+    row = matching[0]
+    expected_device = f"{os.major(source_identity['device'])}:{os.minor(source_identity['device'])}"
+    if row.get("device") != expected_device:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_BIND_IDENTITY_MISMATCH")
+    flags = set(row.get("mountOptions", []))
+    if not {"ro", "nosuid", "nodev"}.issubset(flags) or "rw" in flags or "noexec" in flags:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_BIND_FLAGS_INVALID")
+    return True
+
+
+def validate_toolchain_namespace_release(namespace_closed):
+    if namespace_closed is not True:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_NAMESPACE_REFERENCE_REMAINS")
+    return True
+
+
+def validate_unpreserved_toolchain_missing(node_missing, corepack_missing):
+    if node_missing is not True or corepack_missing is not True:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_NO_PRESERVATION_NEGATIVE_FALSE_GREEN")
+    return True
+
+
 def verify_toolchain(node, corepack, *, workspace, expected=None):
     node_identity = toolchain_identity(node)
     corepack_identity = toolchain_identity(corepack)
-    if expected is not None and (node_identity != expected["node"] or corepack_identity != expected["corepack"]):
-        raise SupervisorFailure("HOSTED_TOOLCHAIN_IDENTITY_CHANGED")
+    if expected is not None:
+        validate_toolchain_identity(expected["node"], node_identity)
+        validate_toolchain_identity(expected["corepack"], corepack_identity)
     host_uid = int(os.environ.get("S8_HOST_UID", str(os.getuid())))
     host_account = host_uid_gid(host_uid, pwd.getpwuid(host_uid).pw_gid)
     env = {"PATH": str(Path(node_identity["resolved"]).parent) + ":/usr/local/bin:/usr/bin:/bin", "HOME": host_account.pw_dir, "COREPACK_HOME": str(Path(host_account.pw_dir) / ".cache/node/corepack"), "COREPACK_ENABLE_AUTO_PIN": "0", "LC_ALL": "C"}
     node_result = supervised_command(app_identity_command(host_uid, host_account.pw_gid, [node_identity["resolved"], "--version"]), cwd=workspace, env=env, label="HOSTED_NODE_VERSION_FAILED")
     if node_result.returncode != 0 or not re.search(rb"(?m)^v22\.[0-9]+\.[0-9]+\s*$", node_result.stdout):
         raise SupervisorFailure("HOSTED_NODE_VERSION_INVALID")
+    node_version = node_result.stdout.strip().decode("ascii", errors="strict")
     env["PATH"] = str(Path(corepack_identity["resolved"]).parent) + ":" + str(Path(node_identity["resolved"]).parent) + ":/usr/local/bin:/usr/bin:/bin"
     pnpm_result = supervised_command(app_identity_command(host_uid, host_account.pw_gid, [corepack_identity["resolved"], "pnpm@12.6.0", "--version"]), cwd=workspace, env=env, label="HOSTED_PNPM_VERSION_FAILED", timeout=120)
     if pnpm_result.returncode != 0 or pnpm_result.stdout.strip() != b"12.6.0":
         raise SupervisorFailure("HOSTED_PNPM_VERSION_INVALID")
-    if toolchain_identity(node) != node_identity or toolchain_identity(corepack) != corepack_identity:
-        raise SupervisorFailure("HOSTED_TOOLCHAIN_IDENTITY_CHANGED")
-    return {"node": node_identity, "corepack": corepack_identity}
+    pnpm_version = pnpm_result.stdout.strip().decode("ascii", errors="strict")
+    validate_toolchain_identity(node_identity, toolchain_identity(node))
+    validate_toolchain_identity(corepack_identity, toolchain_identity(corepack))
+    return {"node": node_identity, "corepack": corepack_identity, "nodeVersion": node_version, "pnpmVersion": pnpm_version}
 
 
 def decode_mountinfo_field(value):
@@ -728,6 +844,153 @@ def validate_inner_opt_child(identity, inner_device, default_acl):
         raise SupervisorFailure("ROUTE_B_OPT_CHILD_MODE_INVALID")
     if default_acl is not None:
         raise SupervisorFailure("ROUTE_B_OPT_CHILD_DEFAULT_ACL_INVALID")
+    return True
+
+
+def create_toolchain_stage_root(temp_root):
+    state_dir = Path(temp_root) / ".namespace-state"
+    metadata = state_dir.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (0, 0, 0o700):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGE_PARENT_INVALID")
+    root = Path(tempfile.mkdtemp(prefix="toolchain-stage-", dir=state_dir))
+    target = root / "tree"
+    try:
+        os.chown(root, 0, 0)
+        os.chmod(root, 0o700)
+        target.mkdir(mode=0o700)
+        os.chown(target, 0, 0)
+        os.chmod(target, 0o700)
+        return root
+    except Exception:
+        if target.exists() and not target.is_symlink() and not list(target.iterdir()):
+            target.rmdir()
+        if root.exists() and not root.is_symlink() and not list(root.iterdir()):
+            root.rmdir()
+        raise
+
+
+def validate_toolchain_stage_root(temp_root, stage_root):
+    root = Path(stage_root)
+    state_dir = Path(temp_root) / ".namespace-state"
+    if not root.is_absolute() or root.parent != state_dir or root == Path("/opt") or Path("/opt") in root.parents:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGE_PATH_INVALID")
+    metadata = root.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (0, 0, 0o700):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGE_ROOT_IDENTITY_INVALID")
+    target = root / "tree"
+    target_metadata = target.lstat()
+    if not stat.S_ISDIR(target_metadata.st_mode) or stat.S_ISLNK(target_metadata.st_mode) or (target_metadata.st_uid, target_metadata.st_gid, stat.S_IMODE(target_metadata.st_mode)) != (0, 0, 0o700):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGE_TARGET_IDENTITY_INVALID")
+    return target
+
+
+def cleanup_toolchain_stage_root(temp_root, stage_root, *, namespace_closed):
+    validate_toolchain_namespace_release(namespace_closed)
+    root = Path(stage_root)
+    target = validate_toolchain_stage_root(temp_root, root)
+    mountpoints = {row["mountpoint"] for row in mountinfo_rows()}
+    if str(root) in mountpoints or str(target) in mountpoints:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGE_MOUNT_REFERENCE_REMAINS")
+    if list(root.iterdir()) != [target] or list(target.iterdir()):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGE_RESOURCE_NOT_EMPTY")
+    target.rmdir()
+    root.rmdir()
+    if root.exists() or root.is_symlink():
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGE_RESOURCE_REMAINS")
+
+
+def require_mount_row(path, label):
+    matching = [row for row in mountinfo_rows() if row["mountpoint"] == str(path)]
+    if len(matching) != 1:
+        raise SupervisorFailure(label)
+    return matching[0]
+
+
+def create_inner_toolchain_parent_directories(destination):
+    target = Path(destination)
+    if not target.is_absolute() or str(target).startswith("/opt/") is False or target == Path("/opt"):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_DESTINATION_INVALID")
+    parents = [path for path in reversed(target.parents) if path != Path("/") and path != Path("/opt")]
+    for path in parents:
+        try:
+            path.mkdir(mode=0o755)
+        except FileExistsError as error:
+            raise SupervisorFailure("HOSTED_TOOLCHAIN_DESTINATION_PARENT_NOT_FRESH") from error
+        os.chown(path, 0, 0)
+        os.chmod(path, 0o755)
+        metadata = path.lstat()
+        default_acl = acl_state(path, "system.posix_acl_default", failure_category="HOSTED_TOOLCHAIN_DESTINATION_ACL_UNREADABLE")
+        identity = {
+            "fileType": "directory" if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode) else "other",
+            "device": metadata.st_dev, "uid": metadata.st_uid, "gid": metadata.st_gid,
+            "mode": stat.S_IMODE(metadata.st_mode),
+        }
+        validate_inner_opt_child(identity, os.stat("/opt").st_dev, default_acl)
+    try:
+        target.mkdir(mode=0o755)
+    except FileExistsError as error:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_DESTINATION_NOT_FRESH") from error
+    os.chown(target, 0, 0)
+    os.chmod(target, 0o755)
+    metadata = target.lstat()
+    default_acl = acl_state(target, "system.posix_acl_default", failure_category="HOSTED_TOOLCHAIN_DESTINATION_ACL_UNREADABLE")
+    identity = {
+        "fileType": "directory" if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode) else "other",
+        "device": metadata.st_dev, "uid": metadata.st_uid, "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+    validate_inner_opt_child(identity, os.stat("/opt").st_dev, default_acl)
+    return target
+
+
+def toolchain_bind_evidence(row):
+    flags = set(row.get("mountOptions", []))
+    return {
+        "mountId": row.get("mountId"), "readOnly": "ro" in flags and "rw" not in flags,
+        "executable": "noexec" not in flags, "nosuid": "nosuid" in flags, "nodev": "nodev" in flags,
+    }
+
+
+def validate_toolchain_preservation_events(events, namespace_number, stage_root):
+    rows = [event for event in events if event.get("kind") == "toolchainPreservation"]
+    phases = [event.get("phase") for event in rows]
+    expected_phases = ["PREMOUNT_IDENTITY", "STAGING_BIND", "NO_BIND_NEGATIVE", "INNER_BIND", "STAGING_RELEASED", "CONTINUITY"]
+    if phases != expected_phases or any(event.get("mountNamespace") != namespace_number for event in rows):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_RESOURCE_LEDGER_INVALID")
+    premount, staging, negative, inner, released, continuity = rows
+    node = premount.get("node")
+    corepack = premount.get("corepack")
+    validate_toolchain_identity(node, node)
+    validate_toolchain_identity(corepack, corepack)
+    plan = derive_toolchain_plan(node, corepack)
+    if premount.get("plan") != plan or premount.get("sourceIdentity", {}).get("path") != plan["source"]:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_RESOURCE_SOURCE_INVALID")
+    expected_stage = Path(stage_root) / "tree"
+    if staging.get("stagePath") != str(expected_stage) or staging.get("sourceIdentity") != premount.get("sourceIdentity"):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_RESOURCE_INVALID")
+    source_identity = premount["sourceIdentity"]
+    staged_identity = staging.get("stagedIdentity", {})
+    if any(source_identity.get(field) != staged_identity.get(field) for field in ("device", "inode", "uid", "gid", "mode")):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_IDENTITY_CONTINUITY_INVALID")
+    stage_mount = staging.get("mount")
+    if not isinstance(stage_mount, dict) or not isinstance(stage_mount.get("mountId"), str) or not stage_mount["mountId"].isdigit() or not all(stage_mount.get(key) is True for key in ("readOnly", "executable", "nosuid", "nodev")):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_BIND_FLAGS_INVALID")
+    if negative.get("nodeMissing") is not True or negative.get("corepackMissing") is not True:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_NO_PRESERVATION_CONTROL_MISSING")
+    destination_identity = inner.get("destinationIdentity", {})
+    if inner.get("destination") != plan["destination"] or inner.get("sourceIdentity") != source_identity or any(source_identity.get(field) != destination_identity.get(field) for field in ("device", "inode", "uid", "gid", "mode")):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_INNER_RESOURCE_INVALID")
+    inner_mount = inner.get("mount")
+    if not isinstance(inner_mount, dict) or not isinstance(inner_mount.get("mountId"), str) or not inner_mount["mountId"].isdigit() or inner_mount["mountId"] == stage_mount["mountId"] or not all(inner_mount.get(key) is True for key in ("readOnly", "executable", "nosuid", "nodev")):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_INNER_BIND_FLAGS_INVALID")
+    if released.get("stagePath") != str(expected_stage) or released.get("mountId") != stage_mount.get("mountId") or released.get("mountAbsent") is not True:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_RELEASE_INVALID")
+    if staging.get("mountpointIdentity") != released.get("mountpointIdentity"):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_MOUNTPOINT_IDENTITY_CHANGED")
+    validate_toolchain_identity(node, continuity.get("node"))
+    validate_toolchain_identity(corepack, continuity.get("corepack"))
+    if not re.fullmatch(r"v22\.[0-9]+\.[0-9]+", continuity.get("nodeVersion", "")) or continuity.get("pnpmVersion") != "12.6.0":
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_VERSION_CONTINUITY_INVALID")
     return True
 
 
@@ -1213,10 +1476,32 @@ def create_namespace_sudoers(temp_root, ledger_path, mount_id):
     emit_to_stdout("APPLICATION_SUDOERS_NAMESPACE_POLICY=ISOLATED\n")
 
 
-def private_opt_mount(outer_opt_reference, ledger_path, mount_id):
+def private_opt_mount(outer_opt_reference, ledger_path, mount_id, node, corepack, workspace, temp_root, stage_root, result_fd):
+    mount_namespace_private()
     current_outer = opt_snapshot()
     validate_outer_opt_snapshot(outer_opt_reference, current_outer)
     outer_device = outer_opt_reference["identity"]["device"]
+    stage_target = validate_toolchain_stage_root(temp_root, stage_root)
+    node_identity = toolchain_identity(node)
+    corepack_identity = toolchain_identity(corepack)
+    plan = derive_toolchain_plan(node_identity, corepack_identity)
+    source_identity = toolchain_directory_identity(plan["source"])
+    emit(result_fd, "toolchainPreservation", phase="PREMOUNT_IDENTITY", mountNamespace=mount_id, node=node_identity, corepack=corepack_identity, plan=plan, sourceIdentity=source_identity)
+    emit_to_stdout("HOSTED_TOOLCHAIN_PREMOUNT_IDENTITY=PASS\n")
+
+    stage_mountpoint_identity = toolchain_directory_identity(stage_target)
+    supervised_command(["/usr/bin/mount", "--bind", plan["source"], str(stage_target)], label="HOSTED_TOOLCHAIN_STAGING_BIND_FAILED", timeout=20)
+    supervised_command(["/usr/bin/mount", "-o", "remount,bind,ro,nosuid,nodev", str(stage_target)], label="HOSTED_TOOLCHAIN_STAGING_READONLY_FAILED", timeout=20)
+    staged_identity = toolchain_directory_identity(stage_target)
+    stage_plan = dict(plan, destination=str(stage_target))
+    stage_row = require_mount_row(stage_target, "HOSTED_TOOLCHAIN_STAGING_MOUNT_IDENTITY_INVALID")
+    validate_toolchain_bind(stage_plan, source_identity, staged_identity, [stage_row])
+    stage_evidence = toolchain_bind_evidence(stage_row)
+    if not all(stage_evidence[key] for key in ("readOnly", "executable", "nosuid", "nodev")):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_BIND_FLAGS_INVALID")
+    emit(result_fd, "toolchainPreservation", phase="STAGING_BIND", mountNamespace=mount_id, stagePath=str(stage_target), sourceIdentity=source_identity, stagedIdentity=staged_identity, mountpointIdentity=stage_mountpoint_identity, mount=stage_evidence)
+    emit_to_stdout("HOSTED_TOOLCHAIN_STAGING_BIND=PASS\n")
+
     supervised_command(["/usr/bin/mount", "-t", "tmpfs", "-o", "size=4G,mode=0755,nosuid,nodev", "tmpfs", "/opt"], label="ROUTE_B_OPT_MOUNT_FAILED", timeout=20)
     inner_path = Path("/opt")
     metadata = inner_path.lstat()
@@ -1230,6 +1515,45 @@ def private_opt_mount(outer_opt_reference, ledger_path, mount_id):
         "mode": stat.S_IMODE(metadata.st_mode),
     }
     validate_inner_opt_mount(inner_identity, outer_device, rows, default_acl)
+
+    missing = []
+    for name, executable in (("node", node), ("corepack", corepack)):
+        try:
+            toolchain_identity(executable)
+        except FileNotFoundError:
+            missing.append(name)
+    node_missing = "node" in missing
+    corepack_missing = "corepack" in missing
+    validate_unpreserved_toolchain_missing(node_missing, corepack_missing)
+    emit(result_fd, "toolchainPreservation", phase="NO_BIND_NEGATIVE", mountNamespace=mount_id, nodeMissing=node_missing, corepackMissing=corepack_missing)
+    emit_to_stdout("HOSTED_TOOLCHAIN_NO_PRESERVATION=REPRODUCED_MISSING\n")
+
+    destination = create_inner_toolchain_parent_directories(plan["destination"])
+    if toolchain_directory_identity(stage_target) != source_identity:
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_SOURCE_IDENTITY_CHANGED")
+    supervised_command(["/usr/bin/mount", "--bind", str(stage_target), str(destination)], label="HOSTED_TOOLCHAIN_INNER_BIND_FAILED", timeout=20)
+    supervised_command(["/usr/bin/mount", "-o", "remount,bind,ro,nosuid,nodev", str(destination)], label="HOSTED_TOOLCHAIN_INNER_READONLY_FAILED", timeout=20)
+    destination_identity = toolchain_directory_identity(destination)
+    destination_plan = dict(plan, destination=str(destination))
+    destination_row = require_mount_row(destination, "HOSTED_TOOLCHAIN_INNER_MOUNT_IDENTITY_INVALID")
+    validate_toolchain_bind(destination_plan, source_identity, destination_identity, [destination_row])
+    destination_evidence = toolchain_bind_evidence(destination_row)
+    if not all(destination_evidence[key] for key in ("readOnly", "executable", "nosuid", "nodev")):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_INNER_BIND_FLAGS_INVALID")
+    emit(result_fd, "toolchainPreservation", phase="INNER_BIND", mountNamespace=mount_id, destination=str(destination), sourceIdentity=source_identity, destinationIdentity=destination_identity, mount=destination_evidence)
+    emit_to_stdout("HOSTED_TOOLCHAIN_INNER_BIND=READ_ONLY\n")
+
+    supervised_command(["/usr/bin/umount", "--", str(stage_target)], label="HOSTED_TOOLCHAIN_STAGING_UNMOUNT_FAILED", timeout=20)
+    remaining_stage_rows = [row for row in mountinfo_rows() if row["mountpoint"] == str(stage_target)]
+    if remaining_stage_rows or toolchain_directory_identity(stage_target) != stage_mountpoint_identity or list(stage_target.iterdir()):
+        raise SupervisorFailure("HOSTED_TOOLCHAIN_STAGING_MOUNT_REFERENCE_REMAINS")
+    emit(result_fd, "toolchainPreservation", phase="STAGING_RELEASED", mountNamespace=mount_id, stagePath=str(stage_target), mountId=stage_evidence["mountId"], mountAbsent=True, mountpointIdentity=stage_mountpoint_identity)
+    emit_to_stdout("HOSTED_TOOLCHAIN_STAGING_UNMOUNT=PASS\n")
+
+    toolchain = verify_toolchain(node, corepack, workspace=workspace, expected={"node": node_identity, "corepack": corepack_identity})
+    emit(result_fd, "toolchainPreservation", phase="CONTINUITY", mountNamespace=mount_id, node=toolchain["node"], corepack=toolchain["corepack"], nodeVersion=toolchain["nodeVersion"], pnpmVersion=toolchain["pnpmVersion"])
+    emit_to_stdout("HOSTED_TOOLCHAIN_IDENTITY_CONTINUITY=PASS\nHOSTED_TOOLCHAIN_CONTINUITY=PASS\nHOSTED_TOOLCACHE_PRODUCT_AUTHORITY=ABSENT\n")
+
     Path("/opt/blender").mkdir(mode=0o755)
     Path("/opt/swooshz").mkdir(mode=0o755)
     for path in (Path("/opt/blender"), Path("/opt/swooshz")):
@@ -1246,6 +1570,7 @@ def private_opt_mount(outer_opt_reference, ledger_path, mount_id):
         }
         validate_inner_opt_child(child_identity, metadata.st_dev, child_default_acl)
     emit_to_stdout("ROUTE_B_INNER_OPT=ROOT_ROOT_0755\nROUTE_B_OPT_FILESYSTEM=DISTINCT_TMPFS\n")
+    return toolchain
 
 
 def run_hosted_contract(workspace, carrier, temp_root, uid, gid, ledger_path, mount_id, mode, *, cancel_event=None):
@@ -1275,12 +1600,12 @@ def control_reader(fd, cancel_event, release_event):
             release_event.set()
 
 
-def prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, outer_opt_reference, result_fd, cancel_event, release_event):
+def prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, outer_opt_reference, node, corepack, stage_root, result_fd, cancel_event, release_event):
     workload = None
     primary_failure = None
     cleanup_failure = None
     try:
-        private_opt_mount(outer_opt_reference, Path(ledger_path), mount_ns["number"])
+        private_opt_mount(outer_opt_reference, Path(ledger_path), mount_ns["number"], node, corepack, workspace, temp_root, stage_root, result_fd)
         runner = host_uid_gid(uid, gid)
         fixture_log = Path(temp_root) / ".namespace-state" / (mode + ".log")
         fixture_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": runner.pw_dir, "USER": runner.pw_name, "LOGNAME": runner.pw_name, "LC_ALL": "C"}
@@ -1331,7 +1656,7 @@ def prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_pa
         raise FixtureSetupFailure("CANCELLATION_STAGE_SETUP_FAILURE", primary_failure, cleanup_failure)
 
 
-def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, control_fd, result_fd, ledger_path, outer_user_ns, outer_pid_ns, mode, outer_opt_reference):
+def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, control_fd, result_fd, ledger_path, outer_user_ns, outer_pid_ns, mode, outer_opt_reference, stage_root):
     global CURRENT_RESULT_FD, CURRENT_CANCEL_EVENT
     CURRENT_RESULT_FD = result_fd
     cancel_event = threading.Event()
@@ -1367,7 +1692,7 @@ def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, contro
         supervised_command(["/usr/bin/mount", "--make-rprivate", "/"], label="FIXTURE_PRIVATE_PROPAGATION_FAILED", timeout=10)
         mount_namespace_private()
         try:
-            prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, outer_opt_reference, result_fd, cancel_event, release_event)
+            prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, outer_opt_reference, node, corepack, stage_root, result_fd, cancel_event, release_event)
             emit(result_fd, "ready", pid=os.getpid(), mountNamespace=mount_ns["number"], userNamespace=user_ns["number"], pidNamespace=pid_ns["number"])
             emit(result_fd, "barrier", childrenQuiescent=True, holderReaped=False, outerStateRevalidated=False, complete=False)
             os.close(result_fd)
@@ -1391,11 +1716,9 @@ def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, contro
         mount_namespace_private()
         emit(result_fd, "stage", name="PRIVATE_PROPAGATION")
         require_not_cancelled(cancel_event, "AFTER_PRIVATE_PROPAGATION")
-        private_opt_mount(outer_opt_reference, ledger_path, mount_ns["number"])
+        toolchain = private_opt_mount(outer_opt_reference, ledger_path, mount_ns["number"], node, corepack, workspace, temp_root, stage_root, result_fd)
         emit(result_fd, "stage", name="OPT_MOUNTED")
         require_not_cancelled(cancel_event, "AFTER_OPT_MOUNT")
-        toolchain = verify_toolchain(node, corepack, workspace=workspace)
-        emit_to_stdout("HOSTED_TOOLCHAIN_CONTINUITY=PASS\nHOSTED_TOOLCACHE_PRODUCT_AUTHORITY=ABSENT\n")
         emit(result_fd, "stage", name="TOOLCHAIN_BOUND", node=toolchain["node"]["sha256"], corepack=toolchain["corepack"]["sha256"])
         require_not_cancelled(cancel_event, "AFTER_TOOLCHAIN")
         create_namespace_sudoers(temp_root, ledger_path, mount_ns["number"])
@@ -1812,6 +2135,91 @@ def run_route_b_opt_controls(expect):
     )
 
 
+def run_toolchain_preservation_controls(expect):
+    def expect_failure(operation, reason, marker):
+        try:
+            operation()
+        except SupervisorFailure as error:
+            expect(str(error) == reason, marker)
+        else:
+            expect(False, marker)
+
+    installation = "/opt/hostedtoolcache/node/22.16.0/x64"
+    node = {
+        "requested": installation + "/bin/node", "resolved": installation + "/bin/node",
+        "device": 2049, "inode": 11, "mode": 0o755, "size": 1024, "sha256": "a" * 64,
+    }
+    corepack = {
+        "requested": installation + "/bin/corepack", "resolved": installation + "/bin/corepack",
+        "device": 2049, "inode": 12, "mode": 0o755, "size": 512, "sha256": "b" * 64,
+    }
+    plan = derive_toolchain_plan(node, corepack)
+    expect(plan["source"] == installation + "/bin" and plan["destination"] == plan["source"], "HOSTED_TOOLCHAIN_CONTROL_MINIMAL_SUBTREE_SELECTED")
+    source_identity = {"path": plan["source"], "device": 2049, "inode": 20, "uid": 0, "gid": 0, "mode": 0o755}
+    target_identity = dict(source_identity, path="/tmp/s8-stage/tree")
+    target_plan = dict(plan, destination=target_identity["path"])
+    mount = {
+        "mountId": "41", "mountpoint": target_identity["path"],
+        "device": f"{os.major(2049)}:{os.minor(2049)}", "mountOptions": ["ro", "nosuid", "nodev", "relatime"],
+    }
+    expect(validate_toolchain_bind(target_plan, source_identity, target_identity, [mount]), "HOSTED_TOOLCHAIN_CONTROL_READONLY_EXECUTABLE_BIND_ACCEPTED")
+    expect_failure(
+        lambda: derive_toolchain_plan(node, corepack, source="/opt/hostedtoolcache"),
+        "HOSTED_TOOLCHAIN_SOURCE_NOT_MINIMAL",
+        "HOSTED_TOOLCHAIN_CONTROL_WRONG_SOURCE_SUBTREE_REJECTED",
+    )
+    expect_failure(
+        lambda: derive_toolchain_plan(node, corepack, source="/opt"),
+        "HOSTED_TOOLCHAIN_SOURCE_NOT_MINIMAL",
+        "HOSTED_TOOLCHAIN_CONTROL_BROAD_OPT_BIND_REJECTED",
+    )
+    unrelated = dict(corepack, resolved="/opt/hostedtoolcache/pnpm/9.0.0/x64/bin/corepack")
+    expect_failure(
+        lambda: derive_toolchain_plan(node, unrelated),
+        "HOSTED_TOOLCHAIN_SOURCE_OUTSIDE_NODE_TOOLCACHE",
+        "HOSTED_TOOLCHAIN_CONTROL_UNRELATED_TOOLCACHE_REJECTED",
+    )
+    expect_failure(
+        lambda: derive_toolchain_plan(node, corepack, destination="/opt/hostedtoolcache/node/22.16.0/x64/lib"),
+        "HOSTED_TOOLCHAIN_DESTINATION_INVALID",
+        "HOSTED_TOOLCHAIN_CONTROL_WRONG_DESTINATION_REJECTED",
+    )
+    changed_target = dict(target_identity, inode=21)
+    expect_failure(
+        lambda: validate_toolchain_bind(target_plan, source_identity, changed_target, [mount]),
+        "HOSTED_TOOLCHAIN_BIND_IDENTITY_MISMATCH",
+        "HOSTED_TOOLCHAIN_CONTROL_SOURCE_IDENTITY_CHANGE_REJECTED",
+    )
+    changed_node = dict(node, sha256="c" * 64)
+    expect_failure(
+        lambda: validate_toolchain_identity(node, changed_node),
+        "HOSTED_TOOLCHAIN_IDENTITY_CHANGED",
+        "HOSTED_TOOLCHAIN_CONTROL_SOURCE_HASH_CHANGE_REJECTED",
+    )
+    wrong_destination = dict(mount, mountpoint="/tmp/wrong-destination")
+    expect_failure(
+        lambda: validate_toolchain_bind(target_plan, source_identity, target_identity, [wrong_destination], destination="/tmp/wrong-destination"),
+        "HOSTED_TOOLCHAIN_BIND_DESTINATION_INVALID",
+        "HOSTED_TOOLCHAIN_CONTROL_WRONG_MOUNT_DESTINATION_REJECTED",
+    )
+    writable_mount = dict(mount, mountOptions=["rw", "nosuid", "nodev"])
+    expect_failure(
+        lambda: validate_toolchain_bind(target_plan, source_identity, target_identity, [writable_mount]),
+        "HOSTED_TOOLCHAIN_BIND_FLAGS_INVALID",
+        "HOSTED_TOOLCHAIN_CONTROL_WRITABLE_BIND_REJECTED",
+    )
+    expect_failure(
+        lambda: validate_unpreserved_toolchain_missing(True, False),
+        "HOSTED_TOOLCHAIN_NO_PRESERVATION_NEGATIVE_FALSE_GREEN",
+        "HOSTED_TOOLCHAIN_CONTROL_NO_BIND_MISSING_FAILURE_REQUIRED",
+    )
+    expect_failure(
+        lambda: validate_toolchain_namespace_release(False),
+        "HOSTED_TOOLCHAIN_NAMESPACE_REFERENCE_REMAINS",
+        "HOSTED_TOOLCHAIN_CONTROL_RETAINED_NAMESPACE_REFERENCE_BLOCKS_TEARDOWN",
+    )
+
+
 def validate_fixture_diagnostic_controls():
     outer_ids = ({"number": 101}, {"number": 202}, {"number": 303})
     ready = {"kind": "ready", "pid": 404, "mountNamespace": 505, "userNamespace": 101, "pidNamespace": 202}
@@ -1823,6 +2231,7 @@ def validate_fixture_diagnostic_controls():
         emit_to_stdout(marker + "=PASS\n")
 
     run_route_b_opt_controls(expect)
+    run_toolchain_preservation_controls(expect)
 
     def fail_before_launch():
         raise SupervisorFailure("UNSHARE_LAUNCH_FAILED")
@@ -1840,6 +2249,7 @@ def validate_fixture_diagnostic_controls():
     parser_arguments = [
         "--holder", "--workspace", "/workspace", "--carrier", "/carrier", "--temp-root", "/tmp",
         "--uid", "1000", "--gid", "1000", "--node", "/usr/bin/python3", "--corepack", "/usr/bin/python3",
+        "--toolchain-stage-root", "/tmp/toolchain-stage-control",
     ]
     for mode_name, marker in zip(FIXTURE_CANCEL_MODES, ("FIXTURE_DIAGNOSTIC_CANCEL_OPT_MODE_ACCEPTED", "FIXTURE_DIAGNOSTIC_CANCEL_APPLICATION_MODE_ACCEPTED")):
         parsed = build_argument_parser().parse_args(parser_arguments + ["--mode", mode_name])
@@ -1954,7 +2364,9 @@ def launch_holder(mode, *, workspace, carrier, temp_root, uid, gid, node, corepa
     control_read = control_write = result_read = result_write = None
     log = None
     owned = None
+    stage_root = None
     try:
+        stage_root = create_toolchain_stage_root(temp_root)
         control_read, control_write = make_pipe()
         result_read, result_write = make_pipe()
         args = [
@@ -1962,6 +2374,7 @@ def launch_holder(mode, *, workspace, carrier, temp_root, uid, gid, node, corepa
             "--holder", "--mode", mode, "--workspace", str(workspace), "--carrier", str(carrier),
             "--temp-root", str(temp_root), "--uid", str(uid), "--gid", str(gid), "--node", str(node),
             "--corepack", str(corepack), "--control-fd", str(control_read), "--result-fd", str(result_write),
+            "--toolchain-stage-root", str(stage_root),
             "--ledger", str(ledger_path), "--outer-user-ns", str(outer_ids[0]["number"]),
             "--outer-pid-ns", str(outer_ids[1]["number"]), "--supervisor-pid", str(os.getpid()),
             "--outer-opt-reference", serialize_outer_opt_reference(outer_opt),
@@ -1974,12 +2387,21 @@ def launch_holder(mode, *, workspace, carrier, temp_root, uid, gid, node, corepa
         os.close(result_write)
         result_write = None
         os.set_inheritable(control_write, False)
-        return owned, control_write, result_read, log
+        return owned, control_write, result_read, log, stage_root
     except Exception as primary_failure:
         cleanup_failure = getattr(primary_failure, "cleanup_failure", None)
         if owned is not None and owned.terminal is None:
             try:
                 terminate_owned(owned)
+            except Exception as error:
+                cleanup_failure = append_cleanup_failure(cleanup_failure, error)
+        if stage_root is not None:
+            try:
+                namespace_closed = owned is None or (
+                    owned.process.poll() is not None and namespace_disappeared(owned.mount_id, NAMESPACE_VERIFY_SECONDS)
+                )
+                validate_toolchain_namespace_release(namespace_closed)
+                cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=namespace_closed)
             except Exception as error:
                 cleanup_failure = append_cleanup_failure(cleanup_failure, error)
         for descriptor in (control_read, result_write, control_write, result_read):
@@ -1993,7 +2415,12 @@ def launch_holder(mode, *, workspace, carrier, temp_root, uid, gid, node, corepa
                 log.close()
             except OSError as error:
                 cleanup_failure = append_cleanup_failure(cleanup_failure, error)
-        raise holder_launch_failure(primary_failure, cleanup_failure) from primary_failure
+        failure = holder_launch_failure(primary_failure, cleanup_failure)
+        if stage_root is not None and stage_root.exists():
+            failure.toolchain_stage_root = stage_root
+        if owned is not None:
+            failure.toolchain_mount_namespace = owned.mount_id
+        raise failure from primary_failure
 
 
 def holder_events(fd, timeout, event_list, *, cancel_event=None, cancel_callback=None):
@@ -2035,7 +2462,7 @@ def validate_process_ledger(path):
     return rows
 
 
-def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt, uid, gid, retained_reference=False):
+def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt, uid, gid, node, corepack, retained_reference=False):
     modes = {
         "leaked-holder": ("fixture", None),
         "positive-release": ("fixture", None),
@@ -2046,11 +2473,14 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt
         raise SupervisorFailure("LIFECYCLE_FIXTURE_KIND_INVALID")
     mode, cancel_stage = modes[kind]
     try:
-        owned, control_write, result_read, log = launch_fixture_holder(
+        owned, control_write, result_read, log, stage_root = launch_fixture_holder(
             launch_holder,
             mode, workspace=workspace, carrier="/", temp_root=temp_root, uid=uid, gid=gid,
-            node="/usr/bin/python3", corepack="/usr/bin/python3", ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt,
+            node=node if cancel_stage is not None else "/usr/bin/python3",
+            corepack=corepack if cancel_stage is not None else "/usr/bin/python3",
+            ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt,
         )
+        namespace_number = owned.mount_id
     except Exception as error:
         failure = error if isinstance(error, FixtureSetupFailure) else holder_launch_failure(error)
         emit_to_stdout("FIXTURE_DIAGNOSTIC=" + safe_failure(failure.category) + "\n")
@@ -2059,6 +2489,7 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt
     namespace_number = None
     events = []
     control_closed = False
+    stage_cleanup_attempted = False
     primary_failure = None
     cleanup_errors = []
 
@@ -2092,7 +2523,10 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt
         if failure is not None:
             raise failure
         ready = [event for event in events if event.get("kind") == "ready"]
-        namespace_number = ready[0]["mountNamespace"]
+        if ready[0]["mountNamespace"] != namespace_number:
+            raise SupervisorFailure("FIXTURE_HOLDER_IDENTITY_CHANGED")
+        if cancel_stage is not None:
+            validate_toolchain_preservation_events(events, namespace_number, stage_root)
         holder_nsfd = os.open(f"/proc/{owned.pid}/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
         if owned.process.poll() is not None:
             raise SupervisorFailure("FIXTURE_HOLDER_REAPED_BEFORE_RELEASE")
@@ -2130,6 +2564,9 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt
             holder_nsfd = None
         if not namespace_disappeared(namespace_number, NAMESPACE_VERIFY_SECONDS):
             raise SupervisorFailure("FIXTURE_NAMESPACE_REFERENCE_REMAINS")
+        stage_cleanup_attempted = True
+        cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)
+        emit_to_stdout("HOSTED_TOOLCHAIN_NAMESPACE_RESOURCE_RELEASE=PASS\n")
         if kind == "positive-release":
             emit_to_stdout("POSITIVE_HOLDER_RELEASE_REAP=PASS\nNAMESPACE_REFERENCE_CLOSURE=PASS\n")
         elif kind == "cancel-opt":
@@ -2172,6 +2609,16 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt
                     cleanup_errors.append(SupervisorFailure("FIXTURE_NAMESPACE_REFERENCE_REMAINS_AFTER_FAILURE"))
             except Exception as error:
                 cleanup_errors.append(error)
+
+    if not stage_cleanup_attempted:
+        try:
+            namespace_closed = namespace_number is not None and namespace_disappeared(namespace_number, NAMESPACE_VERIFY_SECONDS)
+            validate_toolchain_namespace_release(namespace_closed)
+            stage_cleanup_attempted = True
+            cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=namespace_closed)
+            emit_to_stdout("HOSTED_TOOLCHAIN_NAMESPACE_RESOURCE_RELEASE=PASS\n")
+        except Exception as error:
+            cleanup_errors.append(error)
 
     if not control_closed:
         try:
@@ -2234,12 +2681,12 @@ def run_owned_process_regressions(temp_root, ledger_path):
                 child.wait(0)
 
 
-def run_namespace_regressions(workspace, temp_root, ledger_path, outer_ids, outer_opt, uid, gid):
+def run_namespace_regressions(workspace, temp_root, ledger_path, outer_ids, outer_opt, uid, gid, node, corepack):
     run_owned_process_regressions(temp_root, ledger_path)
-    run_fixture("leaked-holder", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid)
-    run_fixture("positive-release", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid, retained_reference=True)
-    run_fixture("cancel-opt", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid)
-    run_fixture("cancel-application", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid)
+    run_fixture("leaked-holder", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid, node=node, corepack=corepack)
+    run_fixture("positive-release", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid, node=node, corepack=corepack, retained_reference=True)
+    run_fixture("cancel-opt", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid, node=node, corepack=corepack)
+    run_fixture("cancel-application", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid, node=node, corepack=corepack)
     emit_to_stdout("NAMESPACE_HOLDER_LIFECYCLE_REGRESSIONS=PASS\nNAMESPACE_CANCELLATION_REGRESSIONS=PASS\n")
 
 
@@ -2288,6 +2735,8 @@ def root_supervise(args):
     log = None
     namespace_fd = None
     holder_namespace = None
+    stage_root = None
+    stage_cleanup_attempted = False
     events = []
     cancel_sent = False
     route_b_cleanup_reported = False
@@ -2303,11 +2752,11 @@ def root_supervise(args):
     try:
         state, ledger = prepare_state(temp_root)
         emit_to_stdout("NAMESPACE_SUPERVISOR=ROOT_ORIGINAL_MOUNT_NAMESPACE\nNAMESPACE_USER_PID_UNCHANGED=REQUIRED\n")
-        run_namespace_regressions(workspace, temp_root, ledger, outer_ids, outer_opt, args.uid, args.gid)
+        run_namespace_regressions(workspace, temp_root, ledger, outer_ids, outer_opt, args.uid, args.gid, args.node, args.corepack)
         regressions_passed = True
         if ROOT_CANCEL_EVENT.is_set():
             raise Cancelled("HOSTED_NAMESPACE_CANCELLED_DURING_REGRESSIONS")
-        holder, control_write, result_read, log = launch_holder(
+        holder, control_write, result_read, log, stage_root = launch_holder(
             "production", workspace=workspace, carrier=carrier, temp_root=temp_root,
             uid=args.uid, gid=args.gid, node=args.node, corepack=args.corepack,
             ledger_path=ledger, outer_ids=outer_ids, outer_opt=outer_opt,
@@ -2317,6 +2766,7 @@ def root_supervise(args):
         holder_failure = holder_emitted_failure(events)
         if holder_failure is not None:
             raise holder_failure
+        validate_toolchain_preservation_events(events, holder.mount_id, stage_root)
         ready = [event for event in events if event.get("kind") == "stage" and event.get("name") == "NAMESPACE_READY"]
         barriers = [(index, event) for index, event in enumerate(events) if event.get("kind") == "barrier"]
         ready_index = next((index for index, event in enumerate(events) if event.get("kind") == "stage" and event.get("name") == "NAMESPACE_READY"), -1)
@@ -2351,6 +2801,10 @@ def root_supervise(args):
         if not namespace_disappeared(holder_namespace, NAMESPACE_VERIFY_SECONDS):
             raise SupervisorFailure("NAMESPACE_REFERENCE_REMAINS")
         emit_to_stdout("NAMESPACE_HOLDER_REAPED=YES\nNAMESPACE_DISAPPEARED=YES\n")
+        stage_cleanup_attempted = True
+        cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)
+        stage_root = None
+        emit_to_stdout("HOSTED_TOOLCHAIN_NAMESPACE_RESOURCE_RELEASE=PASS\n")
         if current_host_ids() != outer_ids or opt_snapshot() != outer_opt:
             raise SupervisorFailure("OUTER_NAMESPACE_OR_OPT_STATE_CHANGED")
         rows = validate_process_ledger(ledger)
@@ -2376,6 +2830,10 @@ def root_supervise(args):
         emit_to_stdout("SUPERVISOR_CLEANUP=PASS\n")
     except Exception as caught:
         operation_error = caught
+        if stage_root is None and getattr(caught, "toolchain_stage_root", None) is not None:
+            stage_root = Path(caught.toolchain_stage_root)
+        if holder_namespace is None and getattr(caught, "toolchain_mount_namespace", None) is not None:
+            holder_namespace = caught.toolchain_mount_namespace
         print("NAMESPACE_OPERATION_FAILURE=" + safe_failure(caught), file=sys.stderr)
     finally:
         if holder is not None and holder.process.poll() is None:
@@ -2430,6 +2888,11 @@ def root_supervise(args):
                 raise SupervisorFailure("NAMESPACE_HOLDER_TERMINAL_WITNESS_MISSING")
             if holder_namespace is not None and not namespace_disappeared(holder_namespace, NAMESPACE_VERIFY_SECONDS):
                 raise SupervisorFailure("NAMESPACE_REFERENCE_REMAINS_AFTER_TEARDOWN")
+            if stage_root is not None and not stage_cleanup_attempted:
+                stage_cleanup_attempted = True
+                cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=holder_namespace is None or namespace_disappeared(holder_namespace, NAMESPACE_VERIFY_SECONDS))
+                stage_root = None
+                emit_to_stdout("HOSTED_TOOLCHAIN_NAMESPACE_RESOURCE_RELEASE=PASS\n")
             if current_host_ids() != outer_ids or opt_snapshot() != outer_opt:
                 raise SupervisorFailure("OUTER_NAMESPACE_OR_OPT_STATE_CHANGED_DURING_TEARDOWN")
             if ledger is not None:
@@ -2507,7 +2970,7 @@ def holder_entry(args):
     # are checked against identities received from the root supervisor.
     try:
         outer_opt_reference = parse_outer_opt_reference(args.outer_opt_reference)
-        return inner_holder(Path(args.workspace), Path(args.carrier), Path(args.temp_root), args.uid, args.gid, args.node, args.corepack, control_fd, result_fd, Path(args.ledger), args.outer_user_ns, args.outer_pid_ns, args.mode, outer_opt_reference)
+        return inner_holder(Path(args.workspace), Path(args.carrier), Path(args.temp_root), args.uid, args.gid, args.node, args.corepack, control_fd, result_fd, Path(args.ledger), args.outer_user_ns, args.outer_pid_ns, args.mode, outer_opt_reference, Path(args.toolchain_stage_root))
     except FixtureSetupFailure as error:
         if args.mode in {"fixture", "fixture-opt-cancel", "fixture-application-cancel"}:
             emit_fixture_failure(result_fd, error.category, error.primary_failure, error.cleanup_failure)
@@ -2690,6 +3153,7 @@ def build_argument_parser():
     parser.add_argument("--outer-user-ns", type=int, default=-1)
     parser.add_argument("--outer-pid-ns", type=int, default=-1)
     parser.add_argument("--outer-opt-reference", default="")
+    parser.add_argument("--toolchain-stage-root", default="")
     parser.add_argument("--supervisor-pid", type=int, default=0)
     return parser
 

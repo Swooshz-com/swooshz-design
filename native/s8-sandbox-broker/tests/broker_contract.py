@@ -1194,20 +1194,45 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "create_namespace_sudoers": ("/etc/sudoers", "/etc/sudoers.d", "NAMESPACE_SUDOERS_POLICY_MOUNT_INVALID"),
         "opt_snapshot": ("validate_outer_opt_path_mode(before.st_mode)", "system.posix_acl_access", "system.posix_acl_default", "normalize_opt_mount_view(rows)"),
         "validate_outer_opt_path_mode": ("OUTER_OPT_SYMLINK", "OUTER_OPT_NOT_DIRECTORY"),
-        "private_opt_mount": ("current_outer = opt_snapshot()", "validate_outer_opt_snapshot", "validate_inner_opt_mount", "validate_inner_opt_child", "/usr/bin/mount", "tmpfs", "/opt"),
+        "hosted_node_toolcache_installation": ("HOSTED_NODE_TOOLCACHE_ROOT", "22\\.[0-9]+\\.[0-9]+", "parts[1] != \"x64\"", "HOSTED_TOOLCHAIN_SOURCE_OUTSIDE_NODE_TOOLCACHE"),
+        "derive_toolchain_plan": ("os.path.commonpath", "minimal_source.relative_to(node_installation)", "HOSTED_TOOLCHAIN_SOURCE_NOT_MINIMAL", "HOSTED_TOOLCHAIN_DESTINATION_INVALID"),
+        "validate_toolchain_identity": ("HOSTED_TOOLCHAIN_IDENTITY_INVALID", "HOSTED_TOOLCHAIN_IDENTITY_CHANGED", "sha256"),
+        "verify_toolchain": ("validate_toolchain_identity(expected[\"node\"], node_identity)", "validate_toolchain_identity(expected[\"corepack\"], corepack_identity)", "HOSTED_NODE_VERSION_INVALID", "HOSTED_PNPM_VERSION_INVALID", "12.6.0"),
+        "validate_toolchain_bind": ("HOSTED_TOOLCHAIN_BIND_IDENTITY_MISMATCH", "HOSTED_TOOLCHAIN_BIND_DESTINATION_INVALID", "os.major", "os.minor", "ro", "nosuid", "nodev", "noexec"),
+        "private_opt_mount": ("mount_namespace_private()", "current_outer = opt_snapshot()", "validate_outer_opt_snapshot", "validate_inner_opt_mount", "validate_inner_opt_child", "/usr/bin/mount", "tmpfs", "/opt", "toolchain_identity(node)", "derive_toolchain_plan", "validate_unpreserved_toolchain_missing(node_missing, corepack_missing)", "--bind", "remount,bind,ro,nosuid,nodev", "validate_toolchain_bind", "verify_toolchain(node, corepack, workspace=workspace, expected=", "HOSTED_TOOLCHAIN_PREMOUNT_IDENTITY=PASS", "HOSTED_TOOLCHAIN_STAGING_BIND=PASS", "HOSTED_TOOLCHAIN_NO_PRESERVATION=REPRODUCED_MISSING", "HOSTED_TOOLCHAIN_INNER_BIND=READ_ONLY", "HOSTED_TOOLCHAIN_STAGING_UNMOUNT=PASS", "HOSTED_TOOLCHAIN_IDENTITY_CONTINUITY=PASS"),
+        "create_toolchain_stage_root": ("tempfile.mkdtemp(prefix=\"toolchain-stage-\"", "0o700", "HOSTED_TOOLCHAIN_STAGE_PARENT_INVALID"),
+        "cleanup_toolchain_stage_root": ("validate_toolchain_namespace_release(namespace_closed)", "HOSTED_TOOLCHAIN_STAGE_MOUNT_REFERENCE_REMAINS", "root.rmdir()"),
+        "validate_toolchain_preservation_events": ("PREMOUNT_IDENTITY", "STAGING_BIND", "NO_BIND_NEGATIVE", "INNER_BIND", "STAGING_RELEASED", "CONTINUITY", "HOSTED_TOOLCHAIN_RESOURCE_LEDGER_INVALID"),
+        "validate_toolchain_namespace_release": ("HOSTED_TOOLCHAIN_NAMESPACE_REFERENCE_REMAINS",),
+        "validate_unpreserved_toolchain_missing": ("HOSTED_TOOLCHAIN_NO_PRESERVATION_NEGATIVE_FALSE_GREEN",),
+        "create_inner_toolchain_parent_directories": ("HOSTED_TOOLCHAIN_DESTINATION_PARENT_NOT_FRESH", "validate_inner_opt_child", "os.chmod(path, 0o755)"),
+        "run_toolchain_preservation_controls": ("HOSTED_TOOLCHAIN_CONTROL_MINIMAL_SUBTREE_SELECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_SOURCE_SUBTREE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_BROAD_OPT_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_UNRELATED_TOOLCACHE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_DESTINATION_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_IDENTITY_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_HASH_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRITABLE_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_RETAINED_NAMESPACE_REFERENCE_BLOCKS_TEARDOWN"),
+        "validate_fixture_diagnostic_controls": ("run_route_b_opt_controls(expect)", "run_toolchain_preservation_controls(expect)"),
+        "run_fixture": ("validate_toolchain_preservation_events(events, namespace_number, stage_root)", "cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)", "FIXTURE_NAMESPACE_REFERENCE_REMAINS_AFTER_FAILURE"),
         "validate_outer_opt_snapshot": ("OUTER_OPT_DEVICE_CHANGED", "OUTER_OPT_INODE_CHANGED", "OUTER_OPT_UID_CHANGED", "OUTER_OPT_GID_CHANGED", "OUTER_OPT_MODE_CHANGED", "OUTER_OPT_ACCESS_ACL_CHANGED", "OUTER_OPT_DEFAULT_ACL_CHANGED", "OUTER_OPT_MOUNT_VIEW_CHANGED", "OUTER_OPT_CHILDREN_CHANGED"),
         "validate_inner_opt_mount": ("ROUTE_B_OPT_FILESYSTEM_NOT_DISTINCT", "ROUTE_B_OPT_OWNER_INVALID", "ROUTE_B_OPT_MODE_INVALID", "ROUTE_B_OPT_MOUNT_IDENTITY_INVALID", "ROUTE_B_OPT_MOUNT_STATE_INVALID", "ROUTE_B_OPT_DEFAULT_ACL_INVALID"),
         "validate_inner_opt_child": ("ROUTE_B_OPT_CHILD_IDENTITY_INVALID", "ROUTE_B_OPT_CHILD_MODE_INVALID", "ROUTE_B_OPT_CHILD_DEFAULT_ACL_INVALID"),
-        "launch_holder": ("/usr/bin/unshare", "\"--mount\"", "--control-fd", "--result-fd", "--ledger", "--outer-opt-reference", "serialize_outer_opt_reference(outer_opt)"),
-        "holder_entry": ("parse_outer_opt_reference(args.outer_opt_reference)", "inner_holder("),
+        "launch_holder": ("/usr/bin/unshare", "\"--mount\"", "--control-fd", "--result-fd", "--ledger", "--outer-opt-reference", "--toolchain-stage-root", "create_toolchain_stage_root", "serialize_outer_opt_reference(outer_opt)"),
+        "holder_entry": ("parse_outer_opt_reference(args.outer_opt_reference)", "args.toolchain_stage_root", "inner_holder("),
         "run_owned_process_regressions": ("child.start_identity + \":mismatch\"", "terminate_owned(child, grace=0.1)"),
-        "run_namespace_regressions": ("leaked-holder", "positive-release", "cancel-opt", "cancel-application", "outer_opt=outer_opt"),
+        "run_namespace_regressions": ("leaked-holder", "positive-release", "cancel-opt", "cancel-application", "outer_opt=outer_opt", "node=node", "corepack=corepack"),
         "remove_supervisor_state": ("validate_process_ledger(ledger)", "remove_root_owned_state_entry", "NAMESPACE_STATE_CLEANUP_IDENTITY_INVALID"),
     }
     for name, tokens in supervisor_requirements.items():
         source = body(sup, supervisor, name)
         if source is None or any(token not in source for token in tokens):
             return False
+    private_toolchain_mount = body(sup, supervisor, "private_opt_mount")
+    verify_toolchain_body = body(sup, supervisor, "verify_toolchain")
+    if (
+        private_toolchain_mount is None
+        or private_toolchain_mount.count("remount,bind,ro,nosuid,nodev") != 2
+        or private_toolchain_mount.count("validate_toolchain_bind(") != 2
+        or verify_toolchain_body is None
+        or verify_toolchain_body.count("validate_toolchain_identity(node_identity, toolchain_identity(node))") != 1
+        or verify_toolchain_body.count("validate_toolchain_identity(corepack_identity, toolchain_identity(corepack))") != 1
+    ):
+        return False
     sudo_matrix = body(sup, supervisor, "run_sudo_matrix")
     if sudo_matrix is None or sudo_matrix.count("os.open(sudoers_path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC)") != 2:
         return False
@@ -1225,7 +1250,7 @@ def valid_hosted_protected_harness(deployment, supervisor):
         return False
     root = body(sup, supervisor, "root_supervise")
     root_requirements = (
-        "workspace != Path(__file__).resolve().parents[3]", "run_namespace_regressions(workspace, temp_root, ledger, outer_ids, outer_opt, args.uid, args.gid)", "ledger_path=ledger, outer_ids=outer_ids, outer_opt=outer_opt", "holder_events(result_read, 90 * 60, events",
+        "workspace != Path(__file__).resolve().parents[3]", "run_namespace_regressions(workspace, temp_root, ledger, outer_ids, outer_opt, args.uid, args.gid, args.node, args.corepack)", "ledger_path=ledger, outer_ids=outer_ids, outer_opt=outer_opt", "holder_events(result_read, 90 * 60, events", "validate_toolchain_preservation_events(events, holder.mount_id, stage_root)", "cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)",
         "cancel_event=ROOT_CANCEL_EVENT", "namespace_disappeared(holder_namespace",
         "current_host_ids() != outer_ids or opt_snapshot() != outer_opt", "cleanup_events = [event for event in events if event.get(\"kind\") == \"deploymentCleanup\"]",
         'not cleanup_events[0]["clean"]', "remove_supervisor_state(state, ledger)",
@@ -1235,8 +1260,14 @@ def valid_hosted_protected_harness(deployment, supervisor):
     return True
 
 
+def hosted_toolcache_product_authority_absent(worker, broker):
+    return "/opt/hostedtoolcache" not in worker and "/opt/hostedtoolcache" not in broker
+
+
 def valid_hosted_binding(workflow, deployment, supervisor, sudoers, proof_bytes, helper_bytes, worker, broker):
     if not valid_hosted_protected_harness(deployment, supervisor) or not valid_sudoers_template(sudoers):
+        return False
+    if not hosted_toolcache_product_authority_absent(worker, broker):
         return False
     semantic_call = '--validate-semantic-readback "$carrier/work/input.json" "$carrier/work/validator-readback.json"'
     semantic_tokens = (
@@ -1421,6 +1452,12 @@ negative_controls = {
     "NO_CHILD_QUIESCENCE_BEFORE_RECOVERY": mutate_control(2, replace_once(supervisor_source, "if active_before_recovery:", "if False:")),
     "NO_APP_UID_ENV_PROOF": mutate_control(2, replace_once(supervisor_source, 'variables != [b"PWD=/work"]', "False")),
     "NO_OUTER_OPT_REVALIDATION": mutate_control(2, supervisor_source.replace("current_host_ids() != outer_ids or opt_snapshot() != outer_opt", "False")),
+    "TOOLCHAIN_MINIMAL_SUBTREE_BINDING_REMOVED": mutate_control(2, replace_once(supervisor_source, "os.path.commonpath((str(node_path), str(corepack_path)))", "os.path.dirname(str(node_path))")),
+    "TOOLCHAIN_READONLY_BIND_REMOVED": mutate_control(2, replace_once(supervisor_source, "remount,bind,ro,nosuid,nodev", "remount,bind,rw,nosuid,nodev")),
+    "TOOLCHAIN_EXECUTABLE_IDENTITY_BINDING_REMOVED": mutate_control(2, replace_once(supervisor_source, "validate_toolchain_identity(node_identity, toolchain_identity(node))", "pass")),
+    "TOOLCHAIN_NO_BIND_REGRESSION_REMOVED": mutate_control(2, replace_once(supervisor_source, "validate_unpreserved_toolchain_missing(node_missing, corepack_missing)", "pass")),
+    "TOOLCACHE_PRODUCT_AUTHORITY_ADDED_TO_WORKER": mutate_control(6, worker_source + '\nconst productMountAllowlist = ["/opt/hostedtoolcache"];'),
+    "TOOLCACHE_PRODUCT_AUTHORITY_ADDED_TO_BROKER": mutate_control(7, broker_source + "\n/* /opt/hostedtoolcache */\n"),
     "NO_RECOVERY_CLEANUP_GATE": mutate_control(2, supervisor_source.replace('not cleanup_events[0]["clean"]', "False")),
     "PINNED_PROOF_BYTES_MISMATCH": mutate_control(4, proof_bytes[:-1] + bytes([proof_bytes[-1] ^ 1])),
     "PINNED_HELPER_BYTES_MISMATCH": mutate_control(5, helper_bytes[:-1] + bytes([helper_bytes[-1] ^ 1])),
