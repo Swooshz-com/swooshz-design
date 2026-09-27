@@ -33,10 +33,10 @@ HOSTED_SUDOERS = "/etc/sudoers.d/swooshz-s8-broker"
 HOSTED_NODE_TOOLCACHE_ROOT = Path("/opt/hostedtoolcache/node")
 APP_PROOF_RELATIVE = "scripts/s8/s8_application_boundary_proof.mts"
 APP_HELPER_RELATIVE = "scripts/s8/s8_application_boundary_proof.sh"
-APP_PROOF_BYTES = 9086
-APP_PROOF_SHA256 = "34a86da59ae51a50501ffcde7fd2086a1ceeeb2258238962404f4a8ce9a3d0e8"
-APP_HELPER_BYTES = 3328
-APP_HELPER_SHA256 = "e594a8749645ef122f22a8bae852745f8c3492f9fcda35597301cdfd1b5e2c42"
+APP_PROOF_BYTES = 8966
+APP_PROOF_SHA256 = "05c7b06a96fe0c45be71a4e2805b29202250130c9dba4bb852a0ef6032aacd31"
+APP_HELPER_BYTES = 3260
+APP_HELPER_SHA256 = "105085a773513c05abdfbc6b0b6da67b74ad8eb811c91c919cc7a08645bd769e"
 LEAK_HOLDER_DEADLINE_SECONDS = 1.0
 PROCESS_REAP_SECONDS = 5.0
 BROKER_TEARDOWN_SECONDS = 35.0
@@ -1354,12 +1354,21 @@ def observe_application_targets(app_pid, app_start_identity, status_path, cancel
     return not failed and observed == {"writer", "validator"}
 
 
+def application_source_identity_matches(proof_bytes, helper_bytes):
+    return (
+        len(proof_bytes) == APP_PROOF_BYTES
+        and hashlib.sha256(proof_bytes).hexdigest() == APP_PROOF_SHA256
+        and len(helper_bytes) == APP_HELPER_BYTES
+        and hashlib.sha256(helper_bytes).hexdigest() == APP_HELPER_SHA256
+    )
+
+
 def application_proof(workspace, carrier, temp_root, node, corepack, uid, gid, policy_h, config_q, ledger_path, mount_id, cancel_event):
     proof_path = Path(workspace) / APP_PROOF_RELATIVE
     helper_path = Path(workspace) / APP_HELPER_RELATIVE
     proof_bytes = proof_path.read_bytes()
     helper_bytes = helper_path.read_bytes()
-    if len(proof_bytes) != APP_PROOF_BYTES or hashlib.sha256(proof_bytes).hexdigest() != APP_PROOF_SHA256 or len(helper_bytes) != APP_HELPER_BYTES or hashlib.sha256(helper_bytes).hexdigest() != APP_HELPER_SHA256:
+    if not application_source_identity_matches(proof_bytes, helper_bytes):
         raise SupervisorFailure("APPLICATION_HELPER_BYTES_MISMATCH")
     app_proof = Path(temp_root) / "s8-application-boundary-proof.mts"
     descriptor = os.open(app_proof, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -1419,7 +1428,10 @@ def application_proof(workspace, carrier, temp_root, node, corepack, uid, gid, p
         )
         if any(marker not in output.splitlines() for marker in required_application_output):
             raise SupervisorFailure("APPLICATION_PROOF_OUTPUT_ASSERTION_MISSING")
-        if hashlib.sha256((Path(workspace) / APP_PROOF_RELATIVE).read_bytes()).hexdigest() != APP_PROOF_SHA256 or hashlib.sha256((Path(workspace) / APP_HELPER_RELATIVE).read_bytes()).hexdigest() != APP_HELPER_SHA256:
+        if not application_source_identity_matches(
+            (Path(workspace) / APP_PROOF_RELATIVE).read_bytes(),
+            (Path(workspace) / APP_HELPER_RELATIVE).read_bytes(),
+        ):
             raise SupervisorFailure("APPLICATION_HELPER_BYTES_CHANGED_DURING_RUN")
         emit_to_stdout(output)
         emit_to_stdout("TARGET_ENV_KEYS=PWD\nPARENT_SECRET_HOSTILE_ENV_LEAKAGE=NO\nPRODUCTION_BOUNDARY_PROOF=PASS\nAPPLICATION_PROOF_MTS_AS_EXACT_HOST_USER=PASS\n")

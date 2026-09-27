@@ -1186,9 +1186,15 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "observe_application_targets": (
             "process_start_identity(pid)", "process_uid_gid(pid)", "variables != [b\"PWD=/work\"]", "PermissionError",
         ),
+        "application_source_identity_matches": (
+            "len(proof_bytes) == APP_PROOF_BYTES", "hashlib.sha256(proof_bytes).hexdigest() == APP_PROOF_SHA256",
+            "len(helper_bytes) == APP_HELPER_BYTES", "hashlib.sha256(helper_bytes).hexdigest() == APP_HELPER_SHA256",
+        ),
         "application_proof": (
-            "APP_PROOF_RELATIVE", "APP_HELPER_RELATIVE", "app_identity_command(uid, gid",
+            "APP_PROOF_RELATIVE", "APP_HELPER_RELATIVE", "proof_path.read_bytes()", "helper_path.read_bytes()",
+            "application_source_identity_matches(proof_bytes, helper_bytes)", "app_identity_command(uid, gid",
             "observe_application_targets", "APPLICATION_SEMANTIC_READBACK=PASS",
+            "application_source_identity_matches(", "APPLICATION_HELPER_BYTES_CHANGED_DURING_RUN",
             "PRODUCTION_BOUNDARY_PROOF=PASS", "APPLICATION_PROOF_MTS_AS_EXACT_HOST_USER=PASS",
         ),
         "create_namespace_sudoers": ("/etc/sudoers", "/etc/sudoers.d", "NAMESPACE_SUDOERS_POLICY_MOUNT_INVALID"),
@@ -1265,6 +1271,27 @@ def hosted_toolcache_product_authority_absent(worker, broker):
     return "/opt/hostedtoolcache" not in worker and "/opt/hostedtoolcache" not in broker
 
 
+APPLICATION_PROOF_LF_BYTES = 8966
+APPLICATION_PROOF_LF_SHA256 = "05c7b06a96fe0c45be71a4e2805b29202250130c9dba4bb852a0ef6032aacd31"
+APPLICATION_HELPER_LF_BYTES = 3260
+APPLICATION_HELPER_LF_SHA256 = "105085a773513c05abdfbc6b0b6da67b74ad8eb811c91c919cc7a08645bd769e"
+
+
+def canonical_uniform_lf_source(content):
+    paired = content.replace(b"\r\n", b"")
+    if b"\r" in paired or (b"\r\n" in content and b"\n" in paired):
+        return None
+    return content.replace(b"\r\n", b"\n")
+
+
+def source_identity_matches(content, expected_size, expected_digest):
+    return (
+        content is not None
+        and len(content) == expected_size
+        and hashlib.sha256(content).hexdigest() == expected_digest
+    )
+
+
 def valid_hosted_binding(workflow, deployment, supervisor, sudoers, proof_bytes, helper_bytes, worker, broker):
     if not valid_hosted_protected_harness(deployment, supervisor) or not valid_sudoers_template(sudoers):
         return False
@@ -1291,14 +1318,14 @@ def valid_hosted_binding(workflow, deployment, supervisor, sudoers, proof_bytes,
         < workflow.index("CANDIDATE_MARKER_REACHED=YES")
     ):
         return False
-    expected_files = (
-        (proof_bytes, 9086, "34a86da59ae51a50501ffcde7fd2086a1ceeeb2258238962404f4a8ce9a3d0e8"),
-        (helper_bytes, 3328, "e594a8749645ef122f22a8bae852745f8c3492f9fcda35597301cdfd1b5e2c42"),
-    )
-    if any(len(content) != size or hashlib.sha256(content).hexdigest() != digest for content, size, digest in expected_files):
+    proof_lf = canonical_uniform_lf_source(proof_bytes)
+    helper_lf = canonical_uniform_lf_source(helper_bytes)
+    if not source_identity_matches(proof_lf, APPLICATION_PROOF_LF_BYTES, APPLICATION_PROOF_LF_SHA256):
+        return False
+    if not source_identity_matches(helper_lf, APPLICATION_HELPER_LF_BYTES, APPLICATION_HELPER_LF_SHA256):
         return False
     try:
-        proof_text, helper_text = proof_bytes.decode("utf-8"), helper_bytes.decode("utf-8")
+        proof_text, helper_text = proof_lf.decode("utf-8"), helper_lf.decode("utf-8")
     except UnicodeDecodeError:
         return False
     begin, end = "# RUN110_ROUTE_B_SUPERVISOR_BEGIN", "# RUN110_ROUTE_B_SUPERVISOR_END"
@@ -1430,6 +1457,74 @@ def replace_once(source, old, new):
     return source.replace(old, new, 1)
 
 
+def mutate_non_eol_byte(content):
+    for index, value in enumerate(content):
+        if value not in (10, 13):
+            return content[:index] + bytes([value ^ 1]) + content[index + 1:]
+    raise SystemExit("SOURCE_BINDING_CONTROL_HAS_NO_MUTABLE_CONTENT_BYTE")
+
+
+def hosted_runtime_identity_checker():
+    tree = ast.parse(supervisor_source)
+    matches = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "application_source_identity_matches"
+    ]
+    if len(matches) != 1:
+        raise SystemExit("HOSTED_RUNTIME_RAW_BYTE_IDENTITY_CHECKER_MISSING")
+    namespace = {
+        "hashlib": hashlib,
+        "APP_PROOF_BYTES": APPLICATION_PROOF_LF_BYTES,
+        "APP_PROOF_SHA256": APPLICATION_PROOF_LF_SHA256,
+        "APP_HELPER_BYTES": APPLICATION_HELPER_LF_BYTES,
+        "APP_HELPER_SHA256": APPLICATION_HELPER_LF_SHA256,
+    }
+    module = ast.Module(body=matches, type_ignores=[])
+    exec(compile(module, "hosted_deployment_namespace.py", "exec"), namespace)
+    return namespace["application_source_identity_matches"]
+
+
+proof_lf = canonical_uniform_lf_source(proof_bytes)
+helper_lf = canonical_uniform_lf_source(helper_bytes)
+proof_crlf = proof_lf.replace(b"\n", b"\r\n")
+helper_crlf = helper_lf.replace(b"\n", b"\r\n")
+lf_control = list(positive_control)
+lf_control[4], lf_control[5] = proof_lf, helper_lf
+if not hosted_binding_accepts(tuple(lf_control)):
+    raise SystemExit("CANONICAL_LF_SOURCE_POSITIVE_CONTROL_FAILED")
+print("HOSTED_SOURCE_EOL_CONTROL_CANONICAL_LF_PASS=PASS")
+if canonical_uniform_lf_source(proof_crlf) != proof_lf or canonical_uniform_lf_source(helper_crlf) != helper_lf:
+    raise SystemExit("UNIFORM_CRLF_CANONICALIZATION_CONTROL_FAILED")
+crlf_control = list(positive_control)
+crlf_control[4], crlf_control[5] = proof_crlf, helper_crlf
+if not hosted_binding_accepts(tuple(crlf_control)):
+    raise SystemExit("UNIFORM_CRLF_SOURCE_POSITIVE_CONTROL_FAILED")
+print("HOSTED_SOURCE_EOL_CONTROL_UNIFORM_CRLF_CANONICALIZES=PASS")
+if canonical_uniform_lf_source(proof_lf + b"\r") is not None:
+    raise SystemExit("STRAY_CR_SOURCE_CONTROL_ACCEPTED")
+print("HOSTED_SOURCE_EOL_CONTROL_STRAY_CR_REJECTED=PASS")
+if canonical_uniform_lf_source(proof_lf + b"\r\n") is not None:
+    raise SystemExit("MIXED_EOL_SOURCE_CONTROL_ACCEPTED")
+print("HOSTED_SOURCE_EOL_CONTROL_MIXED_EOL_REJECTED=PASS")
+mutated_proof = mutate_non_eol_byte(proof_crlf)
+mutated_canonical = canonical_uniform_lf_source(mutated_proof)
+if mutated_canonical is None or source_identity_matches(
+    mutated_canonical, APPLICATION_PROOF_LF_BYTES, APPLICATION_PROOF_LF_SHA256
+):
+    raise SystemExit("CANONICALIZED_CONTENT_MUTATION_CONTROL_ACCEPTED")
+mutated_control = list(crlf_control)
+mutated_control[4] = mutated_proof
+if hosted_binding_accepts(tuple(mutated_control)):
+    raise SystemExit("CANONICALIZED_CONTENT_MUTATION_BINDING_ACCEPTED")
+print("HOSTED_SOURCE_EOL_CONTROL_CONTENT_MUTATION_REJECTED=PASS")
+runtime_identity_matches = hosted_runtime_identity_checker()
+if not runtime_identity_matches(proof_lf, helper_lf):
+    raise SystemExit("HOSTED_RUNTIME_LF_EXACT_BYTE_CONTROL_FAILED")
+if runtime_identity_matches(proof_crlf, helper_crlf):
+    raise SystemExit("HOSTED_RUNTIME_RAW_CRLF_CONTROL_ACCEPTED")
+print("HOSTED_RUNTIME_RAW_CRLF_EXACT_GATE_REJECTED=PASS")
+
+
 negative_controls = {
     "NO_SEMANTIC_READBACK_DISPATCH": mutate_control(0, replace_once(workflow_source, "--validate-semantic-readback", "--validate-missing-semantic-readback")),
     "NO_SEMANTIC_REJECTION_CONTROL": mutate_control(2, replace_once(supervisor_source, '        "MISSING_ROOT",', '        "MISSING_ROOT_DISABLED",')),
@@ -1462,8 +1557,8 @@ negative_controls = {
     "TOOLCACHE_PRODUCT_AUTHORITY_ADDED_TO_WORKER": mutate_control(6, worker_source + '\nconst productMountAllowlist = ["/opt/hostedtoolcache"];'),
     "TOOLCACHE_PRODUCT_AUTHORITY_ADDED_TO_BROKER": mutate_control(7, broker_source + "\n/* /opt/hostedtoolcache */\n"),
     "NO_RECOVERY_CLEANUP_GATE": mutate_control(2, supervisor_source.replace('not cleanup_events[0]["clean"]', "False")),
-    "PINNED_PROOF_BYTES_MISMATCH": mutate_control(4, proof_bytes[:-1] + bytes([proof_bytes[-1] ^ 1])),
-    "PINNED_HELPER_BYTES_MISMATCH": mutate_control(5, helper_bytes[:-1] + bytes([helper_bytes[-1] ^ 1])),
+    "PINNED_PROOF_BYTES_MISMATCH": mutate_control(4, mutate_non_eol_byte(proof_bytes)),
+    "PINNED_HELPER_BYTES_MISMATCH": mutate_control(5, mutate_non_eol_byte(helper_bytes)),
     "WORKER_ALTERNATE_LAUNCHER": mutate_control(6, replace_once(worker_source, "spawnSync(/* turbopackIgnore: true */ launcher, [], {", 'spawnSync("/usr/bin/bwrap", [], {')),
     "WORKER_SHELL_FALLBACK": mutate_control(6, replace_once(worker_source, "shell: false", "shell: true")),
     "BROKER_REQUEST_HQ_MISMATCH": mutate_control(7, replace_once(broker_source, "constant_equal(request->config_sha256, expected_config, sizeof(expected_config))", "constant_equal(request->policy_sha256, expected_config, sizeof(expected_config))")),
