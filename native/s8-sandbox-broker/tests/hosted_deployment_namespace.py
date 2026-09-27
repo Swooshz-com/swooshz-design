@@ -1285,6 +1285,9 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, uid, gid,
 
     try:
         read_events_and_eof(result_read, 20, collect)
+        failures = [event for event in events if event.get("kind") == "failure"]
+        if failures:
+            raise SupervisorFailure("FIXTURE_HOLDER_FAILURE:" + safe_failure(failures[0].get("reason", "UNKNOWN")))
         ready = [event for event in events if event.get("kind") == "ready"]
         barriers = [event for event in events if event.get("kind") == "barrier"]
         if len(ready) != 1 or len(barriers) != 1 or barriers[0] != {"kind": "barrier", "childrenQuiescent": True, "holderReaped": False, "outerStateRevalidated": False, "complete": False}:
