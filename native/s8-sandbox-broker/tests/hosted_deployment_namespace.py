@@ -40,6 +40,8 @@ PROCESS_REAP_SECONDS = 5.0
 BROKER_TEARDOWN_SECONDS = 35.0
 ROOT_CLEANUP_SECONDS = 30.0
 NAMESPACE_VERIFY_SECONDS = 10.0
+FIXTURE_CANCEL_MODES = ("fixture-opt-cancel", "fixture-application-cancel")
+HOLDER_MODE_CHOICES = ("production", "fixture") + FIXTURE_CANCEL_MODES
 CURRENT_RESULT_FD = -1
 CURRENT_CANCEL_EVENT = None
 ROOT_CANCEL_EVENT = threading.Event()
@@ -1271,6 +1273,9 @@ def bounded_holder_log_detail(log):
         supervisor = re.search(r"SupervisorFailure:\s*([A-Z0-9_.:-]{1,160})$", line)
         if supervisor:
             return safe_failure(supervisor.group(1))
+        invalid_mode = re.search(r"argument --mode: invalid choice: ['\"]([^'\"]+)['\"]", line)
+        if invalid_mode:
+            return "PYTHON_MODE_ARGUMENT_REJECTED_" + safe_failure(invalid_mode.group(1))
         if "Operation not permitted" in line:
             return "OPERATION_NOT_PERMITTED"
         if "Permission denied" in line:
@@ -1422,6 +1427,13 @@ def validate_fixture_diagnostic_controls():
     expect(str(eof_before_ready).startswith("EOF_BEFORE_REQUIRED_EVENTS:READY_EVENT_MISSING"), "FIXTURE_DIAGNOSTIC_EOF_BEFORE_READY")
     timeout_before_ready = fixture_event_failure([], outer_ids, "timeout")
     expect(str(timeout_before_ready).startswith("TIMEOUT_BEFORE_REQUIRED_EVENTS:READY_EVENT_MISSING"), "FIXTURE_DIAGNOSTIC_TIMEOUT_BEFORE_READY")
+    parser_arguments = [
+        "--holder", "--workspace", "/workspace", "--carrier", "/carrier", "--temp-root", "/tmp",
+        "--uid", "1000", "--gid", "1000", "--node", "/usr/bin/python3", "--corepack", "/usr/bin/python3",
+    ]
+    for mode_name, marker in zip(FIXTURE_CANCEL_MODES, ("FIXTURE_DIAGNOSTIC_CANCEL_OPT_MODE_ACCEPTED", "FIXTURE_DIAGNOSTIC_CANCEL_APPLICATION_MODE_ACCEPTED")):
+        parsed = build_argument_parser().parse_args(parser_arguments + ["--mode", mode_name])
+        expect(parsed.holder and parsed.mode == mode_name, marker)
     invalid_stream_before_ready = fixture_event_failure(
         [], outer_ids, "invalid", stream_failure=SupervisorFailure("NAMESPACE_HOLDER_EVENT_INVALID"),
     )
@@ -1439,6 +1451,8 @@ def validate_fixture_diagnostic_controls():
         expect(bounded_holder_log_detail(LogReference()) == "NAMESPACE_SETUP_FAILED", "FIXTURE_DIAGNOSTIC_BOUNDED_LOG_REASON")
         timeout_with_live_holder_log = fixture_event_failure([], outer_ids, "timeout", holder_log=LogReference())
         expect(str(timeout_with_live_holder_log).endswith("HOLDER_LOG_NAMESPACE_SETUP_FAILED"), "FIXTURE_DIAGNOSTIC_TIMEOUT_LOG_REASON")
+        log_path.write_bytes(b"error: argument --mode: invalid choice: 'fixture-opt-cancel'\n")
+        expect(bounded_holder_log_detail(LogReference()) == "PYTHON_MODE_ARGUMENT_REJECTED_FIXTURE-OPT-CANCEL", "FIXTURE_DIAGNOSTIC_ARGUMENT_PARSE_REASON")
         log_path.write_bytes(b"ModuleNotFoundError: No module named 'pwd'\n")
         expect(bounded_holder_log_detail(LogReference()) == "PYTHON_MODULE_IMPORT_FAILURE", "FIXTURE_DIAGNOSTIC_STARTUP_IMPORT_FAILURE")
     namespace_failure = fixture_event_failure(
@@ -1614,8 +1628,8 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, uid, gid,
     modes = {
         "leaked-holder": ("fixture", None),
         "positive-release": ("fixture", None),
-        "cancel-opt": ("fixture-opt-cancel", "OPT_MOUNTED"),
-        "cancel-application": ("fixture-application-cancel", "APPLICATION_RUNNING"),
+        "cancel-opt": (FIXTURE_CANCEL_MODES[0], "OPT_MOUNTED"),
+        "cancel-application": (FIXTURE_CANCEL_MODES[1], "APPLICATION_RUNNING"),
     }
     if kind not in modes:
         raise SupervisorFailure("LIFECYCLE_FIXTURE_KIND_INVALID")
@@ -2245,18 +2259,12 @@ def validate_workflow_semantic_readback_files(payload_path, readback_path):
     print("SEMANTIC_READBACK_RESULT=PASS")
 
 
-def main():
-    if len(sys.argv) == 2 and sys.argv[1] == "--validate-fixture-diagnostics":
-        validate_fixture_diagnostic_controls()
-        return
-    if len(sys.argv) == 4 and sys.argv[1] == "--validate-semantic-readback":
-        validate_workflow_semantic_readback_files(Path(sys.argv[2]), Path(sys.argv[3]))
-        return
+def build_argument_parser():
     parser = argparse.ArgumentParser(add_help=False)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--supervise", action="store_true")
     mode.add_argument("--holder", action="store_true")
-    parser.add_argument("--mode", choices=("production", "fixture"), default="production")
+    parser.add_argument("--mode", choices=HOLDER_MODE_CHOICES, default="production")
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--carrier", required=True)
     parser.add_argument("--temp-root", required=True)
@@ -2270,6 +2278,17 @@ def main():
     parser.add_argument("--outer-user-ns", type=int, default=-1)
     parser.add_argument("--outer-pid-ns", type=int, default=-1)
     parser.add_argument("--supervisor-pid", type=int, default=0)
+    return parser
+
+
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--validate-fixture-diagnostics":
+        validate_fixture_diagnostic_controls()
+        return
+    if len(sys.argv) == 4 and sys.argv[1] == "--validate-semantic-readback":
+        validate_workflow_semantic_readback_files(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
+    parser = build_argument_parser()
     args = parser.parse_args()
     try:
         if args.holder:
