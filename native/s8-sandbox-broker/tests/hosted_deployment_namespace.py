@@ -1541,6 +1541,7 @@ def root_supervise(args):
         emit_to_stdout("SUPERVISOR_CLEANUP=PASS\n")
     except Exception as caught:
         operation_error = caught
+        print("NAMESPACE_OPERATION_FAILURE=" + safe_failure(caught), file=sys.stderr)
     finally:
         if holder is not None and holder.process.poll() is None:
             try:
