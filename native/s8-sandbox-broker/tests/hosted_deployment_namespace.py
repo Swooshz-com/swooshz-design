@@ -8,6 +8,7 @@ installed, so hosted-runner-wide sudo grants cannot satisfy application tests.
 """
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -422,6 +423,10 @@ def verify_toolchain(node, corepack, *, workspace, expected=None):
     return {"node": node_identity, "corepack": corepack_identity}
 
 
+def decode_mountinfo_field(value):
+    return value.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+
+
 def mountinfo_rows():
     rows = []
     for line in Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines():
@@ -429,7 +434,25 @@ def mountinfo_rows():
         if "-" not in fields:
             raise SupervisorFailure("MOUNTINFO_MALFORMED")
         separator = fields.index("-")
-        rows.append({"mountpoint": fields[4].replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\"), "optional": fields[6:separator], "fstype": fields[separator + 1], "source": fields[separator + 2], "raw": line})
+        if separator < 6 or separator + 3 >= len(fields):
+            raise SupervisorFailure("MOUNTINFO_MALFORMED")
+        rows.append({
+            "mountId": fields[0],
+            "parentId": fields[1],
+            "device": fields[2],
+            "root": decode_mountinfo_field(fields[3]),
+            "mountpoint": decode_mountinfo_field(fields[4]),
+            "mountOptions": fields[5].split(","),
+            "optional": fields[6:separator],
+            "fstype": fields[separator + 1],
+            "source": decode_mountinfo_field(fields[separator + 2]),
+            "superOptions": fields[separator + 3].split(","),
+            "raw": line,
+        })
+    by_id = {row["mountId"]: row for row in rows}
+    for row in rows:
+        parent = by_id.get(row["parentId"])
+        row["parentMountpoint"] = parent["mountpoint"] if parent is not None else None
     return rows
 
 
@@ -439,22 +462,273 @@ def mount_namespace_private():
         raise SupervisorFailure("MOUNT_PROPAGATION_NOT_RECURSIVELY_PRIVATE")
 
 
+def opt_mount_rows(rows):
+    ancestors = [
+        row for row in rows
+        if row["mountpoint"] == "/"
+        or row["mountpoint"] == "/opt"
+        or "/opt".startswith(row["mountpoint"].rstrip("/") + "/")
+    ]
+    if not ancestors:
+        raise SupervisorFailure("OUTER_OPT_MOUNT_VIEW_UNAVAILABLE")
+    covering = max(ancestors, key=lambda row: len(row["mountpoint"]))
+    selected_ids = {covering["mountId"]}
+    selected_ids.update(
+        row["mountId"] for row in rows
+        if row["mountpoint"] == "/opt" or row["mountpoint"].startswith("/opt/")
+    )
+    return [row for row in rows if row["mountId"] in selected_ids]
+
+
+def normalize_opt_mount_view(rows):
+    normalized = []
+    for row in opt_mount_rows(rows):
+        optional = [
+            item for item in row["optional"]
+            if not item.startswith(("shared:", "master:", "propagate_from:"))
+        ]
+        normalized.append({
+            "device": row["device"],
+            "root": row["root"],
+            "mountpoint": row["mountpoint"],
+            "parentMountpoint": row["parentMountpoint"],
+            "mountOptions": list(row["mountOptions"]),
+            "optional": optional,
+            "fstype": row["fstype"],
+            "source": row["source"],
+            "superOptions": list(row["superOptions"]),
+        })
+    return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+
+
+def validate_outer_opt_path_mode(mode):
+    if stat.S_ISLNK(mode):
+        raise SupervisorFailure("OUTER_OPT_SYMLINK")
+    if not stat.S_ISDIR(mode):
+        raise SupervisorFailure("OUTER_OPT_NOT_DIRECTORY")
+
+
+def acl_state(path, name, *, is_symlink=False, failure_category="ACL_STATE_UNREADABLE"):
+    if is_symlink:
+        return "not-applicable"
+    try:
+        value = os.getxattr(path, name, follow_symlinks=False)
+    except OSError as error:
+        missing = {errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)}
+        unsupported = {errno.ENOTSUP, errno.EOPNOTSUPP}
+        if error.errno in missing:
+            return None
+        if error.errno in unsupported:
+            return "unsupported"
+        raise SupervisorFailure(failure_category) from error
+    except (AttributeError, TypeError) as error:
+        raise SupervisorFailure(failure_category) from error
+    return value.hex()
+
+
+def outer_opt_identity(metadata):
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "size": metadata.st_size,
+        "mtimeNs": metadata.st_mtime_ns,
+        "ctimeNs": metadata.st_ctime_ns,
+    }
+
+
 def opt_snapshot():
     root = Path("/opt")
-    before = root.lstat()
-    if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
-        raise SupervisorFailure("OUTER_OPT_ROOT_INVALID")
+    try:
+        before = root.lstat()
+    except FileNotFoundError as error:
+        raise SupervisorFailure("OUTER_OPT_NOT_DIRECTORY") from error
+    validate_outer_opt_path_mode(before.st_mode)
+    before_identity = outer_opt_identity(before)
+    access_acl = acl_state(root, "system.posix_acl_access", failure_category="OUTER_OPT_ACL_STATE_UNREADABLE")
+    default_acl = acl_state(root, "system.posix_acl_default", failure_category="OUTER_OPT_ACL_STATE_UNREADABLE")
     children = []
-    for entry in sorted(os.scandir(root), key=lambda item: item.name):
-        metadata = entry.stat(follow_symlinks=False)
-        item = {"name": entry.name, "device": metadata.st_dev, "inode": metadata.st_ino, "uid": metadata.st_uid, "gid": metadata.st_gid, "mode": stat.S_IMODE(metadata.st_mode), "size": metadata.st_size, "mtimeNs": metadata.st_mtime_ns}
-        if stat.S_ISLNK(metadata.st_mode):
-            item["target"] = os.readlink(entry.path)
-        children.append(item)
-        if len(children) > 20000:
-            raise SupervisorFailure("OUTER_OPT_SNAPSHOT_OVERSIZE")
-    mount_rows = tuple(row["raw"] for row in mountinfo_rows() if row["mountpoint"] == "/opt" or row["mountpoint"].startswith("/opt/"))
-    return {"identity": {"device": before.st_dev, "inode": before.st_ino, "uid": before.st_uid, "gid": before.st_gid, "mode": stat.S_IMODE(before.st_mode)}, "children": children, "mounts": mount_rows}
+    try:
+        for entry in sorted(os.scandir(root), key=lambda item: item.name):
+            metadata = entry.stat(follow_symlinks=False)
+            is_symlink = stat.S_ISLNK(metadata.st_mode)
+            item = {
+                "name": entry.name,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "uid": metadata.st_uid,
+                "gid": metadata.st_gid,
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "size": metadata.st_size,
+                "mtimeNs": metadata.st_mtime_ns,
+                "ctimeNs": metadata.st_ctime_ns,
+                "accessAcl": acl_state(entry.path, "system.posix_acl_access", is_symlink=is_symlink, failure_category="OUTER_OPT_ACL_STATE_UNREADABLE"),
+                "defaultAcl": acl_state(entry.path, "system.posix_acl_default", is_symlink=is_symlink, failure_category="OUTER_OPT_ACL_STATE_UNREADABLE"),
+            }
+            if is_symlink:
+                item["target"] = os.readlink(entry.path)
+            after_child = Path(entry.path).lstat()
+            child_identity = {
+                "device": metadata.st_dev, "inode": metadata.st_ino, "uid": metadata.st_uid, "gid": metadata.st_gid,
+                "mode": stat.S_IMODE(metadata.st_mode), "size": metadata.st_size,
+                "mtimeNs": metadata.st_mtime_ns, "ctimeNs": metadata.st_ctime_ns,
+            }
+            if outer_opt_identity(after_child) != child_identity:
+                raise SupervisorFailure("OUTER_OPT_SNAPSHOT_CHANGED")
+            children.append(item)
+            if len(children) > 20000:
+                raise SupervisorFailure("OUTER_OPT_SNAPSHOT_OVERSIZE")
+    except SupervisorFailure:
+        raise
+    except OSError as error:
+        raise SupervisorFailure("OUTER_OPT_SNAPSHOT_UNREADABLE") from error
+    after = root.lstat()
+    after_access_acl = acl_state(root, "system.posix_acl_access", failure_category="OUTER_OPT_ACL_STATE_UNREADABLE")
+    after_default_acl = acl_state(root, "system.posix_acl_default", failure_category="OUTER_OPT_ACL_STATE_UNREADABLE")
+    if outer_opt_identity(after) != before_identity or (after_access_acl, after_default_acl) != (access_acl, default_acl):
+        raise SupervisorFailure("OUTER_OPT_SNAPSHOT_CHANGED")
+    rows = mountinfo_rows()
+    relevant_mounts = opt_mount_rows(rows)
+    return {
+        "fileType": "directory",
+        "identity": before_identity,
+        "accessAcl": access_acl,
+        "defaultAcl": default_acl,
+        "children": children,
+        "mountView": normalize_opt_mount_view(rows),
+        "mounts": tuple(row["raw"] for row in relevant_mounts),
+    }
+
+
+OUTER_OPT_IDENTITY_FIELDS = ("device", "inode", "uid", "gid", "mode", "size", "mtimeNs", "ctimeNs")
+OUTER_OPT_REFERENCE_HASH_FIELDS = ("accessAclSha256", "defaultAclSha256", "childrenSha256", "mountViewSha256")
+
+
+def sha256_json(value):
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def outer_opt_reference(snapshot):
+    identity = {key: snapshot["identity"][key] for key in OUTER_OPT_IDENTITY_FIELDS}
+    payload = {
+        "schema": "s8-route-b-outer-opt-reference-v1",
+        "identity": identity,
+        "accessAclSha256": sha256_json(snapshot["accessAcl"]),
+        "defaultAclSha256": sha256_json(snapshot["defaultAcl"]),
+        "childrenSha256": sha256_json(snapshot["children"]),
+        "mountViewSha256": sha256_json(snapshot["mountView"]),
+    }
+    reference = {**payload, "snapshotSha256": sha256_json(payload)}
+    reference["receiptSha256"] = sha256_json(reference)
+    return reference
+
+
+def serialize_outer_opt_reference(snapshot):
+    serialized = json.dumps(outer_opt_reference(snapshot), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if len(serialized) > 4096:
+        raise SupervisorFailure("OUTER_OPT_REFERENCE_OVERSIZE")
+    return serialized
+
+
+def unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate object key")
+        value[key] = item
+    return value
+
+
+def parse_outer_opt_reference(value):
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise SupervisorFailure("OUTER_OPT_REFERENCE_INVALID")
+    try:
+        reference = json.loads(value, object_pairs_hook=unique_json_object)
+    except (TypeError, ValueError) as error:
+        raise SupervisorFailure("OUTER_OPT_REFERENCE_INVALID") from error
+    payload_fields = {"schema", "identity", *OUTER_OPT_REFERENCE_HASH_FIELDS}
+    expected_fields = payload_fields | {"snapshotSha256", "receiptSha256"}
+    if not isinstance(reference, dict) or set(reference) != expected_fields or reference.get("schema") != "s8-route-b-outer-opt-reference-v1":
+        raise SupervisorFailure("OUTER_OPT_REFERENCE_INVALID")
+    identity = reference.get("identity")
+    if not isinstance(identity, dict) or set(identity) != set(OUTER_OPT_IDENTITY_FIELDS):
+        raise SupervisorFailure("OUTER_OPT_REFERENCE_INVALID")
+    if any(type(identity[field]) is not int or identity[field] < 0 for field in OUTER_OPT_IDENTITY_FIELDS):
+        raise SupervisorFailure("OUTER_OPT_REFERENCE_INVALID")
+    if identity["mode"] > 0o7777:
+        raise SupervisorFailure("OUTER_OPT_REFERENCE_INVALID")
+    for field in OUTER_OPT_REFERENCE_HASH_FIELDS + ("snapshotSha256", "receiptSha256"):
+        if not isinstance(reference.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", reference[field]):
+            raise SupervisorFailure("OUTER_OPT_REFERENCE_INVALID")
+    payload = {field: reference[field] for field in payload_fields}
+    if reference["snapshotSha256"] != sha256_json(payload):
+        raise SupervisorFailure("OUTER_OPT_REFERENCE_INVALID")
+    sealed = {**payload, "snapshotSha256": reference["snapshotSha256"]}
+    if reference["receiptSha256"] != sha256_json(sealed):
+        raise SupervisorFailure("OUTER_OPT_REFERENCE_INVALID")
+    return reference
+
+
+def validate_outer_opt_snapshot(reference, snapshot):
+    if snapshot.get("fileType") == "symlink":
+        raise SupervisorFailure("OUTER_OPT_SYMLINK")
+    if snapshot.get("fileType") != "directory":
+        raise SupervisorFailure("OUTER_OPT_NOT_DIRECTORY")
+    current = outer_opt_reference(snapshot)
+    for field, reason in (
+        ("device", "OUTER_OPT_DEVICE_CHANGED"),
+        ("inode", "OUTER_OPT_INODE_CHANGED"),
+        ("uid", "OUTER_OPT_UID_CHANGED"),
+        ("gid", "OUTER_OPT_GID_CHANGED"),
+        ("mode", "OUTER_OPT_MODE_CHANGED"),
+    ):
+        if current["identity"][field] != reference["identity"][field]:
+            raise SupervisorFailure(reason)
+    if current["accessAclSha256"] != reference["accessAclSha256"]:
+        raise SupervisorFailure("OUTER_OPT_ACCESS_ACL_CHANGED")
+    if current["defaultAclSha256"] != reference["defaultAclSha256"]:
+        raise SupervisorFailure("OUTER_OPT_DEFAULT_ACL_CHANGED")
+    if current["mountViewSha256"] != reference["mountViewSha256"]:
+        raise SupervisorFailure("OUTER_OPT_MOUNT_VIEW_CHANGED")
+    if current["childrenSha256"] != reference["childrenSha256"]:
+        raise SupervisorFailure("OUTER_OPT_CHILDREN_CHANGED")
+    if current["identity"] != reference["identity"] or current["snapshotSha256"] != reference["snapshotSha256"]:
+        raise SupervisorFailure("OUTER_OPT_METADATA_CHANGED")
+    return True
+
+
+def validate_inner_opt_mount(identity, outer_device, rows, default_acl):
+    if identity.get("fileType") != "directory":
+        raise SupervisorFailure("ROUTE_B_OPT_DIRECTORY_INVALID")
+    if identity.get("device") == outer_device:
+        raise SupervisorFailure("ROUTE_B_OPT_FILESYSTEM_NOT_DISTINCT")
+    if (identity.get("uid"), identity.get("gid")) != (0, 0):
+        raise SupervisorFailure("ROUTE_B_OPT_OWNER_INVALID")
+    if identity.get("mode") != 0o755:
+        raise SupervisorFailure("ROUTE_B_OPT_MODE_INVALID")
+    if len(rows) != 1 or rows[0].get("fstype") != "tmpfs" or rows[0].get("source") != "tmpfs":
+        raise SupervisorFailure("ROUTE_B_OPT_MOUNT_IDENTITY_INVALID")
+    if "rw" not in rows[0].get("mountOptions", []):
+        raise SupervisorFailure("ROUTE_B_OPT_MOUNT_STATE_INVALID")
+    mount_flags = set(rows[0].get("mountOptions", [])) | set(rows[0].get("superOptions", []))
+    if not {"nosuid", "nodev"}.issubset(mount_flags):
+        raise SupervisorFailure("ROUTE_B_OPT_MOUNT_FLAGS_INVALID")
+    if default_acl is not None:
+        raise SupervisorFailure("ROUTE_B_OPT_DEFAULT_ACL_INVALID")
+    return True
+
+
+def validate_inner_opt_child(identity, inner_device, default_acl):
+    if identity.get("fileType") != "directory" or identity.get("device") != inner_device:
+        raise SupervisorFailure("ROUTE_B_OPT_CHILD_IDENTITY_INVALID")
+    if (identity.get("uid"), identity.get("gid"), identity.get("mode")) != (0, 0, 0o755):
+        raise SupervisorFailure("ROUTE_B_OPT_CHILD_MODE_INVALID")
+    if default_acl is not None:
+        raise SupervisorFailure("ROUTE_B_OPT_CHILD_DEFAULT_ACL_INVALID")
+    return True
 
 
 def namespace_processes(namespace_number):
@@ -939,22 +1213,38 @@ def create_namespace_sudoers(temp_root, ledger_path, mount_id):
     emit_to_stdout("APPLICATION_SUDOERS_NAMESPACE_POLICY=ISOLATED\n")
 
 
-def private_opt_mount(outer_opt, ledger_path, mount_id):
-    before = Path("/opt").lstat()
-    if not stat.S_ISDIR(before.st_mode) or (before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode)) != (0, 0, 0o755):
-        raise SupervisorFailure("OUTER_OPT_MOUNTPOINT_INVALID")
+def private_opt_mount(outer_opt_reference, ledger_path, mount_id):
+    current_outer = opt_snapshot()
+    validate_outer_opt_snapshot(outer_opt_reference, current_outer)
+    outer_device = outer_opt_reference["identity"]["device"]
     supervised_command(["/usr/bin/mount", "-t", "tmpfs", "-o", "size=4G,mode=0755,nosuid,nodev", "tmpfs", "/opt"], label="ROUTE_B_OPT_MOUNT_FAILED", timeout=20)
-    metadata = Path("/opt").stat()
+    inner_path = Path("/opt")
+    metadata = inner_path.lstat()
     rows = [row for row in mountinfo_rows() if row["mountpoint"] == "/opt"]
-    if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (0, 0, 0o755) or len(rows) != 1 or rows[0]["fstype"] != "tmpfs" or "rw" not in rows[0]["raw"].split(" ")[5].split(","):
-        raise SupervisorFailure("ROUTE_B_OPT_MOUNT_IDENTITY_INVALID")
-    if (metadata.st_dev, metadata.st_ino) == (before.st_dev, before.st_ino):
-        raise SupervisorFailure("ROUTE_B_OPT_FILESYSTEM_NOT_DISTINCT")
+    default_acl = acl_state(inner_path, "system.posix_acl_default", failure_category="ROUTE_B_OPT_ACL_STATE_UNREADABLE")
+    inner_identity = {
+        "fileType": "directory" if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode) else "other",
+        "device": metadata.st_dev,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+    validate_inner_opt_mount(inner_identity, outer_device, rows, default_acl)
     Path("/opt/blender").mkdir(mode=0o755)
     Path("/opt/swooshz").mkdir(mode=0o755)
     for path in (Path("/opt/blender"), Path("/opt/swooshz")):
         os.chown(path, 0, 0)
         os.chmod(path, 0o755)
+        child = path.lstat()
+        child_default_acl = acl_state(path, "system.posix_acl_default", failure_category="ROUTE_B_OPT_ACL_STATE_UNREADABLE")
+        child_identity = {
+            "fileType": "directory" if stat.S_ISDIR(child.st_mode) and not stat.S_ISLNK(child.st_mode) else "other",
+            "device": child.st_dev,
+            "uid": child.st_uid,
+            "gid": child.st_gid,
+            "mode": stat.S_IMODE(child.st_mode),
+        }
+        validate_inner_opt_child(child_identity, metadata.st_dev, child_default_acl)
     emit_to_stdout("ROUTE_B_INNER_OPT=ROOT_ROOT_0755\nROUTE_B_OPT_FILESYSTEM=DISTINCT_TMPFS\n")
 
 
@@ -985,12 +1275,12 @@ def control_reader(fd, cancel_event, release_event):
             release_event.set()
 
 
-def prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, result_fd, cancel_event, release_event):
+def prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, outer_opt_reference, result_fd, cancel_event, release_event):
     workload = None
     primary_failure = None
     cleanup_failure = None
     try:
-        private_opt_mount(None, Path(ledger_path), mount_ns["number"])
+        private_opt_mount(outer_opt_reference, Path(ledger_path), mount_ns["number"])
         runner = host_uid_gid(uid, gid)
         fixture_log = Path(temp_root) / ".namespace-state" / (mode + ".log")
         fixture_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": runner.pw_dir, "USER": runner.pw_name, "LOGNAME": runner.pw_name, "LC_ALL": "C"}
@@ -1041,7 +1331,7 @@ def prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_pa
         raise FixtureSetupFailure("CANCELLATION_STAGE_SETUP_FAILURE", primary_failure, cleanup_failure)
 
 
-def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, control_fd, result_fd, ledger_path, outer_user_ns, outer_pid_ns, mode):
+def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, control_fd, result_fd, ledger_path, outer_user_ns, outer_pid_ns, mode, outer_opt_reference):
     global CURRENT_RESULT_FD, CURRENT_CANCEL_EVENT
     CURRENT_RESULT_FD = result_fd
     cancel_event = threading.Event()
@@ -1077,7 +1367,7 @@ def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, contro
         supervised_command(["/usr/bin/mount", "--make-rprivate", "/"], label="FIXTURE_PRIVATE_PROPAGATION_FAILED", timeout=10)
         mount_namespace_private()
         try:
-            prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, result_fd, cancel_event, release_event)
+            prepare_cancellation_fixture(mode, workspace, temp_root, uid, gid, ledger_path, mount_ns, outer_opt_reference, result_fd, cancel_event, release_event)
             emit(result_fd, "ready", pid=os.getpid(), mountNamespace=mount_ns["number"], userNamespace=user_ns["number"], pidNamespace=pid_ns["number"])
             emit(result_fd, "barrier", childrenQuiescent=True, holderReaped=False, outerStateRevalidated=False, complete=False)
             os.close(result_fd)
@@ -1101,7 +1391,7 @@ def inner_holder(workspace, carrier, temp_root, uid, gid, node, corepack, contro
         mount_namespace_private()
         emit(result_fd, "stage", name="PRIVATE_PROPAGATION")
         require_not_cancelled(cancel_event, "AFTER_PRIVATE_PROPAGATION")
-        private_opt_mount(None, ledger_path, mount_ns["number"])
+        private_opt_mount(outer_opt_reference, ledger_path, mount_ns["number"])
         emit(result_fd, "stage", name="OPT_MOUNTED")
         require_not_cancelled(cancel_event, "AFTER_OPT_MOUNT")
         toolchain = verify_toolchain(node, corepack, workspace=workspace)
@@ -1404,6 +1694,124 @@ def holder_emitted_failure(events):
     return FixtureSetupFailure(category, primary, combined_failure(cleanup))
 
 
+def run_route_b_opt_controls(expect):
+    def expect_failure(operation, reason, marker):
+        try:
+            operation()
+        except SupervisorFailure as error:
+            expect(str(error) == reason, marker)
+        else:
+            expect(False, marker)
+
+    mount_row = {
+        "mountId": "10", "parentId": "1", "device": "0:42", "root": "/",
+        "mountpoint": "/", "parentMountpoint": "/", "mountOptions": ["rw"],
+        "optional": ["shared:4"], "fstype": "ext4", "source": "/dev/root",
+        "superOptions": ["rw", "errors=remount-ro"], "raw": "control",
+    }
+    private_mount_row = dict(mount_row, mountId="99", parentId="77", optional=["master:12"])
+    expect(
+        normalize_opt_mount_view([mount_row]) == normalize_opt_mount_view([private_mount_row]),
+        "ROUTE_B_OPT_CONTROL_PROPAGATION_NORMALIZED",
+    )
+    outer = {
+        "fileType": "directory",
+        "identity": {
+            "device": 42, "inode": 100, "uid": 0, "gid": 0, "mode": 0o777,
+            "size": 4096, "mtimeNs": 11, "ctimeNs": 12,
+        },
+        "accessAcl": None, "defaultAcl": None, "children": [],
+        "mountView": normalize_opt_mount_view([mount_row]), "mounts": ("control",),
+    }
+    receipt = parse_outer_opt_reference(serialize_outer_opt_reference(outer))
+    expect(validate_outer_opt_snapshot(receipt, outer), "ROUTE_B_OPT_CONTROL_OUTER_0777_ACCEPTED")
+    expect_failure(
+        lambda: parse_outer_opt_reference('{"schema":"x","schema":"y"}'),
+        "OUTER_OPT_REFERENCE_INVALID",
+        "ROUTE_B_OPT_CONTROL_DUPLICATE_RECEIPT_KEY_REJECTED",
+    )
+
+    changed_cases = (
+        ("device", 43, "OUTER_OPT_DEVICE_CHANGED", "ROUTE_B_OPT_CONTROL_OUTER_DEVICE_DRIFT"),
+        ("inode", 101, "OUTER_OPT_INODE_CHANGED", "ROUTE_B_OPT_CONTROL_OUTER_INODE_DRIFT"),
+        ("uid", 1, "OUTER_OPT_UID_CHANGED", "ROUTE_B_OPT_CONTROL_OUTER_UID_DRIFT"),
+        ("gid", 1, "OUTER_OPT_GID_CHANGED", "ROUTE_B_OPT_CONTROL_OUTER_GID_DRIFT"),
+        ("mode", 0o755, "OUTER_OPT_MODE_CHANGED", "ROUTE_B_OPT_CONTROL_OUTER_MODE_DRIFT"),
+    )
+    for field, value, reason, marker in changed_cases:
+        changed = json.loads(json.dumps(outer))
+        changed["identity"][field] = value
+        expect_failure(lambda changed=changed: validate_outer_opt_snapshot(receipt, changed), reason, marker)
+    for field, value, reason, marker in (
+        ("accessAcl", "010203", "OUTER_OPT_ACCESS_ACL_CHANGED", "ROUTE_B_OPT_CONTROL_OUTER_ACCESS_ACL_DRIFT"),
+        ("defaultAcl", "040506", "OUTER_OPT_DEFAULT_ACL_CHANGED", "ROUTE_B_OPT_CONTROL_OUTER_DEFAULT_ACL_DRIFT"),
+    ):
+        changed = json.loads(json.dumps(outer))
+        changed[field] = value
+        expect_failure(lambda changed=changed: validate_outer_opt_snapshot(receipt, changed), reason, marker)
+    changed_mount = json.loads(json.dumps(outer))
+    changed_mount["mountView"][0]["mountOptions"] = ["ro"]
+    expect_failure(
+        lambda: validate_outer_opt_snapshot(receipt, changed_mount),
+        "OUTER_OPT_MOUNT_VIEW_CHANGED",
+        "ROUTE_B_OPT_CONTROL_OUTER_MOUNT_VIEW_DRIFT",
+    )
+    changed_children = json.loads(json.dumps(outer))
+    changed_children["children"] = [{"name": "changed"}]
+    expect_failure(
+        lambda: validate_outer_opt_snapshot(receipt, changed_children),
+        "OUTER_OPT_CHILDREN_CHANGED",
+        "ROUTE_B_OPT_CONTROL_OUTER_CHILD_DRIFT",
+    )
+    expect_failure(
+        lambda: validate_outer_opt_path_mode(stat.S_IFLNK | 0o777),
+        "OUTER_OPT_SYMLINK",
+        "ROUTE_B_OPT_CONTROL_OUTER_SYMLINK_REJECTED",
+    )
+    expect_failure(
+        lambda: validate_outer_opt_path_mode(stat.S_IFREG | 0o755),
+        "OUTER_OPT_NOT_DIRECTORY",
+        "ROUTE_B_OPT_CONTROL_OUTER_NON_DIRECTORY_REJECTED",
+    )
+
+    inner_identity = {"fileType": "directory", "device": 77, "uid": 0, "gid": 0, "mode": 0o755}
+    inner_rows = [{
+        "fstype": "tmpfs", "source": "tmpfs", "mountOptions": ["rw"],
+        "superOptions": ["rw", "nosuid", "nodev", "mode=755", "size=4G"],
+    }]
+    expect(
+        validate_inner_opt_mount(inner_identity, outer["identity"]["device"], inner_rows, None),
+        "ROUTE_B_OPT_CONTROL_INNER_DISTINCT_TMPFS_ACCEPTED",
+    )
+    for field, value, reason, marker in (
+        ("uid", 1, "ROUTE_B_OPT_OWNER_INVALID", "ROUTE_B_OPT_CONTROL_INNER_UID_REJECTED"),
+        ("gid", 1, "ROUTE_B_OPT_OWNER_INVALID", "ROUTE_B_OPT_CONTROL_INNER_GID_REJECTED"),
+        ("mode", 0o777, "ROUTE_B_OPT_MODE_INVALID", "ROUTE_B_OPT_CONTROL_INNER_MODE_REJECTED"),
+    ):
+        changed = dict(inner_identity, **{field: value})
+        expect_failure(
+            lambda changed=changed: validate_inner_opt_mount(changed, outer["identity"]["device"], inner_rows, None),
+            reason,
+            marker,
+        )
+    expect_failure(
+        lambda: validate_inner_opt_mount(dict(inner_identity, device=outer["identity"]["device"]), outer["identity"]["device"], inner_rows, None),
+        "ROUTE_B_OPT_FILESYSTEM_NOT_DISTINCT",
+        "ROUTE_B_OPT_CONTROL_INNER_SAME_DEVICE_REJECTED",
+    )
+    bad_filesystem = [dict(inner_rows[0], fstype="ext4")]
+    expect_failure(
+        lambda: validate_inner_opt_mount(inner_identity, outer["identity"]["device"], bad_filesystem, None),
+        "ROUTE_B_OPT_MOUNT_IDENTITY_INVALID",
+        "ROUTE_B_OPT_CONTROL_INNER_FILESYSTEM_REJECTED",
+    )
+    expect_failure(
+        lambda: validate_inner_opt_mount(inner_identity, outer["identity"]["device"], inner_rows, "010203"),
+        "ROUTE_B_OPT_DEFAULT_ACL_INVALID",
+        "ROUTE_B_OPT_CONTROL_INNER_DEFAULT_ACL_REJECTED",
+    )
+
+
 def validate_fixture_diagnostic_controls():
     outer_ids = ({"number": 101}, {"number": 202}, {"number": 303})
     ready = {"kind": "ready", "pid": 404, "mountNamespace": 505, "userNamespace": 101, "pidNamespace": 202}
@@ -1413,6 +1821,8 @@ def validate_fixture_diagnostic_controls():
         if not condition:
             raise SupervisorFailure("FIXTURE_DIAGNOSTIC_CONTROL_FAILED:" + marker)
         emit_to_stdout(marker + "=PASS\n")
+
+    run_route_b_opt_controls(expect)
 
     def fail_before_launch():
         raise SupervisorFailure("UNSHARE_LAUNCH_FAILED")
@@ -1540,7 +1950,7 @@ def drain_until_eof(fd, deadline):
             return
 
 
-def launch_holder(mode, *, workspace, carrier, temp_root, uid, gid, node, corepack, ledger_path, outer_ids):
+def launch_holder(mode, *, workspace, carrier, temp_root, uid, gid, node, corepack, ledger_path, outer_ids, outer_opt):
     control_read = control_write = result_read = result_write = None
     log = None
     owned = None
@@ -1554,6 +1964,7 @@ def launch_holder(mode, *, workspace, carrier, temp_root, uid, gid, node, corepa
             "--corepack", str(corepack), "--control-fd", str(control_read), "--result-fd", str(result_write),
             "--ledger", str(ledger_path), "--outer-user-ns", str(outer_ids[0]["number"]),
             "--outer-pid-ns", str(outer_ids[1]["number"]), "--supervisor-pid", str(os.getpid()),
+            "--outer-opt-reference", serialize_outer_opt_reference(outer_opt),
         ]
         minimal_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C", "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"}
         log = open(Path(temp_root) / ".namespace-state" / ("holder-" + mode + ".log"), "wb", buffering=0)
@@ -1624,7 +2035,7 @@ def validate_process_ledger(path):
     return rows
 
 
-def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, uid, gid, retained_reference=False):
+def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, outer_opt, uid, gid, retained_reference=False):
     modes = {
         "leaked-holder": ("fixture", None),
         "positive-release": ("fixture", None),
@@ -1638,7 +2049,7 @@ def run_fixture(kind, *, workspace, temp_root, ledger_path, outer_ids, uid, gid,
         owned, control_write, result_read, log = launch_fixture_holder(
             launch_holder,
             mode, workspace=workspace, carrier="/", temp_root=temp_root, uid=uid, gid=gid,
-            node="/usr/bin/python3", corepack="/usr/bin/python3", ledger_path=ledger_path, outer_ids=outer_ids,
+            node="/usr/bin/python3", corepack="/usr/bin/python3", ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt,
         )
     except Exception as error:
         failure = error if isinstance(error, FixtureSetupFailure) else holder_launch_failure(error)
@@ -1823,12 +2234,12 @@ def run_owned_process_regressions(temp_root, ledger_path):
                 child.wait(0)
 
 
-def run_namespace_regressions(workspace, temp_root, ledger_path, outer_ids, uid, gid):
+def run_namespace_regressions(workspace, temp_root, ledger_path, outer_ids, outer_opt, uid, gid):
     run_owned_process_regressions(temp_root, ledger_path)
-    run_fixture("leaked-holder", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, uid=uid, gid=gid)
-    run_fixture("positive-release", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, uid=uid, gid=gid, retained_reference=True)
-    run_fixture("cancel-opt", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, uid=uid, gid=gid)
-    run_fixture("cancel-application", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, uid=uid, gid=gid)
+    run_fixture("leaked-holder", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid)
+    run_fixture("positive-release", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid, retained_reference=True)
+    run_fixture("cancel-opt", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid)
+    run_fixture("cancel-application", workspace=workspace, temp_root=temp_root, ledger_path=ledger_path, outer_ids=outer_ids, outer_opt=outer_opt, uid=uid, gid=gid)
     emit_to_stdout("NAMESPACE_HOLDER_LIFECYCLE_REGRESSIONS=PASS\nNAMESPACE_CANCELLATION_REGRESSIONS=PASS\n")
 
 
@@ -1892,14 +2303,14 @@ def root_supervise(args):
     try:
         state, ledger = prepare_state(temp_root)
         emit_to_stdout("NAMESPACE_SUPERVISOR=ROOT_ORIGINAL_MOUNT_NAMESPACE\nNAMESPACE_USER_PID_UNCHANGED=REQUIRED\n")
-        run_namespace_regressions(workspace, temp_root, ledger, outer_ids, args.uid, args.gid)
+        run_namespace_regressions(workspace, temp_root, ledger, outer_ids, outer_opt, args.uid, args.gid)
         regressions_passed = True
         if ROOT_CANCEL_EVENT.is_set():
             raise Cancelled("HOSTED_NAMESPACE_CANCELLED_DURING_REGRESSIONS")
         holder, control_write, result_read, log = launch_holder(
             "production", workspace=workspace, carrier=carrier, temp_root=temp_root,
             uid=args.uid, gid=args.gid, node=args.node, corepack=args.corepack,
-            ledger_path=ledger, outer_ids=outer_ids,
+            ledger_path=ledger, outer_ids=outer_ids, outer_opt=outer_opt,
         )
         holder_namespace = holder.mount_id
         holder_events(result_read, 90 * 60, events, cancel_event=ROOT_CANCEL_EVENT, cancel_callback=cancel_holder)
@@ -2095,7 +2506,8 @@ def holder_entry(args):
     # This process entered only the mount namespace; user and PID namespaces
     # are checked against identities received from the root supervisor.
     try:
-        return inner_holder(Path(args.workspace), Path(args.carrier), Path(args.temp_root), args.uid, args.gid, args.node, args.corepack, control_fd, result_fd, Path(args.ledger), args.outer_user_ns, args.outer_pid_ns, args.mode)
+        outer_opt_reference = parse_outer_opt_reference(args.outer_opt_reference)
+        return inner_holder(Path(args.workspace), Path(args.carrier), Path(args.temp_root), args.uid, args.gid, args.node, args.corepack, control_fd, result_fd, Path(args.ledger), args.outer_user_ns, args.outer_pid_ns, args.mode, outer_opt_reference)
     except FixtureSetupFailure as error:
         if args.mode in {"fixture", "fixture-opt-cancel", "fixture-application-cancel"}:
             emit_fixture_failure(result_fd, error.category, error.primary_failure, error.cleanup_failure)
@@ -2277,6 +2689,7 @@ def build_argument_parser():
     parser.add_argument("--ledger", default="")
     parser.add_argument("--outer-user-ns", type=int, default=-1)
     parser.add_argument("--outer-pid-ns", type=int, default=-1)
+    parser.add_argument("--outer-opt-reference", default="")
     parser.add_argument("--supervisor-pid", type=int, default=0)
     return parser
 
