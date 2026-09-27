@@ -1,6 +1,9 @@
 name: S8 FBX end-to-end contract
 
 on:
+  push:
+    branches:
+      - codex/s8-run110-prepublication-linux-carrier
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -28,12 +31,12 @@ jobs:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact PR head
         shell: bash
         env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
       - name: Download verify and run pinned actionlint on Linux
         if: matrix.platform == 'linux/amd64'
@@ -495,12 +498,12 @@ jobs:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact PR head
         shell: bash
         env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -650,12 +653,12 @@ jobs:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact PR head
         shell: bash
         env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
       - name: Build and run native process boundary
         shell: bash
@@ -687,12 +690,12 @@ jobs:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact PR head
         shell: bash
         env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
       - name: Setup Node 22 for hosted toolchain
         id: setup_node
