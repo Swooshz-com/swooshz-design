@@ -25,24 +25,67 @@ HOSTED_TIMER = Path("/etc/systemd/system/swooshz-s8-broker-recover.timer")
 HOSTED_RUNTIME = Path("/opt/blender")
 HOSTED_WRITER_ROOT = Path("/opt/swooshz")
 HOSTED_LEDGER_NAME = "s8-broker-deployment.ledger"
+HOSTED_DEPLOYMENT_ABSENCE_PATHS = (
+    Path("/usr/local/libexec/swooshz-s8"),
+    Path("/var/lib/swooshz/s8"),
+    Path("/opt/blender"),
+    Path("/opt/swooshz"),
+    HOSTED_POLICY_PATH,
+    HOSTED_SUDOERS,
+    HOSTED_SERVICE,
+    HOSTED_TIMER,
+    HOSTED_LAUNCHER,
+    HOSTED_BROKER,
+    HOSTED_RUNNER,
+    HOSTED_VALIDATOR,
+)
 
 
 class HostedDeploymentFailure(RuntimeError):
     pass
 
 
-def hosted_run(args, label, *, cwd=None, log_path=None):
-    result = subprocess.run(args, cwd=cwd, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if log_path is not None:
-        Path(log_path).write_bytes(result.stdout)
+def hosted_run(args, label, *, cwd=None, env=None, log_path=None):
+    ledger_path = os.environ.get("S8_PROCESS_LEDGER")
+    if ledger_path:
+        try:
+            from hosted_deployment_namespace import supervised_command
+        except ImportError as error:
+            raise HostedDeploymentFailure("HOSTED_PROCESS_SUPERVISOR_UNAVAILABLE") from error
+        result = supervised_command(args, cwd=cwd, env=env, label=label, log_path=log_path)
+    else:
+        result = subprocess.run(args, cwd=cwd, env=env, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if log_path is not None:
+            Path(log_path).write_bytes(result.stdout)
     if result.returncode != 0:
         detail = result.stdout.decode("utf-8", errors="replace")[-12000:]
         raise HostedDeploymentFailure(label + ("\n" + detail if detail else ""))
     return result.stdout.decode("utf-8", errors="strict")
 
 
-def hosted_sudo(*args, label="HOSTED_SUDO_COMMAND_FAILED"):
-    return hosted_run(["/usr/bin/sudo", "-n", *args], label)
+def hosted_run_as_host_user(args, runner_uid, runner_gid, label, *, cwd=None, log_path=None):
+    runner_account = pwd.getpwuid(int(runner_uid))
+    if runner_account.pw_gid != int(runner_gid):
+        raise HostedDeploymentFailure("HOSTED_RUNNER_ACCOUNT_GID_MISMATCH")
+    env = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": runner_account.pw_dir,
+        "USER": runner_account.pw_name,
+        "LOGNAME": runner_account.pw_name,
+        "LC_ALL": "C",
+    }
+    command = [
+        "/usr/bin/setpriv", "--reuid", str(runner_uid), "--regid", str(runner_gid),
+        "--clear-groups", "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all",
+        "--", *args,
+    ]
+    return hosted_run(command, label, cwd=cwd, env=env, log_path=log_path)
+
+
+def hosted_root(*args, label="HOSTED_ROOT_COMMAND_FAILED"):
+    if os.geteuid() != 0 or os.getuid() != 0:
+        raise HostedDeploymentFailure("HOSTED_ROOT_AUTHORITY_REQUIRED")
+    return hosted_run(list(args), label)
 
 
 def hosted_canonical(value):
@@ -107,7 +150,7 @@ def hosted_protected_state(path, *, digest=False):
     path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
         raise HostedDeploymentFailure("HOSTED_PATH_PROBE_ARGUMENT_INVALID")
-    output = hosted_sudo("/usr/bin/python3", "-c", HOSTED_PATH_STATE_SCRIPT, "digest" if digest else "state", str(path), label="HOSTED_PATH_PROBE_FAILED:" + str(path))
+    output = hosted_root("/usr/bin/python3", "-c", HOSTED_PATH_STATE_SCRIPT, "digest" if digest else "state", str(path), label="HOSTED_PATH_PROBE_FAILED:" + str(path))
     try:
         state = json.loads(output)
     except (ValueError, TypeError) as error:
@@ -129,7 +172,8 @@ def hosted_identity(state):
 
 
 def hosted_ledger(temp_root):
-    return Path(temp_root) / HOSTED_LEDGER_NAME
+    root = Path(os.environ.get("S8_ROOT_STATE", str(temp_root)))
+    return root / HOSTED_LEDGER_NAME
 
 
 def hosted_append_ledger(temp_root, row):
@@ -152,25 +196,26 @@ def hosted_record_file(temp_root, path):
     hosted_append_ledger(temp_root, {"kind": "F", "identity": hosted_identity(state), "digest": state["sha256"], "path": str(path)})
 
 
-def hosted_create_directory(temp_root, path, mode):
+def hosted_create_directory(temp_root, path, mode, *, record=True):
     if hosted_protected_state(path) is not None:
         raise HostedDeploymentFailure("HOSTED_DIRECTORY_NOT_FRESH:" + str(path))
-    hosted_sudo("/usr/bin/mkdir", "-m", format(mode, "04o"), "--", str(path), label="HOSTED_DIRECTORY_CREATE_FAILED")
-    try:
-        hosted_record_directory(temp_root, path)
-    except Exception:
-        hosted_sudo("/usr/bin/rmdir", "--", str(path), label="HOSTED_UNRECORDED_DIRECTORY_CLEANUP_FAILED")
-        raise
+    hosted_root("/usr/bin/mkdir", "-m", format(mode, "04o"), "--", str(path), label="HOSTED_DIRECTORY_CREATE_FAILED")
+    if record:
+        try:
+            hosted_record_directory(temp_root, path)
+        except Exception:
+            hosted_root("/usr/bin/rmdir", "--", str(path), label="HOSTED_UNRECORDED_DIRECTORY_CLEANUP_FAILED")
+            raise
 
 
 def hosted_install(temp_root, source, target, mode):
     if hosted_protected_state(target) is not None:
         raise HostedDeploymentFailure("HOSTED_FILE_NOT_FRESH:" + str(target))
-    hosted_sudo("/usr/bin/install", "-o", "root", "-g", "root", "-m", format(mode, "04o"), "--", str(source), str(target), label="HOSTED_FILE_INSTALL_FAILED:" + str(target))
+    hosted_root("/usr/bin/install", "-o", "root", "-g", "root", "-m", format(mode, "04o"), "--", str(source), str(target), label="HOSTED_FILE_INSTALL_FAILED:" + str(target))
     try:
         hosted_record_file(temp_root, target)
     except Exception:
-        hosted_sudo("/usr/bin/rm", "-f", "--", str(target), label="HOSTED_UNRECORDED_FILE_CLEANUP_FAILED")
+        hosted_root("/usr/bin/rm", "-f", "--", str(target), label="HOSTED_UNRECORDED_FILE_CLEANUP_FAILED")
         raise
 
 
@@ -240,10 +285,10 @@ def hosted_acl_diagnostic(access, defaults, state, issues, effective_mismatch, r
     return json.dumps(diagnostic, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
-def hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after):
+def hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after, *, installing=False):
     access, access_issues = hosted_parse_acl(access_text, default=False)
     defaults, default_issues = hosted_parse_acl(default_text, default=True)
-    expected = {"user:": "rwx", "user:" + str(runner_uid): "--x", "group:": "--x", "mask:": "--x", "other:": "---"}
+    expected = {"user:": "rwx", "user:" + str(runner_uid): "--x", "group:": "---", "mask:": "--x", "other:": "---"}
     access_rights = {key: rights for key, (rights, _) in access.items()}
     mask = access_rights.get("mask:")
     effective_mismatch = []
@@ -254,50 +299,114 @@ def hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, a
             effective_mismatch.append(key + ":REPORTED")
         if key in expected and derived != expected[key]:
             effective_mismatch.append(key + ":INTENDED")
+    before_mode = 0o700 if installing else 0o710
     identity_match = (
         before is not None and after is not None
         and (before["device"], before["inode"]) == (after["device"], after["inode"])
-        and all((state["kind"], state["uid"], state["gid"], state["mode"]) == ("directory", 0, 0, 0o710) for state in (before, after))
+        and (before["kind"], before["uid"], before["gid"], before["mode"]) == ("directory", 0, 0, before_mode)
+        and (after["kind"], after["uid"], after["gid"], after["mode"]) == ("directory", 0, 0, 0o710)
     )
     if access_issues or default_issues or access_rights != expected or defaults or effective_mismatch or not identity_match:
         diagnostic = hosted_acl_diagnostic(access, defaults, after, access_issues + default_issues, effective_mismatch, "SEMANTIC_MISMATCH", identity_match=identity_match)
         raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_INVALID:" + diagnostic)
 
 
-def hosted_verify_private_root_acl(runner_uid):
+def hosted_remove_incomplete_private_root(before):
+    current = hosted_protected_state(HOSTED_PRIVATE_ROOT)
+    if current is None:
+        return
+    if before is None or (
+        current["kind"], current["device"], current["inode"], current["uid"], current["gid"]
+    ) != (
+        "directory", before["device"], before["inode"], 0, 0
+    ):
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ROLLBACK_IDENTITY_INVALID")
+    mounts = hosted_root(
+        "/usr/bin/findmnt", "--noheadings", "--raw", "--output", "TARGET",
+        label="HOSTED_PRIVATE_ROOT_ROLLBACK_MOUNT_INSPECTION_FAILED",
+    ).splitlines()
+    path = str(HOSTED_PRIVATE_ROOT)
+    if any(mount == path or mount.startswith(path.rstrip("/") + "/") for mount in mounts):
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ROLLBACK_MOUNT_REFUSED")
+    contents = hosted_root(
+        "/usr/bin/find", "-P", path, "-mindepth", "1", "-maxdepth", "1", "-print", "-quit",
+        label="HOSTED_PRIVATE_ROOT_ROLLBACK_CONTENT_INSPECTION_FAILED",
+    ).strip()
+    if contents:
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ROLLBACK_NOT_EMPTY")
+    hosted_root("/usr/bin/rmdir", "--", path, label="HOSTED_PRIVATE_ROOT_ROLLBACK_FAILED")
+    if hosted_protected_state(HOSTED_PRIVATE_ROOT) is not None:
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ROLLBACK_REMAINS")
+
+
+def hosted_verify_private_root_acl(runner_uid, *, install=False):
     try:
         before = hosted_protected_state(HOSTED_PRIVATE_ROOT)
     except HostedDeploymentFailure as error:
         diagnostic = hosted_acl_diagnostic({}, {}, None, ["PRE_PROBE_FAILED"], [], "PRIVILEGED_IDENTITY_READ_FAILED", identity_match=False)
         raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_IDENTITY_READ_FAILED:" + diagnostic) from error
-    if before is None or (before["kind"], before["uid"], before["gid"], before["mode"]) != ("directory", 0, 0, 0o710):
+    expected_mode = 0o700 if install else 0o710
+    if before is None or (before["kind"], before["uid"], before["gid"], before["mode"]) != ("directory", 0, 0, expected_mode):
         diagnostic = hosted_acl_diagnostic({}, {}, before, [], [], "PRE_APPLY_IDENTITY_INVALID", identity_match=False)
         raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_INVALID:" + diagnostic)
-    acl = f"u::rwx,u:{runner_uid}:--x,g::--x,m::--x,o::---"
     try:
-        hosted_sudo("/usr/bin/setfacl", "--no-mask", "--set", acl, "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_CREATE_FAILED")
-    except HostedDeploymentFailure as error:
-        diagnostic = hosted_acl_diagnostic({}, {}, before, ["SETFACL_FAILED"], [], "PRIVILEGED_WRITE_FAILED", identity_match=False)
-        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_CREATE_FAILED:" + diagnostic) from error
-    try:
-        access_text = hosted_sudo("/usr/bin/getfacl", "--numeric", "--omit-header", "--absolute-names", "--physical", "--all-effective", "--access", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_ACCESS_READ_FAILED")
-    except HostedDeploymentFailure as error:
-        diagnostic = hosted_acl_diagnostic({}, {}, before, ["ACCESS_READ_FAILED"], [], "PRIVILEGED_READ_FAILED", identity_match=False)
-        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_READ_FAILED:" + diagnostic) from error
-    try:
-        default_text = hosted_sudo("/usr/bin/getfacl", "--numeric", "--omit-header", "--absolute-names", "--physical", "--all-effective", "--default", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_DEFAULT_READ_FAILED")
-    except HostedDeploymentFailure as error:
-        access, issues = hosted_parse_acl(access_text, default=False)
-        diagnostic = hosted_acl_diagnostic(access, {}, before, issues + ["DEFAULT_READ_FAILED"], [], "PRIVILEGED_READ_FAILED", identity_match=False)
-        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_READ_FAILED:" + diagnostic) from error
-    try:
-        after = hosted_protected_state(HOSTED_PRIVATE_ROOT)
-    except HostedDeploymentFailure as error:
-        access, access_issues = hosted_parse_acl(access_text, default=False)
-        defaults, default_issues = hosted_parse_acl(default_text, default=True)
-        diagnostic = hosted_acl_diagnostic(access, defaults, None, access_issues + default_issues + ["POST_PROBE_FAILED"], [], "PRIVILEGED_IDENTITY_READ_FAILED", identity_match=False)
-        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_IDENTITY_READ_FAILED:" + diagnostic) from error
-    hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after)
+        if install:
+            acl = f"u::rwx,u:{runner_uid}:--x,g::---,m::--x,o::---"
+            try:
+                hosted_root("/usr/bin/setfacl", "-k", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_DEFAULT_CLEAR_FAILED")
+                hosted_root("/usr/bin/setfacl", "--no-mask", "--set", acl, "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_CREATE_FAILED")
+                hosted_root("/usr/bin/chmod", "0710", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_MODE_SET_FAILED")
+            except HostedDeploymentFailure as error:
+                diagnostic = hosted_acl_diagnostic({}, {}, before, ["ACL_INSTALL_FAILED"], [], "PRIVILEGED_WRITE_FAILED", identity_match=False)
+                raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_CREATE_FAILED:" + diagnostic) from error
+        try:
+            access_text = hosted_root("/usr/bin/getfacl", "--numeric", "--omit-header", "--absolute-names", "--physical", "--all-effective", "--access", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_ACCESS_READ_FAILED")
+        except HostedDeploymentFailure as error:
+            diagnostic = hosted_acl_diagnostic({}, {}, before, ["ACCESS_READ_FAILED"], [], "PRIVILEGED_READ_FAILED", identity_match=False)
+            raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_READ_FAILED:" + diagnostic) from error
+        try:
+            default_text = hosted_root("/usr/bin/getfacl", "--numeric", "--omit-header", "--absolute-names", "--physical", "--all-effective", "--default", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_DEFAULT_READ_FAILED")
+        except HostedDeploymentFailure as error:
+            access, issues = hosted_parse_acl(access_text, default=False)
+            diagnostic = hosted_acl_diagnostic(access, {}, before, issues + ["DEFAULT_READ_FAILED"], [], "PRIVILEGED_READ_FAILED", identity_match=False)
+            raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_READ_FAILED:" + diagnostic) from error
+        try:
+            after = hosted_protected_state(HOSTED_PRIVATE_ROOT)
+        except HostedDeploymentFailure as error:
+            access, access_issues = hosted_parse_acl(access_text, default=False)
+            defaults, default_issues = hosted_parse_acl(default_text, default=True)
+            diagnostic = hosted_acl_diagnostic(access, defaults, None, access_issues + default_issues + ["POST_PROBE_FAILED"], [], "PRIVILEGED_IDENTITY_READ_FAILED", identity_match=False)
+            raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_IDENTITY_READ_FAILED:" + diagnostic) from error
+        hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after, installing=install)
+    except Exception as error:
+        if install:
+            try:
+                hosted_remove_incomplete_private_root(before)
+            except Exception as rollback_error:
+                failure = str(error).split(":", 1)[0]
+                rollback = str(rollback_error).split(":", 1)[0]
+                raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_ROLLBACK_FAILED:" + failure + ":" + rollback) from error
+        if isinstance(error, HostedDeploymentFailure):
+            raise
+        raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_VERIFY_FAILED") from error
+
+
+def valid_sudoers_template(source):
+    expected = (
+        "Cmnd_Alias S8_BROKER_STDIO = ^/usr/local/libexec/swooshz-s8/s8-sandbox-broker$ ^--stdio-v1$",
+        'Defaults!S8_BROKER_STDIO env_reset,stay_setuid,!setenv,env_keep="",env_check=""',
+        "@S8_HOST_USER@ ALL=(root) NOPASSWD: NOSETENV: S8_BROKER_STDIO",
+    )
+    return isinstance(source, str) and tuple(source.splitlines()) == expected
+
+
+def require_sudo_regex_version():
+    minimum = (1, 9, 10)
+    for executable, label in (("/usr/bin/sudo", "SUDO"), ("/usr/sbin/visudo", "VISUDO")):
+        output = hosted_root(executable, "-V", label="HOSTED_" + label + "_VERSION_QUERY_FAILED")
+        match = re.search(r"(?m)^(?:Sudo|visudo) version ([0-9]+)\.([0-9]+)\.([0-9]+)(?:p([0-9]+))?\s*$", output)
+        if match is None or tuple(int(value or 0) for value in match.groups())[:3] < minimum:
+            raise HostedDeploymentFailure("HOSTED_SUDO_REGEX_UNSUPPORTED:" + label)
 
 
 def hosted_policy(temp_root, runner_uid, runner_gid):
@@ -335,7 +444,7 @@ def hosted_policy(temp_root, runner_uid, runner_gid):
     config["sandboxPolicySha256"] = policy_h
     policy_bytes = hosted_canonical(policy)
     config_q = hashlib.sha256(hosted_canonical(config)).hexdigest()
-    policy_tmp = Path(temp_root) / "s8-broker-v1.json"
+    policy_tmp = Path(os.environ.get("S8_ROOT_STATE", str(temp_root))) / "s8-broker-v1.json"
     descriptor = os.open(policy_tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "wb") as output:
         output.write(policy_bytes)
@@ -352,10 +461,9 @@ def hosted_policy(temp_root, runner_uid, runner_gid):
 def hosted_load_ledger(temp_root):
     path = hosted_ledger(temp_root)
     if not path.exists() and not path.is_symlink():
-        print("BROKER_DEPLOYMENT_CLEANUP=PASS_NO_LEDGER")
         return None
     metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (os.getuid(), os.getgid(), 0o600):
+    if not stat.S_ISREG(metadata.st_mode) or (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode), metadata.st_nlink) != (os.getuid(), os.getgid(), 0o600, 1):
         raise HostedDeploymentFailure("HOSTED_LEDGER_IDENTITY_INVALID")
     rows = [json.loads(line) for line in path.read_text(encoding="ascii").splitlines()]
     allowed_dirs = {
@@ -384,11 +492,23 @@ def hosted_load_ledger(temp_root):
     return rows
 
 
-def hosted_cleanup(temp_root):
+def hosted_verify_deployment_absent():
+    present = [str(path) for path in HOSTED_DEPLOYMENT_ABSENCE_PATHS if hosted_protected_state(path) is not None]
+    if present:
+        raise HostedDeploymentFailure("HOSTED_DEPLOYMENT_RESIDUE_REMAINS:" + ",".join(present))
+
+
+def hosted_cleanup(temp_root, runner_uid):
     temp_root = Path(temp_root)
     rows = hosted_load_ledger(temp_root)
     if rows is None:
+        hosted_verify_deployment_absent()
+        print("BROKER_DEPLOYMENT_CLEANUP=PASS_NO_LEDGER")
+        print("PRODUCTION_DEPLOYMENT_ABSENT=YES")
         return
+    private_root_state = hosted_protected_state(HOSTED_PRIVATE_ROOT)
+    if private_root_state is not None:
+        hosted_verify_private_root_acl(runner_uid)
     journal = HOSTED_PRIVATE_ROOT / ".journal"
     journal_state = hosted_protected_state(journal)
     if journal_state is not None:
@@ -396,11 +516,11 @@ def hosted_cleanup(temp_root):
         policy_state = hosted_protected_state(HOSTED_POLICY_PATH)
         if broker_state is None or broker_state["kind"] != "regular" or policy_state is None or policy_state["kind"] != "regular":
             raise HostedDeploymentFailure("HOSTED_RECOVERY_INPUTS_INVALID")
-        hosted_sudo(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_RECOVERY_FAILED")
+        hosted_root(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_RECOVERY_FAILED")
         journal_state = hosted_protected_state(journal)
         if journal_state is None or (journal_state["kind"], journal_state["uid"], journal_state["gid"], journal_state["mode"]) != ("directory", 0, 0, 0o700):
             raise HostedDeploymentFailure("HOSTED_JOURNAL_IDENTITY_INVALID")
-        extra = hosted_sudo("/usr/bin/find", "-P", str(journal), "-mindepth", "1", "-maxdepth", "1", "!", "-name", ".lock", "-print", "-quit", label="HOSTED_JOURNAL_INSPECTION_FAILED").strip()
+        extra = hosted_root("/usr/bin/find", "-P", str(journal), "-mindepth", "1", "-maxdepth", "1", "!", "-name", ".lock", "-print", "-quit", label="HOSTED_JOURNAL_INSPECTION_FAILED").strip()
         if extra:
             raise HostedDeploymentFailure("HOSTED_JOURNAL_UNEXPECTED_CONTENT")
         lock = journal / ".lock"
@@ -408,8 +528,8 @@ def hosted_cleanup(temp_root):
         if lock_state is not None:
             if (lock_state["kind"], lock_state["uid"], lock_state["gid"], lock_state["mode"], lock_state["nlink"]) != ("regular", 0, 0, 0o600, 1):
                 raise HostedDeploymentFailure("HOSTED_JOURNAL_LOCK_IDENTITY_INVALID")
-            hosted_sudo("/usr/bin/rm", "-f", "--", str(lock), label="HOSTED_JOURNAL_LOCK_CLEANUP_FAILED")
-        hosted_sudo("/usr/bin/rmdir", "--", str(journal), label="HOSTED_JOURNAL_CLEANUP_FAILED")
+            hosted_root("/usr/bin/rm", "-f", "--", str(lock), label="HOSTED_JOURNAL_LOCK_CLEANUP_FAILED")
+        hosted_root("/usr/bin/rmdir", "--", str(journal), label="HOSTED_JOURNAL_CLEANUP_FAILED")
 
     for row in reversed(rows):
         target = Path(row["path"])
@@ -420,7 +540,7 @@ def hosted_cleanup(temp_root):
             raise HostedDeploymentFailure("HOSTED_FILE_CLEANUP_IDENTITY_INVALID:" + str(target))
         if state["sha256"] != row["digest"]:
             raise HostedDeploymentFailure("HOSTED_FILE_CLEANUP_HASH_INVALID:" + str(target))
-        hosted_sudo("/usr/bin/rm", "-f", "--", str(target), label="HOSTED_FILE_CLEANUP_FAILED")
+        hosted_root("/usr/bin/rm", "-f", "--", str(target), label="HOSTED_FILE_CLEANUP_FAILED")
         if hosted_protected_state(target) is not None:
             raise HostedDeploymentFailure("HOSTED_FILE_REMAINS:" + str(target))
 
@@ -435,12 +555,15 @@ def hosted_cleanup(temp_root):
         if any(mount == str(target) or mount.startswith(str(target).rstrip("/") + "/") for mount in mounts):
             raise HostedDeploymentFailure("HOSTED_NESTED_MOUNT_REFUSED:" + str(target))
         if str(target) == "/opt/blender":
-            hosted_sudo("/usr/bin/rm", "-rf", "--", str(target), label="HOSTED_RUNTIME_CLEANUP_FAILED")
+            hosted_root("/usr/bin/rm", "-rf", "--", str(target), label="HOSTED_RUNTIME_CLEANUP_FAILED")
         else:
-            hosted_sudo("/usr/bin/rmdir", "--", str(target), label="HOSTED_DIRECTORY_CLEANUP_FAILED")
+            hosted_root("/usr/bin/rmdir", "--", str(target), label="HOSTED_DIRECTORY_CLEANUP_FAILED")
         if hosted_protected_state(target) is not None:
             raise HostedDeploymentFailure("HOSTED_DIRECTORY_REMAINS:" + str(target))
+    hosted_verify_deployment_absent()
     hosted_ledger(temp_root).unlink()
+    if hosted_ledger(temp_root).exists() or hosted_ledger(temp_root).is_symlink():
+        raise HostedDeploymentFailure("HOSTED_LEDGER_CLEANUP_FAILED")
     print("BROKER_DEPLOYMENT_CLEANUP=PASS")
     print("PRODUCTION_DEPLOYMENT_ABSENT=YES")
 
@@ -454,11 +577,19 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
     if not workspace.is_dir() or workspace.is_symlink() or workspace.resolve() != Path(__file__).resolve().parents[3]:
         raise HostedDeploymentFailure("HOSTED_WORKSPACE_IDENTITY_INVALID")
     temp_meta = temp_root.lstat() if temp_root.exists() or temp_root.is_symlink() else None
-    if temp_meta is None or not stat.S_ISDIR(temp_meta.st_mode) or temp_root.is_symlink() or (temp_meta.st_uid, temp_meta.st_gid, stat.S_IMODE(temp_meta.st_mode)) != (os.getuid(), os.getgid(), 0o700):
+    if temp_meta is None or not stat.S_ISDIR(temp_meta.st_mode) or temp_root.is_symlink() or (temp_meta.st_uid, temp_meta.st_gid, stat.S_IMODE(temp_meta.st_mode)) != (int(runner_uid), int(runner_gid), 0o700):
         raise HostedDeploymentFailure("HOSTED_TEMP_ROOT_IDENTITY_INVALID")
-    if not re.fullmatch(r"[1-9][0-9]*", runner_uid) or not re.fullmatch(r"[1-9][0-9]*", runner_gid) or (int(runner_uid), int(runner_gid)) != (os.getuid(), os.getgid()):
+    if os.geteuid() != 0 or os.getuid() != 0:
+        raise HostedDeploymentFailure("HOSTED_DEPLOYMENT_ROOT_SUPERVISOR_REQUIRED")
+    if not re.fullmatch(r"[1-9][0-9]*", runner_uid) or not re.fullmatch(r"[1-9][0-9]*", runner_gid):
         raise HostedDeploymentFailure("HOSTED_RUNNER_IDENTITY_INVALID")
-    runner_name = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        runner_account = pwd.getpwuid(int(runner_uid))
+    except KeyError as error:
+        raise HostedDeploymentFailure("HOSTED_RUNNER_ACCOUNT_MISSING") from error
+    if runner_account.pw_gid != int(runner_gid):
+        raise HostedDeploymentFailure("HOSTED_RUNNER_ACCOUNT_GID_MISMATCH")
+    runner_name = runner_account.pw_name
     if not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", runner_name):
         raise HostedDeploymentFailure("HOSTED_RUNNER_NAME_INVALID")
     ledger = hosted_ledger(temp_root)
@@ -467,12 +598,17 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
     descriptor = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
     try:
+        root_state = Path(os.environ.get("S8_ROOT_STATE", str(temp_root)))
         build = temp_root / "s8-broker-build"
-        hosted_run(["/usr/local/bin/cmake", "-S", str(workspace / "native/s8-sandbox-broker"), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release"], "BROKER_CMAKE_CONFIGURE_FAILED", log_path=temp_root / "broker-cmake-configure.log")
-        hosted_run(["/usr/local/bin/cmake", "--build", str(build), "--config", "Release", "--parallel"], "BROKER_BUILD_FAILED", log_path=temp_root / "broker-build.log")
-        hosted_run(["/usr/local/bin/ctest", "--test-dir", str(build), "--output-on-failure"], "BROKER_TESTS_FAILED", log_path=temp_root / "broker-ctest.log")
+        if hosted_protected_state(build) is not None:
+            raise HostedDeploymentFailure("HOSTED_BROKER_BUILD_PATH_NOT_FRESH")
+        runner_cmake_log = root_state / "broker-cmake-configure.log"
+        hosted_run_as_host_user(["/usr/local/bin/cmake", "-S", str(workspace / "native/s8-sandbox-broker"), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release"], runner_uid, runner_gid, "BROKER_CMAKE_CONFIGURE_FAILED", cwd=workspace, log_path=runner_cmake_log)
+        hosted_run_as_host_user(["/usr/local/bin/cmake", "--build", str(build), "--config", "Release", "--parallel"], runner_uid, runner_gid, "BROKER_BUILD_FAILED", cwd=workspace, log_path=root_state / "broker-build.log")
+        hosted_run_as_host_user(["/usr/local/bin/ctest", "--test-dir", str(build), "--output-on-failure"], runner_uid, runner_gid, "BROKER_TESTS_FAILED", cwd=workspace, log_path=root_state / "broker-ctest.log")
         broker_build = build / "s8-sandbox-broker"
-        if not broker_build.is_file() or broker_build.is_symlink() or not os.access(broker_build, os.X_OK):
+        broker_build_meta = broker_build.lstat() if broker_build.exists() or broker_build.is_symlink() else None
+        if broker_build_meta is None or not stat.S_ISREG(broker_build_meta.st_mode) or broker_build.is_symlink() or (broker_build_meta.st_uid, broker_build_meta.st_gid, broker_build_meta.st_nlink, stat.S_IMODE(broker_build_meta.st_mode)) != (int(runner_uid), int(runner_gid), 1, 0o755):
             raise HostedDeploymentFailure("HOSTED_BROKER_BUILD_OUTPUT_INVALID")
 
         absent = [Path(path) for path in (
@@ -491,17 +627,24 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
         hosted_create_directory(temp_root, Path("/usr/local/libexec/swooshz-s8"), 0o755)
         hosted_create_directory(temp_root, HOSTED_RUNTIME, 0o755)
         hosted_create_directory(temp_root, HOSTED_WRITER_ROOT, 0o755)
-        hosted_create_directory(temp_root, HOSTED_PRIVATE_ROOT, 0o710)
-        if hosted_protected_state(Path("/etc/swooshz")) is None:
-            hosted_create_directory(temp_root, Path("/etc/swooshz"), 0o755)
+        hosted_create_directory(temp_root, HOSTED_PRIVATE_ROOT, 0o700, record=False)
+        private_root_before = hosted_protected_state(HOSTED_PRIVATE_ROOT)
+        if private_root_before is None:
+            raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_CREATE_IDENTITY_MISSING")
+        hosted_create_directory(temp_root, Path("/etc/swooshz"), 0o755)
 
-        hosted_verify_private_root_acl(runner_uid)
+        hosted_verify_private_root_acl(runner_uid, install=True)
+        try:
+            hosted_record_directory(temp_root, HOSTED_PRIVATE_ROOT)
+        except Exception:
+            hosted_remove_incomplete_private_root(private_root_before)
+            raise
 
         source_runtime = carrier / "runtime/blender-5.2.2-linux-x64"
-        hosted_sudo("/usr/bin/cp", "-a", "--no-dereference", "--", str(source_runtime) + "/.", str(HOSTED_RUNTIME) + "/", label="HOSTED_RUNTIME_COPY_FAILED")
-        hosted_sudo("/usr/bin/chown", "-R", "--no-dereference", "root:root", "--", str(HOSTED_RUNTIME), label="HOSTED_RUNTIME_OWNER_FAILED")
+        hosted_root("/usr/bin/cp", "-a", "--no-dereference", "--", str(source_runtime) + "/.", str(HOSTED_RUNTIME) + "/", label="HOSTED_RUNTIME_COPY_FAILED")
+        hosted_root("/usr/bin/chown", "-R", "--no-dereference", "root:root", "--", str(HOSTED_RUNTIME), label="HOSTED_RUNTIME_OWNER_FAILED")
         for args, label in ((["-type", "d", "-exec", "/usr/bin/chmod", "0755", "--", "{}", "+"], "HOSTED_RUNTIME_DIRECTORY_MODE_FAILED"), (["-type", "f", "-perm", "/111", "-exec", "/usr/bin/chmod", "0755", "--", "{}", "+"], "HOSTED_RUNTIME_EXECUTABLE_MODE_FAILED"), (["-type", "f", "!", "-perm", "/111", "-exec", "/usr/bin/chmod", "0644", "--", "{}", "+"], "HOSTED_RUNTIME_DATA_MODE_FAILED")):
-            hosted_sudo("/usr/bin/find", "-P", str(HOSTED_RUNTIME), *args, label=label)
+            hosted_root("/usr/bin/find", "-P", str(HOSTED_RUNTIME), *args, label=label)
 
         hosted_install(temp_root, carrier / "native/s8-process-runner", HOSTED_RUNNER, 0o755)
         hosted_install(temp_root, carrier / "native/s8-fbx-validator", HOSTED_VALIDATOR, 0o755)
@@ -515,19 +658,20 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
 
         sudoers_template = workspace / "native/s8-sandbox-broker/deploy/swooshz-s8-broker.sudoers.in"
         sudoers_source = sudoers_template.read_text(encoding="ascii")
-        if sudoers_source.count("@S8_HOST_USER@") != 1:
+        if not valid_sudoers_template(sudoers_source) or sudoers_source.count("@S8_HOST_USER@") != 1:
             raise HostedDeploymentFailure("HOSTED_SUDOERS_TEMPLATE_INVALID")
-        sudoers_tmp = temp_root / "swooshz-s8-broker.sudoers"
+        sudoers_tmp = root_state / "swooshz-s8-broker.sudoers"
         sudoers_tmp.write_text(sudoers_source.replace("@S8_HOST_USER@", runner_name), encoding="ascii")
         sudoers_tmp.chmod(0o600)
         hosted_install(temp_root, sudoers_tmp, HOSTED_SUDOERS, 0o440)
-        hosted_sudo("/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS), label="HOSTED_SUDOERS_VALIDATION_FAILED")
+        require_sudo_regex_version()
+        hosted_root("/usr/sbin/visudo", "-c", "-f", "/etc/sudoers", label="HOSTED_SUDOERS_VALIDATION_FAILED")
 
         policy_tmp, policy_h, config_q, policy_file_hash = hosted_policy(temp_root, int(runner_uid), int(runner_gid))
         hosted_install(temp_root, policy_tmp, HOSTED_POLICY_PATH, 0o600)
         if hosted_file_digest(HOSTED_POLICY_PATH, 0o600) != policy_file_hash:
             raise HostedDeploymentFailure("HOSTED_POLICY_INSTALL_HASH_MISMATCH")
-        hosted_sudo(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_POLICY_ADMISSION_FAILED")
+        hosted_root(str(HOSTED_BROKER), "--recover-v1", label="HOSTED_BROKER_POLICY_ADMISSION_FAILED")
         print("BROKER_BUILD=PASS")
         print("BROKER_TESTS=PASS")
         print("HOSTED_BROKER_BUILD_WIRING=PASS")
@@ -547,7 +691,7 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
     except Exception as error:
         print("HOSTED_COMBINED_BROKER_DEPLOYMENT_FAILURE=" + str(error), file=sys.stderr)
         try:
-            hosted_cleanup(temp_root)
+            hosted_cleanup(temp_root, runner_uid)
         except Exception as cleanup_error:
             print("BROKER_DEPLOYMENT_ROLLBACK=FAIL", file=sys.stderr)
             print("BROKER_DEPLOYMENT_ROLLBACK_FAILURE=" + str(cleanup_error), file=sys.stderr)
@@ -561,8 +705,8 @@ def hosted_cli():
     try:
         if mode == "--hosted-deploy" and len(sys.argv) == 6:
             hosted_deploy(*sys.argv[2:])
-        elif mode == "--hosted-cleanup" and len(sys.argv) == 3:
-            hosted_cleanup(sys.argv[2])
+        elif mode == "--hosted-cleanup" and len(sys.argv) == 4:
+            hosted_cleanup(sys.argv[2], sys.argv[3])
         else:
             raise HostedDeploymentFailure("HOSTED_DEPLOYMENT_ARGUMENTS_INVALID")
     except Exception as error:
@@ -580,7 +724,7 @@ contract, production = sys.argv[1:]
 
 
 def assert_hosted_probe_regressions():
-    original_sudo = hosted_sudo
+    original_sudo = hosted_root
     try:
         with tempfile.TemporaryDirectory(prefix="s8-hosted-path-probe-") as temporary:
             root = Path(temporary)
@@ -598,7 +742,7 @@ def assert_hosted_probe_regressions():
                     raise SystemExit("HOSTED_PATH_PROBE_ROUTE_INVALID")
                 return hosted_run(list(args), label)
 
-            globals()["hosted_sudo"] = local_sudo
+            globals()["hosted_root"] = local_sudo
             if hosted_protected_state(root / "missing") is not None:
                 raise SystemExit("HOSTED_PATH_PROBE_ABSENCE_INVALID")
             file_state = hosted_protected_state(regular, digest=True)
@@ -618,7 +762,7 @@ def assert_hosted_probe_regressions():
             def denied_sudo(*args, label):
                 raise HostedDeploymentFailure("HOSTED_PATH_PROBE_PERMISSION_DENIED")
 
-            globals()["hosted_sudo"] = denied_sudo
+            globals()["hosted_root"] = denied_sudo
             try:
                 hosted_protected_state(root / "missing")
             except HostedDeploymentFailure as error:
@@ -630,7 +774,7 @@ def assert_hosted_probe_regressions():
             def malformed_sudo(*args, label):
                 return '{"state":"absent","uncertain":true}\n'
 
-            globals()["hosted_sudo"] = malformed_sudo
+            globals()["hosted_root"] = malformed_sudo
             try:
                 hosted_protected_state(root / "missing")
             except HostedDeploymentFailure:
@@ -638,7 +782,7 @@ def assert_hosted_probe_regressions():
             else:
                 raise SystemExit("HOSTED_PATH_PROBE_MALFORMED_ACCEPTED")
     finally:
-        globals()["hosted_sudo"] = original_sudo
+        globals()["hosted_root"] = original_sudo
     print("HOSTED_PROTECTED_PATH_PROBE_REGRESSIONS=PASS")
 
 
@@ -648,8 +792,8 @@ assert_hosted_probe_regressions()
 def assert_hosted_acl_regressions():
     runner_uid = "1001"
     state = {"state": "present", "kind": "directory", "device": 17, "inode": 23, "uid": 0, "gid": 0, "mode": 0o710, "nlink": 2}
-    exact = "user::rwx\nuser:1001:--x\ngroup::--x\nmask::--x\nother::---\n"
-    reordered = "# file: omitted-by-header-option\n  other : : ---\r\nmask::--x\r\ngroup::--x  #effective:--x\r\nuser:1001:--x\t#effective:--x\r\nuser::rwx\r\n"
+    exact = "user::rwx\nuser:1001:--x\ngroup::---\nmask::--x\nother::---\n"
+    reordered = "# file: omitted-by-header-option\n  other : : ---\r\nmask::--x\r\ngroup::---  #effective:---\r\nuser:1001:--x\t#effective:--x\r\nuser::rwx\r\n"
     hosted_verify_acl_semantics(exact, "", runner_uid, state, state)
     hosted_verify_acl_semantics(reordered, "  \n", runner_uid, state, state)
     print("HOSTED_ACL_SEMANTIC_POSITIVE_CONTROLS=PASS")
@@ -661,7 +805,7 @@ def assert_hosted_acl_regressions():
         "EXTRA_NAMED_GROUP": (exact + "group:2002:--x\n", "", runner_uid, state, state),
         "WRONG_RUNNER_UID": (exact.replace("user:1001", "user:1002"), "", runner_uid, state, state),
         "WRONG_MASK": (exact.replace("mask::--x", "mask::r-x"), "", runner_uid, state, state),
-        "WRONG_GROUP": (exact.replace("group::--x", "group::r-x"), "", runner_uid, state, state),
+        "WRONG_GROUP": (exact.replace("group::---", "group::r-x"), "", runner_uid, state, state),
         "WRONG_OTHER": (exact.replace("other::---", "other::--x"), "", runner_uid, state, state),
         "DEFAULT_ACL": (exact, "default:user::rwx\ndefault:group::--x\n", runner_uid, state, state),
         "EFFECTIVE_RIGHTS": (exact.replace("user:1001:--x", "user:1001:--x\t#effective:---"), "", runner_uid, state, state),
@@ -682,7 +826,7 @@ def assert_hosted_acl_regressions():
             raise SystemExit("HOSTED_ACL_NEGATIVE_CONTROL_ACCEPTED:" + label)
         print("HOSTED_ACL_NEGATIVE_CONTROL_" + label + "=PASS")
 
-    original_sudo, original_probe = hosted_sudo, hosted_protected_state
+    original_sudo, original_probe = hosted_root, hosted_protected_state
     calls = []
     try:
         def fake_probe(path):
@@ -702,17 +846,83 @@ def assert_hosted_acl_regressions():
             raise SystemExit("HOSTED_ACL_PRIVILEGED_ROUTE_INVALID")
 
         globals()["hosted_protected_state"] = fake_probe
-        globals()["hosted_sudo"] = fake_sudo
+        globals()["hosted_root"] = fake_sudo
         hosted_verify_private_root_acl(runner_uid)
-        if len(calls) != 5 or calls[0] != "probe" or calls[-1] != "probe" or calls[1][0] != "/usr/bin/setfacl" or "--no-mask" not in calls[1] or "--access" not in calls[2] or "--default" not in calls[3] or any("--physical" not in args or "--absolute-names" not in args for args in calls[2:4]):
+        if len(calls) != 4 or calls[0] != "probe" or calls[-1] != "probe" or calls[1][0] != "/usr/bin/getfacl" or "--access" not in calls[1] or "--default" not in calls[2] or any("--physical" not in args or "--absolute-names" not in args for args in calls[1:3]):
             raise SystemExit("HOSTED_ACL_PRIVILEGED_ROUTE_INVALID")
+
+        install_calls = []
+        probe_calls = [0]
+
+        def fresh_then_final_probe(path):
+            if path != HOSTED_PRIVATE_ROOT:
+                raise SystemExit("HOSTED_ACL_INSTALL_PROBE_TARGET_INVALID")
+            probe_calls[0] += 1
+            install_calls.append("probe")
+            return dict(state, mode=0o700 if probe_calls[0] == 1 else 0o710)
+
+        def fake_install_root(*args, label):
+            install_calls.append(args)
+            if args[0] == "/usr/bin/setfacl" or args[0] == "/usr/bin/chmod":
+                return ""
+            if args[0] == "/usr/bin/getfacl" and "--access" in args:
+                return reordered
+            if args[0] == "/usr/bin/getfacl" and "--default" in args:
+                return ""
+            raise SystemExit("HOSTED_ACL_INSTALL_PRIVILEGED_ROUTE_INVALID")
+
+        globals()["hosted_root"] = fake_install_root
+        globals()["hosted_protected_state"] = fresh_then_final_probe
+        hosted_verify_private_root_acl(runner_uid, install=True)
+        install_commands = [call for call in install_calls if call != "probe"]
+        if len(install_calls) != 7 or len(install_commands) != 5 or install_commands[0][:2] != ("/usr/bin/setfacl", "-k") or "--no-mask" not in install_commands[1] or not any("g::---" in argument for argument in install_commands[1]) or install_commands[2][:2] != ("/usr/bin/chmod", "0710"):
+            raise SystemExit("HOSTED_ACL_INSTALL_PRIVILEGED_ROUTE_INVALID")
+        rollback_exists = [True]
+        rollback_calls = []
+
+        def rollback_probe(path):
+            if path != HOSTED_PRIVATE_ROOT:
+                raise SystemExit("HOSTED_ACL_ROLLBACK_PROBE_TARGET_INVALID")
+            rollback_calls.append("probe")
+            return dict(state, mode=0o700) if rollback_exists[0] else None
+
+        def partial_acl_install(*args, label):
+            rollback_calls.append(args)
+            if args[0] == "/usr/bin/setfacl" and args[1] == "-k":
+                return ""
+            if args[0] == "/usr/bin/setfacl" and "--set" in args:
+                raise HostedDeploymentFailure("PRIVATE_ACL_INSTALL_FAILURE")
+            if args[0] == "/usr/bin/findmnt":
+                return ""
+            if args[0] == "/usr/bin/find":
+                return ""
+            if args[0] == "/usr/bin/rmdir" and args[-1] == str(HOSTED_PRIVATE_ROOT):
+                rollback_exists[0] = False
+                return ""
+            raise SystemExit("HOSTED_ACL_ROLLBACK_ROUTE_INVALID")
+
+        globals()["hosted_root"] = partial_acl_install
+        globals()["hosted_protected_state"] = rollback_probe
+        try:
+            hosted_verify_private_root_acl(runner_uid, install=True)
+        except HostedDeploymentFailure as error:
+            if not str(error).startswith("HOSTED_PRIVATE_ROOT_ACL_CREATE_FAILED:"):
+                raise SystemExit("HOSTED_ACL_PARTIAL_INSTALL_DIAGNOSTIC_INVALID")
+        else:
+            raise SystemExit("HOSTED_ACL_PARTIAL_INSTALL_FALSE_GREEN")
+        rollback_commands = [call for call in rollback_calls if call != "probe"]
+        if rollback_exists[0] or not any(call[0] == "/usr/bin/findmnt" for call in rollback_commands) or not any(call[0] == "/usr/bin/find" for call in rollback_commands) or not any(call[0] == "/usr/bin/rmdir" for call in rollback_commands):
+            raise SystemExit("HOSTED_ACL_PARTIAL_INSTALL_ROLLBACK_MISSING")
+        print("HOSTED_ACL_PARTIAL_INSTALL_ROLLBACK=PASS")
+        globals()["hosted_root"] = fake_sudo
+        globals()["hosted_protected_state"] = fake_probe
 
         def denied_read(*args, label):
             if args[0] == "/usr/bin/getfacl":
                 raise HostedDeploymentFailure("PRIVATE_UNTRUSTED_TOOL_OUTPUT")
             return ""
 
-        globals()["hosted_sudo"] = denied_read
+        globals()["hosted_root"] = denied_read
         try:
             hosted_verify_private_root_acl(runner_uid)
         except HostedDeploymentFailure as error:
@@ -726,7 +936,7 @@ def assert_hosted_acl_regressions():
                 raise HostedDeploymentFailure("PRIVATE_UNTRUSTED_TOOL_OUTPUT")
             return reordered if "--access" in args else ""
 
-        globals()["hosted_sudo"] = denied_default
+        globals()["hosted_root"] = denied_default
         try:
             hosted_verify_private_root_acl(runner_uid)
         except HostedDeploymentFailure as error:
@@ -743,7 +953,7 @@ def assert_hosted_acl_regressions():
                 raise HostedDeploymentFailure("HOSTED_PATH_PROBE_FAILED")
             return dict(state)
 
-        globals()["hosted_sudo"] = fake_sudo
+        globals()["hosted_root"] = fake_sudo
         globals()["hosted_protected_state"] = denied_post_probe
         try:
             hosted_verify_private_root_acl(runner_uid)
@@ -765,7 +975,7 @@ def assert_hosted_acl_regressions():
         else:
             raise SystemExit("HOSTED_ACL_PRIVILEGED_PROBE_FAILURE_ACCEPTED")
     finally:
-        globals()["hosted_sudo"] = original_sudo
+        globals()["hosted_root"] = original_sudo
         globals()["hosted_protected_state"] = original_probe
     print("HOSTED_ACL_PRIVILEGED_ROUTE_REGRESSIONS=PASS")
 
@@ -861,164 +1071,208 @@ proof_helper_path = repo_root / "scripts/s8/s8_application_boundary_proof.sh"
 worker_path = repo_root / "src/lib/s8-fbx-worker.ts"
 broker_path = repo_root / "native/s8-sandbox-broker/src/broker.c"
 deployment_path = Path(__file__).resolve()
+supervisor_path = repo_root / "native/s8-sandbox-broker/tests/hosted_deployment_namespace.py"
+sudoers_path = repo_root / "native/s8-sandbox-broker/deploy/swooshz-s8-broker.sudoers.in"
 
 
-def valid_hosted_protected_harness(deployment):
+def valid_hosted_protected_harness(deployment, supervisor):
     try:
-        tree = ast.parse(deployment)
+        deployment_tree = ast.parse(deployment)
+        supervisor_tree = ast.parse(supervisor)
         probe_source = deployment.split("HOSTED_PATH_STATE_SCRIPT = r'''", 1)[1].split("'''", 1)[0]
-        probe = ast.parse(probe_source)
+        probe_tree = ast.parse(probe_source)
     except (SyntaxError, IndexError):
         return False
     if probe_source.count("os.O_NOFOLLOW") != 3 or probe_source.count("follow_symlinks=False") != 2:
         return False
-    probe_handlers = [node for node in ast.walk(probe) if isinstance(node, ast.ExceptHandler)]
+    probe_handlers = [node for node in ast.walk(probe_tree) if isinstance(node, ast.ExceptHandler)]
     if len(probe_handlers) != 1 or not isinstance(probe_handlers[0].type, ast.Name) or probe_handlers[0].type.id != "FileNotFoundError":
         return False
-    if any(token not in deployment for token in (
-        'os.O_NOFOLLOW | os.O_CLOEXEC',
-        'follow_symlinks=False',
-        'hosted_sudo("/usr/bin/python3", "-c", HOSTED_PATH_STATE_SCRIPT',
-        'hosted_protected_state(path, digest=True)',
-        'hosted_sudo("/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS)',
+    if any(isinstance(node, ast.Name) and node.id == "hosted_sudo" for node in ast.walk(deployment_tree)) or any(isinstance(node, ast.Name) and node.id == "hosted_sudo" for node in ast.walk(supervisor_tree)):
+        return False
+    dep = {node.name: node for node in deployment_tree.body if isinstance(node, ast.FunctionDef)}
+    sup = {node.name: node for node in supervisor_tree.body if isinstance(node, ast.FunctionDef)}
+    owned_class = next((node for node in supervisor_tree.body if isinstance(node, ast.ClassDef) and node.name == "OwnedProcess"), None)
+    if owned_class is None:
+        return False
+    owned_methods = {node.name: node for node in owned_class.body if isinstance(node, ast.FunctionDef)}
+    signal_body = ast.get_source_segment(supervisor, owned_methods.get("signal")) if owned_methods.get("signal") is not None else None
+    wait_body = ast.get_source_segment(supervisor, owned_methods.get("wait")) if owned_methods.get("wait") is not None else None
+    if signal_body is None or any(token not in signal_body for token in (
+        "expected_identity != self.start_identity", "self.identity_valid()", "signal.pidfd_send_signal(self.pidfd, signum)",
+        "except ProcessLookupError:", "PIDFD_SIGNAL_FAILED",
+    )) or "os.kill(self.pid, signum)" in signal_body:
+        return False
+    if wait_body is None or any(token not in wait_body for token in (
+        "self.process.wait(timeout=timeout)", "self.terminal = result", "write_ledger(self._ledger_path", "os.close(self.pidfd)",
     )):
         return False
-    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
-    protected_receivers = {
-        "hosted_record_directory": {"path"},
-        "hosted_record_file": {"path"},
-        "hosted_create_directory": {"path"},
-        "hosted_install": {"target"},
-        "hosted_file_digest": {"path"},
-        "hosted_verify_private_root_acl": {"HOSTED_PRIVATE_ROOT"},
-        "hosted_policy": {"HOSTED_PRIVATE_ROOT"},
-        "hosted_cleanup": {"journal", "lock", "target", "HOSTED_BROKER", "HOSTED_POLICY_PATH"},
-        "hosted_deploy": {"path", "parent", "HOSTED_SUDOERS"},
-    }
-    forbidden_methods = {"exists", "is_file", "is_dir", "is_symlink", "lstat", "stat", "open", "read_bytes", "read_text"}
-    for name, receivers in protected_receivers.items():
-        function = functions.get(name)
-        if function is None:
-            return False
-        for node in ast.walk(function):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-                continue
-            if isinstance(node.func.value, ast.Name) and node.func.value.id == "os" and node.func.attr in {"open", "stat", "lstat", "access"} and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id in receivers:
-                return False
-            if node.func.attr not in forbidden_methods:
-                continue
-            receiver = node.func.value
-            if isinstance(receiver, ast.Name) and receiver.id in receivers:
-                return False
-            if name == "hosted_deploy" and isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name) and receiver.func.id == "Path" and receiver.args and isinstance(receiver.args[0], ast.Constant) and receiver.args[0].value == "/etc/swooshz":
-                return False
-    required = {
-        "hosted_record_directory": ("state = hosted_protected_state(path)",),
-        "hosted_record_file": ("state = hosted_protected_state(path, digest=True)",),
-        "hosted_create_directory": ("hosted_protected_state(path) is not None",),
-        "hosted_install": ("hosted_protected_state(target) is not None",),
-        "hosted_file_digest": ("hosted_protected_state(path, digest=True)",),
+
+    def body(table, source, name):
+        node = table.get(name)
+        return ast.get_source_segment(source, node) if node is not None else None
+
+    deployment_requirements = {
+        "hosted_root": ("os.geteuid() != 0 or os.getuid() != 0", "return hosted_run(list(args), label)"),
+        "hosted_protected_state": ('hosted_root("/usr/bin/python3", "-c", HOSTED_PATH_STATE_SCRIPT',),
+        "hosted_remove_incomplete_private_root": (
+            'current["device"], current["inode"]', "HOSTED_PRIVATE_ROOT_ROLLBACK_MOUNT_REFUSED",
+            '"/usr/bin/find"', "HOSTED_PRIVATE_ROOT_ROLLBACK_NOT_EMPTY",
+            '"/usr/bin/rmdir"', "HOSTED_PRIVATE_ROOT_ROLLBACK_REMAINS",
+        ),
         "hosted_verify_private_root_acl": (
-            "before = hosted_protected_state(HOSTED_PRIVATE_ROOT)",
-            'hosted_sudo("/usr/bin/setfacl", "--no-mask", "--set", acl',
-            'access_text = hosted_sudo("/usr/bin/getfacl"',
-            '"--all-effective", "--access"',
-            'default_text = hosted_sudo("/usr/bin/getfacl"',
-            '"--all-effective", "--default"',
-            "after = hosted_protected_state(HOSTED_PRIVATE_ROOT)",
-            "hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after)",
+            'hosted_root("/usr/bin/setfacl", "-k"',
+            'hosted_root("/usr/bin/setfacl", "--no-mask", "--set", acl',
+            '"--all-effective", "--access"', '"--all-effective", "--default"',
+            "hosted_verify_acl_semantics(access_text, default_text, runner_uid, before, after, installing=install)",
+            "hosted_remove_incomplete_private_root(before)",
+        ),
+        "hosted_verify_deployment_absent": (
+            "HOSTED_DEPLOYMENT_ABSENCE_PATHS", "HOSTED_DEPLOYMENT_RESIDUE_REMAINS",
         ),
         "hosted_verify_acl_semantics": (
-            '"user:": "rwx"',
-            '"user:" + str(runner_uid): "--x"',
-            '"group:": "--x"',
-            '"mask:": "--x"',
-            '"other:": "---"',
-            "if reported is not None and reported != derived:",
-            'effective_mismatch.append(key + ":REPORTED")',
+            '"user:": "rwx"', '"user:" + str(runner_uid): "--x"', '"group:": "---"',
+            '"mask:": "--x"', '"other:": "---"',
             "access_rights != expected or defaults or effective_mismatch or not identity_match",
         ),
-        "hosted_policy": ("root_state = hosted_protected_state(HOSTED_PRIVATE_ROOT)",),
+        "valid_sudoers_template": (
+            "Cmnd_Alias S8_BROKER_STDIO", "stay_setuid,!setenv,env_keep=", "NOPASSWD: NOSETENV: S8_BROKER_STDIO",
+        ),
+        "require_sudo_regex_version": (
+            "minimum = (1, 9, 10)", '("/usr/bin/sudo", "SUDO")', '("/usr/sbin/visudo", "VISUDO")',
+        ),
         "hosted_cleanup": (
-            "journal_state = hosted_protected_state(journal)",
-            "broker_state = hosted_protected_state(HOSTED_BROKER)",
-            "policy_state = hosted_protected_state(HOSTED_POLICY_PATH)",
-            "lock_state = hosted_protected_state(lock)",
-            "state = hosted_protected_state(target, digest=True)",
-            "if hosted_protected_state(target) is not None:",
-            "state = hosted_protected_state(target)",
+            'hosted_root(str(HOSTED_BROKER), "--recover-v1"', "hosted_load_ledger(temp_root)",
+            "hosted_verify_private_root_acl(runner_uid)", "HOSTED_NESTED_MOUNT_REFUSED",
+            "hosted_verify_deployment_absent()", "PRODUCTION_DEPLOYMENT_ABSENT=YES",
         ),
         "hosted_deploy": (
             "if any(hosted_protected_state(path) is not None for path in absent):",
-            "parent_state = hosted_protected_state(parent)",
-            'hosted_protected_state(Path("/etc/swooshz")) is None',
-            'hosted_sudo("/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS)',
-            "hosted_file_digest(HOSTED_POLICY_PATH, 0o600) != policy_file_hash",
-            "hosted_verify_private_root_acl(runner_uid)",
+            'hosted_run_as_host_user(["/usr/local/bin/cmake", "-S"',
+            'hosted_run_as_host_user(["/usr/local/bin/cmake", "--build"',
+            'hosted_run_as_host_user(["/usr/local/bin/ctest", "--test-dir"',
+            "private_root_before = hosted_protected_state(HOSTED_PRIVATE_ROOT)",
+        "hosted_verify_private_root_acl(runner_uid, install=True)",
+        "hosted_remove_incomplete_private_root(private_root_before)",
+            'hosted_root("/usr/sbin/visudo", "-c", "-f", "/etc/sudoers"',
+            'hosted_root(str(HOSTED_BROKER), "--recover-v1"',
+            'print("HOSTED_POLICY_H=" + policy_h)', 'print("HOSTED_CONFIG_Q=" + config_q)',
         ),
     }
-    for name, tokens in required.items():
-        source = ast.get_source_segment(deployment, functions[name])
+    for name, tokens in deployment_requirements.items():
+        source = body(dep, deployment, name)
         if source is None or any(token not in source for token in tokens):
             return False
+    cleanup_body = body(dep, deployment, "hosted_cleanup")
+    if cleanup_body is None or cleanup_body.count("hosted_verify_deployment_absent()") != 2:
+        return False
+    run_as_user = body(dep, deployment, "hosted_run_as_host_user")
+    if run_as_user is None or "setpriv" not in run_as_user or "--clear-groups" not in run_as_user:
+        return False
+    if "hosted_root(str(HOSTED_BROKER), \"--recover-v1\"" not in body(dep, deployment, "hosted_deploy"):
+        return False
+
+    supervisor_requirements = {
+        "launch_owned": ("os.pidfd_open(process.pid, 0)", "process_start_identity(process.pid)", "OwnedProcess(process"),
+        "terminate_owned": ("signal.SIGTERM", "signal.SIGKILL", "owned.wait(grace)"),
+        "namespace_processes": ("process_start_identity(pid) != start_identity", "mnt:[{namespace_number}]", "NAMESPACE_REFERENCE_SCAN_UNREADABLE"),
+        "run_sudo_matrix": (
+            "SUDO_EXACT_STDIO_POSITIVE", "--recover-v1", "ALTERNATE_COPY", "ALTERNATE_SYMLINK",
+            "WRONG_RUNAS", "PRESERVE_ENV", "ENV_ASSIGNMENT", "WRONG_CALLER", "protected_snapshot() != before",
+            'tempfile.TemporaryDirectory(prefix="s8-sudo-matrix-"', "SUDO_MATRIX_SOURCE_BROKER_IDENTITY_INVALID",
+            "O_EXCL | os.O_NOFOLLOW", "matrix_root.iterdir()", "SUDO_MATRIX_ROOT_CLEANUP_IDENTITY_INVALID",
+            "def replace_policy(mutated, label)", "os.fsync(descriptor)", "sudoers_identity",
+        ),
+        "observe_application_targets": (
+            "process_start_identity(pid)", "process_uid_gid(pid)", "variables != [b\"PWD=/work\"]", "PermissionError",
+        ),
+        "application_proof": (
+            "APP_PROOF_RELATIVE", "APP_HELPER_RELATIVE", "app_identity_command(uid, gid",
+            "observe_application_targets", "APPLICATION_SEMANTIC_READBACK=PASS",
+            "PRODUCTION_BOUNDARY_PROOF=PASS", "APPLICATION_PROOF_MTS_AS_EXACT_HOST_USER=PASS",
+        ),
+        "create_namespace_sudoers": ("/etc/sudoers", "/etc/sudoers.d", "NAMESPACE_SUDOERS_POLICY_MOUNT_INVALID"),
+        "private_opt_mount": ("/usr/bin/mount", "tmpfs", "/opt", "ROUTE_B_OPT_FILESYSTEM_NOT_DISTINCT"),
+        "launch_holder": ("/usr/bin/unshare", "\"--mount\"", "--control-fd", "--result-fd", "--ledger"),
+        "run_owned_process_regressions": ("child.start_identity + \":mismatch\"", "terminate_owned(child, grace=0.1)"),
+        "run_namespace_regressions": ("leaked-holder", "positive-release", "cancel-opt", "cancel-application"),
+        "remove_supervisor_state": ("validate_process_ledger(ledger)", "remove_root_owned_state_entry", "NAMESPACE_STATE_CLEANUP_IDENTITY_INVALID"),
+    }
+    for name, tokens in supervisor_requirements.items():
+        source = body(sup, supervisor, name)
+        if source is None or any(token not in source for token in tokens):
+            return False
+    sudo_matrix = body(sup, supervisor, "run_sudo_matrix")
+    if sudo_matrix is None or sudo_matrix.count("os.open(sudoers_path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC)") != 2:
+        return False
+    launch = body(sup, supervisor, "launch_owned")
+    if launch is None or launch.count("process_start_identity(process.pid)") < 2:
+        return False
+    inner = body(sup, supervisor, "inner_holder")
+    inner_order = (
+        '"--make-rprivate"', "private_opt_mount(None, ledger_path", '"deploy", cancel_event=cancel_event)', "run_sudo_matrix(",
+        "application_proof(", "active_before_recovery", "if active_before_recovery:", "UNKNOWN_NAMESPACE_PROCESS_REMAINS_BEFORE_RECOVERY",
+        '"cleanup", cancel_event=threading.Event())',
+    )
+    positions = [inner.find(token) for token in inner_order]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        return False
+    root = body(sup, supervisor, "root_supervise")
+    root_requirements = (
+        "workspace != Path(__file__).resolve().parents[3]", "holder_events(result_read, 90 * 60, events",
+        "cancel_event=ROOT_CANCEL_EVENT", "namespace_disappeared(holder_namespace",
+        "current_host_ids() != outer_ids or opt_snapshot() != outer_opt", "cleanup_events = [event for event in events if event.get(\"kind\") == \"deploymentCleanup\"]",
+        'not cleanup_events[0]["clean"]', "remove_supervisor_state(state, ledger)",
+    )
+    if root is None or any(token not in root for token in root_requirements) or 'Path(os.environ.get("GITHUB_WORKSPACE"' in root:
+        return False
     return True
 
 
-def valid_hosted_binding(workflow, deployment, proof_helper, worker, broker, proof_bytes, helper_bytes):
-    if not valid_hosted_protected_harness(deployment):
+def valid_hosted_binding(workflow, deployment, supervisor, sudoers, proof_bytes, helper_bytes, worker, broker):
+    if not valid_hosted_protected_harness(deployment, supervisor) or not valid_sudoers_template(sudoers):
         return False
-    pinned_helpers = (
-        (proof_bytes, 8966, "05c7b06a96fe0c45be71a4e2805b29202250130c9dba4bb852a0ef6032aacd31"),
-        (helper_bytes, 3260, "105085a773513c05abdfbc6b0b6da67b74ad8eb811c91c919cc7a08645bd769e"),
+    expected_files = (
+        (proof_bytes, 9086, "34a86da59ae51a50501ffcde7fd2086a1ceeeb2258238962404f4a8ce9a3d0e8"),
+        (helper_bytes, 3328, "e594a8749645ef122f22a8bae852745f8c3492f9fcda35597301cdfd1b5e2c42"),
     )
-    for content, expected_length, expected_digest in pinned_helpers:
-        if len(content) != expected_length or hashlib.sha256(content).hexdigest() != expected_digest:
-            return False
+    if any(len(content) != size or hashlib.sha256(content).hexdigest() != digest for content, size, digest in expected_files):
+        return False
     try:
         proof_text, helper_text = proof_bytes.decode("utf-8"), helper_bytes.decode("utf-8")
     except UnicodeDecodeError:
         return False
-
-    begin = "# RUN107_HOSTED_BROKER_DEPLOYMENT_BEGIN"
-    end = "# RUN107_HOSTED_BROKER_DEPLOYMENT_END"
+    begin, end = "# RUN110_ROUTE_B_SUPERVISOR_BEGIN", "# RUN110_ROUTE_B_SUPERVISOR_END"
     source = 'source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"'
     if workflow.count(begin) != 1 or workflow.count(end) != 1 or workflow.count(source) != 1:
         return False
+    if not workflow.index(end) < workflow.index(source):
+        return False
+    block = workflow[workflow.index(begin):workflow.index(end)]
+    required = (
+        "broker_deployment_attempted=1", "run_tracked_command /usr/bin/sudo -n -- /usr/bin/python3",
+        '"$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/hosted_deployment_namespace.py"', "--supervise",
+        '--workspace "$GITHUB_WORKSPACE"', '--carrier "$carrier"', '--temp-root "$temp_root"',
+        '--uid "$runner_uid"', '--gid "$runner_gid"', '--node "$(command -v node)"', '--corepack "$(command -v corepack)"',
+        "NAMESPACE_SUPERVISOR_STATE_CLEANUP=PASS", "ROUTE_B_OUTER_OPT_UNCHANGED=YES",
+        "ROUTE_B_BROKER_CLEANUP=PASS", "ROUTE_B_PRODUCTION_DEPLOYMENT_ABSENT=YES",
+        "HOSTED_POLICY_H=", "HOSTED_CONFIG_Q=", "S8_APP_PRIVATE_ROOT=", "S8_APP_SANDBOX_POLICY_SHA256=",
+        "S8_APP_CONFIG_SHA256=", "broker_deployment_attempted=0", "HOSTED_NAMESPACE_HARNESS_HOLD",
+    )
+    if any(token not in block for token in required) or "--hosted-cleanup" in workflow:
+        return False
     binding_markers = (
-        "APPLICATION_PRIVATE_ROOT_BINDING=PASS",
-        "APPLICATION_POLICY_H_BINDING=PASS",
-        "APPLICATION_CONFIG_Q_BINDING=PASS",
-        "APPLICATION_SANDBOX_BINDING=PASS",
-        "SAME_POLICY_SNAPSHOT_BINDING=PASS",
+        "APPLICATION_PRIVATE_ROOT_BINDING=PASS", "APPLICATION_POLICY_H_BINDING=PASS",
+        "APPLICATION_CONFIG_Q_BINDING=PASS", "APPLICATION_SANDBOX_BINDING=PASS", "SAME_POLICY_SNAPSHOT_BINDING=PASS",
     )
     if any(workflow.count(marker) != 1 for marker in binding_markers):
         return False
-    begin_index, end_index, source_index = workflow.index(begin), workflow.index(end), workflow.index(source)
-    if not begin_index < end_index < source_index:
+    cleanup_start = workflow.find("          cleanup() {")
+    cleanup_end = workflow.find("          trap cleanup EXIT", cleanup_start)
+    if cleanup_start < 0 or cleanup_end <= cleanup_start:
         return False
-    if any(workflow.index(marker) < source_index for marker in binding_markers):
-        return False
-    block = workflow[begin_index:end_index]
-    workflow_tokens = (
-        '--hosted-deploy "$carrier" "$temp_root" "$runner_uid" "$runner_gid"',
-        'S8_APP_PRIVATE_ROOT="$(/usr/bin/awk',
-        'S8_APP_SANDBOX_POLICY_SHA256="$(/usr/bin/awk',
-        'S8_APP_CONFIG_SHA256="$(/usr/bin/awk',
-        'S8_APP_SANDBOX="$(/usr/bin/awk',
-        '[[ "$S8_APP_PRIVATE_ROOT" == /var/lib/swooshz/s8 && "$S8_APP_SANDBOX" == /usr/local/libexec/swooshz-s8/s8-sandbox ]]',
-        '"$S8_APP_SANDBOX_POLICY_SHA256" ]] || fail_amendment "APPLICATION_POLICY_SNAPSHOT_MISMATCH"',
-        '"$S8_APP_CONFIG_SHA256" ]] || fail_amendment "APPLICATION_CONFIG_SNAPSHOT_MISMATCH"',
-        "CONFIG_DIGEST_INCLUDES_POLICY_DIGEST=YES",
-        "export S8_APP_PRIVATE_ROOT S8_APP_SANDBOX_POLICY_SHA256 S8_APP_CONFIG_SHA256 S8_APP_SANDBOX",
-    )
-    if any(token not in block for token in workflow_tokens):
-        return False
-    if any(token not in workflow for token in (
-        '--hosted-cleanup "$temp_root"',
-        "if (( all_launched_children_reaped == 1 ))",
-        "broker_deployment_attempted=0",
-        "TEMP_CLEANUP_RESULT=DEFERRED_BROKER_DEPLOYMENT_RESIDUE",
-    )):
+    cleanup = workflow[cleanup_start:cleanup_end]
+    if "if (( broker_deployment_attempted == 1 )); then" not in cleanup or "SUPERVISOR_STATE_RESIDUE=YES" not in cleanup or "--hosted-cleanup" in cleanup:
         return False
 
     policy_start = deployment.find("def hosted_policy(")
@@ -1028,124 +1282,59 @@ def valid_hosted_binding(workflow, deployment, proof_helper, worker, broker, pro
     if min(policy_start, deploy_start) < 0 or policy_end <= policy_start or deploy_end <= deploy_start:
         return False
     policy, deploy = deployment[policy_start:policy_end], deployment[deploy_start:deploy_end]
-    deployment_paths = (
-        'HOSTED_POLICY_PATH = Path("/etc/swooshz/s8-broker-v1.json")',
-        'HOSTED_PRIVATE_ROOT = Path("/var/lib/swooshz/s8")',
-        'HOSTED_LAUNCHER = Path("/usr/local/libexec/swooshz-s8/s8-sandbox")',
-        'HOSTED_BROKER = Path("/usr/local/libexec/swooshz-s8/s8-sandbox-broker")',
-    )
-    if any(token not in deployment for token in deployment_paths):
-        return False
-    deploy_tokens = (
-        'hosted_run(["/usr/local/bin/cmake", "-S", str(workspace / "native/s8-sandbox-broker")',
-        'hosted_run(["/usr/local/bin/cmake", "--build", str(build)',
-        'hosted_run(["/usr/local/bin/ctest", "--test-dir", str(build)',
-        'broker_build = build / "s8-sandbox-broker"',
-        "hosted_create_directory(temp_root, HOSTED_PRIVATE_ROOT, 0o710)",
-        "hosted_verify_private_root_acl(runner_uid)",
-        "hosted_install(temp_root, broker_build, HOSTED_BROKER, 0o755)",
-        'hosted_install(temp_root, workspace / "native/s8-sandbox-broker/deploy/s8-sandbox", HOSTED_LAUNCHER, 0o755)',
-        'hosted_install(temp_root, workspace / "native/s8-sandbox-broker/deploy/swooshz-s8-broker-recover.service"',
-        'hosted_install(temp_root, workspace / "native/s8-sandbox-broker/deploy/swooshz-s8-broker-recover.timer"',
+    deploy_order = (
+        "hosted_create_directory(temp_root, HOSTED_PRIVATE_ROOT, 0o700, record=False)",
+        "hosted_verify_private_root_acl(runner_uid, install=True)", "hosted_record_directory(temp_root, HOSTED_PRIVATE_ROOT)",
         "policy_tmp, policy_h, config_q, policy_file_hash = hosted_policy(",
         "hosted_install(temp_root, policy_tmp, HOSTED_POLICY_PATH, 0o600)",
-        'hosted_sudo(str(HOSTED_BROKER), "--recover-v1"',
-        'print("BROKER_POLICY_ADMISSION=PASS")',
-        'print("HOSTED_POLICY_H=" + policy_h)',
-        'print("HOSTED_CONFIG_Q=" + config_q)',
-        'print("S8_APP_PRIVATE_ROOT=" + str(HOSTED_PRIVATE_ROOT))',
-        'print("S8_APP_SANDBOX_POLICY_SHA256=" + policy_h)',
-        'print("S8_APP_CONFIG_SHA256=" + config_q)',
-        'print("S8_APP_SANDBOX=" + str(HOSTED_LAUNCHER))',
+        'hosted_root(str(HOSTED_BROKER), "--recover-v1"',
     )
-    positions = [deploy.find(token) for token in deploy_tokens]
+    positions = [deploy.find(token) for token in deploy_order]
     if any(position < 0 for position in positions) or positions != sorted(positions):
         return False
-    policy_tokens = (
-        "root_state = hosted_protected_state(HOSTED_PRIVATE_ROOT)",
-        '"privateWorkRoot": str(HOSTED_PRIVATE_ROOT)',
-        '"sandboxExecutable": str(HOSTED_LAUNCHER)',
-        '"blenderExecutableSha256": hosted_file_digest(HOSTED_RUNTIME / "blender", 0o755)',
-        '"privateRootDevice": str(root_state["device"])',
-        '"privateRootInode": str(root_state["inode"])',
-        '"launcherSha256": hosted_file_digest(HOSTED_LAUNCHER, 0o755)',
-        '"brokerSha256": hosted_file_digest(HOSTED_BROKER, 0o755)',
-        '"runnerSha256": hosted_file_digest(HOSTED_RUNNER, 0o755)',
-        '"validatorSha256": hosted_file_digest(HOSTED_VALIDATOR, 0o755)',
-        '"writerSha256": hosted_file_digest(HOSTED_WRITER_ROOT / "writer.py", 0o644)',
-        'policy_h = hashlib.sha256(hosted_canonical(policy)).hexdigest()',
-        'config["sandboxPolicySha256"] = policy_h',
-        'config_q = hashlib.sha256(hosted_canonical(config)).hexdigest()',
-        'del preimage["config"]["sandboxPolicySha256"]',
-        "hashlib.sha256(hosted_canonical(preimage)).hexdigest() != policy_h",
-        'hashlib.sha256(hosted_canonical(reconstructed["config"])).hexdigest() != config_q',
+    policy_order = (
+        '"privateWorkRoot": str(HOSTED_PRIVATE_ROOT)', '"sandboxExecutable": str(HOSTED_LAUNCHER)',
+        '"privateRootDevice": str(root_state["device"])', '"privateRootInode": str(root_state["inode"])',
+        'policy_h = hashlib.sha256(hosted_canonical(policy)).hexdigest()', 'config["sandboxPolicySha256"] = policy_h',
+        'config_q = hashlib.sha256(hosted_canonical(config)).hexdigest()', 'del preimage["config"]["sandboxPolicySha256"]',
     )
-    positions = [policy.find(token) for token in policy_tokens]
-    if any(position < 0 for position in positions) or positions != sorted(positions):
+    positions = [policy.find(token) for token in policy_order]
+    if any(position < 0 for position in positions) or positions != sorted(positions) or re.search(r"[\"'][0-9a-f]{64}[\"']", policy + deploy):
         return False
-    if re.search(r"""["'][0-9a-f]{64}["']""", policy + deploy):
-        return False
-
     proof_tokens = (
-        "process.env.S8_APP_PRIVATE_ROOT!",
-        "process.env.S8_APP_SANDBOX_POLICY_SHA256!",
-        "process.env.S8_APP_SANDBOX!",
-        "runS8BlenderWriter(prepared.bytes, workerConfig)",
-        "runS8NativeValidator(written.artifact, workerConfig)",
-        "compareS8UfbxReadback(s6, s7, native.readback)",
-        '"APPLICATION_EXPLICIT_SETENV_COUNT=0"',
-        '"FINAL_RUNTIME_ALLOWLIST_PROOF=PASS"',
-        '"BROAD_RUNTIME_BINDS_ABSENT=YES"',
+        "process.env.S8_APP_PRIVATE_ROOT!", "process.env.S8_APP_SANDBOX_POLICY_SHA256!", "process.env.S8_APP_SANDBOX!",
+        "runS8BlenderWriter(prepared.bytes, workerConfig)", "runS8NativeValidator(written.artifact, workerConfig)",
+        "compareS8UfbxReadback(s6, s7, native.readback)", '"APPLICATION_EXPLICIT_SETENV_COUNT=0"',
+        '"FINAL_RUNTIME_ALLOWLIST_PROOF=PASS"', '"BROAD_RUNTIME_BINDS_ABSENT=YES"',
     )
     helper_tokens = (
-        "S8_APP_PRIVATE_ROOT",
-        "S8_APP_SANDBOX_POLICY_SHA256",
-        "is required",
-        'S8_APP_SANDBOX:-/usr/local/libexec/swooshz-s8/s8-sandbox',
-        "TARGET_ENV_KEYS=PWD",
-        "PARENT_SECRET_HOSTILE_ENV_LEAKAGE=NO",
-        "PRODUCTION_BOUNDARY_PROOF=PASS",
+        "S8_APP_PRIVATE_ROOT", "S8_APP_SANDBOX_POLICY_SHA256", "is required", 'S8_APP_SANDBOX:-/usr/local/libexec/swooshz-s8/s8-sandbox',
+        "TARGET_ENV_KEYS=PWD", "PARENT_SECRET_HOSTILE_ENV_LEAKAGE=NO", "PRODUCTION_BOUNDARY_PROOF=PASS",
     )
     if any(token not in proof_text for token in proof_tokens) or any(token not in helper_text for token in helper_tokens):
         return False
-
     worker_tokens = (
-        'const BROKER_LAUNCHER_PATH = "/usr/local/libexec/swooshz-s8/s8-sandbox";',
-        "config.sandboxExecutable !== BROKER_LAUNCHER_PATH",
+        'const BROKER_LAUNCHER_PATH = "/usr/local/libexec/swooshz-s8/s8-sandbox";', "config.sandboxExecutable !== BROKER_LAUNCHER_PATH",
         'const launcher = assertRegularFile(config.sandboxExecutable ?? "", "sandboxExecutable");',
         'if (launcher !== BROKER_LAUNCHER_PATH) fail("S8_WORKER_SANDBOX_REQUIRED");',
-        "spawnSync(/* turbopackIgnore: true */ launcher, [], {",
-        "const configSha256 = s8Sha256(canonicalS8ConfigBytes(config));",
-        'Buffer.from(config.sandboxPolicySha256, "hex").copy(header, 28);',
-        'Buffer.from(configSha256, "hex").copy(header, 60);',
-        "policySha256: string; configSha256: string",
-        "expected.policySha256 && header.subarray(152, 184).toString",
-        "if (response.brokerStatus === 0 && !response.identityBound)",
-        "policySha256: config.sandboxPolicySha256, configSha256: request.configSha256",
-        "validateS8BrokerResponseIdentity(response);",
-        "shell: false",
+        "spawnSync(/* turbopackIgnore: true */ launcher, [], {", "const configSha256 = s8Sha256(canonicalS8ConfigBytes(config));",
+        'Buffer.from(config.sandboxPolicySha256, "hex").copy(header, 28);', 'Buffer.from(configSha256, "hex").copy(header, 60);',
+        "expected.policySha256 && header.subarray(152, 184).toString", "validateS8BrokerResponseIdentity(response);", "shell: false",
     )
     broker_tokens = (
-        "serialize_policy(&preimage, policy, 0)",
-        "sha256_bytes(preimage.bytes, preimage.length, policy_digest)",
-        "strcmp(policy->policy_sha256, policy->config.sandbox_policy_sha256) != 0",
-        "serialize_config(&config_bytes, &policy->config, 1)",
-        "sha256_bytes(config_bytes.bytes, config_bytes.length, config_digest)",
+        "serialize_policy(&preimage, policy, 0)", "sha256_bytes(preimage.bytes, preimage.length, policy_digest)",
+        'strcmp(policy->policy_sha256, policy->config.sandbox_policy_sha256) != 0',
+        "serialize_config(&config_bytes, &policy->config, 1)", "sha256_bytes(config_bytes.bytes, config_bytes.length, config_digest)",
         "constant_equal(request->policy_sha256, expected_policy, sizeof(expected_policy))",
         "constant_equal(request->config_sha256, expected_config, sizeof(expected_config))",
     )
-    if any(token not in worker for token in worker_tokens) or any(token not in broker for token in broker_tokens):
-        return False
-    if "/usr/bin/bwrap" in proof_text + helper_text + worker:
-        return False
-    if 'S8_APP_SANDBOX:-/usr/bin/bwrap' in helper_text or 'sandboxExecutable || "/usr/bin/bwrap"' in worker:
-        return False
-    return True
+    return not any(token not in worker for token in worker_tokens) and not any(token not in broker for token in broker_tokens) and "/usr/bin/bwrap" not in proof_text + helper_text + worker
 
 
 workflow_source = workflow_path.read_text(encoding="utf-8")
 deployment_source = deployment_path.read_text(encoding="utf-8")
-proof_helper_source = proof_helper_path.read_text(encoding="utf-8")
+supervisor_source = supervisor_path.read_text(encoding="utf-8")
+sudoers_source = sudoers_path.read_text(encoding="ascii")
 worker_source = worker_path.read_text(encoding="utf-8")
 broker_source = broker_path.read_text(encoding="utf-8")
 proof_bytes = proof_path.read_bytes()
@@ -1153,25 +1342,13 @@ helper_bytes = proof_helper_path.read_bytes()
 
 
 def hosted_binding_accepts(candidate):
-    workflow, deployment, candidate_proof, candidate_helper, worker, broker = candidate
-    return valid_hosted_binding(
-        workflow,
-        deployment,
-        proof_helper_source,
-        worker,
-        broker,
-        candidate_proof,
-        candidate_helper,
-    )
+    workflow, deployment, supervisor, sudoers, candidate_proof, candidate_helper, worker, broker = candidate
+    return valid_hosted_binding(workflow, deployment, supervisor, sudoers, candidate_proof, candidate_helper, worker, broker)
 
 
 positive_control = (
-    workflow_source,
-    deployment_source,
-    proof_bytes,
-    helper_bytes,
-    worker_source,
-    broker_source,
+    workflow_source, deployment_source, supervisor_source, sudoers_source,
+    proof_bytes, helper_bytes, worker_source, broker_source,
 )
 if not hosted_binding_accepts(positive_control):
     raise SystemExit("HOSTED_COMBINED_BROKER_APPLICATION_BINDING_INVALID")
@@ -1179,48 +1356,45 @@ print("APPLICATION_BOUNDARY_HELPER_BYTES=PASS")
 print("APPLICATION_WORKER_BROKER_HQ_BINDING=PASS")
 print("HOSTED_POLICY_ROOT_BINDING=PASS")
 
-acl_deploy_line = next(line for line in deployment_source.splitlines() if line.strip() == "hosted_verify_private_root_acl(runner_uid)")
-acl_access_line = next(line for line in deployment_source.splitlines() if "access_text = hosted_sudo(" in line)
-acl_default_line = next(line for line in deployment_source.splitlines() if "default_text = hosted_sudo(" in line)
-acl_post_probe_line = next(line for line in deployment_source.splitlines() if line.strip() == "after = hosted_protected_state(HOSTED_PRIVATE_ROOT)")
+def mutate_control(index, value):
+    candidate = list(positive_control)
+    candidate[index] = value
+    return tuple(candidate)
+
+
+def replace_once(source, old, new):
+    if old not in source:
+        raise SystemExit("SOURCE_BINDING_NEGATIVE_CONTROL_INPUT_MISSING:" + old[:80])
+    return source.replace(old, new, 1)
+
 
 negative_controls = {
-    "NO_DEPLOYMENT": (workflow_source.replace("--hosted-deploy", "--hosted-diagnostic", 1), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "NO_PRIVATE_ROOT": ("\n".join(line for line in workflow_source.splitlines() if 'S8_APP_PRIVATE_ROOT="$(/usr/bin/awk' not in line), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "NO_POLICY_H": ("\n".join(line for line in workflow_source.splitlines() if 'S8_APP_SANDBOX_POLICY_SHA256="$(/usr/bin/awk' not in line), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "NO_CONFIG_Q": ("\n".join(line for line in workflow_source.splitlines() if 'S8_APP_CONFIG_SHA256="$(/usr/bin/awk' not in line), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "DIFFERENT_PRIVATE_ROOT": (workflow_source.replace("/var/lib/swooshz/s8 &&", "/var/lib/swooshz/s8-different &&", 1), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "DIFFERENT_POLICY_H": (workflow_source.replace('== "$S8_APP_SANDBOX_POLICY_SHA256" ]] || fail_amendment "APPLICATION_POLICY_SNAPSHOT_MISMATCH"', '== "$S8_APP_CONFIG_SHA256" ]] || fail_amendment "APPLICATION_POLICY_SNAPSHOT_MISMATCH"', 1), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "DIFFERENT_CONFIG_Q": (workflow_source.replace('== "$S8_APP_CONFIG_SHA256" ]] || fail_amendment "APPLICATION_CONFIG_SNAPSHOT_MISMATCH"', '== "$S8_APP_SANDBOX_POLICY_SHA256" ]] || fail_amendment "APPLICATION_CONFIG_SNAPSHOT_MISMATCH"', 1), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "NO_POLICY_SNAPSHOT_COMPARE": ("\n".join(line for line in workflow_source.splitlines() if "APPLICATION_POLICY_SNAPSHOT_MISMATCH" not in line), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "NO_APPLICATION_BINDING_MARKER": ("\n".join(line for line in workflow_source.splitlines() if "APPLICATION_CONFIG_Q_BINDING=PASS" not in line), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "NO_BROKER_BUILD": (workflow_source, deployment_source.replace('hosted_run(["/usr/local/bin/cmake", "--build", str(build)', 'hosted_run(["/usr/local/bin/cmake", "--skip-build", str(build)', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "NO_HOSTED_CLEANUP": (workflow_source.replace('--hosted-cleanup "$temp_root"', '--hosted-cleanup-disabled "$temp_root"', 1), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "WORKER_ALTERNATE_LAUNCHER": (workflow_source, deployment_source, proof_bytes, helper_bytes, worker_source.replace("spawnSync(/* turbopackIgnore: true */ launcher, [], {", 'spawnSync("/usr/bin/bwrap", [], {', 1), broker_source),
-    "WORKER_SHELL_FALLBACK": (workflow_source, deployment_source, proof_bytes, helper_bytes, worker_source.replace("shell: false", "shell: true", 1), broker_source),
-    "DIRECT_BUBBLEWRAP": (workflow_source.replace("/usr/local/libexec/swooshz-s8/s8-sandbox ]] || fail_amendment", "/usr/bin/bwrap ]] || fail_amendment", 1), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "SOURCE_BEFORE_ADMISSION": (workflow_source.replace(
-        "          # RUN107_HOSTED_BROKER_DEPLOYMENT_BEGIN\n",
-        '          source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"\n          # RUN107_HOSTED_BROKER_DEPLOYMENT_BEGIN\n',
-        1,
-    ), deployment_source, proof_bytes, helper_bytes, worker_source, broker_source),
-    "HOSTED_POLICY_FIXTURE": (workflow_source, deployment_source.replace('policy_h = hashlib.sha256(hosted_canonical(policy)).hexdigest()', 'policy_h = "a" * 64', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "HOSTED_CONFIG_FIXTURE": (workflow_source, deployment_source.replace('config_q = hashlib.sha256(hosted_canonical(config)).hexdigest()', 'config_q = "b" * 64', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "WORKER_RESPONSE_HQ_MISMATCH": (workflow_source, deployment_source, proof_bytes, helper_bytes, worker_source.replace("validateS8BrokerResponseIdentity(response);", "/* identity validation removed */", 1), broker_source),
-    "BROKER_REQUEST_HQ_MISMATCH": (workflow_source, deployment_source, proof_bytes, helper_bytes, worker_source, broker_source.replace("constant_equal(request->config_sha256, expected_config, sizeof(expected_config))", "constant_equal(request->policy_sha256, expected_config, sizeof(expected_config))", 1)),
-    "PINNED_HELPER_BYTES_MISMATCH": (workflow_source, deployment_source, proof_bytes[:-1] + bytes([proof_bytes[-1] ^ 1]), helper_bytes, worker_source, broker_source),
-    "UNPRIVILEGED_PREFLIGHT": (workflow_source, deployment_source.replace("hosted_protected_state(path) is not None for path in absent", "path.exists() or path.is_symlink() for path in absent", 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "UNPRIVILEGED_CLEANUP": (workflow_source, deployment_source.replace('if row["kind"] != "F":\n            continue\n        state = hosted_protected_state(target, digest=True)', 'if row["kind"] != "F":\n            continue\n        state = target.lstat()', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "UNPRIVILEGED_VISUDO": (workflow_source, deployment_source.replace('hosted_sudo("/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS), label="HOSTED_SUDOERS_VALIDATION_FAILED")', 'hosted_run(["/usr/sbin/visudo", "-c", "-f", str(HOSTED_SUDOERS)], "HOSTED_SUDOERS_VALIDATION_FAILED")', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "PERMISSION_AS_ABSENCE": (workflow_source, deployment_source.replace("except FileNotFoundError:", "except OSError:", 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "NOFOLLOW_REMOVED": (workflow_source, deployment_source.replace('os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC', 'os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "UNPRIVILEGED_DIGEST": (workflow_source, deployment_source.replace('state = hosted_protected_state(path, digest=True)', 'state = os.open(path, os.O_RDONLY)', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "RAW_TEXT_ACL": (workflow_source, deployment_source.replace(acl_deploy_line, '        if hosted_sudo("/usr/bin/getfacl", "--access", "--", str(HOSTED_PRIVATE_ROOT), label="HOSTED_PRIVATE_ROOT_ACL_READ_FAILED").strip() != "user::rwx":\n            raise HostedDeploymentFailure("HOSTED_PRIVATE_ROOT_ACL_INVALID")', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "UNPRIVILEGED_ACL_READ": (workflow_source, deployment_source.replace(acl_access_line, '        access_text = HOSTED_PRIVATE_ROOT.read_text(encoding="ascii")', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "NO_DEFAULT_ACL_READ": (workflow_source, deployment_source.replace(acl_default_line, '        default_text = ""', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "NO_POST_ACL_IDENTITY": (workflow_source, deployment_source.replace(acl_post_probe_line, '    after = before', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "EFFECTIVE_RIGHTS_BYPASS": (workflow_source, deployment_source.replace('if reported is not None and reported != derived:', 'if False:', 1), proof_bytes, helper_bytes, worker_source, broker_source),
-    "DEFAULT_ACL_ACCEPTED": (workflow_source, deployment_source.replace('or defaults or effective_mismatch', 'or False or effective_mismatch', 1), proof_bytes, helper_bytes, worker_source, broker_source),
+    "NO_ROUTE_B_SUPERVISOR": mutate_control(0, workflow_source.replace("# RUN110_ROUTE_B_SUPERVISOR_BEGIN", "# RUN110_ROUTE_B_SUPERVISOR_DISABLED", 1)),
+    "SHELL_RECOVERY_PATH": mutate_control(0, replace_once(workflow_source, "SUPERVISOR_STATE_RESIDUE=YES", "SUPERVISOR_STATE_RESIDUE=YES --hosted-cleanup")),
+    "NO_HOSTED_CLEANUP_WITNESS": mutate_control(0, "\n".join(line for line in workflow_source.splitlines() if "ROUTE_B_BROKER_CLEANUP=" not in line)),
+    "PRIVATE_ROOT_PARTIAL_SETUP_ROLLBACK_REMOVED": mutate_control(1, replace_once(deployment_source, "hosted_remove_incomplete_private_root(before)", "pass")),
+    "CLEANUP_FIXED_PATH_ABSENCE_CHECK_REMOVED": mutate_control(1, replace_once(deployment_source, "hosted_verify_deployment_absent()", "pass")),
+    "SUDOERS_NO_NOPASSWD": mutate_control(3, replace_once(sudoers_source, "NOPASSWD:", "PASSWD:")),
+    "SUDOERS_NO_NOSETENV": mutate_control(3, replace_once(sudoers_source, "NOPASSWD: NOSETENV:", "NOPASSWD:")),
+    "SUDOERS_NO_STAY_SETUID": mutate_control(3, replace_once(sudoers_source, "stay_setuid,", "")),
+    "SUDOERS_BROAD_RECOVERY": mutate_control(3, replace_once(sudoers_source, "^--stdio-v1$", "^(--stdio-v1|--recover-v1)$")),
+    "SUDOERS_UNANCHORED_PATH": mutate_control(3, replace_once(sudoers_source, "^/usr/local/libexec/swooshz-s8/s8-sandbox-broker$", "/usr/local/libexec/swooshz-s8/s8-sandbox-broker")),
+    "BUILD_AS_ROOT": mutate_control(1, replace_once(deployment_source, 'hosted_run_as_host_user(["/usr/local/bin/cmake", "-S"', 'hosted_root("/usr/local/bin/cmake", "-S"')),
+    "DEPLOYMENT_VIA_SUDO": mutate_control(1, replace_once(deployment_source, 'hosted_root(str(HOSTED_BROKER), "--recover-v1"', 'hosted_run(["/usr/bin/sudo", str(HOSTED_BROKER), "--recover-v1"]')),
+    "NO_PIDFD_SIGNAL": mutate_control(2, replace_once(supervisor_source, "signal.pidfd_send_signal(self.pidfd, signum)", "os.kill(self.pid, signum)")),
+    "NO_START_IDENTITY_CHECK": mutate_control(2, replace_once(supervisor_source, "process_start_identity(process.pid)", "str(process.pid)")),
+    "SUDO_MATRIX_RUNNER_OWNED_PATHS": mutate_control(2, replace_once(supervisor_source, 'tempfile.TemporaryDirectory(prefix="s8-sudo-matrix-"', 'tempfile.mkdtemp(prefix="s8-sudo-matrix-"')),
+    "SUDOERS_MATRIX_FOLLOWS_SYMLINK": mutate_control(2, replace_once(supervisor_source, "os.open(sudoers_path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC)", "os.open(sudoers_path, os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC)")),
+    "NO_CANCEL_PROPAGATION": mutate_control(2, replace_once(supervisor_source, '"deploy", cancel_event=cancel_event)', '"deploy", cancel_event=None)')),
+    "NO_CHILD_QUIESCENCE_BEFORE_RECOVERY": mutate_control(2, replace_once(supervisor_source, "if active_before_recovery:", "if False:")),
+    "NO_APP_UID_ENV_PROOF": mutate_control(2, replace_once(supervisor_source, 'variables != [b"PWD=/work"]', "False")),
+    "NO_OUTER_OPT_REVALIDATION": mutate_control(2, supervisor_source.replace("current_host_ids() != outer_ids or opt_snapshot() != outer_opt", "False")),
+    "NO_RECOVERY_CLEANUP_GATE": mutate_control(2, supervisor_source.replace('not cleanup_events[0]["clean"]', "False")),
+    "PINNED_PROOF_BYTES_MISMATCH": mutate_control(4, proof_bytes[:-1] + bytes([proof_bytes[-1] ^ 1])),
+    "PINNED_HELPER_BYTES_MISMATCH": mutate_control(5, helper_bytes[:-1] + bytes([helper_bytes[-1] ^ 1])),
+    "WORKER_ALTERNATE_LAUNCHER": mutate_control(6, replace_once(worker_source, "spawnSync(/* turbopackIgnore: true */ launcher, [], {", 'spawnSync("/usr/bin/bwrap", [], {')),
+    "WORKER_SHELL_FALLBACK": mutate_control(6, replace_once(worker_source, "shell: false", "shell: true")),
+    "BROKER_REQUEST_HQ_MISMATCH": mutate_control(7, replace_once(broker_source, "constant_equal(request->config_sha256, expected_config, sizeof(expected_config))", "constant_equal(request->policy_sha256, expected_config, sizeof(expected_config))")),
 }
 for label, candidate in negative_controls.items():
     if hosted_binding_accepts(candidate):

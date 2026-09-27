@@ -2221,12 +2221,8 @@ jobs:
               printf 'CHILDREN_REAPED=YES\n'
             fi
             if (( broker_deployment_attempted == 1 )); then
-              if (( all_launched_children_reaped == 1 )) && /usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/broker_contract.py" --hosted-cleanup "$temp_root"; then
-                broker_deployment_attempted=0
-              else
-                printf 'BROKER_DEPLOYMENT_CLEANUP=FAIL\nPRODUCTION_DEPLOYMENT_ABSENT=NO\n' >&2
-                cleanup_failed=1
-              fi
+              printf 'SUPERVISOR_STATE_RESIDUE=YES\nBROKER_DEPLOYMENT_CLEANUP=FAIL\nPRODUCTION_DEPLOYMENT_ABSENT=NO\n' >&2
+              cleanup_failed=1
             fi
             if (( carrier_created_by_attempt == 1 )); then
               if (( carrier_identity_recorded == 1 && carrier_identity_poisoned == 0 && identity_poisoned == 0 && all_launched_children_reaped == 1 )); then
@@ -2266,7 +2262,7 @@ jobs:
                 fi
               else
                 if (( broker_deployment_attempted == 1 )); then
-                  printf 'TEMP_CLEANUP_RESULT=DEFERRED_BROKER_DEPLOYMENT_RESIDUE\n' >&2
+                  printf 'TEMP_CLEANUP_RESULT=DEFERRED_SUPERVISOR_STATE_RESIDUE\n' >&2
                 else
                   printf 'TEMP_CLEANUP_RESULT=DEFERRED_UNRESOLVED_CHILD\n' >&2
                 fi
@@ -9392,27 +9388,43 @@ jobs:
           admit_work_for_use || fail_hold "WORK_POST_CANDIDATE_ADMISSION_FAILED"
           printf 'NATIVE_RUNNER_ADMISSION_RESULT=PASS\nPINNED_BLENDER_RESULT=PASS\nPRIVATE_EXPORTER_RESULT=PASS\nNATIVE_VALIDATOR_RESULT=PASS\nBLENDER_SEMANTIC_QUALIFICATION=PASS\n'
 
-          # RUN107_HOSTED_BROKER_DEPLOYMENT_BEGIN
+          # RUN110_ROUTE_B_SUPERVISOR_BEGIN
           broker_deployment_attempted=1
-          if ! broker_deployment_output="$(/usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/broker_contract.py" --hosted-deploy "$carrier" "$temp_root" "$runner_uid" "$runner_gid")"; then
-            fail_amendment "HOSTED_COMBINED_BROKER_DEPLOYMENT_FAILED"
+          supervisor_log="$temp_root/route-b-supervisor.log"
+          route_b_status=0
+          set +e
+          run_tracked_command /usr/bin/sudo -n -- /usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/hosted_deployment_namespace.py" --supervise \
+            --workspace "$GITHUB_WORKSPACE" --carrier "$carrier" --temp-root "$temp_root" --uid "$runner_uid" --gid "$runner_gid" \
+            --node "$(command -v node)" --corepack "$(command -v corepack)" > "$supervisor_log" 2>&1
+          route_b_status=$?
+          set -e
+          /usr/bin/cat "$supervisor_log"
+          if /usr/bin/grep -Fxq 'ROUTE_B_PRODUCTION_DEPLOYMENT_ABSENT=YES' "$supervisor_log" \
+            && /usr/bin/grep -Fxq 'NAMESPACE_SUPERVISOR_STATE_CLEANUP=PASS' "$supervisor_log"; then
+            broker_deployment_attempted=0
           fi
-          printf '%s\n' "$broker_deployment_output"
-          [[ "$(/usr/bin/grep -c '^S8_APP_PRIVATE_ROOT=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_PRIVATE_ROOT_BINDING_INVALID"
-          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX_POLICY_SHA256=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_POLICY_H_BINDING_INVALID"
-          [[ "$(/usr/bin/grep -c '^S8_APP_CONFIG_SHA256=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_CONFIG_Q_BINDING_INVALID"
-          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_SANDBOX_BINDING_INVALID"
-          S8_APP_PRIVATE_ROOT="$(/usr/bin/awk -F= '$1 == "S8_APP_PRIVATE_ROOT" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
-          S8_APP_SANDBOX_POLICY_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX_POLICY_SHA256" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
-          S8_APP_CONFIG_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_CONFIG_SHA256" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
-          S8_APP_SANDBOX="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
-          [[ "$S8_APP_PRIVATE_ROOT" == /var/lib/swooshz/s8 && "$S8_APP_SANDBOX" == /usr/local/libexec/swooshz-s8/s8-sandbox ]] || fail_amendment "APPLICATION_DEPLOYMENT_PATH_BINDING_INVALID"
-          [[ "$S8_APP_SANDBOX_POLICY_SHA256" =~ ^[0-9a-f]{64}$ && "$S8_APP_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail_amendment "APPLICATION_DEPLOYMENT_DIGEST_INVALID"
-          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_POLICY_H" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")" == "$S8_APP_SANDBOX_POLICY_SHA256" ]] || fail_amendment "APPLICATION_POLICY_SNAPSHOT_MISMATCH"
-          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_CONFIG_Q" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")" == "$S8_APP_CONFIG_SHA256" ]] || fail_amendment "APPLICATION_CONFIG_SNAPSHOT_MISMATCH"
-          [[ "$(/usr/bin/grep -Fx -c 'CONFIG_DIGEST_INCLUDES_POLICY_DIGEST=YES' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_CONFIG_POLICY_DIGEST_BINDING_MISSING"
+          if (( route_b_status != 0 )); then fail_hold "HOSTED_NAMESPACE_HARNESS_HOLD"; fi
+          [[ "$(/usr/bin/grep -Fx -c 'ROUTE_B_BROKER_CLEANUP=PASS' "$supervisor_log" || true)" == 1 || "$(/usr/bin/grep -Fx -c 'ROUTE_B_BROKER_CLEANUP=PASS_NOT_ATTEMPTED' "$supervisor_log" || true)" == 1 ]] || fail_hold "HOSTED_BROKER_CLEANUP_WITNESS_MISSING"
+          [[ "$(/usr/bin/grep -Fx -c 'NAMESPACE_SUPERVISOR_STATE_CLEANUP=PASS' "$supervisor_log" || true)" == 1 ]] || fail_hold "HOSTED_NAMESPACE_STATE_CLEANUP_WITNESS_MISSING"
+          [[ "$(/usr/bin/grep -Fx -c 'ROUTE_B_OUTER_OPT_UNCHANGED=YES' "$supervisor_log" || true)" == 1 ]] || fail_hold "HOSTED_OUTER_OPT_WITNESS_MISSING"
+          [[ "$(/usr/bin/grep -Fx -c 'ROUTE_B_PRODUCTION_DEPLOYMENT_ABSENT=YES' "$supervisor_log" || true)" == 1 ]] || fail_hold "HOSTED_PRODUCTION_ABSENCE_WITNESS_MISSING"
+          [[ "$(/usr/bin/grep -c '^HOSTED_POLICY_H=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_POLICY_H_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^HOSTED_CONFIG_Q=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_CONFIG_Q_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_PRIVATE_ROOT=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_PRIVATE_ROOT_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX_POLICY_SHA256=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_POLICY_H_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_CONFIG_SHA256=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_CONFIG_Q_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_SANDBOX_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -Fx -c 'CONFIG_DIGEST_INCLUDES_POLICY_DIGEST=YES' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_CONFIG_POLICY_DIGEST_BINDING_MISSING"
+          S8_APP_PRIVATE_ROOT="$(/usr/bin/awk -F= '$1 == "S8_APP_PRIVATE_ROOT" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")"
+          S8_APP_SANDBOX_POLICY_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX_POLICY_SHA256" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")"
+          S8_APP_CONFIG_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_CONFIG_SHA256" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")"
+          S8_APP_SANDBOX="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")"
+          [[ "$S8_APP_PRIVATE_ROOT" == /var/lib/swooshz/s8 && "$S8_APP_SANDBOX" == /usr/local/libexec/swooshz-s8/s8-sandbox ]] || fail_hold "APPLICATION_DEPLOYMENT_PATH_BINDING_INVALID"
+          [[ "$S8_APP_SANDBOX_POLICY_SHA256" =~ ^[0-9a-f]{64}$ && "$S8_APP_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail_hold "APPLICATION_DEPLOYMENT_DIGEST_INVALID"
+          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_POLICY_H" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")" == "$S8_APP_SANDBOX_POLICY_SHA256" ]] || fail_hold "APPLICATION_POLICY_SNAPSHOT_MISMATCH"
+          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_CONFIG_Q" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")" == "$S8_APP_CONFIG_SHA256" ]] || fail_hold "APPLICATION_CONFIG_SNAPSHOT_MISMATCH"
           export S8_APP_PRIVATE_ROOT S8_APP_SANDBOX_POLICY_SHA256 S8_APP_CONFIG_SHA256 S8_APP_SANDBOX
-          # RUN107_HOSTED_BROKER_DEPLOYMENT_END
+          # RUN110_ROUTE_B_SUPERVISOR_END
           source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"
           printf 'APPLICATION_PRIVATE_ROOT_BINDING=PASS\nAPPLICATION_POLICY_H_BINDING=PASS\nAPPLICATION_CONFIG_Q_BINDING=PASS\nAPPLICATION_SANDBOX_BINDING=PASS\nSAME_POLICY_SNAPSHOT_BINDING=PASS\n'
           admit_work_for_use || fail_hold "WORK_AFTER_APPLICATION_BOUNDARY_PROOF_FAILED"
