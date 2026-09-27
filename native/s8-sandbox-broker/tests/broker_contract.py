@@ -1232,6 +1232,27 @@ def valid_hosted_protected_harness(deployment, supervisor):
 def valid_hosted_binding(workflow, deployment, supervisor, sudoers, proof_bytes, helper_bytes, worker, broker):
     if not valid_hosted_protected_harness(deployment, supervisor) or not valid_sudoers_template(sudoers):
         return False
+    semantic_call = '--validate-semantic-readback "$carrier/work/input.json" "$carrier/work/validator-readback.json"'
+    semantic_tokens = (
+        "def validate_workflow_semantic_readback(readback, payload):",
+        '"s8-ufbx-readback-v1"', '"semantic synthetic root provenance forbidden"',
+        'workflow_semantic_checker_control("VALID_ROOT_AND_PHYSICAL_NODE"',
+        '"MISSING_ROOT",',
+        '"DUPLICATE_ROOT",',
+        '"EXTRA_NODE",',
+        '"MALFORMED_ROOT",',
+        '"ROOT_SOURCE_OBJECT_ID_PRESENT",',
+        '"ROOT_IDENTITY_KEY_PRESENT",',
+        "SEMANTIC_READBACK_RESULT=PASS",
+    )
+    if workflow.count(semantic_call) != 1 or any(token not in supervisor for token in semantic_tokens):
+        return False
+    if not (
+        workflow.index("BEFORE_SEMANTIC_READBACK_IDENTITY_FAILED")
+        < workflow.index(semantic_call)
+        < workflow.index("CANDIDATE_MARKER_REACHED=YES")
+    ):
+        return False
     expected_files = (
         (proof_bytes, 9086, "34a86da59ae51a50501ffcde7fd2086a1ceeeb2258238962404f4a8ce9a3d0e8"),
         (helper_bytes, 3328, "e594a8749645ef122f22a8bae852745f8c3492f9fcda35597301cdfd1b5e2c42"),
@@ -1332,6 +1353,9 @@ def valid_hosted_binding(workflow, deployment, supervisor, sudoers, proof_bytes,
 
 
 workflow_source = workflow_path.read_text(encoding="utf-8")
+if workflow_path.stat().st_size > 500 * 1024:
+    raise SystemExit("GITHUB_WORKFLOW_FILE_EXCEEDS_500_KB")
+print("GITHUB_WORKFLOW_FILE_SIZE=PASS")
 deployment_source = deployment_path.read_text(encoding="utf-8")
 supervisor_source = supervisor_path.read_text(encoding="utf-8")
 sudoers_source = sudoers_path.read_text(encoding="ascii")
@@ -1369,6 +1393,8 @@ def replace_once(source, old, new):
 
 
 negative_controls = {
+    "NO_SEMANTIC_READBACK_DISPATCH": mutate_control(0, replace_once(workflow_source, "--validate-semantic-readback", "--validate-missing-semantic-readback")),
+    "NO_SEMANTIC_REJECTION_CONTROL": mutate_control(2, replace_once(supervisor_source, '        "MISSING_ROOT",', '        "MISSING_ROOT_DISABLED",')),
     "NO_ROUTE_B_SUPERVISOR": mutate_control(0, workflow_source.replace("# RUN110_ROUTE_B_SUPERVISOR_BEGIN", "# RUN110_ROUTE_B_SUPERVISOR_DISABLED", 1)),
     "SHELL_RECOVERY_PATH": mutate_control(0, replace_once(workflow_source, "SUPERVISOR_STATE_RESIDUE=YES", "SUPERVISOR_STATE_RESIDUE=YES --hosted-cleanup")),
     "NO_HOSTED_CLEANUP_WITNESS": mutate_control(0, "\n".join(line for line in workflow_source.splitlines() if "ROUTE_B_BROKER_CLEANUP=" not in line)),

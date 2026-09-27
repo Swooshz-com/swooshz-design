@@ -1660,7 +1660,161 @@ def holder_entry(args):
     return inner_holder(Path(args.workspace), Path(args.carrier), Path(args.temp_root), args.uid, args.gid, args.node, args.corepack, control_fd, result_fd, Path(args.ledger), args.outer_user_ns, args.outer_pid_ns, args.mode)
 
 
+def validate_workflow_semantic_readback(readback, payload):
+    if readback.get("schemaVersion") != "s8-ufbx-readback-v1":
+        raise SystemExit("semantic readback schema mismatch")
+    source = readback.get("source")
+    expected_source = payload["source"]
+    if not isinstance(source, dict) or any(
+        source.get(key) != expected_source[key]
+        for key in ("revisionId", "revisionHash", "s6ValidationHash", "s6HandoffDigest")
+    ):
+        raise SystemExit("semantic source provenance mismatch")
+
+    nodes = readback.get("nodes")
+    if not isinstance(nodes, list):
+        raise SystemExit("semantic node collection mismatch")
+    roots = [node for node in nodes if isinstance(node, dict) and node.get("name") == "SWZ_ROOT"]
+    if not roots:
+        raise SystemExit("semantic synthetic root missing")
+    if len(roots) != 1:
+        raise SystemExit("semantic synthetic root duplicated")
+    root = roots[0]
+    if "sourceObjectId" in root or "identityKey" in root:
+        raise SystemExit("semantic synthetic root provenance forbidden")
+    identity = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]
+    if (
+        set(root) != {"name", "parent", "mesh", "effectiveScale", "nodeToParent", "nodeToWorld"}
+        or root.get("parent") is not None
+        or root.get("mesh") is not None
+        or root.get("effectiveScale") != [1, 1, 1]
+        or root.get("nodeToParent") != identity
+        or root.get("nodeToWorld") != identity
+    ):
+        raise SystemExit("semantic synthetic root shape mismatch")
+
+    if len(nodes) != 2:
+        raise SystemExit("semantic node cardinality mismatch")
+    names = [node.get("name") if isinstance(node, dict) else None for node in nodes]
+    if any(not isinstance(name, str) for name in names) or len(set(names)) != 2:
+        raise SystemExit("semantic node names are not unique")
+    expected_object = payload["objects"][0]
+    if set(names) != {"SWZ_ROOT", expected_object["name"]}:
+        raise SystemExit("semantic node names mismatch")
+    physical = next(node for node in nodes if node.get("name") == expected_object["name"])
+    if (
+        physical.get("sourceObjectId") != expected_object["sourceObjectId"]
+        or physical.get("identityKey") != expected_object["identityKey"]
+    ):
+        raise SystemExit("semantic object identity mismatch")
+    mesh = physical.get("mesh")
+    if (
+        not isinstance(mesh, dict)
+        or len(mesh.get("vertices", [])) != 3
+        or mesh.get("triangles") != [[0, 1, 2]]
+        or len(mesh.get("cornerNormals", [])) != 3
+    ):
+        raise SystemExit("semantic geometry mismatch")
+
+
+def workflow_semantic_checker_control(name, readback, payload, expected_error=None):
+    try:
+        validate_workflow_semantic_readback(readback, payload)
+    except SystemExit as error:
+        if expected_error is None or str(error) != expected_error:
+            raise SystemExit(
+                f"workflow semantic control {name} failed: expected {expected_error!r}, got {str(error)!r}"
+            )
+    else:
+        if expected_error is not None:
+            raise SystemExit(
+                f"workflow semantic control {name} failed: expected rejection {expected_error!r}"
+            )
+    print(f"WORKFLOW_SEMANTIC_CONTROL_{name}=PASS")
+
+
+def validate_workflow_semantic_readback_files(payload_path, readback_path):
+    control_source = {
+        "revisionId": "semantic-control-revision",
+        "revisionHash": "a" * 64,
+        "s6ValidationHash": "b" * 64,
+        "s6HandoffDigest": "c" * 64,
+    }
+    control_object = {
+        "name": "CONTROL_PHYSICAL",
+        "sourceObjectId": "control-source-id",
+        "identityKey": "control-identity-key",
+    }
+    control_payload = {"source": control_source, "objects": [control_object]}
+    control_root = {
+        "name": "SWZ_ROOT",
+        "parent": None,
+        "mesh": None,
+        "effectiveScale": [1, 1, 1],
+        "nodeToParent": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+        "nodeToWorld": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+    }
+    control_physical = {
+        "name": "CONTROL_PHYSICAL",
+        "sourceObjectId": "control-source-id",
+        "identityKey": "control-identity-key",
+        "parent": "SWZ_ROOT",
+        "effectiveScale": [1, 1, 1],
+        "nodeToParent": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+        "nodeToWorld": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+        "mesh": {
+            "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+            "triangles": [[0, 1, 2]],
+            "cornerNormals": [[0, 0, 1]] * 3,
+        },
+    }
+    control_base = {
+        "schemaVersion": "s8-ufbx-readback-v1",
+        "source": control_source,
+        "nodes": [control_root, control_physical],
+    }
+    workflow_semantic_checker_control("VALID_ROOT_AND_PHYSICAL_NODE", control_base, control_payload)
+    workflow_semantic_checker_control(
+        "MISSING_ROOT", {**control_base, "nodes": [control_physical]}, control_payload,
+        "semantic synthetic root missing",
+    )
+    workflow_semantic_checker_control(
+        "DUPLICATE_ROOT", {**control_base, "nodes": [control_root, dict(control_root), control_physical]},
+        control_payload, "semantic synthetic root duplicated",
+    )
+    workflow_semantic_checker_control(
+        "EXTRA_NODE", {**control_base, "nodes": [control_root, control_physical, {"name": "EXTRA", "mesh": None}]},
+        control_payload, "semantic node cardinality mismatch",
+    )
+    malformed_root = dict(control_root)
+    malformed_root["parent"] = "CONTROL_PHYSICAL"
+    workflow_semantic_checker_control(
+        "MALFORMED_ROOT", {**control_base, "nodes": [malformed_root, control_physical]},
+        control_payload, "semantic synthetic root shape mismatch",
+    )
+    root_with_source_id = dict(control_root)
+    root_with_source_id["sourceObjectId"] = "SWZ_ROOT"
+    workflow_semantic_checker_control(
+        "ROOT_SOURCE_OBJECT_ID_PRESENT", {**control_base, "nodes": [root_with_source_id, control_physical]},
+        control_payload, "semantic synthetic root provenance forbidden",
+    )
+    root_with_identity_key = dict(control_root)
+    root_with_identity_key["identityKey"] = "SWZ_ROOT"
+    workflow_semantic_checker_control(
+        "ROOT_IDENTITY_KEY_PRESENT", {**control_base, "nodes": [root_with_identity_key, control_physical]},
+        control_payload, "semantic synthetic root provenance forbidden",
+    )
+
+    payload = json.loads(Path(payload_path).read_text(encoding="ascii"))
+    readback = json.loads(Path(readback_path).read_text(encoding="ascii"))
+    validate_workflow_semantic_readback(readback, payload)
+    print("SEMANTIC_READBACK_RESULT=PASS")
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--validate-semantic-readback":
+        validate_workflow_semantic_readback_files(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
     parser = argparse.ArgumentParser(add_help=False)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--supervise", action="store_true")
