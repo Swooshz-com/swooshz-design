@@ -200,11 +200,28 @@ class OwnedProcess:
         return result
 
 
-def launch_owned(argv, *, owner, ledger_path, mount_id=None, cwd=None, env=None, stdin=None, stdout=None, stderr=None, pass_fds=()):
+def owned_stdin_plan(stdin, *, deferred_stdin=False):
+    if type(deferred_stdin) is not bool:
+        raise SupervisorFailure("OWNED_STDIN_DEFERRED_FLAG_INVALID")
+    if stdin is not None and deferred_stdin:
+        raise SupervisorFailure("OWNED_STDIN_PAYLOAD_AND_DEFERRED_CONFLICT")
+    if deferred_stdin:
+        return subprocess.PIPE, None
+    if stdin is None:
+        return subprocess.DEVNULL, None
+    try:
+        payload = memoryview(stdin).tobytes()
+    except (TypeError, ValueError) as error:
+        raise SupervisorFailure("OWNED_STDIN_PAYLOAD_NOT_BYTES_LIKE") from error
+    return subprocess.PIPE, payload
+
+
+def launch_owned(argv, *, owner, ledger_path, mount_id=None, cwd=None, env=None, stdin=None, deferred_stdin=False, stdout=None, stderr=None, pass_fds=()):
+    stdin_mode, stdin_payload = owned_stdin_plan(stdin, deferred_stdin=deferred_stdin)
     if not callable(getattr(os, "pidfd_open", None)) or not callable(getattr(signal, "pidfd_send_signal", None)):
         raise SupervisorFailure("PIDFD_UNAVAILABLE")
     process = subprocess.Popen(
-        argv, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+        argv, cwd=cwd, env=env, stdin=stdin_mode,
         stdout=stdout if stdout is not None else subprocess.DEVNULL, stderr=stderr if stderr is not None else subprocess.STDOUT,
         close_fds=True, pass_fds=tuple(pass_fds),
     )
@@ -275,12 +292,19 @@ def launch_owned(argv, *, owner, ledger_path, mount_id=None, cwd=None, env=None,
     if mount_id is not None and actual_mount_id != mount_id:
         terminate_owned(owned)
         raise SupervisorFailure("OWNED_PROCESS_MOUNT_NAMESPACE_INVALID")
-    if stdin is not None:
+    if stdin_payload is not None:
         try:
-            process.stdin.write(stdin)
-            process.stdin.close()
+            written = process.stdin.write(stdin_payload)
+            if written != len(stdin_payload):
+                raise SupervisorFailure("OWNED_STDIN_SHORT_WRITE")
         except BrokenPipeError:
             pass
+        finally:
+            if process.stdin is not None and not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
     return owned
 
 
@@ -1876,7 +1900,7 @@ def run_sudo_credential_diagnostic(uid, gid, workspace, temp_root, policy_h, con
         command = app_identity_command(uid, gid, [HOSTED_LAUNCHER])
         owned = launch_owned(
             command, owner=f"broker-contract:sudo-diagnostic:{os.getpid()}", ledger_path=ledger_path,
-            mount_id=mount_id, cwd=workspace, env=base_env, stdin=True,
+            mount_id=mount_id, cwd=workspace, env=base_env, deferred_stdin=True,
             stdout=stdout_file, stderr=stderr_file,
         )
         broker_pid, broker_start_identity, broker_pidfd, observed_executable, sudo_observed = locate_owned_broker(
@@ -2015,7 +2039,156 @@ def synthetic_sudo_response(status, policy_h, config_q, magic=b"S8BRS001", *, le
     return bytes(response)
 
 
+def validate_owned_stdin_controls(expect):
+    class RecordingStream:
+        def __init__(self):
+            self.written = bytearray()
+            self.closed = False
+
+        def write(self, data):
+            if self.closed:
+                raise ValueError("stream is closed")
+            payload = memoryview(data).tobytes()
+            self.written.extend(payload)
+            return len(payload)
+
+        def flush(self):
+            if self.closed:
+                raise ValueError("stream is closed")
+
+        def close(self):
+            self.closed = True
+
+    class FakeProcess:
+        pid = 4242
+
+        def __init__(self, kwargs):
+            self.stdin = RecordingStream() if kwargs["stdin"] == subprocess.PIPE else None
+
+        def poll(self):
+            return 0
+
+    class FakeOwnedProcess:
+        def __init__(self, process, owner, ledger_path, mount_id, start_identity, pidfd):
+            self.process = process
+            self.terminal = None
+
+        def wait(self, _timeout):
+            self.terminal = 0
+            return 0
+
+    original_popen = subprocess.Popen
+    original_pidfd_open = getattr(os, "pidfd_open", None)
+    original_pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    original_start_identity = process_start_identity
+    original_namespace_identity = namespace_identity
+    original_owned_process = OwnedProcess
+    launched = []
+
+    def fake_popen(_argv, **kwargs):
+        process = FakeProcess(kwargs)
+        launched.append((process, kwargs))
+        return process
+
+    try:
+        subprocess.Popen = fake_popen
+        os.pidfd_open = lambda _pid, _flags: 51
+        signal.pidfd_send_signal = lambda *_args: None
+        globals()["process_start_identity"] = lambda pid: f"boot:{pid}:start"
+        globals()["namespace_identity"] = lambda _pid, _name: {"number": 123}
+        globals()["OwnedProcess"] = FakeOwnedProcess
+
+        payload = bytearray(b"\x00ordinary-request\xff")
+        owned = launch_owned(
+            ["fixture"], owner="fixture", ledger_path="fixture-ledger", stdin=memoryview(payload),
+        )
+        process, kwargs = launched[-1]
+        expect(
+            kwargs["stdin"] == subprocess.PIPE and bytes(process.stdin.written) == bytes(payload)
+            and process.stdin.closed,
+            "BYTE_PAYLOAD_POSITIVE",
+        )
+
+        default_owned = launch_owned(["fixture"], owner="fixture", ledger_path="fixture-ledger")
+        default_process, default_kwargs = launched[-1]
+        expect(
+            default_kwargs["stdin"] == subprocess.DEVNULL and default_process.stdin is None,
+            "OWNED_STDIN_DEFAULT_DEVNULL",
+        )
+
+        deferred = launch_owned(
+            ["fixture"], owner="fixture", ledger_path="fixture-ledger", deferred_stdin=True,
+        )
+        deferred_process, deferred_kwargs = launched[-1]
+        expect(
+            deferred_kwargs["stdin"] == subprocess.PIPE and deferred_process.stdin is not None
+            and not deferred_process.stdin.written and not deferred_process.stdin.closed,
+            "DEFERRED_STDIN_POSITIVE",
+        )
+        request = b"exact deferred probe request\x00\xff"
+        send_probe_request(deferred, request)
+        expect(
+            bytes(deferred_process.stdin.written) == request and deferred_process.stdin.closed,
+            "DEFERRED_REQUEST_POSITIVE",
+        )
+
+        unused = launch_owned(
+            ["fixture"], owner="fixture", ledger_path="fixture-ledger", deferred_stdin=True,
+        )
+        close_probe_stdin(unused)
+        expect(unused.process.stdin.closed and not unused.process.stdin.written,
+               "DEFERRED_UNUSED_CLOSE_POSITIVE")
+
+        for value, deferred_mode, error_code, marker in (
+            (True, False, "OWNED_STDIN_PAYLOAD_NOT_BYTES_LIKE", "BOOL_STDIN_REJECTED"),
+            (object(), False, "OWNED_STDIN_PAYLOAD_NOT_BYTES_LIKE", "NON_BYTES_STDIN_REJECTED"),
+            (b"payload", True, "OWNED_STDIN_PAYLOAD_AND_DEFERRED_CONFLICT", "PAYLOAD_PLUS_DEFERRED_REJECTED"),
+        ):
+            before_launches = len(launched)
+            try:
+                launch_owned(
+                    ["fixture"], owner="fixture", ledger_path="fixture-ledger",
+                    stdin=value, deferred_stdin=deferred_mode,
+                )
+            except SupervisorFailure as error:
+                expect(str(error) == error_code and len(launched) == before_launches, marker)
+            else:
+                expect(False, marker)
+
+        original_ledger = os.environ.get("S8_PROCESS_LEDGER")
+        os.environ["S8_PROCESS_LEDGER"] = "fixture-ledger"
+        try:
+            completed = supervised_command(["fixture"], stdin=bytes(payload))
+            supervised_process, supervised_kwargs = launched[-1]
+            expect(
+                isinstance(completed, subprocess.CompletedProcess) and completed.returncode == 0
+                and supervised_kwargs["stdin"] == subprocess.PIPE
+                and bytes(supervised_process.stdin.written) == bytes(payload)
+                and supervised_process.stdin.closed,
+                "SUPERVISED_BYTE_PAYLOAD_PASSTHROUGH",
+            )
+        finally:
+            if original_ledger is None:
+                os.environ.pop("S8_PROCESS_LEDGER", None)
+            else:
+                os.environ["S8_PROCESS_LEDGER"] = original_ledger
+    finally:
+        subprocess.Popen = original_popen
+        if original_pidfd_open is None:
+            delattr(os, "pidfd_open")
+        else:
+            os.pidfd_open = original_pidfd_open
+        if original_pidfd_send_signal is None:
+            delattr(signal, "pidfd_send_signal")
+        else:
+            signal.pidfd_send_signal = original_pidfd_send_signal
+        globals()["process_start_identity"] = original_start_identity
+        globals()["namespace_identity"] = original_namespace_identity
+        globals()["OwnedProcess"] = original_owned_process
+
+
 def validate_sudo_diagnostic_controls(expect):
+    validate_owned_stdin_controls(expect)
     expected_h = "a" * 64
     expected_q = "b" * 64
     status = "\n".join((

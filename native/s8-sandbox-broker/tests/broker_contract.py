@@ -1324,11 +1324,21 @@ def valid_hosted_protected_harness(deployment, supervisor):
             '"/usr/bin/setpriv"', '"--clear-groups"', '"--inh-caps=-all"',
             '"--ambient-caps=-all"', '"--bounding-set=-all"',
         ),
+        "owned_stdin_plan": (
+            "if type(deferred_stdin) is not bool:", "stdin is not None and deferred_stdin",
+            "memoryview(stdin).tobytes()", "return subprocess.PIPE, None",
+            "return subprocess.DEVNULL, None", "return subprocess.PIPE, payload",
+            "OWNED_STDIN_PAYLOAD_NOT_BYTES_LIKE", "OWNED_STDIN_PAYLOAD_AND_DEFERRED_CONFLICT",
+        ),
         "launch_owned": (
             "os.pidfd_open(process.pid, 0)", "process_start_identity(process.pid)", "OwnedProcess(process",
-            "stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL",
+            "stdin_mode, stdin_payload = owned_stdin_plan(stdin, deferred_stdin=deferred_stdin)",
+            "stdin=stdin_mode", "process.stdin.write(stdin_payload)", "process.stdin.close()",
             "stderr=stderr if stderr is not None else subprocess.STDOUT",
         ),
+        "supervised_command": ("input=stdin", "stdin=stdin", "launch_owned("),
+        "send_probe_request": ("memoryview(request)", "stream.write(view)", "stream.close()"),
+        "close_probe_stdin": ("stream.close()",),
         "wait_owned_pidfd": ("owned.identity_valid()", "poller.register(owned.pidfd", "owned.wait(0)"),
         "parse_proc_credentials": (
             '"Uid", "Gid", "Groups", "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs", "Seccomp"',
@@ -1382,7 +1392,7 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "run_sudo_credential_diagnostic": (
             "capture_sudo_provenance()", "file_identity(HOSTED_LAUNCHER)", "file_identity(HOSTED_BROKER)",
             'emit_runtime_file_identity("BROKER_INSTALLATION", broker_identity)',
-            "stdin=True", "stdout=stdout_file", "stderr=stderr_file", "locate_owned_broker(",
+            "deferred_stdin=True", "stdout=stdout_file", "stderr=stderr_file", "locate_owned_broker(",
             "capture_broker_entry_credentials(", "send_probe_request(owned, make_request(policy_h, config_q))",
             "wait_observed_broker_exit(", "BROKER_PROCESS_REAPED", "SUDO_DIAGNOSTIC_EVIDENCE_COMPLETE=",
             "PRODUCT_SEMANTICS_PROVEN_BAD=NOT_PROVEN", "G3_ATTEMPT_IMPACT=NONE",
@@ -1435,7 +1445,13 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "create_inner_toolchain_parent_directories": ("HOSTED_TOOLCHAIN_DESTINATION_PARENT_NOT_FRESH", "validate_inner_opt_child", "os.chmod(path, 0o755)"),
         "run_toolchain_preservation_controls": ("HOSTED_TOOLCHAIN_CONTROL_MINIMAL_SUBTREE_SELECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_SOURCE_SUBTREE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_BROAD_OPT_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_UNRELATED_TOOLCACHE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_DESTINATION_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_DIFFERENT_SOURCE_STAGE_PATHS_ACCEPTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_IDENTITY_CONTINUITY_ACCEPTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_DEVICE_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_INODE_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_UID_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_GID_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_MODE_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_STAGING_PATH_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_STAGING_ROLE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_IDENTITY_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_ORIGINAL_SOURCE_OBJECT_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_HASH_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRITABLE_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_RETAINED_NAMESPACE_REFERENCE_BLOCKS_TEARDOWN"),
         "run_product_leaf_lifecycle_controls": ("HOSTED_PRODUCT_LEAF_CONTROL_EMPTY_INNER_OPT_ACCEPTED", "HOSTED_PRODUCT_LEAF_CONTROL_BLENDER_PREEXISTING_DIRECTORY_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_SWOOSHZ_PREEXISTING_DIRECTORY_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_FILE_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_SYMLINK_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_BROKEN_SYMLINK_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_SPECIAL_OBJECT_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_OTHER_OBJECT_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_MOUNTPOINT_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEPLOYED_BLENDER_ACCEPTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEPLOYED_SWOOSHZ_ACCEPTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_SYMLINK_DEPLOYMENT_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_DEVICE_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_UID_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_GID_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_MODE_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEFAULT_ACL_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_NONFIXED_PATH_REJECTED"),
+        "validate_owned_stdin_controls": (
+            "BYTE_PAYLOAD_POSITIVE", "DEFERRED_STDIN_POSITIVE", "DEFERRED_REQUEST_POSITIVE",
+            "DEFERRED_UNUSED_CLOSE_POSITIVE", "BOOL_STDIN_REJECTED", "NON_BYTES_STDIN_REJECTED",
+            "PAYLOAD_PLUS_DEFERRED_REJECTED", "SUPERVISED_BYTE_PAYLOAD_PASSTHROUGH",
+        ),
         "validate_sudo_diagnostic_controls": (
+            "validate_owned_stdin_controls(expect)",
             "SUDO_DIAGNOSTIC_PID_REUSE_REJECTED", "SUDO_DIAGNOSTIC_PIDFD_REQUIRED",
             "SUDO_DIAGNOSTIC_EXEC_IDENTITY_REJECTED", "SUDO_DIAGNOSTIC_RESPONSE_H_MISMATCH",
             "SUDO_DIAGNOSTIC_RESPONSE_Q_MISMATCH", "SUDO_DIAGNOSTIC_STDERR_SECRET_REDACTION",
@@ -1463,9 +1479,19 @@ def valid_hosted_protected_harness(deployment, supervisor):
         source = body(sup, supervisor, name)
         if source is None or any(token not in source for token in tokens):
             return False
+    launch = body(sup, supervisor, "launch_owned")
+    launch_order = (
+        "owned_stdin_plan(stdin, deferred_stdin=deferred_stdin)", "process = subprocess.Popen(",
+        "process.stdin.write(stdin_payload)", "process.stdin.close()",
+    )
+    launch_positions = [launch.find(token) for token in launch_order] if launch is not None else []
+    if any(position < 0 for position in launch_positions) or launch_positions != sorted(launch_positions):
+        return False
     diagnostic = body(sup, supervisor, "run_sudo_credential_diagnostic")
+    if diagnostic is None or re.search(r"(?<![A-Za-z0-9_])stdin\s*=\s*True\b", diagnostic):
+        return False
     diagnostic_order = (
-        "capture_sudo_provenance()", "stdin=True", "locate_owned_broker(",
+        "capture_sudo_provenance()", "deferred_stdin=True", "locate_owned_broker(",
         "capture_broker_entry_credentials(", "send_probe_request(owned, make_request(policy_h, config_q))",
         "wait_owned_pidfd(", "broker_response_evidence(",
     )
@@ -1713,6 +1739,8 @@ positive_control = (
 )
 if not hosted_binding_accepts(positive_control):
     raise SystemExit("HOSTED_COMBINED_BROKER_APPLICATION_BINDING_INVALID")
+print("STATIC_BINDING=PASS")
+print("DIAGNOSTIC_MAGIC_BOOL_REMOVED=PASS")
 if not valid_sudoers_template(sudoers_source):
     raise SystemExit("HOSTED_SUDOERS_TEMPLATE_POSITIVE_CONTROL_FAILED")
 print("HOSTED_SUDOERS_TEMPLATE_POSITIVE=PASS")
@@ -1838,7 +1866,9 @@ negative_controls = {
     "SUDO_DIAGNOSTIC_EXECUTABLE_IDENTITY_REMOVED": mutate_control(2, replace_once(supervisor_source, "same_executable_identity(expected_executable, executable_before)", "True")),
     "SUDO_DIAGNOSTIC_CREDENTIAL_CAPTURE_REMOVED": mutate_control(2, replace_once(supervisor_source, "parse_proc_credentials(status_text)", "{}")),
     "SUDO_DIAGNOSTIC_IDENTITY_CHANGE_SWALLOWED": mutate_control(2, replace_once(supervisor_source, 'if str(error) == "PROCESS_IDENTITY_OBSERVATION_UNSAFE":', "if False:")),
-    "SUDO_DIAGNOSTIC_HELD_STDIN_REMOVED": mutate_control(2, replace_once(supervisor_source, "stdin=True", "stdin=False")),
+    "SUDO_DIAGNOSTIC_HELD_STDIN_REMOVED": mutate_control(2, replace_once(supervisor_source, "env=base_env, deferred_stdin=True,", "env=base_env, deferred_stdin=False,")),
+    "SUDO_DIAGNOSTIC_MAGIC_BOOL_REINTRODUCED": mutate_control(2, replace_once(supervisor_source, "env=base_env, deferred_stdin=True,", "env=base_env, stdin=True,")),
+    "OWNED_STDIN_CONTRACT_REMOVED": mutate_control(2, replace_once(supervisor_source, "stdin_mode, stdin_payload = owned_stdin_plan(stdin, deferred_stdin=deferred_stdin)", "stdin_mode, stdin_payload = subprocess.DEVNULL, None")),
     "SUDO_APP_IDENTITY_CAPABILITY_SEMANTICS_CHANGED": mutate_control(2, replace_once(supervisor_source, '"--bounding-set=-all"', '"--bounding-set=all"')),
     "SUDO_DIAGNOSTIC_STDERR_MERGED": mutate_control(2, replace_once(supervisor_source, "stderr=stderr_file,", "stderr=subprocess.STDOUT,")),
     "SUDO_DIAGNOSTIC_H_MATCH_DISABLED": mutate_control(2, replace_once(supervisor_source, 'elif h_match == "NO":', "elif False:")),
