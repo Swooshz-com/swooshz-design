@@ -1,6 +1,9 @@
 name: S8 FBX end-to-end contract
 
 on:
+  push:
+    branches:
+      - codex/s8-run110-prepublication-linux-carrier
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -28,12 +31,12 @@ jobs:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact PR head
         shell: bash
         env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
       - name: Download verify and run pinned actionlint on Linux
         if: matrix.platform == 'linux/amd64'
@@ -495,12 +498,12 @@ jobs:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact PR head
         shell: bash
         env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -650,12 +653,12 @@ jobs:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact PR head
         shell: bash
         env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
       - name: Build and run native process boundary
         shell: bash
@@ -687,12 +690,12 @@ jobs:
       - name: Checkout exact PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Verify exact PR head
         shell: bash
         env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
       - name: Setup Node 22 for hosted toolchain
         id: setup_node
@@ -2221,12 +2224,8 @@ jobs:
               printf 'CHILDREN_REAPED=YES\n'
             fi
             if (( broker_deployment_attempted == 1 )); then
-              if (( all_launched_children_reaped == 1 )) && /usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/broker_contract.py" --hosted-cleanup "$temp_root"; then
-                broker_deployment_attempted=0
-              else
-                printf 'BROKER_DEPLOYMENT_CLEANUP=FAIL\nPRODUCTION_DEPLOYMENT_ABSENT=NO\n' >&2
-                cleanup_failed=1
-              fi
+              printf 'SUPERVISOR_STATE_RESIDUE=YES\nBROKER_DEPLOYMENT_CLEANUP=FAIL\nPRODUCTION_DEPLOYMENT_ABSENT=NO\n' >&2
+              cleanup_failed=1
             fi
             if (( carrier_created_by_attempt == 1 )); then
               if (( carrier_identity_recorded == 1 && carrier_identity_poisoned == 0 && identity_poisoned == 0 && all_launched_children_reaped == 1 )); then
@@ -2266,7 +2265,7 @@ jobs:
                 fi
               else
                 if (( broker_deployment_attempted == 1 )); then
-                  printf 'TEMP_CLEANUP_RESULT=DEFERRED_BROKER_DEPLOYMENT_RESIDUE\n' >&2
+                  printf 'TEMP_CLEANUP_RESULT=DEFERRED_SUPERVISOR_STATE_RESIDUE\n' >&2
                 else
                   printf 'TEMP_CLEANUP_RESULT=DEFERRED_UNRESOLVED_CHILD\n' >&2
                 fi
@@ -9392,27 +9391,43 @@ jobs:
           admit_work_for_use || fail_hold "WORK_POST_CANDIDATE_ADMISSION_FAILED"
           printf 'NATIVE_RUNNER_ADMISSION_RESULT=PASS\nPINNED_BLENDER_RESULT=PASS\nPRIVATE_EXPORTER_RESULT=PASS\nNATIVE_VALIDATOR_RESULT=PASS\nBLENDER_SEMANTIC_QUALIFICATION=PASS\n'
 
-          # RUN107_HOSTED_BROKER_DEPLOYMENT_BEGIN
+          # RUN110_ROUTE_B_SUPERVISOR_BEGIN
           broker_deployment_attempted=1
-          if ! broker_deployment_output="$(/usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/broker_contract.py" --hosted-deploy "$carrier" "$temp_root" "$runner_uid" "$runner_gid")"; then
-            fail_amendment "HOSTED_COMBINED_BROKER_DEPLOYMENT_FAILED"
+          supervisor_log="$temp_root/route-b-supervisor.log"
+          route_b_status=0
+          set +e
+          run_tracked_command /usr/bin/sudo -n -- /usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/hosted_deployment_namespace.py" --supervise \
+            --workspace "$GITHUB_WORKSPACE" --carrier "$carrier" --temp-root "$temp_root" --uid "$runner_uid" --gid "$runner_gid" \
+            --node "$(command -v node)" --corepack "$(command -v corepack)" > "$supervisor_log" 2>&1
+          route_b_status=$?
+          set -e
+          /usr/bin/cat "$supervisor_log"
+          if /usr/bin/grep -Fxq 'ROUTE_B_PRODUCTION_DEPLOYMENT_ABSENT=YES' "$supervisor_log" \
+            && /usr/bin/grep -Fxq 'NAMESPACE_SUPERVISOR_STATE_CLEANUP=PASS' "$supervisor_log"; then
+            broker_deployment_attempted=0
           fi
-          printf '%s\n' "$broker_deployment_output"
-          [[ "$(/usr/bin/grep -c '^S8_APP_PRIVATE_ROOT=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_PRIVATE_ROOT_BINDING_INVALID"
-          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX_POLICY_SHA256=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_POLICY_H_BINDING_INVALID"
-          [[ "$(/usr/bin/grep -c '^S8_APP_CONFIG_SHA256=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_CONFIG_Q_BINDING_INVALID"
-          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX=' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_SANDBOX_BINDING_INVALID"
-          S8_APP_PRIVATE_ROOT="$(/usr/bin/awk -F= '$1 == "S8_APP_PRIVATE_ROOT" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
-          S8_APP_SANDBOX_POLICY_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX_POLICY_SHA256" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
-          S8_APP_CONFIG_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_CONFIG_SHA256" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
-          S8_APP_SANDBOX="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")"
-          [[ "$S8_APP_PRIVATE_ROOT" == /var/lib/swooshz/s8 && "$S8_APP_SANDBOX" == /usr/local/libexec/swooshz-s8/s8-sandbox ]] || fail_amendment "APPLICATION_DEPLOYMENT_PATH_BINDING_INVALID"
-          [[ "$S8_APP_SANDBOX_POLICY_SHA256" =~ ^[0-9a-f]{64}$ && "$S8_APP_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail_amendment "APPLICATION_DEPLOYMENT_DIGEST_INVALID"
-          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_POLICY_H" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")" == "$S8_APP_SANDBOX_POLICY_SHA256" ]] || fail_amendment "APPLICATION_POLICY_SNAPSHOT_MISMATCH"
-          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_CONFIG_Q" { sub(/^[^=]*=/, ""); print }' <<< "$broker_deployment_output")" == "$S8_APP_CONFIG_SHA256" ]] || fail_amendment "APPLICATION_CONFIG_SNAPSHOT_MISMATCH"
-          [[ "$(/usr/bin/grep -Fx -c 'CONFIG_DIGEST_INCLUDES_POLICY_DIGEST=YES' <<< "$broker_deployment_output")" == 1 ]] || fail_amendment "APPLICATION_CONFIG_POLICY_DIGEST_BINDING_MISSING"
+          if (( route_b_status != 0 )); then fail_hold "HOSTED_NAMESPACE_HARNESS_HOLD"; fi
+          [[ "$(/usr/bin/grep -Fx -c 'ROUTE_B_BROKER_CLEANUP=PASS' "$supervisor_log" || true)" == 1 || "$(/usr/bin/grep -Fx -c 'ROUTE_B_BROKER_CLEANUP=PASS_NOT_ATTEMPTED' "$supervisor_log" || true)" == 1 ]] || fail_hold "HOSTED_BROKER_CLEANUP_WITNESS_MISSING"
+          [[ "$(/usr/bin/grep -Fx -c 'NAMESPACE_SUPERVISOR_STATE_CLEANUP=PASS' "$supervisor_log" || true)" == 1 ]] || fail_hold "HOSTED_NAMESPACE_STATE_CLEANUP_WITNESS_MISSING"
+          [[ "$(/usr/bin/grep -Fx -c 'ROUTE_B_OUTER_OPT_UNCHANGED=YES' "$supervisor_log" || true)" == 1 ]] || fail_hold "HOSTED_OUTER_OPT_WITNESS_MISSING"
+          [[ "$(/usr/bin/grep -Fx -c 'ROUTE_B_PRODUCTION_DEPLOYMENT_ABSENT=YES' "$supervisor_log" || true)" == 1 ]] || fail_hold "HOSTED_PRODUCTION_ABSENCE_WITNESS_MISSING"
+          [[ "$(/usr/bin/grep -c '^HOSTED_POLICY_H=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_POLICY_H_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^HOSTED_CONFIG_Q=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_CONFIG_Q_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_PRIVATE_ROOT=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_PRIVATE_ROOT_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX_POLICY_SHA256=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_POLICY_H_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_CONFIG_SHA256=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_CONFIG_Q_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -c '^S8_APP_SANDBOX=' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_SANDBOX_BINDING_INVALID"
+          [[ "$(/usr/bin/grep -Fx -c 'CONFIG_DIGEST_INCLUDES_POLICY_DIGEST=YES' "$supervisor_log" || true)" == 1 ]] || fail_hold "APPLICATION_CONFIG_POLICY_DIGEST_BINDING_MISSING"
+          S8_APP_PRIVATE_ROOT="$(/usr/bin/awk -F= '$1 == "S8_APP_PRIVATE_ROOT" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")"
+          S8_APP_SANDBOX_POLICY_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX_POLICY_SHA256" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")"
+          S8_APP_CONFIG_SHA256="$(/usr/bin/awk -F= '$1 == "S8_APP_CONFIG_SHA256" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")"
+          S8_APP_SANDBOX="$(/usr/bin/awk -F= '$1 == "S8_APP_SANDBOX" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")"
+          [[ "$S8_APP_PRIVATE_ROOT" == /var/lib/swooshz/s8 && "$S8_APP_SANDBOX" == /usr/local/libexec/swooshz-s8/s8-sandbox ]] || fail_hold "APPLICATION_DEPLOYMENT_PATH_BINDING_INVALID"
+          [[ "$S8_APP_SANDBOX_POLICY_SHA256" =~ ^[0-9a-f]{64}$ && "$S8_APP_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail_hold "APPLICATION_DEPLOYMENT_DIGEST_INVALID"
+          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_POLICY_H" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")" == "$S8_APP_SANDBOX_POLICY_SHA256" ]] || fail_hold "APPLICATION_POLICY_SNAPSHOT_MISMATCH"
+          [[ "$(/usr/bin/awk -F= '$1 == "HOSTED_CONFIG_Q" { sub(/^[^=]*=/, ""); print }' "$supervisor_log")" == "$S8_APP_CONFIG_SHA256" ]] || fail_hold "APPLICATION_CONFIG_SNAPSHOT_MISMATCH"
           export S8_APP_PRIVATE_ROOT S8_APP_SANDBOX_POLICY_SHA256 S8_APP_CONFIG_SHA256 S8_APP_SANDBOX
-          # RUN107_HOSTED_BROKER_DEPLOYMENT_END
+          # RUN110_ROUTE_B_SUPERVISOR_END
           source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"
           printf 'APPLICATION_PRIVATE_ROOT_BINDING=PASS\nAPPLICATION_POLICY_H_BINDING=PASS\nAPPLICATION_CONFIG_Q_BINDING=PASS\nAPPLICATION_SANDBOX_BINDING=PASS\nSAME_POLICY_SNAPSHOT_BINDING=PASS\n'
           admit_work_for_use || fail_hold "WORK_AFTER_APPLICATION_BOUNDARY_PROOF_FAILED"
@@ -9422,175 +9437,7 @@ jobs:
           admit_root_and_carrier || fail_hold "BEFORE_SEMANTIC_READBACK_IDENTITY_FAILED"
           mount_table_admission "$carrier" || fail_hold "MOUNT_ADMISSION_BEFORE_SEMANTIC_READBACK_FAILED"
           admit_work_for_use || fail_hold "WORK_BEFORE_SEMANTIC_READBACK_FAILED"
-          if ! /usr/bin/python3 - "$carrier/work/input.json" "$carrier/work/validator-readback.json" <<'PY'
-          import json
-          import pathlib
-          import sys
-          def validate_semantic_readback(readback, payload):
-              if readback.get("schemaVersion") != "s8-ufbx-readback-v1":
-                  raise SystemExit("semantic readback schema mismatch")
-              source = readback.get("source")
-              expected_source = payload["source"]
-              if not isinstance(source, dict) or any(
-                  source.get(key) != expected_source[key]
-                  for key in ("revisionId", "revisionHash", "s6ValidationHash", "s6HandoffDigest")
-              ):
-                  raise SystemExit("semantic source provenance mismatch")
-
-              nodes = readback.get("nodes")
-              if not isinstance(nodes, list):
-                  raise SystemExit("semantic node collection mismatch")
-              roots = [
-                  node for node in nodes
-                  if isinstance(node, dict) and node.get("name") == "SWZ_ROOT"
-              ]
-              if not roots:
-                  raise SystemExit("semantic synthetic root missing")
-              if len(roots) != 1:
-                  raise SystemExit("semantic synthetic root duplicated")
-              root = roots[0]
-              if "sourceObjectId" in root or "identityKey" in root:
-                  raise SystemExit("semantic synthetic root provenance forbidden")
-              identity = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]
-              if (
-                  set(root) != {"name", "parent", "mesh", "effectiveScale", "nodeToParent", "nodeToWorld"}
-                  or root.get("parent") is not None
-                  or root.get("mesh") is not None
-                  or root.get("effectiveScale") != [1, 1, 1]
-                  or root.get("nodeToParent") != identity
-                  or root.get("nodeToWorld") != identity
-              ):
-                  raise SystemExit("semantic synthetic root shape mismatch")
-
-              if len(nodes) != 2:
-                  raise SystemExit("semantic node cardinality mismatch")
-              names = [node.get("name") if isinstance(node, dict) else None for node in nodes]
-              if any(not isinstance(name, str) for name in names) or len(set(names)) != 2:
-                  raise SystemExit("semantic node names are not unique")
-              expected_object = payload["objects"][0]
-              if set(names) != {"SWZ_ROOT", expected_object["name"]}:
-                  raise SystemExit("semantic node names mismatch")
-              physical = next(node for node in nodes if node.get("name") == expected_object["name"])
-              if (
-                  physical.get("sourceObjectId") != expected_object["sourceObjectId"]
-                  or physical.get("identityKey") != expected_object["identityKey"]
-              ):
-                  raise SystemExit("semantic object identity mismatch")
-              mesh = physical.get("mesh")
-              if (
-                  not isinstance(mesh, dict)
-                  or len(mesh.get("vertices", [])) != 3
-                  or mesh.get("triangles") != [[0, 1, 2]]
-                  or len(mesh.get("cornerNormals", [])) != 3
-              ):
-                  raise SystemExit("semantic geometry mismatch")
-
-
-          def semantic_checker_control(name, readback, payload, expected_error=None):
-              try:
-                  validate_semantic_readback(readback, payload)
-              except SystemExit as error:
-                  if expected_error is None or str(error) != expected_error:
-                      raise SystemExit(
-                          f"workflow semantic control {name} failed: expected {expected_error!r}, got {str(error)!r}"
-                      )
-              else:
-                  if expected_error is not None:
-                      raise SystemExit(
-                          f"workflow semantic control {name} failed: expected rejection {expected_error!r}"
-                      )
-              print(f"WORKFLOW_SEMANTIC_CONTROL_{name}=PASS")
-
-
-          control_source = {
-              "revisionId": "semantic-control-revision",
-              "revisionHash": "a" * 64,
-              "s6ValidationHash": "b" * 64,
-              "s6HandoffDigest": "c" * 64,
-          }
-          control_object = {
-              "name": "CONTROL_PHYSICAL",
-              "sourceObjectId": "control-source-id",
-              "identityKey": "control-identity-key",
-          }
-          control_payload = {"source": control_source, "objects": [control_object]}
-          control_root = {
-              "name": "SWZ_ROOT",
-              "parent": None,
-              "mesh": None,
-              "effectiveScale": [1, 1, 1],
-              "nodeToParent": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-              "nodeToWorld": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-          }
-          control_physical = {
-              "name": "CONTROL_PHYSICAL",
-              "sourceObjectId": "control-source-id",
-              "identityKey": "control-identity-key",
-              "parent": "SWZ_ROOT",
-              "effectiveScale": [1, 1, 1],
-              "nodeToParent": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-              "nodeToWorld": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-              "mesh": {"vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "triangles": [[0, 1, 2]], "cornerNormals": [[0, 0, 1]] * 3},
-          }
-          control_base = {
-              "schemaVersion": "s8-ufbx-readback-v1",
-              "source": control_source,
-              "nodes": [control_root, control_physical],
-          }
-          semantic_checker_control(
-              "VALID_ROOT_AND_PHYSICAL_NODE",
-              control_base,
-              control_payload,
-          )
-          semantic_checker_control(
-              "MISSING_ROOT",
-              {**control_base, "nodes": [control_physical]},
-              control_payload,
-              "semantic synthetic root missing",
-          )
-          semantic_checker_control(
-              "DUPLICATE_ROOT",
-              {**control_base, "nodes": [control_root, dict(control_root), control_physical]},
-              control_payload,
-              "semantic synthetic root duplicated",
-          )
-          semantic_checker_control(
-              "EXTRA_NODE",
-              {**control_base, "nodes": [control_root, control_physical, {"name": "EXTRA", "mesh": None}]},
-              control_payload,
-              "semantic node cardinality mismatch",
-          )
-          malformed_root = dict(control_root)
-          malformed_root["parent"] = "CONTROL_PHYSICAL"
-          semantic_checker_control(
-              "MALFORMED_ROOT",
-              {**control_base, "nodes": [malformed_root, control_physical]},
-              control_payload,
-              "semantic synthetic root shape mismatch",
-          )
-          root_with_source_id = dict(control_root)
-          root_with_source_id["sourceObjectId"] = "SWZ_ROOT"
-          semantic_checker_control(
-              "ROOT_SOURCE_OBJECT_ID_PRESENT",
-              {**control_base, "nodes": [root_with_source_id, control_physical]},
-              control_payload,
-              "semantic synthetic root provenance forbidden",
-          )
-          root_with_identity_key = dict(control_root)
-          root_with_identity_key["identityKey"] = "SWZ_ROOT"
-          semantic_checker_control(
-              "ROOT_IDENTITY_KEY_PRESENT",
-              {**control_base, "nodes": [root_with_identity_key, control_physical]},
-              control_payload,
-              "semantic synthetic root provenance forbidden",
-          )
-
-          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="ascii"))
-          readback = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="ascii"))
-          validate_semantic_readback(readback, payload)
-          print("SEMANTIC_READBACK_RESULT=PASS")
-          PY
-          then
+          if ! /usr/bin/python3 "$GITHUB_WORKSPACE/native/s8-sandbox-broker/tests/hosted_deployment_namespace.py" --validate-semantic-readback "$carrier/work/input.json" "$carrier/work/validator-readback.json"; then
             failure_reported=1
             printf 'CANDIDATE_FAILURE_PROVEN=YES\nFAILURE_CLASS=CANDIDATE_DEFECT__SEMANTIC_READBACK\n' >&2
             exit 1

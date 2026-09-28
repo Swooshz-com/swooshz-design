@@ -1,2 +1,3 @@
-Defaults!/usr/local/libexec/swooshz-s8/s8-sandbox-broker env_reset
-@S8_HOST_USER@ ALL=(root) NOSETENV: /usr/local/libexec/swooshz-s8/s8-sandbox-broker --stdio-v1
+Cmnd_Alias S8_BROKER_STDIO = ^/usr/local/libexec/swooshz-s8/s8-sandbox-broker$ ^--stdio-v1$
+Defaults!S8_BROKER_STDIO env_reset,stay_setuid,!setenv,!env_keep,!env_check
+@S8_HOST_USER@ ALL=(root) NOPASSWD: NOSETENV: S8_BROKER_STDIO
