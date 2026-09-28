@@ -206,8 +206,8 @@ jobs:
             echo "DIRECT_VM_EXECUTION=WORKFLOW_CONTAINER_ABSENT; user namespace mapping is translated or unknown"
           fi
           echo "IDENTITY_ALLOCATION_POLICY=$(grep -E '^(UID|GID|SYS_UID|SYS_GID)_(MIN|MAX)[[:space:]]' /etc/login.defs | tr '\n' ';' || true)"
-          echo "OCCUPIED_HIGH_UIDS=$(getent passwd | awk -F: '$3 >= 60000 && $3 <= 65535 {printf \"%s:%s,\", $3, $1}' | cut -c1-1200)"
-          echo "OCCUPIED_HIGH_GIDS=$(getent group | awk -F: '$3 >= 60000 && $3 <= 65535 {printf \"%s:%s,\", $3, $1}' | cut -c1-1200)"
+          echo "OCCUPIED_HIGH_UIDS=$(getent passwd | awk -F: '$3 >= 60000 && $3 <= 65535 {printf "%s:%s,", $3, $1}' | cut -c1-1200)"
+          echo "OCCUPIED_HIGH_GIDS=$(getent group | awk -F: '$3 >= 60000 && $3 <= 65535 {printf "%s:%s,", $3, $1}' | cut -c1-1200)"
           echo "FIXTURE_UID_1001=$(getent passwd 1001 | cut -d: -f1,3 || echo UNASSIGNED)"
           echo "FIXTURE_GID_1001=$(getent group 1001 | cut -d: -f1,3 || echo UNASSIGNED)"
           if sudo -n true 2>/dev/null; then
@@ -257,11 +257,16 @@ jobs:
           fi
 
           PID1_COMM=$(cat /proc/1/comm 2>/dev/null || echo UNREADABLE)
-          PID1_EXE=$(readlink -f /proc/1/exe 2>/dev/null || echo UNREADABLE)
+          PID1_EXE=$(readlink -f /proc/1/exe 2>/dev/null || sudo -n /usr/bin/readlink -f /proc/1/exe 2>/dev/null || echo UNREADABLE)
           echo "PID1_COMM=$PID1_COMM"
           echo "PID1_EXE=$PID1_EXE"
-          if [[ $PID1_COMM == systemd && $(basename "$PID1_EXE") == systemd ]]; then
-            PID1_IS_SYSTEMD=YES
+          if [[ $PID1_COMM == systemd ]]; then
+            if [[ $PID1_EXE == UNREADABLE || $(basename "$PID1_EXE") == systemd ]]; then
+              PID1_IS_SYSTEMD=YES
+            else
+              PID1_IS_SYSTEMD=NO
+              mark_unqualified PID1_EXE_DOES_NOT_IDENTIFY_SYSTEMD
+            fi
           else
             PID1_IS_SYSTEMD=NO
             mark_unqualified PID1_IS_NOT_SYSTEMD
@@ -276,6 +281,18 @@ jobs:
           SYSTEMD_STATE=$(sudo -n /usr/bin/systemctl is-system-running 2>&1)
           SYSTEMD_STATE_RC=$?
           set -e
+          SYSTEMD_STATE_INITIAL=$SYSTEMD_STATE
+          echo "SYSTEMD_STATE_INITIAL=$SYSTEMD_STATE_INITIAL (exit=$SYSTEMD_STATE_RC)"
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            if [[ $SYSTEMD_STATE != starting ]]; then
+              break
+            fi
+            sleep 1
+            set +e
+            SYSTEMD_STATE=$(sudo -n /usr/bin/systemctl is-system-running 2>&1)
+            SYSTEMD_STATE_RC=$?
+            set -e
+          done
           echo "SYSTEMD_STATE=$SYSTEMD_STATE (exit=$SYSTEMD_STATE_RC)"
           if command -v systemd-analyze >/dev/null 2>&1; then
             UNIT_PATHS=$(sudo -n /usr/bin/systemd-analyze unit-paths 2>&1 || echo UNAVAILABLE)
@@ -1008,3 +1025,4 @@ jobs:
             echo "RESULT=G0_EVIDENCE_COMPLETE_WITH_CLEANUP_FAILURE"
             exit 1
           fi
+
