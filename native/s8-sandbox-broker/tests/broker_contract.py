@@ -394,7 +394,7 @@ def hosted_verify_private_root_acl(runner_uid, *, install=False):
 def valid_sudoers_template(source):
     expected = (
         "Cmnd_Alias S8_BROKER_STDIO = ^/usr/local/libexec/swooshz-s8/s8-sandbox-broker$ ^--stdio-v1$",
-        'Defaults!S8_BROKER_STDIO env_reset,stay_setuid,!setenv,env_keep="",env_check=""',
+        "Defaults!S8_BROKER_STDIO env_reset,stay_setuid,!setenv,!env_keep,!env_check",
         "@S8_HOST_USER@ ALL=(root) NOPASSWD: NOSETENV: S8_BROKER_STDIO",
     )
     return isinstance(source, str) and tuple(source.splitlines()) == expected
@@ -663,6 +663,7 @@ def hosted_deploy(carrier, temp_root, runner_uid, runner_gid):
         sudoers_tmp = root_state / "swooshz-s8-broker.sudoers"
         sudoers_tmp.write_text(sudoers_source.replace("@S8_HOST_USER@", runner_name), encoding="ascii")
         sudoers_tmp.chmod(0o600)
+        hosted_root("/usr/sbin/visudo", "-c", "-f", str(sudoers_tmp), label="HOSTED_SUDOERS_TEMP_VALIDATION_FAILED")
         hosted_install(temp_root, sudoers_tmp, HOSTED_SUDOERS, 0o440)
         require_sudo_regex_version()
         hosted_root("/usr/sbin/visudo", "-c", "-f", "/etc/sudoers", label="HOSTED_SUDOERS_VALIDATION_FAILED")
@@ -1161,7 +1162,9 @@ def valid_hosted_protected_harness(deployment, supervisor):
             "access_rights != expected or defaults or effective_mismatch or not identity_match",
         ),
         "valid_sudoers_template": (
-            "Cmnd_Alias S8_BROKER_STDIO", "stay_setuid,!setenv,env_keep=", "NOPASSWD: NOSETENV: S8_BROKER_STDIO",
+            "Cmnd_Alias S8_BROKER_STDIO",
+            "Defaults!S8_BROKER_STDIO env_reset,stay_setuid,!setenv,!env_keep,!env_check",
+            "NOPASSWD: NOSETENV: S8_BROKER_STDIO",
         ),
         "require_sudo_regex_version": (
             "minimum = (1, 9, 10)", '("/usr/bin/sudo", "SUDO")', '("/usr/sbin/visudo", "VISUDO")',
@@ -1187,6 +1190,8 @@ def valid_hosted_protected_harness(deployment, supervisor):
             "private_root_before = hosted_protected_state(HOSTED_PRIVATE_ROOT)",
         "hosted_verify_private_root_acl(runner_uid, install=True)",
         "hosted_remove_incomplete_private_root(private_root_before)",
+        'hosted_root("/usr/sbin/visudo", "-c", "-f", str(sudoers_tmp), label="HOSTED_SUDOERS_TEMP_VALIDATION_FAILED")',
+        'hosted_install(temp_root, sudoers_tmp, HOSTED_SUDOERS, 0o440)',
             'hosted_root("/usr/sbin/visudo", "-c", "-f", "/etc/sudoers"',
             'hosted_root(str(HOSTED_BROKER), "--recover-v1"',
             'print("HOSTED_POLICY_H=" + policy_h)', 'print("HOSTED_CONFIG_Q=" + config_q)',
@@ -1424,6 +1429,15 @@ def valid_hosted_binding(workflow, deployment, supervisor, sudoers, proof_bytes,
     positions = [deploy.find(token) for token in deploy_order]
     if any(position < 0 for position in positions) or positions != sorted(positions):
         return False
+    sudoers_order = (
+        'sudoers_tmp.write_text(sudoers_source.replace("@S8_HOST_USER@", runner_name), encoding="ascii")',
+        'hosted_root("/usr/sbin/visudo", "-c", "-f", str(sudoers_tmp), label="HOSTED_SUDOERS_TEMP_VALIDATION_FAILED")',
+        "hosted_install(temp_root, sudoers_tmp, HOSTED_SUDOERS, 0o440)",
+        'hosted_root("/usr/sbin/visudo", "-c", "-f", "/etc/sudoers", label="HOSTED_SUDOERS_VALIDATION_FAILED")',
+    )
+    positions = [deploy.find(token) for token in sudoers_order]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        return False
     policy_order = (
         '"privateWorkRoot": str(HOSTED_PRIVATE_ROOT)', '"sandboxExecutable": str(HOSTED_LAUNCHER)',
         '"privateRootDevice": str(root_state["device"])', '"privateRootInode": str(root_state["inode"])',
@@ -1487,6 +1501,9 @@ positive_control = (
 )
 if not hosted_binding_accepts(positive_control):
     raise SystemExit("HOSTED_COMBINED_BROKER_APPLICATION_BINDING_INVALID")
+if not valid_sudoers_template(sudoers_source):
+    raise SystemExit("HOSTED_SUDOERS_TEMPLATE_POSITIVE_CONTROL_FAILED")
+print("HOSTED_SUDOERS_TEMPLATE_POSITIVE=PASS")
 print("APPLICATION_BOUNDARY_HELPER_BYTES=PASS")
 print("APPLICATION_WORKER_BROKER_HQ_BINDING=PASS")
 print("HOSTED_POLICY_ROOT_BINDING=PASS")
@@ -1589,9 +1606,17 @@ negative_controls = {
     "DEPLOYMENT_PRODUCT_WRITER_CLEANUP_REMOVED": mutate_control(1, replace_once(deployment_source, 'hosted_root("/usr/bin/rmdir", "--", str(target), label="HOSTED_DIRECTORY_CLEANUP_FAILED")', "pass")),
     "SUDOERS_NO_NOPASSWD": mutate_control(3, replace_once(sudoers_source, "NOPASSWD:", "PASSWD:")),
     "SUDOERS_NO_NOSETENV": mutate_control(3, replace_once(sudoers_source, "NOPASSWD: NOSETENV:", "NOPASSWD:")),
+    "SUDOERS_NO_ENV_RESET": mutate_control(3, replace_once(sudoers_source, "env_reset,stay_setuid", "stay_setuid")),
     "SUDOERS_NO_STAY_SETUID": mutate_control(3, replace_once(sudoers_source, "stay_setuid,", "")),
+    "SUDOERS_ENABLE_SETENV": mutate_control(3, replace_once(sudoers_source, "!setenv", "setenv")),
+    "SUDOERS_REENABLE_ENV_KEEP": mutate_control(3, replace_once(sudoers_source, "!env_keep", 'env_keep=""')),
+    "SUDOERS_REENABLE_ENV_CHECK": mutate_control(3, replace_once(sudoers_source, "!env_check", 'env_check=""')),
     "SUDOERS_BROAD_RECOVERY": mutate_control(3, replace_once(sudoers_source, "^--stdio-v1$", "^(--stdio-v1|--recover-v1)$")),
+    "SUDOERS_RECOVERY_FLAG_EXPOSED": mutate_control(3, replace_once(sudoers_source, "^--stdio-v1$", "^--recover-v1$")),
+    "SUDOERS_BROAD_ARGUMENTS": mutate_control(3, replace_once(sudoers_source, "^--stdio-v1$", "^--.*$")),
     "SUDOERS_UNANCHORED_PATH": mutate_control(3, replace_once(sudoers_source, "^/usr/local/libexec/swooshz-s8/s8-sandbox-broker$", "/usr/local/libexec/swooshz-s8/s8-sandbox-broker")),
+    "SUDOERS_BROAD_PATH": mutate_control(3, replace_once(sudoers_source, "^/usr/local/libexec/swooshz-s8/s8-sandbox-broker$", "^/usr/local/libexec/swooshz-s8/.*$")),
+    "SUDOERS_TEMP_VISUDO_GATE_REMOVED": mutate_control(1, replace_once(deployment_source, 'hosted_root("/usr/sbin/visudo", "-c", "-f", str(sudoers_tmp), label="HOSTED_SUDOERS_TEMP_VALIDATION_FAILED")', "pass")),
     "BUILD_AS_ROOT": mutate_control(1, replace_once(deployment_source, 'hosted_run_as_host_user(["/usr/local/bin/cmake", "-S"', 'hosted_root("/usr/local/bin/cmake", "-S"')),
     "DEPLOYMENT_VIA_SUDO": mutate_control(1, replace_once(deployment_source, 'hosted_root(str(HOSTED_BROKER), "--recover-v1"', 'hosted_run(["/usr/bin/sudo", str(HOSTED_BROKER), "--recover-v1"]')),
     "NO_PIDFD_SIGNAL": mutate_control(2, replace_once(supervisor_source, "signal.pidfd_send_signal(self.pidfd, signum)", "os.kill(self.pid, signum)")),
