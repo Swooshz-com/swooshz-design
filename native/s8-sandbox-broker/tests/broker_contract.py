@@ -15,6 +15,77 @@ import tempfile
 
 HOSTED_POLICY_PATH = Path("/etc/swooshz/s8-broker-v1.json")
 HOSTED_PRIVATE_ROOT = Path("/var/lib/swooshz/s8")
+HOSTED_JOURNAL_LOCK_NAME = "lock"
+HOSTED_JOURNAL_LOCK_UNLINK_SCRIPT = r'''
+import json
+import os
+import stat
+import sys
+
+journal, name, expected_text = sys.argv[1:4]
+if journal != "/var/lib/swooshz/s8/.journal" or name != "lock":
+    raise SystemExit("HOSTED_JOURNAL_LOCK_PATH_INVALID")
+expected = json.loads(expected_text)
+if not isinstance(expected, list) or len(expected) != 6:
+    raise SystemExit("HOSTED_JOURNAL_LOCK_IDENTITY_INVALID")
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+directory = os.open("/", flags)
+try:
+    for part in (item for item in journal.split("/") if item):
+        child = os.open(part, flags, dir_fd=directory)
+        os.close(directory)
+        directory = child
+    parent = os.fstat(directory)
+    metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    actual = (
+        metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode), metadata.st_nlink,
+    )
+    if (
+        not stat.S_ISREG(metadata.st_mode) or actual != tuple(expected)
+        or metadata.st_dev != parent.st_dev or metadata.st_uid != 0
+        or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise SystemExit("HOSTED_JOURNAL_LOCK_IDENTITY_INVALID")
+    os.unlink(name, dir_fd=directory)
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise SystemExit("HOSTED_JOURNAL_LOCK_REMAINS")
+finally:
+    os.close(directory)
+'''
+
+
+def unexpected_journal_entries(names):
+    return tuple(name for name in names if name != HOSTED_JOURNAL_LOCK_NAME)
+
+
+def hosted_remove_journal_lock(journal, state):
+    if str(journal) != str(HOSTED_PRIVATE_ROOT / ".journal"):
+        raise HostedDeploymentFailure("HOSTED_JOURNAL_LOCK_PATH_INVALID")
+    expected = [
+        state["device"], state["inode"], state["uid"], state["gid"],
+        state["mode"], state["nlink"],
+    ]
+    hosted_root(
+        "/usr/bin/python3", "-c", HOSTED_JOURNAL_LOCK_UNLINK_SCRIPT,
+        str(journal), HOSTED_JOURNAL_LOCK_NAME, json.dumps(expected, separators=(",", ":")),
+        label="HOSTED_JOURNAL_LOCK_CLEANUP_FAILED",
+    )
+
+
+def assert_journal_lock_name_controls():
+    if HOSTED_JOURNAL_LOCK_NAME != "lock" or unexpected_journal_entries(("lock",)):
+        raise SystemExit("HOSTED_JOURNAL_LOCK_NAME_POSITIVE_CONTROL_FAILED")
+    print("HOSTED_JOURNAL_LOCK_NAME_POSITIVE_CONTROL=PASS")
+    if unexpected_journal_entries((".lock",)) != (".lock",):
+        raise SystemExit("HOSTED_JOURNAL_DOT_LOCK_NEGATIVE_CONTROL_ACCEPTED")
+    print("HOSTED_JOURNAL_DOT_LOCK_NEGATIVE_CONTROL=PASS")
+
 HOSTED_LAUNCHER = Path("/usr/local/libexec/swooshz-s8/s8-sandbox")
 HOSTED_BROKER = Path("/usr/local/libexec/swooshz-s8/s8-sandbox-broker")
 HOSTED_RUNNER = Path("/usr/local/libexec/swooshz-s8/s8-process-runner")
@@ -520,15 +591,24 @@ def hosted_cleanup(temp_root, runner_uid):
         journal_state = hosted_protected_state(journal)
         if journal_state is None or (journal_state["kind"], journal_state["uid"], journal_state["gid"], journal_state["mode"]) != ("directory", 0, 0, 0o700):
             raise HostedDeploymentFailure("HOSTED_JOURNAL_IDENTITY_INVALID")
-        extra = hosted_root("/usr/bin/find", "-P", str(journal), "-mindepth", "1", "-maxdepth", "1", "!", "-name", ".lock", "-print", "-quit", label="HOSTED_JOURNAL_INSPECTION_FAILED").strip()
+        extra = hosted_root(
+            "/usr/bin/find", "-P", str(journal), "-mindepth", "1", "-maxdepth", "1",
+            "!", "-name", HOSTED_JOURNAL_LOCK_NAME, "-print", "-quit",
+            label="HOSTED_JOURNAL_INSPECTION_FAILED",
+        ).strip()
         if extra:
             raise HostedDeploymentFailure("HOSTED_JOURNAL_UNEXPECTED_CONTENT")
-        lock = journal / ".lock"
+        lock = journal / HOSTED_JOURNAL_LOCK_NAME
         lock_state = hosted_protected_state(lock)
         if lock_state is not None:
-            if (lock_state["kind"], lock_state["uid"], lock_state["gid"], lock_state["mode"], lock_state["nlink"]) != ("regular", 0, 0, 0o600, 1):
+            if (
+                (lock_state["kind"], lock_state["uid"], lock_state["gid"], lock_state["mode"], lock_state["nlink"])
+                != ("regular", 0, 0, 0o600, 1)
+                or lock_state["device"] != journal_state["device"]
+                or lock_state["inode"] <= 0
+            ):
                 raise HostedDeploymentFailure("HOSTED_JOURNAL_LOCK_IDENTITY_INVALID")
-            hosted_root("/usr/bin/rm", "-f", "--", str(lock), label="HOSTED_JOURNAL_LOCK_CLEANUP_FAILED")
+            hosted_remove_journal_lock(journal, lock_state)
         hosted_root("/usr/bin/rmdir", "--", str(journal), label="HOSTED_JOURNAL_CLEANUP_FAILED")
 
     for row in reversed(rows):
@@ -725,6 +805,7 @@ contract, production = sys.argv[1:]
 
 
 def assert_hosted_probe_regressions():
+    assert_journal_lock_name_controls()
     original_sudo = hosted_root
     try:
         with tempfile.TemporaryDirectory(prefix="s8-hosted-path-probe-") as temporary:
@@ -1103,6 +1184,8 @@ def valid_hosted_protected_harness(deployment, supervisor):
         return False
     if assignment_text(deployment_tree, deployment, "HOSTED_WRITER_ROOT") != 'HOSTED_WRITER_ROOT = Path("/opt/swooshz")':
         return False
+    if assignment_text(deployment_tree, deployment, "HOSTED_JOURNAL_LOCK_NAME") != 'HOSTED_JOURNAL_LOCK_NAME = "lock"':
+        return False
     if assignment_text(supervisor_tree, supervisor, "ROUTE_B_PRODUCT_LEAF_NAMES") != 'ROUTE_B_PRODUCT_LEAF_NAMES = ("blender", "swooshz")':
         return False
     absence_assignment = next((
@@ -1112,6 +1195,25 @@ def valid_hosted_protected_harness(deployment, supervisor):
     ), None)
     absence_source = ast.get_source_segment(deployment, absence_assignment) if absence_assignment is not None else None
     if absence_source is None or any(token not in absence_source for token in ('Path("/opt/blender")', 'Path("/opt/swooshz")')):
+        return False
+    lock_script_assignment = next((
+        node for node in deployment_tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "HOSTED_JOURNAL_LOCK_UNLINK_SCRIPT" for target in node.targets)
+    ), None)
+    try:
+        lock_script = ast.literal_eval(lock_script_assignment.value) if lock_script_assignment is not None else None
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(lock_script, str) or any(token not in lock_script for token in (
+        'journal != "/var/lib/swooshz/s8/.journal"', 'name != "lock"',
+        "os.O_NOFOLLOW", "os.stat(name, dir_fd=directory, follow_symlinks=False)",
+        "actual != tuple(expected)", "stat.S_ISREG(metadata.st_mode)",
+        "metadata.st_uid != 0", "metadata.st_gid != 0", "metadata.st_nlink != 1",
+        "os.unlink(name, dir_fd=directory)",
+    )):
+        return False
+    if lock_script.count("os.stat(name, dir_fd=directory, follow_symlinks=False)") != 2:
         return False
     owned_class = next((node for node in supervisor_tree.body if isinstance(node, ast.ClassDef) and node.name == "OwnedProcess"), None)
     if owned_class is None:
@@ -1172,6 +1274,7 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "hosted_cleanup": (
             'hosted_root(str(HOSTED_BROKER), "--recover-v1"', "hosted_load_ledger(temp_root)",
             "hosted_verify_private_root_acl(runner_uid)", "HOSTED_NESTED_MOUNT_REFUSED",
+            "HOSTED_JOURNAL_LOCK_NAME", "HOSTED_JOURNAL_UNEXPECTED_CONTENT", "hosted_remove_journal_lock(journal, lock_state)",
             "for row in reversed(rows):", 'if row["kind"] != "D":',
             'if str(target) == "/opt/blender":',
             'hosted_root("/usr/bin/rm", "-rf", "--", str(target)',
@@ -1179,6 +1282,12 @@ def valid_hosted_protected_harness(deployment, supervisor):
             "HOSTED_DIRECTORY_CLEANUP_IDENTITY_INVALID", "HOSTED_DIRECTORY_REMAINS",
             "hosted_verify_deployment_absent()", "PRODUCTION_DEPLOYMENT_ABSENT=YES",
         ),
+        "hosted_remove_journal_lock": (
+            'str(HOSTED_PRIVATE_ROOT / ".journal")', "HOSTED_JOURNAL_LOCK_UNLINK_SCRIPT",
+            'str(journal), HOSTED_JOURNAL_LOCK_NAME', "HOSTED_JOURNAL_LOCK_CLEANUP_FAILED",
+        ),
+        "unexpected_journal_entries": ("name != HOSTED_JOURNAL_LOCK_NAME",),
+        "assert_hosted_probe_regressions": ("assert_journal_lock_name_controls()",),
         "hosted_deploy": (
             "if any(hosted_protected_state(path) is not None for path in absent):",
             '"/opt/blender"', '"/opt/swooshz"', "HOSTED_DEPLOYMENT_PATH_NOT_FRESH",
@@ -1211,11 +1320,77 @@ def valid_hosted_protected_harness(deployment, supervisor):
         return False
 
     supervisor_requirements = {
-        "launch_owned": ("os.pidfd_open(process.pid, 0)", "process_start_identity(process.pid)", "OwnedProcess(process"),
+        "app_identity_command": (
+            '"/usr/bin/setpriv"', '"--clear-groups"', '"--inh-caps=-all"',
+            '"--ambient-caps=-all"', '"--bounding-set=-all"',
+        ),
+        "launch_owned": (
+            "os.pidfd_open(process.pid, 0)", "process_start_identity(process.pid)", "OwnedProcess(process",
+            "stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL",
+            "stderr=stderr if stderr is not None else subprocess.STDOUT",
+        ),
+        "wait_owned_pidfd": ("owned.identity_valid()", "poller.register(owned.pidfd", "owned.wait(0)"),
+        "parse_proc_credentials": (
+            '"Uid", "Gid", "Groups", "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs", "Seccomp"',
+            "BROKER_CREDENTIAL_STATUS_DUPLICATE_FIELD", "BROKER_CREDENTIAL_STATUS_FIELD_MISSING",
+        ),
+        "process_executable_identity": (
+            'f"/proc/{pid}/exe"', "os.readlink(proc_exe)", " (deleted)", "os.fstat(descriptor)", "hashlib.sha256()",
+        ),
+        "require_stable_process_observation": (
+            "start_before != start_after", "pidfd_open is not True", "same_executable_identity(expected_executable, observed_executable)",
+        ),
+        "process_parent_pid": ('f"/proc/{pid}/stat"', 'text.rsplit(")", 1)', "rest[19]"),
+        "process_descends_from": (
+            "process_start_identity(current) != ancestor_start_identity", "PROCESS_IDENTITY_OBSERVATION_UNSAFE",
+        ),
+        "locate_owned_broker": (
+            "process_descends_from(pid, owned.pid, owned.start_identity)", "os.pidfd_open(pid, 0)",
+            "process_start_identity(pid)", "process_executable_identity(pid)", "require_stable_process_observation(",
+            'if str(error) == "PROCESS_IDENTITY_OBSERVATION_UNSAFE":', "BROKER_PROCESS_DISCOVERY_AMBIGUOUS",
+        ),
+        "capture_broker_entry_credentials": (
+            "process_start_identity(pid) != start_identity", "pidfd_has_exited(pidfd)",
+            "process_executable_identity(pid)", 'Path(f"/proc/{pid}/status")',
+            "same_executable_identity(expected_executable, executable_before)",
+            "parse_proc_credentials(status_text)", "require_stable_process_observation(",
+        ),
+        "capture_sudo_provenance": (
+            'file_identity("/usr/bin/sudo")', 'package_owner_and_version("/usr/bin/sudo")',
+            '"/usr/bin/sudo", "-V"', '"/usr/sbin/visudo", "-V"',
+            "installed_sudoers_plugin_path(sudo_package)", 'file_identity("/usr/bin/setpriv")',
+            'package_owner_and_version("/usr/bin/setpriv")', "SUDO_RUNTIME_PROVENANCE=COMPLETE",
+        ),
+        "parse_sudo_response": (
+            'stdout[:8]', 'struct.unpack_from(">H", stdout, 28)', "stdout[120:152]", "stdout[152:184]",
+            'len(stdout) < 320', 'elif h_match == "NO"', 'elif q_match == "NO"',
+            '"POSITIVE_PATH_ACCEPTED"',
+        ),
+        "broker_response_evidence": (
+            "stdout_file.read(min(stdout_length, 320))", "stderr_file.read(SUDO_STDERR_MAX_BYTES + 1)",
+            "STDOUT_SHA256", "RESPONSE_MAGIC", "RESPONSE_POLICY_H", "RESPONSE_CONFIG_Q", "STDERR_TEXT_JSON",
+        ),
+        "observed_broker_still_owned": (
+            "process_start_identity(pid)", "pidfd_has_exited(pidfd)",
+            "if current_identity != start_identity:", "PROCESS_IDENTITY_OBSERVATION_UNSAFE",
+        ),
+        "wait_observed_broker_exit": ("observed_broker_still_owned(", "poller.poll(0)"),
+        "terminate_observed_broker": (
+            "observed_broker_still_owned(", "signal.pidfd_send_signal(pidfd, signal.SIGTERM)",
+            "signal.pidfd_send_signal(pidfd, signal.SIGKILL)", "except ProcessLookupError:",
+        ),
+        "run_sudo_credential_diagnostic": (
+            "capture_sudo_provenance()", "file_identity(HOSTED_LAUNCHER)", "file_identity(HOSTED_BROKER)",
+            'emit_runtime_file_identity("BROKER_INSTALLATION", broker_identity)',
+            "stdin=True", "stdout=stdout_file", "stderr=stderr_file", "locate_owned_broker(",
+            "capture_broker_entry_credentials(", "send_probe_request(owned, make_request(policy_h, config_q))",
+            "wait_observed_broker_exit(", "BROKER_PROCESS_REAPED", "SUDO_DIAGNOSTIC_EVIDENCE_COMPLETE=",
+            "PRODUCT_SEMANTICS_PROVEN_BAD=NOT_PROVEN", "G3_ATTEMPT_IMPACT=NONE",
+        ),
         "terminate_owned": ("signal.SIGTERM", "signal.SIGKILL", "owned.wait(grace)"),
         "namespace_processes": ("process_start_identity(pid) != start_identity", "mnt:[{namespace_number}]", "NAMESPACE_REFERENCE_SCAN_UNREADABLE"),
         "run_sudo_matrix": (
-            "SUDO_EXACT_STDIO_POSITIVE", "--recover-v1", "ALTERNATE_COPY", "ALTERNATE_SYMLINK",
+            "run_sudo_credential_diagnostic(", "SUDO_DIAGNOSTIC_PRIMARY_FAILURE:", "--recover-v1", "ALTERNATE_COPY", "ALTERNATE_SYMLINK",
             "WRONG_RUNAS", "PRESERVE_ENV", "ENV_ASSIGNMENT", "WRONG_CALLER", "protected_snapshot() != before",
             'tempfile.TemporaryDirectory(prefix="s8-sudo-matrix-"', "SUDO_MATRIX_SOURCE_BROKER_IDENTITY_INVALID",
             "O_EXCL | os.O_NOFOLLOW", "matrix_root.iterdir()", "SUDO_MATRIX_ROOT_CLEANUP_IDENTITY_INVALID",
@@ -1260,7 +1435,20 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "create_inner_toolchain_parent_directories": ("HOSTED_TOOLCHAIN_DESTINATION_PARENT_NOT_FRESH", "validate_inner_opt_child", "os.chmod(path, 0o755)"),
         "run_toolchain_preservation_controls": ("HOSTED_TOOLCHAIN_CONTROL_MINIMAL_SUBTREE_SELECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_SOURCE_SUBTREE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_BROAD_OPT_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_UNRELATED_TOOLCACHE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_DESTINATION_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_DIFFERENT_SOURCE_STAGE_PATHS_ACCEPTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_IDENTITY_CONTINUITY_ACCEPTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_DEVICE_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_INODE_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_UID_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_GID_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_STAGING_MODE_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_STAGING_PATH_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_STAGING_ROLE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_IDENTITY_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRONG_ORIGINAL_SOURCE_OBJECT_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_SOURCE_HASH_CHANGE_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_WRITABLE_BIND_REJECTED", "HOSTED_TOOLCHAIN_CONTROL_RETAINED_NAMESPACE_REFERENCE_BLOCKS_TEARDOWN"),
         "run_product_leaf_lifecycle_controls": ("HOSTED_PRODUCT_LEAF_CONTROL_EMPTY_INNER_OPT_ACCEPTED", "HOSTED_PRODUCT_LEAF_CONTROL_BLENDER_PREEXISTING_DIRECTORY_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_SWOOSHZ_PREEXISTING_DIRECTORY_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_FILE_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_SYMLINK_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_BROKEN_SYMLINK_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_SPECIAL_OBJECT_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_OTHER_OBJECT_REJECTED", "HOSTED_PRODUCT_LEAF_CONTROL_MOUNTPOINT_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEPLOYED_BLENDER_ACCEPTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEPLOYED_SWOOSHZ_ACCEPTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_SYMLINK_DEPLOYMENT_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_DEVICE_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_UID_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_GID_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_WRONG_MODE_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_DEFAULT_ACL_REJECTED", "ROUTE_B_PRODUCT_LEAF_CONTROL_NONFIXED_PATH_REJECTED"),
-        "validate_fixture_diagnostic_controls": ("run_route_b_opt_controls(expect)", "run_product_leaf_lifecycle_controls(expect)", "run_toolchain_preservation_controls(expect)"),
+        "validate_sudo_diagnostic_controls": (
+            "SUDO_DIAGNOSTIC_PID_REUSE_REJECTED", "SUDO_DIAGNOSTIC_PIDFD_REQUIRED",
+            "SUDO_DIAGNOSTIC_EXEC_IDENTITY_REJECTED", "SUDO_DIAGNOSTIC_RESPONSE_H_MISMATCH",
+            "SUDO_DIAGNOSTIC_RESPONSE_Q_MISMATCH", "SUDO_DIAGNOSTIC_STDERR_SECRET_REDACTION",
+            "validate_observed_broker_controls(expect)",
+        ),
+        "validate_observed_broker_controls": (
+            "SUDO_DIAGNOSTIC_EXITED_PIDFD_ACCEPTED", "SUDO_DIAGNOSTIC_EXIT_PID_REUSE_REJECTED",
+            "SUDO_DIAGNOSTIC_EXIT_DURING_IDENTITY_READ_REAPED",
+        ),
+        "validate_fixture_diagnostic_controls": (
+            "run_route_b_opt_controls(expect)", "run_product_leaf_lifecycle_controls(expect)",
+            "run_toolchain_preservation_controls(expect)", "validate_sudo_diagnostic_controls(expect)",
+        ),
         "run_fixture": ("validate_toolchain_preservation_events(events, namespace_number, stage_root)", 'namespace_number = ready_event["mountNamespace"]', 'ready_event.get("pid") != owned.pid', 'namespace_identity(owned.pid, "mnt")["number"] != namespace_number', "owned.mount_id = namespace_number", "cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=True)", "FIXTURE_NAMESPACE_REFERENCE_REMAINS_AFTER_FAILURE"),
         "validate_outer_opt_snapshot": ("OUTER_OPT_DEVICE_CHANGED", "OUTER_OPT_INODE_CHANGED", "OUTER_OPT_UID_CHANGED", "OUTER_OPT_GID_CHANGED", "OUTER_OPT_MODE_CHANGED", "OUTER_OPT_ACCESS_ACL_CHANGED", "OUTER_OPT_DEFAULT_ACL_CHANGED", "OUTER_OPT_MOUNT_VIEW_CHANGED", "OUTER_OPT_CHILDREN_CHANGED"),
         "validate_inner_opt_mount": ("ROUTE_B_OPT_FILESYSTEM_NOT_DISTINCT", "ROUTE_B_OPT_OWNER_INVALID", "ROUTE_B_OPT_MODE_INVALID", "ROUTE_B_OPT_MOUNT_IDENTITY_INVALID", "ROUTE_B_OPT_MOUNT_STATE_INVALID", "ROUTE_B_OPT_DEFAULT_ACL_INVALID"),
@@ -1275,6 +1463,28 @@ def valid_hosted_protected_harness(deployment, supervisor):
         source = body(sup, supervisor, name)
         if source is None or any(token not in source for token in tokens):
             return False
+    diagnostic = body(sup, supervisor, "run_sudo_credential_diagnostic")
+    diagnostic_order = (
+        "capture_sudo_provenance()", "stdin=True", "locate_owned_broker(",
+        "capture_broker_entry_credentials(", "send_probe_request(owned, make_request(policy_h, config_q))",
+        "wait_owned_pidfd(", "broker_response_evidence(",
+    )
+    diagnostic_positions = [diagnostic.find(token) for token in diagnostic_order] if diagnostic is not None else []
+    if any(position < 0 for position in diagnostic_positions) or diagnostic_positions != sorted(diagnostic_positions):
+        return False
+    cleanup_start = diagnostic.find("\n    finally:\n") if diagnostic is not None else -1
+    cleanup = diagnostic[cleanup_start:] if cleanup_start >= 0 else ""
+    cleanup_order = ("close_probe_stdin(owned)", "wait_observed_broker_exit(", "terminate_observed_broker(", "os.close(broker_pidfd)")
+    cleanup_positions = [cleanup.find(token) for token in cleanup_order]
+    if any(position < 0 for position in cleanup_positions) or cleanup_positions != sorted(cleanup_positions):
+        return False
+    sudo_matrix = body(sup, supervisor, "run_sudo_matrix")
+    if (
+        sudo_matrix is None or sudo_matrix.find("run_sudo_credential_diagnostic(") < 0
+        or sudo_matrix.find("without_nopasswd =") < 0
+        or sudo_matrix.find("run_sudo_credential_diagnostic(") > sudo_matrix.find("without_nopasswd =")
+    ):
+        return False
     private_toolchain_mount = body(sup, supervisor, "private_opt_mount")
     verify_toolchain_body = body(sup, supervisor, "verify_toolchain")
     if (
@@ -1291,7 +1501,6 @@ def valid_hosted_protected_harness(deployment, supervisor):
         or verify_toolchain_body.count("validate_toolchain_identity(corepack_identity, toolchain_identity(corepack))") != 1
     ):
         return False
-    sudo_matrix = body(sup, supervisor, "run_sudo_matrix")
     if sudo_matrix is None or sudo_matrix.count("os.open(sudoers_path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC)") != 2:
         return False
     launch = body(sup, supervisor, "launch_owned")
@@ -1312,6 +1521,9 @@ def valid_hosted_protected_harness(deployment, supervisor):
         "cancel_event=ROOT_CANCEL_EVENT", "namespace_disappeared(holder_namespace",
         "current_host_ids() != outer_ids or opt_snapshot() != outer_opt", "cleanup_events = [event for event in events if event.get(\"kind\") == \"deploymentCleanup\"]",
         'not cleanup_events[0]["clean"]', "remove_supervisor_state(state, ledger)",
+        '"SUDO_DIAGNOSTIC_EVIDENCE_COMPLETE=YES" in output_text', "cleanup_complete = (",
+        "if evidence_complete and cleanup_complete and operation_error is None:",
+        "SUDO_DIAGNOSTIC_PRIMARY_FAILURE:", "G0_PASS=YES", "G0_TERMINAL_RESULT=G0_HOLD",
     )
     if root is None or any(token not in root for token in root_requirements) or 'Path(os.environ.get("GITHUB_WORKSPACE"' in root:
         return False
@@ -1621,6 +1833,35 @@ negative_controls = {
     "DEPLOYMENT_VIA_SUDO": mutate_control(1, replace_once(deployment_source, 'hosted_root(str(HOSTED_BROKER), "--recover-v1"', 'hosted_run(["/usr/bin/sudo", str(HOSTED_BROKER), "--recover-v1"]')),
     "NO_PIDFD_SIGNAL": mutate_control(2, replace_once(supervisor_source, "signal.pidfd_send_signal(self.pidfd, signum)", "os.kill(self.pid, signum)")),
     "NO_START_IDENTITY_CHECK": mutate_control(2, replace_once(supervisor_source, "process_start_identity(process.pid)", "str(process.pid)")),
+    "SUDO_DIAGNOSTIC_PIDFD_OBSERVATION_REMOVED": mutate_control(2, replace_once(supervisor_source, "broker_pidfd = os.pidfd_open(pid, 0)", "broker_pidfd = None")),
+    "SUDO_DIAGNOSTIC_START_IDENTITY_RECHECK_REMOVED": mutate_control(2, replace_once(supervisor_source, "start_before != start_after", "False")),
+    "SUDO_DIAGNOSTIC_EXECUTABLE_IDENTITY_REMOVED": mutate_control(2, replace_once(supervisor_source, "same_executable_identity(expected_executable, executable_before)", "True")),
+    "SUDO_DIAGNOSTIC_CREDENTIAL_CAPTURE_REMOVED": mutate_control(2, replace_once(supervisor_source, "parse_proc_credentials(status_text)", "{}")),
+    "SUDO_DIAGNOSTIC_IDENTITY_CHANGE_SWALLOWED": mutate_control(2, replace_once(supervisor_source, 'if str(error) == "PROCESS_IDENTITY_OBSERVATION_UNSAFE":', "if False:")),
+    "SUDO_DIAGNOSTIC_HELD_STDIN_REMOVED": mutate_control(2, replace_once(supervisor_source, "stdin=True", "stdin=False")),
+    "SUDO_APP_IDENTITY_CAPABILITY_SEMANTICS_CHANGED": mutate_control(2, replace_once(supervisor_source, '"--bounding-set=-all"', '"--bounding-set=all"')),
+    "SUDO_DIAGNOSTIC_STDERR_MERGED": mutate_control(2, replace_once(supervisor_source, "stderr=stderr_file,", "stderr=subprocess.STDOUT,")),
+    "SUDO_DIAGNOSTIC_H_MATCH_DISABLED": mutate_control(2, replace_once(supervisor_source, 'elif h_match == "NO":', "elif False:")),
+    "SUDO_DIAGNOSTIC_Q_MATCH_DISABLED": mutate_control(2, replace_once(supervisor_source, 'elif q_match == "NO":', "elif False:")),
+    "SUDO_DIAGNOSTIC_EOF_GRACE_REMOVED": mutate_control(2, replace_once(
+        supervisor_source,
+        "broker_reaped = wait_observed_broker_exit(\n                        broker_pid, broker_start_identity, broker_pidfd, timeout=5.0,\n                    )",
+        "broker_reaped = True",
+    )),
+    "SUDO_DIAGNOSTIC_PIDFD_CLOSE_REMOVED": mutate_control(2, replace_once(
+        supervisor_source,
+        "                    os.close(broker_pidfd)\n                except OSError as error:",
+        "                    pass\n                except OSError as error:",
+    )),
+    "SUDO_DIAGNOSTIC_REQUEST_SENT_BEFORE_ENTRY_OBSERVATION": mutate_control(2, replace_once(
+        supervisor_source,
+        "            executable, credentials = capture_broker_entry_credentials(\n                broker_pid, broker_start_identity, broker_pidfd, broker_identity,\n            )\n            emit_broker_entry_observation",
+        "            send_probe_request(owned, make_request(policy_h, config_q))\n            request_sent = True\n            executable, credentials = capture_broker_entry_credentials(\n                broker_pid, broker_start_identity, broker_pidfd, broker_identity,\n            )\n            emit_broker_entry_observation",
+    )),
+    "SUDO_DIAGNOSTIC_PROVENANCE_REMOVED": mutate_control(2, replace_once(supervisor_source, "capture_sudo_provenance()", "(None, None, None)")),
+    "JOURNAL_DOT_LOCK_NAME_ACCEPTED": mutate_control(1, replace_once(deployment_source, 'HOSTED_JOURNAL_LOCK_NAME = "lock"', 'HOSTED_JOURNAL_LOCK_NAME = ".lock"')),
+    "JOURNAL_LOCK_NOFOLLOW_REMOVED": mutate_control(1, replace_once(deployment_source, "os.stat(name, dir_fd=directory, follow_symlinks=False)", "os.stat(name, dir_fd=directory, follow_symlinks=True)")),
+    "JOURNAL_LOCK_IDENTITY_COMPARE_REMOVED": mutate_control(1, replace_once(deployment_source, "actual != tuple(expected)", "False")),
     "SUDO_MATRIX_RUNNER_OWNED_PATHS": mutate_control(2, replace_once(supervisor_source, 'tempfile.TemporaryDirectory(prefix="s8-sudo-matrix-"', 'tempfile.mkdtemp(prefix="s8-sudo-matrix-"')),
     "SUDOERS_MATRIX_FOLLOWS_SYMLINK": mutate_control(2, replace_once(supervisor_source, "os.open(sudoers_path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC)", "os.open(sudoers_path, os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC)")),
     "NO_CANCEL_PROPAGATION": mutate_control(2, replace_once(supervisor_source, '"deploy", cancel_event=cancel_event)', '"deploy", cancel_event=None)')),
@@ -1638,6 +1879,7 @@ negative_controls = {
     "TOOLCACHE_PRODUCT_AUTHORITY_ADDED_TO_WORKER": mutate_control(6, worker_source + '\nconst productMountAllowlist = ["/opt/hostedtoolcache"];'),
     "TOOLCACHE_PRODUCT_AUTHORITY_ADDED_TO_BROKER": mutate_control(7, broker_source + "\n/* /opt/hostedtoolcache */\n"),
     "NO_RECOVERY_CLEANUP_GATE": mutate_control(2, supervisor_source.replace('not cleanup_events[0]["clean"]', "False")),
+    "G0_DIAGNOSTIC_FAILURE_FALSE_GREEN": mutate_control(2, replace_once(supervisor_source, "if evidence_complete and cleanup_complete and operation_error is None:", "if evidence_complete and cleanup_complete:")),
     "PINNED_PROOF_BYTES_MISMATCH": mutate_control(4, mutate_non_eol_byte(proof_bytes)),
     "PINNED_HELPER_BYTES_MISMATCH": mutate_control(5, mutate_non_eol_byte(helper_bytes)),
     "WORKER_ALTERNATE_LAUNCHER": mutate_control(6, replace_once(worker_source, "spawnSync(/* turbopackIgnore: true */ launcher, [], {", 'spawnSync("/usr/bin/bwrap", [], {')),

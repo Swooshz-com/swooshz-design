@@ -200,12 +200,12 @@ class OwnedProcess:
         return result
 
 
-def launch_owned(argv, *, owner, ledger_path, mount_id=None, cwd=None, env=None, stdin=None, stdout=None, pass_fds=()):
+def launch_owned(argv, *, owner, ledger_path, mount_id=None, cwd=None, env=None, stdin=None, stdout=None, stderr=None, pass_fds=()):
     if not callable(getattr(os, "pidfd_open", None)) or not callable(getattr(signal, "pidfd_send_signal", None)):
         raise SupervisorFailure("PIDFD_UNAVAILABLE")
     process = subprocess.Popen(
         argv, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-        stdout=stdout if stdout is not None else subprocess.DEVNULL, stderr=subprocess.STDOUT,
+        stdout=stdout if stdout is not None else subprocess.DEVNULL, stderr=stderr if stderr is not None else subprocess.STDOUT,
         close_fds=True, pass_fds=tuple(pass_fds),
     )
     pidfd = None
@@ -291,6 +291,20 @@ def launch_owned_to_log(argv, *, log_path, **kwargs):
 
 def wait_owned(owned, timeout):
     return owned.wait(timeout)
+
+
+def wait_owned_pidfd(owned, timeout):
+    if owned.terminal is not None:
+        return owned.terminal
+    if owned.pidfd is None or not owned.identity_valid():
+        raise SupervisorFailure("OWNED_PROCESS_IDENTITY_INVALID")
+    poller = select.poll()
+    poller.register(owned.pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    if not poller.poll(max(0, int(timeout * 1000))):
+        return None
+    if not owned.identity_valid():
+        raise SupervisorFailure("OWNED_PROCESS_IDENTITY_INVALID")
+    return owned.wait(0)
 
 
 def terminate_owned(owned, *, grace=5.0):
@@ -1256,6 +1270,868 @@ def user_environment(uid, node, corepack, *, workspace, carrier, temp_root, poli
     }
 
 
+
+SUDO_STDERR_MAX_BYTES = 4096
+SUDO_PROVENANCE_MAX_BYTES = 8192
+SUDO_BROKER_DISCOVERY_SECONDS = 8.0
+SUDO_BROKER_RESPONSE_SECONDS = 30.0
+SUDO_DIAGNOSTIC_SECRET_PATTERN = re.compile(
+    r"(?i)(\b(?:password|passwd|secret|token|api[_-]?key|credential)\b\s*[=:]\s*)([^\s,;\"']+)"
+)
+SUDO_DIAGNOSTIC_BEARER_PATTERN = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]{12,}")
+
+
+def diagnostic_text(raw, limit):
+    retained = raw[:limit]
+    truncated = len(raw) > limit
+    try:
+        text = retained.decode("utf-8")
+    except UnicodeDecodeError:
+        text = retained.decode("ascii", errors="backslashreplace")
+    redacted_text, count = SUDO_DIAGNOSTIC_SECRET_PATTERN.subn(r"\1[REDACTED]", text)
+    redacted_text, bearer_count = SUDO_DIAGNOSTIC_BEARER_PATTERN.subn(r"\1[REDACTED]", redacted_text)
+    return redacted_text, truncated, bool(count or bearer_count), len(retained)
+
+
+def parse_proc_credentials(status_text):
+    required = {"Uid", "Gid", "Groups", "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs", "Seccomp"}
+    fields = {}
+    for line in status_text.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key in required:
+            if key in fields:
+                raise SupervisorFailure("BROKER_CREDENTIAL_STATUS_DUPLICATE_FIELD")
+            fields[key] = value.strip()
+    if set(fields) != required:
+        raise SupervisorFailure("BROKER_CREDENTIAL_STATUS_FIELD_MISSING")
+
+    def integer_tuple(key, count):
+        parts = fields[key].split()
+        if len(parts) != count or any(not part.isdecimal() for part in parts):
+            raise SupervisorFailure("BROKER_CREDENTIAL_STATUS_FIELD_INVALID")
+        return tuple(int(part, 10) for part in parts)
+
+    uid = integer_tuple("Uid", 4)
+    gid = integer_tuple("Gid", 4)
+    group_parts = fields["Groups"].split()
+    if any(not part.isdecimal() for part in group_parts):
+        raise SupervisorFailure("BROKER_CREDENTIAL_STATUS_FIELD_INVALID")
+    groups = tuple(int(part, 10) for part in group_parts)
+    caps = {}
+    for source, target in (("CapInh", "capInheritable"), ("CapPrm", "capPermitted"),
+                           ("CapEff", "capEffective"), ("CapBnd", "capBounding"),
+                           ("CapAmb", "capAmbient")):
+        value = fields[source]
+        if not re.fullmatch(r"[0-9A-Fa-f]+", value):
+            raise SupervisorFailure("BROKER_CREDENTIAL_STATUS_FIELD_INVALID")
+        caps[target] = value
+    no_new_privs = integer_tuple("NoNewPrivs", 1)[0]
+    seccomp = integer_tuple("Seccomp", 1)[0]
+    if no_new_privs not in (0, 1):
+        raise SupervisorFailure("BROKER_CREDENTIAL_STATUS_FIELD_INVALID")
+    return {
+        "uid": uid, "gid": gid, "groups": groups, **caps,
+        "noNewPrivs": no_new_privs, "seccomp": seccomp,
+    }
+
+
+def file_identity(path):
+    try:
+        canonical = str(Path(path).resolve(strict=True))
+        descriptor = os.open(canonical, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except (OSError, RuntimeError) as error:
+        raise SupervisorFailure("SUDO_RUNTIME_FILE_IDENTITY_UNAVAILABLE") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SupervisorFailure("SUDO_RUNTIME_FILE_NOT_REGULAR")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        before_identity = (before.st_dev, before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_size)
+        after_identity = (after.st_dev, after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_size)
+        if before_identity != after_identity:
+            raise SupervisorFailure("SUDO_RUNTIME_FILE_IDENTITY_CHANGED")
+        return {
+            "path": str(path), "canonicalPath": canonical, "device": before.st_dev, "inode": before.st_ino,
+            "uid": before.st_uid, "gid": before.st_gid, "mode": stat.S_IMODE(before.st_mode),
+            "size": before.st_size, "sha256": digest.hexdigest(),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def process_executable_identity(pid):
+    proc_exe = f"/proc/{pid}/exe"
+    try:
+        link_path = os.readlink(proc_exe)
+        if link_path.endswith(" (deleted)") or not link_path.startswith("/"):
+            raise SupervisorFailure("PROCESS_EXECUTABLE_IDENTITY_INVALID")
+        descriptor = os.open(proc_exe, os.O_RDONLY | os.O_CLOEXEC)
+    except (OSError, RuntimeError) as error:
+        raise SupervisorFailure("PROCESS_EXECUTABLE_IDENTITY_UNREADABLE") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SupervisorFailure("PROCESS_EXECUTABLE_IDENTITY_INVALID")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        before_identity = (before.st_dev, before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_size)
+        after_identity = (after.st_dev, after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_size)
+        if before_identity != after_identity:
+            raise SupervisorFailure("PROCESS_EXECUTABLE_IDENTITY_CHANGED")
+        return {
+            "path": link_path, "canonicalPath": os.path.realpath(link_path), "device": before.st_dev,
+            "inode": before.st_ino, "uid": before.st_uid, "gid": before.st_gid,
+            "mode": stat.S_IMODE(before.st_mode), "size": before.st_size, "sha256": digest.hexdigest(),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def same_executable_identity(expected, observed):
+    keys = ("canonicalPath", "device", "inode", "uid", "gid", "mode", "size", "sha256")
+    return all(expected.get(key) == observed.get(key) for key in keys)
+
+
+def require_stable_process_observation(pid, start_before, start_after, pidfd_open,
+                                      expected_executable, observed_executable):
+    if (
+        type(pid) is not int or pid <= 0 or not start_before or start_before != start_after
+        or pidfd_open is not True or not same_executable_identity(expected_executable, observed_executable)
+    ):
+        raise SupervisorFailure("PROCESS_IDENTITY_OBSERVATION_UNSAFE")
+
+
+def process_parent_pid(pid):
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        raise SupervisorFailure("PROCESS_PARENT_IDENTITY_UNREADABLE") from error
+    rest = text.rsplit(")", 1)[1].strip().split()
+    if len(rest) < 20 or not rest[1].isdecimal() or not rest[19].isdecimal():
+        raise SupervisorFailure("PROCESS_PARENT_IDENTITY_INVALID")
+    return int(rest[1], 10)
+
+
+def process_descends_from(pid, ancestor_pid, ancestor_start_identity):
+    current = pid
+    seen = set()
+    for _ in range(128):
+        if current in seen:
+            raise SupervisorFailure("PROCESS_ANCESTRY_CYCLE")
+        seen.add(current)
+        if current == ancestor_pid:
+            if process_start_identity(current) != ancestor_start_identity:
+                raise SupervisorFailure("PROCESS_IDENTITY_OBSERVATION_UNSAFE")
+            return True
+        parent = process_parent_pid(current)
+        if parent <= 1 or parent == current:
+            return False
+        current = parent
+    raise SupervisorFailure("PROCESS_ANCESTRY_DEPTH_EXCEEDED")
+
+
+def pidfd_has_exited(pidfd):
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    return bool(poller.poll(0))
+
+
+def locate_owned_broker(owned, broker_identity, sudo_identity, *, timeout=SUDO_BROKER_DISCOVERY_SECONDS):
+    deadline = time.monotonic() + timeout
+    sudo_observed = False
+    discovered_pidfds = set()
+    try:
+        while time.monotonic() < deadline:
+            if not owned.identity_valid():
+                raise SupervisorFailure("PROCESS_IDENTITY_OBSERVATION_UNSAFE")
+            if pidfd_has_exited(owned.pidfd):
+                return None, None, None, None, sudo_observed
+            matches = []
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdecimal():
+                    continue
+                pid = int(entry.name, 10)
+                try:
+                    if not process_descends_from(pid, owned.pid, owned.start_identity):
+                        continue
+                    metadata = os.stat(entry / "exe")
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
+                except SupervisorFailure as error:
+                    if str(error) == "PROCESS_IDENTITY_OBSERVATION_UNSAFE":
+                        raise
+                    continue
+                if (metadata.st_dev, metadata.st_ino) == (sudo_identity["device"], sudo_identity["inode"]):
+                    sudo_observed = True
+                if (metadata.st_dev, metadata.st_ino) != (broker_identity["device"], broker_identity["inode"]):
+                    continue
+                start_identity = process_start_identity(pid)
+                broker_pidfd = None
+                try:
+                    broker_pidfd = os.pidfd_open(pid, 0)
+                    if process_start_identity(pid) != start_identity or pidfd_has_exited(broker_pidfd):
+                        raise SupervisorFailure("PROCESS_IDENTITY_OBSERVATION_UNSAFE")
+                    executable = process_executable_identity(pid)
+                    start_after = process_start_identity(pid)
+                    require_stable_process_observation(
+                        pid, start_identity, start_after, broker_pidfd is not None and not pidfd_has_exited(broker_pidfd),
+                        broker_identity, executable,
+                    )
+                    if not process_descends_from(pid, owned.pid, owned.start_identity):
+                        raise SupervisorFailure("PROCESS_IDENTITY_OBSERVATION_UNSAFE")
+                    matches.append((pid, start_identity, broker_pidfd, executable))
+                    discovered_pidfds.add(broker_pidfd)
+                    broker_pidfd = None
+                finally:
+                    if broker_pidfd is not None:
+                        os.close(broker_pidfd)
+            if len(matches) > 1:
+                raise SupervisorFailure("BROKER_PROCESS_DISCOVERY_AMBIGUOUS")
+            if matches:
+                pid, start_identity, broker_pidfd, executable = matches[0]
+                discovered_pidfds.remove(broker_pidfd)
+                return pid, start_identity, broker_pidfd, executable, sudo_observed
+            if pidfd_has_exited(owned.pidfd):
+                return None, None, None, None, sudo_observed
+            time.sleep(0.02)
+        return None, None, None, None, sudo_observed
+    finally:
+        for pidfd in discovered_pidfds:
+            try:
+                os.close(pidfd)
+            except OSError as error:
+                raise SupervisorFailure("BROKER_DISCOVERY_PIDFD_CLOSE_FAILED") from error
+
+
+def capture_broker_entry_credentials(pid, start_identity, pidfd, expected_executable):
+    if process_start_identity(pid) != start_identity or pidfd_has_exited(pidfd):
+        raise SupervisorFailure("PROCESS_IDENTITY_OBSERVATION_UNSAFE")
+    executable_before = process_executable_identity(pid)
+    if not same_executable_identity(expected_executable, executable_before):
+        raise SupervisorFailure("PROCESS_IDENTITY_OBSERVATION_UNSAFE")
+    try:
+        status_text = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        raise SupervisorFailure("BROKER_CREDENTIAL_STATUS_UNREADABLE") from error
+    credentials = parse_proc_credentials(status_text)
+    executable_after = process_executable_identity(pid)
+    start_after = process_start_identity(pid)
+    require_stable_process_observation(
+        pid, start_identity, start_after, pidfd is not None and not pidfd_has_exited(pidfd),
+        expected_executable, executable_after,
+    )
+    if not same_executable_identity(executable_before, executable_after):
+        raise SupervisorFailure("PROCESS_IDENTITY_OBSERVATION_UNSAFE")
+    return executable_after, credentials
+
+
+def credentials_mode(mode):
+    return format(mode, "04o")
+
+
+def parse_sudo_response(return_code, stdout, expected_policy_h, expected_config_q):
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_policy_h) or not re.fullmatch(r"[0-9a-f]{64}", expected_config_q):
+        raise SupervisorFailure("SUDO_DIAGNOSTIC_EXPECTED_HQ_INVALID")
+    magic_bytes = stdout[:8]
+    magic = "UNAVAILABLE" if not magic_bytes else (
+        "S8BRS001" if magic_bytes == b"S8BRS001" else magic_bytes.hex()
+    )
+    status = struct.unpack_from(">H", stdout, 28)[0] if len(stdout) >= 30 else None
+    policy_h = stdout[120:152].hex() if len(stdout) >= 152 else None
+    config_q = stdout[152:184].hex() if len(stdout) >= 184 else None
+    h_match = "UNAVAILABLE" if policy_h is None else ("YES" if policy_h == expected_policy_h else "NO")
+    q_match = "UNAVAILABLE" if config_q is None else ("YES" if config_q == expected_config_q else "NO")
+    if len(stdout) < 320:
+        classification = "RESPONSE_TOO_SHORT"
+    elif magic != "S8BRS001":
+        classification = "BAD_RESPONSE_MAGIC"
+    elif status == 65:
+        classification = "BROKER_CALLER_OR_POLICY_REJECTED_65"
+    elif h_match == "NO":
+        classification = "H_MISMATCH"
+    elif q_match == "NO":
+        classification = "Q_MISMATCH"
+    elif status is None:
+        classification = "RESPONSE_TOO_SHORT"
+    elif status != 0:
+        classification = "OTHER_BROKER_STATUS"
+    elif return_code != 0:
+        classification = "LAUNCHER_EXECUTION_FAILED"
+    else:
+        classification = "POSITIVE_PATH_ACCEPTED"
+    return {
+        "headerPresent": "YES" if len(stdout) >= 320 else "NO",
+        "magic": magic, "status": status, "policyH": policy_h, "configQ": config_q,
+        "hMatch": h_match, "qMatch": q_match, "classification": classification,
+    }
+
+
+def classify_unreached(return_code, stderr_text, sudo_observed):
+    lower = stderr_text.lower()
+    if re.search(r"not allowed|not in the sudoers|a password is required|a terminal is required", lower):
+        return "SUDO_POLICY_DENIED"
+    if re.search(r"(?im)^\s*setpriv:.*(?:failed to execute|execve|no such file)", stderr_text):
+        return "LAUNCHER_EXECUTION_FAILED"
+    if sudo_observed or re.search(r"(?im)^\s*sudo:", stderr_text):
+        return "SUDO_EXECUTION_OR_CREDENTIAL_SETUP_FAILED"
+    return "BROKER_NOT_REACHED"
+
+
+def bounded_command(argv, limit=SUDO_PROVENANCE_MAX_BYTES):
+    try:
+        completed = subprocess.run(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+            check=False, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SupervisorFailure("SUDO_PROVENANCE_COMMAND_FAILED") from error
+    return {
+        "returnCode": completed.returncode, "stdout": completed.stdout[:limit],
+        "stdoutTruncated": len(completed.stdout) > limit, "stderr": completed.stderr[:limit],
+        "stderrTruncated": len(completed.stderr) > limit,
+    }
+
+
+def require_bounded_command_text(argv, *, max_bytes=SUDO_PROVENANCE_MAX_BYTES):
+    result = bounded_command(argv, limit=max_bytes)
+    if result["returnCode"] != 0 or result["stdoutTruncated"] or result["stderrTruncated"]:
+        raise SupervisorFailure("SUDO_PROVENANCE_COMMAND_FAILED")
+    try:
+        return result["stdout"].decode("utf-8").strip()
+    except UnicodeDecodeError as error:
+        raise SupervisorFailure("SUDO_PROVENANCE_COMMAND_OUTPUT_INVALID") from error
+
+
+def package_owner_and_version(path):
+    owner_output = require_bounded_command_text(["/usr/bin/dpkg-query", "-S", path])
+    packages = {
+        line.rsplit(": ", 1)[0]
+        for line in owner_output.splitlines()
+        if ": " in line
+    }
+    if len(packages) != 1:
+        raise SupervisorFailure("SUDO_PROVENANCE_PACKAGE_OWNER_AMBIGUOUS")
+    package = next(iter(packages))
+    version_output = require_bounded_command_text([
+        "/usr/bin/dpkg-query", "-W", "-f=" + chr(36) + "{binary:Package}\t" + chr(36) + "{Version}", package,
+    ])
+    if not version_output or "\n" in version_output:
+        raise SupervisorFailure("SUDO_PROVENANCE_PACKAGE_VERSION_INVALID")
+    return package, version_output
+
+
+def installed_sudoers_plugin_path(sudo_package):
+    configured = []
+    sudo_conf = Path("/etc/sudo.conf")
+    if sudo_conf.exists():
+        for raw_line in sudo_conf.read_text(encoding="utf-8").splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == "Plugin" and parts[1] == "sudoers_policy":
+                configured.append(parts[2])
+    if len(configured) > 1:
+        raise SupervisorFailure("SUDOERS_PLUGIN_METADATA_AMBIGUOUS")
+    package_files = require_bounded_command_text([
+        "/usr/bin/dpkg-query", "-L", sudo_package,
+    ], max_bytes=256 * 1024).splitlines()
+    if configured:
+        setting = configured[0]
+        if os.path.isabs(setting):
+            return setting, "SUDO_CONF"
+        candidates = [value for value in package_files if Path(value).name == Path(setting).name]
+    else:
+        candidates = [value for value in package_files if Path(value).name == "sudoers.so"]
+    if len(candidates) != 1:
+        raise SupervisorFailure("SUDOERS_PLUGIN_METADATA_AMBIGUOUS")
+    return candidates[0], "DPKG_PACKAGE_FILE_LIST"
+
+
+def emit_runtime_file_identity(prefix, identity):
+    emit_to_stdout(
+        f"{prefix}_CANONICAL_PATH={identity['canonicalPath']}\n"
+        f"{prefix}_DEVICE={identity['device']}\n{prefix}_INODE={identity['inode']}\n"
+        f"{prefix}_UID={identity['uid']}\n{prefix}_GID={identity['gid']}\n"
+        f"{prefix}_MODE={credentials_mode(identity['mode'])}\n{prefix}_SIZE={identity['size']}\n"
+        f"{prefix}_SHA256={identity['sha256']}\n"
+    )
+
+
+def emit_version_command(prefix, argv):
+    result = bounded_command(argv)
+    stdout_text, stdout_truncated, stdout_redacted, stdout_bytes = diagnostic_text(
+        result["stdout"], SUDO_PROVENANCE_MAX_BYTES,
+    )
+    stderr_text, stderr_truncated, stderr_redacted, stderr_bytes = diagnostic_text(
+        result["stderr"], SUDO_PROVENANCE_MAX_BYTES,
+    )
+    emit_to_stdout(
+        f"{prefix}_EXIT_CODE={result['returnCode']}\n"
+        f"{prefix}_STDOUT_BYTES={stdout_bytes}\n{prefix}_STDOUT_TRUNCATED={'YES' if stdout_truncated else 'NO'}\n"
+        f"{prefix}_STDOUT_REDACTED={'YES' if stdout_redacted else 'NO'}\n"
+        f"{prefix}_STDOUT_JSON={json.dumps(stdout_text, ensure_ascii=True)}\n"
+        f"{prefix}_STDERR_BYTES={stderr_bytes}\n{prefix}_STDERR_TRUNCATED={'YES' if stderr_truncated else 'NO'}\n"
+        f"{prefix}_STDERR_REDACTED={'YES' if stderr_redacted else 'NO'}\n"
+        f"{prefix}_STDERR_JSON={json.dumps(stderr_text, ensure_ascii=True)}\n"
+    )
+    if result["returnCode"] != 0:
+        raise SupervisorFailure("SUDO_PROVENANCE_VERSION_COMMAND_FAILED")
+
+
+def capture_sudo_provenance():
+    sudo = file_identity("/usr/bin/sudo")
+    sudo_package, sudo_package_version = package_owner_and_version("/usr/bin/sudo")
+    emit_runtime_file_identity("SUDO", sudo)
+    emit_to_stdout(f"SUDO_PACKAGE_OWNER={sudo_package}\nSUDO_PACKAGE_VERSION={sudo_package_version}\n")
+    emit_version_command("SUDO_V", ["/usr/bin/sudo", "-V"])
+    emit_version_command("VISUDO_V", ["/usr/sbin/visudo", "-V"])
+
+    plugin_path, plugin_source = installed_sudoers_plugin_path(sudo_package)
+    plugin = file_identity(plugin_path)
+    emit_to_stdout(f"SUDOERS_PLUGIN_PATH_SOURCE={plugin_source}\n")
+    emit_runtime_file_identity("SUDOERS_PLUGIN", plugin)
+
+    setpriv = file_identity("/usr/bin/setpriv")
+    setpriv_package, setpriv_package_version = package_owner_and_version("/usr/bin/setpriv")
+    emit_runtime_file_identity("SETPRIV", setpriv)
+    emit_to_stdout(f"SETPRIV_PACKAGE_OWNER={setpriv_package}\nSETPRIV_PACKAGE_VERSION={setpriv_package_version}\n")
+    emit_to_stdout("SUDO_RUNTIME_PROVENANCE=COMPLETE\n")
+    return sudo, setpriv, plugin
+
+
+def emit_broker_entry_observation(pid, start_identity, executable, credentials):
+    lines = [
+        f"PID={pid}", f"START_IDENTITY={start_identity}", f"EXE_PATH={executable['path']}",
+        f"EXE_CANONICAL_PATH={executable['canonicalPath']}", f"EXE_DEVICE={executable['device']}",
+        f"EXE_INODE={executable['inode']}", f"EXE_UID={executable['uid']}", f"EXE_GID={executable['gid']}",
+        f"EXE_MODE={credentials_mode(executable['mode'])}", f"EXE_SIZE={executable['size']}",
+        f"EXE_SHA256={executable['sha256']}",
+        f"UID_REAL={credentials['uid'][0]}", f"UID_EFFECTIVE={credentials['uid'][1]}",
+        f"UID_SAVED={credentials['uid'][2]}", f"UID_FS={credentials['uid'][3]}",
+        f"GID_REAL={credentials['gid'][0]}", f"GID_EFFECTIVE={credentials['gid'][1]}",
+        f"GID_SAVED={credentials['gid'][2]}", f"GID_FS={credentials['gid'][3]}",
+        "SUPPLEMENTARY_GROUPS=" + ",".join(str(value) for value in credentials["groups"]),
+        f"CAP_INHERITABLE={credentials['capInheritable']}", f"CAP_PERMITTED={credentials['capPermitted']}",
+        f"CAP_EFFECTIVE={credentials['capEffective']}", f"CAP_BOUNDING={credentials['capBounding']}",
+        f"CAP_AMBIENT={credentials['capAmbient']}", f"NO_NEW_PRIVS={credentials['noNewPrivs']}",
+        f"SECCOMP={credentials['seccomp']}",
+    ]
+    emit_to_stdout("\n".join(lines) + "\n")
+
+
+def broker_response_evidence(stdout_file, stderr_file, return_code, expected_policy_h, expected_config_q):
+    stdout_file.seek(0, os.SEEK_END)
+    stdout_length = stdout_file.tell()
+    stdout_file.seek(0)
+    digest = hashlib.sha256()
+    while True:
+        chunk = stdout_file.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    stdout_file.seek(0)
+    response_header = stdout_file.read(min(stdout_length, 320))
+    stderr_file.seek(0, os.SEEK_END)
+    stderr_length = stderr_file.tell()
+    stderr_file.seek(0)
+    stderr_raw = stderr_file.read(SUDO_STDERR_MAX_BYTES + 1)
+    stderr_text, stderr_truncated_by_text, stderr_redacted, retained = diagnostic_text(
+        stderr_raw, SUDO_STDERR_MAX_BYTES,
+    )
+    stderr_truncated = stderr_length > retained
+    response = parse_sudo_response(return_code, response_header, expected_policy_h, expected_config_q)
+    emit_to_stdout(
+        f"RETURN_CODE={return_code if return_code is not None else 'UNAVAILABLE'}\n"
+        f"STDOUT_LENGTH={stdout_length}\nSTDOUT_SHA256={digest.hexdigest()}\n"
+        f"HEADER_BYTES=320\nRESPONSE_HEADER_PRESENT={response['headerPresent']}\n"
+        f"RESPONSE_MAGIC={response['magic']}\n"
+        f"BROKER_STATUS={response['status'] if response['status'] is not None else 'UNAVAILABLE'}\n"
+        f"RESPONSE_POLICY_H={response['policyH'] if response['policyH'] is not None else 'UNAVAILABLE'}\n"
+        f"RESPONSE_CONFIG_Q={response['configQ'] if response['configQ'] is not None else 'UNAVAILABLE'}\n"
+        f"EXPECTED_POLICY_H={expected_policy_h}\nEXPECTED_CONFIG_Q={expected_config_q}\n"
+        f"H_MATCH={response['hMatch']}\nQ_MATCH={response['qMatch']}\n"
+        f"STDERR_LENGTH={stderr_length}\nSTDERR_RETAINED_BYTES={retained}\n"
+        f"STDERR_TRUNCATED={'YES' if stderr_truncated or stderr_truncated_by_text else 'NO'}\n"
+        f"STDERR_REDACTED={'YES' if stderr_redacted else 'NO'}\n"
+        f"STDERR_TEXT_JSON={json.dumps(stderr_text, ensure_ascii=True)}\n"
+    )
+    return response, stderr_text
+
+
+def close_probe_stdin(owned):
+    stream = owned.process.stdin
+    if stream is not None and not stream.closed:
+        try:
+            stream.close()
+        except BrokenPipeError:
+            pass
+
+
+def send_probe_request(owned, request):
+    stream = owned.process.stdin
+    if stream is None or stream.closed:
+        raise SupervisorFailure("SUDO_DIAGNOSTIC_STDIN_UNAVAILABLE")
+    view = memoryview(request)
+    while view:
+        written = stream.write(view)
+        if written is None or written <= 0:
+            raise SupervisorFailure("SUDO_DIAGNOSTIC_REQUEST_WRITE_FAILED")
+        view = view[written:]
+    stream.flush()
+    stream.close()
+
+
+def observed_broker_still_owned(pid, start_identity, pidfd):
+    if pidfd_has_exited(pidfd):
+        return False
+    try:
+        current_identity = process_start_identity(pid)
+    except SupervisorFailure:
+        if pidfd_has_exited(pidfd):
+            return False
+        raise
+    if current_identity != start_identity:
+        raise SupervisorFailure("PROCESS_IDENTITY_OBSERVATION_UNSAFE")
+    return not pidfd_has_exited(pidfd)
+
+
+def wait_observed_broker_exit(pid, start_identity, pidfd, *, timeout=5.0):
+    if not observed_broker_still_owned(pid, start_identity, pidfd):
+        return True
+    deadline = time.monotonic() + timeout
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    while time.monotonic() < deadline:
+        if poller.poll(0):
+            return True
+        if not observed_broker_still_owned(pid, start_identity, pidfd):
+            return True
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    return bool(poller.poll(0))
+
+
+def terminate_observed_broker(pid, start_identity, pidfd, *, grace=5.0):
+    if not observed_broker_still_owned(pid, start_identity, pidfd):
+        return True
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+    except ProcessLookupError:
+        return pidfd_has_exited(pidfd)
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    if poller.poll(int(grace * 1000)):
+        return True
+    if not observed_broker_still_owned(pid, start_identity, pidfd):
+        return True
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+    except ProcessLookupError:
+        return pidfd_has_exited(pidfd)
+    return bool(poller.poll(int(grace * 1000)))
+
+
+def run_sudo_credential_diagnostic(uid, gid, workspace, temp_root, policy_h, config_q, ledger_path, mount_id, base_env):
+    emit_to_stdout(
+        f"DIAGNOSTIC_LAUNCHER={HOSTED_LAUNCHER}\nDIAGNOSTIC_BROKER={HOSTED_BROKER}\n"
+        f"EXPECTED_POLICY_H={policy_h}\nEXPECTED_CONFIG_Q={config_q}\n"
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", policy_h) or not re.fullmatch(r"[0-9a-f]{64}", config_q):
+        raise SupervisorFailure("SUDO_DIAGNOSTIC_EXPECTED_HQ_INVALID")
+    try:
+        sudo_identity, _, _ = capture_sudo_provenance()
+        launcher_identity = file_identity(HOSTED_LAUNCHER)
+        broker_identity = file_identity(HOSTED_BROKER)
+        emit_runtime_file_identity("LAUNCHER", launcher_identity)
+        emit_runtime_file_identity("BROKER_INSTALLATION", broker_identity)
+    except SupervisorFailure as error:
+        emit_to_stdout("G0_HOLD=SUDO_PROVENANCE_UNAVAILABLE\n")
+        raise error
+
+    stdout_file = tempfile.TemporaryFile(prefix="s8-sudo-diagnostic-stdout-", dir="/tmp")
+    stderr_file = tempfile.TemporaryFile(prefix="s8-sudo-diagnostic-stderr-", dir="/tmp")
+    owned = None
+    broker_pidfd = None
+    broker_pid = None
+    broker_start_identity = None
+    sudo_observed = False
+    request_sent = False
+    observation_error = None
+    cleanup_error = None
+    return_code = None
+    classification = None
+    response = None
+    stderr_text = ""
+    try:
+        command = app_identity_command(uid, gid, [HOSTED_LAUNCHER])
+        owned = launch_owned(
+            command, owner=f"broker-contract:sudo-diagnostic:{os.getpid()}", ledger_path=ledger_path,
+            mount_id=mount_id, cwd=workspace, env=base_env, stdin=True,
+            stdout=stdout_file, stderr=stderr_file,
+        )
+        broker_pid, broker_start_identity, broker_pidfd, observed_executable, sudo_observed = locate_owned_broker(
+            owned, broker_identity, sudo_identity,
+        )
+        emit_to_stdout(f"SUDO_PROCESS_OBSERVED={'YES' if sudo_observed else 'NO'}\n")
+        if broker_pid is not None:
+            executable, credentials = capture_broker_entry_credentials(
+                broker_pid, broker_start_identity, broker_pidfd, broker_identity,
+            )
+            emit_broker_entry_observation(broker_pid, broker_start_identity, executable, credentials)
+            emit_to_stdout("BROKER_ENTRY_CREDENTIAL_TUPLE_OBSERVED=YES\n")
+            send_probe_request(owned, make_request(policy_h, config_q))
+            request_sent = True
+            broker_exit = select.poll()
+            broker_exit.register(broker_pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            broker_exited = bool(broker_exit.poll(int(SUDO_BROKER_RESPONSE_SECONDS * 1000)))
+            emit_to_stdout(f"BROKER_PIDFD_EXITED={'YES' if broker_exited else 'NO'}\n")
+            if not broker_exited and not terminate_observed_broker(
+                broker_pid, broker_start_identity, broker_pidfd,
+            ):
+                cleanup_error = SupervisorFailure("BROKER_PROCESS_REAP_UNPROVEN")
+        else:
+            emit_to_stdout(
+                "BROKER_ENTRY_CREDENTIAL_TUPLE_OBSERVED=NO\n"
+                f"BROKER_DISCOVERY_WINDOW_SECONDS={SUDO_BROKER_DISCOVERY_SECONDS:g}\n"
+            )
+            close_probe_stdin(owned)
+        if owned is not None:
+            timeout = SUDO_BROKER_RESPONSE_SECONDS if request_sent else 10.0
+            wait_result = wait_owned_pidfd(owned, timeout)
+            if wait_result is None:
+                emit_to_stdout("SUDO_LAUNCHER_PIDFD_EXITED=NO\n")
+                return_code = terminate_owned(owned)
+            else:
+                return_code = wait_result
+    except SupervisorFailure as error:
+        observation_error = error
+        error_text = str(error)
+        if error_text == "PROCESS_IDENTITY_OBSERVATION_UNSAFE":
+            emit_to_stdout("G0_HOLD=PROCESS_IDENTITY_OBSERVATION_UNSAFE\n")
+        elif error_text == "BROKER_PROCESS_DISCOVERY_AMBIGUOUS":
+            emit_to_stdout("G0_HOLD=BROKER_PROCESS_DISCOVERY_AMBIGUOUS\n")
+        elif error_text.startswith("BROKER_CREDENTIAL_STATUS_"):
+            emit_to_stdout("G0_HOLD=BROKER_CREDENTIAL_TUPLE_UNAVAILABLE\n")
+    finally:
+        if owned is not None:
+            close_probe_stdin(owned)
+        if broker_pidfd is not None:
+            try:
+                if not pidfd_has_exited(broker_pidfd):
+                    broker_reaped = wait_observed_broker_exit(
+                        broker_pid, broker_start_identity, broker_pidfd, timeout=5.0,
+                    )
+                    if not broker_reaped:
+                        broker_reaped = terminate_observed_broker(
+                            broker_pid, broker_start_identity, broker_pidfd,
+                        )
+                else:
+                    broker_reaped = True
+                emit_to_stdout(f"BROKER_PROCESS_REAPED={'YES' if broker_reaped else 'NO'}\n")
+                if not broker_reaped:
+                    cleanup_error = cleanup_error or SupervisorFailure("BROKER_PROCESS_REAP_UNPROVEN")
+            except Exception as error:
+                cleanup_error = cleanup_error or error
+            finally:
+                try:
+                    os.close(broker_pidfd)
+                except OSError as error:
+                    cleanup_error = cleanup_error or SupervisorFailure("BROKER_PIDFD_CLOSE_FAILED")
+        if owned is not None and owned.terminal is None:
+            try:
+                wait_result = wait_owned_pidfd(owned, 5.0)
+                if wait_result is None:
+                    return_code = terminate_owned(owned)
+                else:
+                    return_code = wait_result
+            except Exception as error:
+                cleanup_error = cleanup_error or error
+        if owned is not None and owned.terminal is not None:
+            return_code = owned.terminal
+        try:
+            response, stderr_text = broker_response_evidence(
+                stdout_file, stderr_file, return_code, policy_h, config_q,
+            )
+            if broker_pid is None and observation_error is None:
+                classification = classify_unreached(return_code, stderr_text, sudo_observed)
+            elif observation_error is None:
+                classification = response["classification"]
+            if classification is not None:
+                emit_to_stdout(f"PRIMARY_CLASSIFICATION={classification}\n")
+            if cleanup_error is not None:
+                emit_to_stdout("SUDO_DIAGNOSTIC_CLEANUP_FAILURE=" + safe_failure(cleanup_error) + "\n")
+            if observation_error is not None and classification is None:
+                emit_to_stdout("SUDO_DIAGNOSTIC_HOLD_REASON=" + safe_failure(observation_error) + "\n")
+            evidence_classes = {
+                "LAUNCHER_EXECUTION_FAILED", "SUDO_POLICY_DENIED",
+                "SUDO_EXECUTION_OR_CREDENTIAL_SETUP_FAILED", "RESPONSE_TOO_SHORT",
+                "BAD_RESPONSE_MAGIC", "BROKER_CALLER_OR_POLICY_REJECTED_65",
+                "H_MISMATCH", "Q_MISMATCH", "OTHER_BROKER_STATUS", "POSITIVE_PATH_ACCEPTED",
+            }
+            evidence_complete = (
+                classification in evidence_classes and observation_error is None and cleanup_error is None
+            )
+            emit_to_stdout(f"SUDO_DIAGNOSTIC_EVIDENCE_COMPLETE={'YES' if evidence_complete else 'NO'}\n")
+            if not evidence_complete and not any(
+                value in str(observation_error) for value in ("PROCESS_IDENTITY_OBSERVATION_UNSAFE", "BROKER_PROCESS_DISCOVERY_AMBIGUOUS")
+            ):
+                if classification == "BROKER_NOT_REACHED":
+                    emit_to_stdout("G0_HOLD=BROKER_NOT_REACHED\n")
+                elif cleanup_error is not None:
+                    emit_to_stdout("G0_HOLD=SUDO_DIAGNOSTIC_CLEANUP_UNPROVEN\n")
+                elif observation_error is not None:
+                    emit_to_stdout("G0_HOLD=SUDO_DIAGNOSTIC_OBSERVATION_INCOMPLETE\n")
+            emit_to_stdout("PRODUCT_SEMANTICS_PROVEN_BAD=NOT_PROVEN\nG3_ATTEMPT_IMPACT=NONE\n")
+        finally:
+            stdout_file.close()
+            stderr_file.close()
+    if cleanup_error is not None:
+        raise SupervisorFailure("SUDO_DIAGNOSTIC_CHILD_CLEANUP_FAILED") from cleanup_error
+    if observation_error is not None:
+        raise observation_error
+    return {"classification": classification, "returnCode": return_code, "response": response}
+
+
+def synthetic_sudo_response(status, policy_h, config_q, magic=b"S8BRS001", *, length=320):
+    response = bytearray(max(length, 0))
+    if len(response) >= 8:
+        response[:8] = magic[:8].ljust(8, b"\0")
+    if len(response) >= 30:
+        struct.pack_into(">H", response, 28, status)
+    if len(response) >= 152:
+        response[120:152] = bytes.fromhex(policy_h)
+    if len(response) >= 184:
+        response[152:184] = bytes.fromhex(config_q)
+    return bytes(response)
+
+
+def validate_sudo_diagnostic_controls(expect):
+    expected_h = "a" * 64
+    expected_q = "b" * 64
+    status = "\n".join((
+        "Name:\tbroker", "Uid:\t1001 0 0 0", "Gid:\t1002 0 0 0", "Groups:\t4 8 15",
+        "CapInh:\t0000000000000001", "CapPrm:\t0000000000000002",
+        "CapEff:\t0000000000000004", "CapBnd:\t0000000000000008",
+        "CapAmb:\t0000000000000010", "NoNewPrivs:\t1", "Seccomp:\t2",
+    ))
+    parsed = parse_proc_credentials(status)
+    expect(parsed["uid"] == (1001, 0, 0, 0) and parsed["gid"] == (1002, 0, 0, 0)
+           and parsed["groups"] == (4, 8, 15), "SUDO_DIAGNOSTIC_PROC_CREDENTIALS")
+    expect(parsed["capInheritable"] == "0000000000000001" and parsed["capAmbient"] == "0000000000000010"
+           and parsed["noNewPrivs"] == 1 and parsed["seccomp"] == 2, "SUDO_DIAGNOSTIC_PROC_CAPABILITIES")
+    for invalid_status, label in (
+        (status.replace("Gid:\t1002 0 0 0\n", ""), "SUDO_DIAGNOSTIC_PROC_MISSING_FIELD"),
+        (status.replace("Uid:\t1001 0 0 0", "Uid:\t1001 0"), "SUDO_DIAGNOSTIC_PROC_MALFORMED_UID"),
+        (status + "\nUid:\t1001 0 0 0", "SUDO_DIAGNOSTIC_PROC_DUPLICATE_FIELD"),
+        (status.replace("CapEff:\t0000000000000004", "CapEff:\tnot-hex"), "SUDO_DIAGNOSTIC_PROC_MALFORMED_CAPABILITY"),
+    ):
+        try:
+            parse_proc_credentials(invalid_status)
+        except SupervisorFailure:
+            expect(True, label)
+        else:
+            expect(False, label)
+
+    executable = {
+        "canonicalPath": "/usr/local/libexec/swooshz-s8/s8-sandbox-broker",
+        "device": 1, "inode": 2, "uid": 0, "gid": 0, "mode": 0o755, "size": 320, "sha256": "c" * 64,
+    }
+    require_stable_process_observation(77, "boot:77:9", "boot:77:9", True, executable, dict(executable))
+    expect(True, "SUDO_DIAGNOSTIC_PROCESS_IDENTITY_POSITIVE")
+    for pid, before, after, pidfd_open, observed, label in (
+        (77, "boot:77:9", "boot:77:10", True, dict(executable), "SUDO_DIAGNOSTIC_PID_REUSE_REJECTED"),
+        (77, "boot:77:9", "boot:77:9", False, dict(executable), "SUDO_DIAGNOSTIC_PIDFD_REQUIRED"),
+        (77, "boot:77:9", "boot:77:9", True, dict(executable, inode=3), "SUDO_DIAGNOSTIC_EXEC_IDENTITY_REJECTED"),
+    ):
+        try:
+            require_stable_process_observation(pid, before, after, pidfd_open, executable, observed)
+        except SupervisorFailure as error:
+            expect(str(error) == "PROCESS_IDENTITY_OBSERVATION_UNSAFE", label)
+        else:
+            expect(False, label)
+
+    valid = synthetic_sudo_response(0, expected_h, expected_q)
+    positive = parse_sudo_response(0, valid, expected_h, expected_q)
+    expect(positive["classification"] == "POSITIVE_PATH_ACCEPTED" and positive["headerPresent"] == "YES"
+           and positive["hMatch"] == "YES" and positive["qMatch"] == "YES", "SUDO_DIAGNOSTIC_RESPONSE_POSITIVE")
+    response_controls = (
+        (synthetic_sudo_response(0, expected_h, expected_q, length=319), "RESPONSE_TOO_SHORT", "SUDO_DIAGNOSTIC_RESPONSE_TOO_SHORT"),
+        (synthetic_sudo_response(0, expected_h, expected_q, magic=b"BADMAGIC"), "BAD_RESPONSE_MAGIC", "SUDO_DIAGNOSTIC_RESPONSE_BAD_MAGIC"),
+        (synthetic_sudo_response(65, expected_h, expected_q), "BROKER_CALLER_OR_POLICY_REJECTED_65", "SUDO_DIAGNOSTIC_RESPONSE_STATUS_65"),
+        (synthetic_sudo_response(0, "d" * 64, expected_q), "H_MISMATCH", "SUDO_DIAGNOSTIC_RESPONSE_H_MISMATCH"),
+        (synthetic_sudo_response(0, expected_h, "e" * 64), "Q_MISMATCH", "SUDO_DIAGNOSTIC_RESPONSE_Q_MISMATCH"),
+        (synthetic_sudo_response(7, expected_h, expected_q), "OTHER_BROKER_STATUS", "SUDO_DIAGNOSTIC_RESPONSE_OTHER_STATUS"),
+        (valid, "LAUNCHER_EXECUTION_FAILED", "SUDO_DIAGNOSTIC_RESPONSE_LAUNCHER_EXIT"),
+    )
+    for index, (candidate, classification, marker) in enumerate(response_controls):
+        return_code = 1 if index == len(response_controls) - 1 else 0
+        observed = parse_sudo_response(return_code, candidate, expected_h, expected_q)
+        expect(observed["classification"] == classification, marker)
+    message = b"sudo: broker diagnostic complete\n"
+    rendered, truncated, redacted, retained = diagnostic_text(message, SUDO_STDERR_MAX_BYTES)
+    expect(rendered.encode("utf-8") == message and not truncated and not redacted and retained == len(message),
+           "SUDO_DIAGNOSTIC_STDERR_SEPARATE_SAFE_TEXT")
+    rendered, truncated, redacted, retained = diagnostic_text(b"x" * (SUDO_STDERR_MAX_BYTES + 1), SUDO_STDERR_MAX_BYTES)
+    expect(len(rendered.encode("utf-8")) == SUDO_STDERR_MAX_BYTES and truncated and retained == SUDO_STDERR_MAX_BYTES,
+           "SUDO_DIAGNOSTIC_STDERR_TRUNCATED")
+    rendered, _, redacted, _ = diagnostic_text(b"token=synthetic-value", SUDO_STDERR_MAX_BYTES)
+    expect(redacted and rendered == "token=[REDACTED]", "SUDO_DIAGNOSTIC_STDERR_SECRET_REDACTION")
+    expect(classify_unreached(1, "sudo: a password is required", True) == "SUDO_POLICY_DENIED",
+           "SUDO_DIAGNOSTIC_POLICY_DENIAL_CLASSIFICATION")
+    expect(classify_unreached(127, "setpriv: failed to execute launcher", False) == "LAUNCHER_EXECUTION_FAILED",
+           "SUDO_DIAGNOSTIC_LAUNCHER_FAILURE_CLASSIFICATION")
+    expect(classify_unreached(1, "sudo: unable to execute broker", True) == "SUDO_EXECUTION_OR_CREDENTIAL_SETUP_FAILED",
+           "SUDO_DIAGNOSTIC_SUDO_SETUP_CLASSIFICATION")
+    expect(classify_unreached(1, "", False) == "BROKER_NOT_REACHED",
+           "SUDO_DIAGNOSTIC_BROKER_NOT_REACHED_CLASSIFICATION")
+    validate_observed_broker_controls(expect)
+
+
+def validate_observed_broker_controls(expect):
+    global pidfd_has_exited, process_start_identity
+    original_pidfd_has_exited = pidfd_has_exited
+    original_process_start_identity = process_start_identity
+    try:
+        pidfd_has_exited = lambda _pidfd: True
+        expect(not observed_broker_still_owned(77, "boot:77:9", object()),
+               "SUDO_DIAGNOSTIC_EXITED_PIDFD_ACCEPTED")
+
+        pidfd_has_exited = lambda _pidfd: False
+        process_start_identity = lambda _pid: "boot:77:9"
+        expect(observed_broker_still_owned(77, "boot:77:9", object()),
+               "SUDO_DIAGNOSTIC_LIVE_PIDFD_IDENTITY_ACCEPTED")
+
+        process_start_identity = lambda _pid: "boot:77:10"
+        try:
+            observed_broker_still_owned(77, "boot:77:9", object())
+        except SupervisorFailure as error:
+            expect(str(error) == "PROCESS_IDENTITY_OBSERVATION_UNSAFE",
+                   "SUDO_DIAGNOSTIC_EXIT_PID_REUSE_REJECTED")
+        else:
+            expect(False, "SUDO_DIAGNOSTIC_EXIT_PID_REUSE_REJECTED")
+
+        def exited_during_identity_read(_pid):
+            raise SupervisorFailure("PROCESS_START_IDENTITY_UNREADABLE")
+
+        pidfd_observations = iter((False, True))
+        pidfd_has_exited = lambda _pidfd: next(pidfd_observations)
+        process_start_identity = exited_during_identity_read
+        expect(not observed_broker_still_owned(77, "boot:77:9", object()),
+               "SUDO_DIAGNOSTIC_EXIT_DURING_IDENTITY_READ_REAPED")
+    finally:
+        pidfd_has_exited = original_pidfd_has_exited
+        process_start_identity = original_process_start_identity
+
 def run_sudo_matrix(uid, gid, workspace, temp_root, policy_h, config_q, ledger_path, mount_id):
     root_before = protected_snapshot()
     request = make_request(policy_h, config_q)
@@ -1266,9 +2142,9 @@ def run_sudo_matrix(uid, gid, workspace, temp_root, policy_h, config_q, ledger_p
         completed = supervised_command(app_identity_command(uid, gid, argv), cwd=workspace, env=env or base_env, label=label, log_path=log_path, timeout=10, stdin=payload)
         return completed
 
-    positive = run_as_user([HOSTED_LAUNCHER], payload=request, label="SUDO_EXACT_STDIO_POSITIVE")
-    if positive.returncode != 0 or len(positive.stdout) < 320 or positive.stdout[:8] != b"S8BRS001" or struct.unpack_from(">H", positive.stdout, 28)[0] == 65:
-        raise SupervisorFailure("SUDO_EXACT_STDIO_OR_HQ_ADMISSION_FAILED")
+    diagnostic = run_sudo_credential_diagnostic(uid, gid, workspace, temp_root, policy_h, config_q, ledger_path, mount_id, base_env)
+    if diagnostic["classification"] != "POSITIVE_PATH_ACCEPTED":
+        raise SupervisorFailure("SUDO_DIAGNOSTIC_PRIMARY_FAILURE:" + str(diagnostic["classification"]))
     emit_to_stdout("SUDO_STDIO_PASSWORDLESS=PASS\nSUDO_VALID_HQ_CALLER_ADMISSION=PASS\n")
 
     sudoers_path = Path(HOSTED_SUDOERS)
@@ -2484,6 +3360,7 @@ def validate_fixture_diagnostic_controls():
             raise SupervisorFailure("FIXTURE_DIAGNOSTIC_CONTROL_FAILED:" + marker)
         emit_to_stdout(marker + "=PASS\n")
 
+    validate_sudo_diagnostic_controls(expect)
     run_route_b_opt_controls(expect)
     run_product_leaf_lifecycle_controls(expect)
     run_toolchain_preservation_controls(expect)
@@ -3004,6 +3881,11 @@ def root_supervise(args):
     route_b_cleanup_reported = False
     operation_error = None
     cleanup_error = None
+    children_reaped = False
+    namespace_references_closed = False
+    deployment_product_paths_absent = False
+    supervisor_state_removed = False
+    outer_opt_unchanged = False
 
     def cancel_holder():
         nonlocal cancel_sent
@@ -3158,6 +4040,10 @@ def root_supervise(args):
                 raise SupervisorFailure("NAMESPACE_HOLDER_TERMINAL_WITNESS_MISSING")
             if holder_namespace is not None and not namespace_disappeared(holder_namespace, NAMESPACE_VERIFY_SECONDS):
                 raise SupervisorFailure("NAMESPACE_REFERENCE_REMAINS_AFTER_TEARDOWN")
+            if holder is not None and holder.terminal is not None and holder_namespace is not None:
+                children_reaped = True
+                namespace_references_closed = True
+                emit_to_stdout("CHILDREN_REAPED=YES\nNAMESPACE_REFERENCES_CLOSED=YES\n")
             if stage_root is not None and not stage_cleanup_attempted:
                 stage_cleanup_attempted = True
                 cleanup_toolchain_stage_root(temp_root, stage_root, namespace_closed=holder_namespace is None or namespace_disappeared(holder_namespace, NAMESPACE_VERIFY_SECONDS))
@@ -3165,6 +4051,8 @@ def root_supervise(args):
                 emit_to_stdout("HOSTED_TOOLCHAIN_NAMESPACE_RESOURCE_RELEASE=PASS\n")
             if current_host_ids() != outer_ids or opt_snapshot() != outer_opt:
                 raise SupervisorFailure("OUTER_NAMESPACE_OR_OPT_STATE_CHANGED_DURING_TEARDOWN")
+            outer_opt_unchanged = True
+            emit_to_stdout("OUTER_OPT_UNCHANGED=YES\n")
             if ledger is not None:
                 rows = validate_process_ledger(ledger)
                 emit_to_stdout(f"HARNESS_PROCESS_RECORDS={len(rows)}\n")
@@ -3182,8 +4070,14 @@ def root_supervise(args):
                     marker = "PASS" if cleanup_events[0]["attempted"] else "PASS_NOT_ATTEMPTED"
                     emit_to_stdout("ROUTE_B_BROKER_CLEANUP=" + marker + "\nROUTE_B_PRODUCTION_DEPLOYMENT_ABSENT=YES\n")
                     route_b_cleanup_reported = True
+            if route_b_cleanup_reported:
+                deployment_product_paths_absent = True
+                emit_to_stdout("DEPLOYMENT_PRODUCT_PATHS_ABSENT=YES\n")
             if state is not None and state.exists():
                 remove_supervisor_state(state, ledger)
+            if state is not None and not state.exists():
+                supervisor_state_removed = True
+                emit_to_stdout("SUPERVISOR_STATE_REMOVED=YES\n")
         except Exception as error:
             cleanup_error = append_cleanup_failure(cleanup_error, error)
         for sig, handler in previous_handlers.items():
@@ -3191,6 +4085,33 @@ def root_supervise(args):
                 signal.signal(sig, handler)
             except Exception as error:
                 cleanup_error = append_cleanup_failure(cleanup_error, error)
+    output_text = "\n".join(
+        event.get("text", "") for event in events if event.get("kind") == "output"
+    )
+    evidence_complete = "SUDO_DIAGNOSTIC_EVIDENCE_COMPLETE=YES" in output_text
+    cleanup_complete = (
+        cleanup_error is None and children_reaped and namespace_references_closed
+        and deployment_product_paths_absent and supervisor_state_removed and outer_opt_unchanged
+    )
+    if evidence_complete and cleanup_complete and operation_error is None:
+        emit_to_stdout("G0_PASS=YES\nG0_TERMINAL_RESULT=G0_PASS\n")
+    else:
+        match = re.search(r"(?m)^G0_HOLD=([A-Z0-9_]+)$", output_text)
+        diagnostic_failure = re.search(
+            r"SUDO_DIAGNOSTIC_PRIMARY_FAILURE:([A-Z0-9_]+)",
+            str(operation_error) if operation_error is not None else "",
+        )
+        if match:
+            hold_reason = match.group(1)
+        elif diagnostic_failure:
+            hold_reason = "SUDO_DIAGNOSTIC_PRIMARY_FAILURE_" + diagnostic_failure.group(1)
+        elif not cleanup_complete:
+            hold_reason = "CLEANUP_UNPROVEN"
+        elif operation_error is not None:
+            hold_reason = "SUPERVISOR_OPERATION_FAILED"
+        else:
+            hold_reason = "SUDO_DIAGNOSTIC_EVIDENCE_INCOMPLETE"
+        emit_to_stdout(f"G0_HOLD={hold_reason}\nG0_TERMINAL_RESULT=G0_HOLD\n")
     if operation_error is not None or cleanup_error is not None:
         report_failure_pair(operation_error, cleanup_error)
     if cleanup_error is not None:
