@@ -1,0 +1,1010 @@
+name: S8 Run-115 hosted systemd qualification
+
+on:
+  push:
+    branches:
+      - codex/s8-run115-github-systemd-qualification
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: G0 hosted VM and real systemd evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Collect bounded qualification evidence
+        shell: bash
+        run: |
+          set -Ee -o pipefail
+          export LC_ALL=C
+
+          PRODUCT_HEAD=ff6a9bada283d36b92637a810a7e9d691b92193e
+          PRODUCT_TREE=cd7ad2ad1e494a733468ecbb883be1afda644c49
+          VALIDATION_HEAD=ca02023bfea2b3431f81933c1733aba6c1ef6185
+          VALIDATION_TREE=a45c7b2e29cb843f90c26d88f09358325f49b903
+          DIAGNOSTIC_BRANCH=codex/s8-run115-github-systemd-qualification
+          DIAGNOSTIC_PARENT=ca02023bfea2b3431f81933c1733aba6c1ef6185
+          SERVICE_PREFIX=s8-run115-qual
+          SOCKET_UNIT_NAME=$SERVICE_PREFIX.socket
+          SERVICE_TEMPLATE=$SERVICE_PREFIX@.service
+          Q_USER=s8g0q115
+          Q_GROUP=s8g0q115
+          ALL_PROOFS=1
+          CLEANUP_OK=1
+          CLEANUP_DONE=0
+          GROUP_CREATED=0
+          USER_CREATED=0
+          RUNTIME_CREATED=0
+          UNIT_FILES_CREATED=0
+          RUNTIME_DIR=
+          EVENTS_FILE=
+          SERVICE_SCRIPT=
+          CLIENT_SCRIPT=
+          SOCKET_PATH=
+          SOCKET_UNIT_FILE=/run/systemd/system/$SOCKET_UNIT_NAME
+          SERVICE_UNIT_FILE=/run/systemd/system/$SERVICE_TEMPLATE
+          UID_CANDIDATE=
+          GID_CANDIDATE=
+          UID_RANGE=
+          GID_RANGE=
+          QUAL_UID=
+          QUAL_GID=
+          QUALIFICATION_IDENTITY_CREATED=NO
+          SOCKET_PROOF=NO
+          CLIENT_PROOF=NO
+          SERVICE_LIFECYCLE_PROOF=NO
+          SOCKET_ACTIVATION_ACCEPT_YES=NOT_OBSERVED
+          PER_CONNECTION_INSTANCE=NOT_OBSERVED
+          STANDARD_SOCKET_HANDOFF=NOT_OBSERVED
+          SO_PEERCRED=NOT_OBSERVED
+          SECOND_CONNECTION_NEW_INSTANCE=NOT_OBSERVED
+          STOP_PREVENTS_NEW_CONNECTIONS=NOT_OBSERVED
+          SERVICE_LIFECYCLE=NOT_OBSERVED
+          SYSTEMD_ANALYZE_VERIFY=NOT_RUN
+          DAEMON_RELOAD=NOT_RUN
+          PID1_IS_SYSTEMD=NO
+
+          mark_unqualified() {
+            ALL_PROOFS=0
+            printf 'OBSERVATION_FAILURE=%s\n' "$1"
+          }
+
+          map_kind() {
+            /usr/bin/python3 - "$1" <<'PY'
+          import sys
+          rows = []
+          try:
+              for line in open(sys.argv[1], encoding="ascii"):
+                  parts = line.split()
+                  if len(parts) != 3:
+                      print("UNKNOWN")
+                      raise SystemExit(0)
+                  inside, outside, length = map(int, parts)
+                  if length <= 0:
+                      print("UNKNOWN")
+                      raise SystemExit(0)
+                  rows.append((inside, outside, length))
+          except (OSError, ValueError):
+              print("UNKNOWN")
+              raise SystemExit(0)
+          print("IDENTITY" if rows and all(a == b for a, b, _ in rows) else "TRANSLATED" if rows else "UNKNOWN")
+          PY
+          }
+
+          map_candidate_kind() {
+            /usr/bin/python3 - "$1" "$2" <<'PY'
+          import sys
+          path, raw_id = sys.argv[1], sys.argv[2]
+          try:
+              target = int(raw_id)
+              rows = [tuple(map(int, line.split())) for line in open(path, encoding="ascii")]
+              for inside, outside, length in rows:
+                  if inside <= target < inside + length:
+                      print("IDENTITY" if outside + target - inside == target else "TRANSLATED")
+                      raise SystemExit(0)
+          except (OSError, ValueError):
+              pass
+          print("UNMAPPED")
+          PY
+          }
+
+          response_field() {
+            printf '%s\n' "$1" | tr ' ' '\n' | awk -F= -v key="$2" '$1 == key {print $2; exit}'
+          }
+
+          event_by_index() {
+            local index=$1
+            local row
+            row=$(sudo -n /usr/bin/python3 - "$EVENTS_FILE" "$index" <<'PY'
+          import json
+          import sys
+          rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+          if len(rows) >= int(sys.argv[2]):
+              item = rows[int(sys.argv[2]) - 1]
+              print("\t".join(str(item.get(key, "")) for key in (
+                  "unit", "pid", "uid", "gid", "peer_pid", "peer_uid", "peer_gid",
+                  "invocation_id", "family_ok", "type_ok", "accepted_socket_ok",
+                  "root_service", "request"
+              )))
+          PY
+          ) || return 1
+            IFS=$'\t' read -r event_unit event_pid event_uid event_gid event_peer_pid event_peer_uid event_peer_gid event_invocation event_family event_type event_accepted event_root event_request <<< "$row"
+          }
+
+          event_count() {
+            sudo -n /usr/bin/python3 - "$EVENTS_FILE" <<'PY'
+          import sys
+          print(sum(1 for line in open(sys.argv[1], encoding="utf-8") if line.strip()))
+          PY
+          }
+
+          wait_unit_inactive() {
+            local target=$1
+            local attempt state
+            for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+              state=$(sudo -n /usr/bin/systemctl show "$target" -p ActiveState --value 2>/dev/null || true)
+              if [[ $state == inactive ]]; then
+                return 0
+              fi
+              if [[ $state == failed ]]; then
+                return 1
+              fi
+              sleep 0.2
+            done
+            return 1
+          }
+
+          run_client() {
+            local mode=$1
+            set +e
+            CLIENT_OUTPUT=$(sudo -n "$SETPRIV_PATH" --reuid "$QUAL_UID" --regid "$QUAL_GID" --clear-groups \
+              --no-new-privs --inh-caps=-all --bounding-set=-all --ambient-caps=-all \
+              /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 "$CLIENT_SCRIPT" "$SOCKET_PATH" "$mode" 2>&1)
+            CLIENT_RC=$?
+            set -e
+            printf '%s\n' "$CLIENT_OUTPUT"
+            CLIENT_PID=$(printf '%s\n' "$CLIENT_OUTPUT" | awk -F= '$1 == "CLIENT_PID" {print $2; exit}')
+            CLIENT_RESPONSE=$(printf '%s\n' "$CLIENT_OUTPUT" | sed -n 's/^SERVER_RESPONSE=//p' | tail -n 1)
+          }
+
+          echo "RUN=S8_G0_PR47_GITHUB_HOSTED_SYSTEMD_QUALIFICATION_115"
+          echo "LOCK=DL-SD-S8-G0-PR47-GITHUB-HOSTED-SYSTEMD-QUALIFICATION-001"
+          echo "ROOT_FAMILY_ID=RF-S8-PR47-G4-075-SIX-BLOCKER"
+          echo "PRODUCT_HEAD=$PRODUCT_HEAD"
+          echo "PRODUCT_TREE=$PRODUCT_TREE"
+          echo "VALIDATION_HEAD=$VALIDATION_HEAD"
+          echo "VALIDATION_TREE=$VALIDATION_TREE"
+          echo "DIAGNOSTIC_BRANCH=$DIAGNOSTIC_BRANCH"
+          echo "DIAGNOSTIC_HEAD=$GITHUB_SHA"
+          echo "DIAGNOSTIC_PARENT=$DIAGNOSTIC_PARENT"
+          echo "RUNNER_LABEL=ubuntu-24.04"
+          echo "IMAGE_OS=$ImageOS"
+          echo "IMAGE_VERSION=$ImageVersion"
+          echo "RUNNER_ARCH=$RUNNER_ARCH"
+          echo "WORKFLOW_LEVEL_CONTAINER=ABSENT"
+          echo "OS_RELEASE=$(grep -E '^(PRETTY_NAME|ID|VERSION_ID|VERSION_CODENAME)=' /etc/os-release | tr '\n' ';')"
+          echo "KERNEL=$(uname -r)"
+          echo "ARCH=$(uname -m)"
+          echo "UNAME=$(uname -srm)"
+          echo "RUNNER_UID=$(id -u)"
+          echo "RUNNER_GID=$(id -g)"
+          echo "RUNNER_GROUPS=$(id -G)"
+          echo "UID_MAP=$(tr '\n' ';' < /proc/self/uid_map)"
+          echo "GID_MAP=$(tr '\n' ';' < /proc/self/gid_map)"
+          UID_MAP_KIND=$(map_kind /proc/self/uid_map)
+          GID_MAP_KIND=$(map_kind /proc/self/gid_map)
+          echo "UID_MAP_KIND=$UID_MAP_KIND"
+          echo "GID_MAP_KIND=$GID_MAP_KIND"
+          if [[ $UID_MAP_KIND != IDENTITY || $GID_MAP_KIND != IDENTITY ]]; then
+            mark_unqualified RUNNER_UID_GID_MAP_NOT_IDENTITY
+          fi
+          if [[ $UID_MAP_KIND == IDENTITY && $GID_MAP_KIND == IDENTITY ]]; then
+            echo "DIRECT_VM_EXECUTION=YES; workflow container absent; identity maps"
+          else
+            echo "DIRECT_VM_EXECUTION=WORKFLOW_CONTAINER_ABSENT; user namespace mapping is translated or unknown"
+          fi
+          echo "IDENTITY_ALLOCATION_POLICY=$(grep -E '^(UID|GID|SYS_UID|SYS_GID)_(MIN|MAX)[[:space:]]' /etc/login.defs | tr '\n' ';' || true)"
+          echo "OCCUPIED_HIGH_UIDS=$(getent passwd | awk -F: '$3 >= 60000 && $3 <= 65535 {printf \"%s:%s,\", $3, $1}' | cut -c1-1200)"
+          echo "OCCUPIED_HIGH_GIDS=$(getent group | awk -F: '$3 >= 60000 && $3 <= 65535 {printf \"%s:%s,\", $3, $1}' | cut -c1-1200)"
+          echo "FIXTURE_UID_1001=$(getent passwd 1001 | cut -d: -f1,3 || echo UNASSIGNED)"
+          echo "FIXTURE_GID_1001=$(getent group 1001 | cut -d: -f1,3 || echo UNASSIGNED)"
+          if sudo -n true 2>/dev/null; then
+            SUDO_ROOT_ORCHESTRATION=AVAILABLE
+          else
+            SUDO_ROOT_ORCHESTRATION=UNAVAILABLE
+            mark_unqualified ROOT_ORCHESTRATION_UNAVAILABLE
+          fi
+          echo "SUDO_ROOT_ORCHESTRATION=$SUDO_ROOT_ORCHESTRATION"
+
+          SETPRIV_PATH=$(command -v setpriv || true)
+          SETPRIV_VERSION=UNAVAILABLE
+          SETPRIV_HELP=
+          if [[ -n $SETPRIV_PATH ]]; then
+            SETPRIV_VERSION=$("$SETPRIV_PATH" --version 2>&1 | head -n 1 || true)
+            SETPRIV_HELP=$("$SETPRIV_PATH" --help 2>&1 || true)
+          fi
+          echo "SETPRIV_VERSION=$SETPRIV_VERSION"
+          if [[ $SETPRIV_HELP == *--no-new-privs* ]]; then
+            NO_NEW_PRIVS_SUPPORTED=YES
+          else
+            NO_NEW_PRIVS_SUPPORTED=NO
+          fi
+          echo "NO_NEW_PRIVS_SUPPORTED=$NO_NEW_PRIVS_SUPPORTED"
+          if [[ $SETPRIV_HELP == *--inh-caps* && $SETPRIV_HELP == *--bounding-set* && $SETPRIV_HELP == *--ambient-caps* ]]; then
+            SETPRIV_CAPABILITY_CONTROLS=AVAILABLE
+          else
+            SETPRIV_CAPABILITY_CONTROLS=UNAVAILABLE
+          fi
+          echo "SETPRIV_CAPABILITY_CONTROLS=$SETPRIV_CAPABILITY_CONTROLS"
+          echo "S8_EXISTING_WRAPPER_CAPABILITY_CONTROL=bwrap --cap-drop ALL"
+          BWRAP_PATH=$(command -v bwrap || true)
+          if [[ -n $BWRAP_PATH ]]; then
+            BWRAP_VERSION=$("$BWRAP_PATH" --version 2>&1 | head -n 1 || true)
+            BWRAP_HELP=$("$BWRAP_PATH" --help 2>&1 || true)
+            echo "BWRAP_PATH=$BWRAP_PATH"
+            echo "BWRAP_VERSION=$BWRAP_VERSION"
+            if [[ $BWRAP_HELP == *--cap-drop* ]]; then
+              echo "BWRAP_CAPABILITY_BOUNDING_CONTROL=AVAILABLE"
+            else
+              echo "BWRAP_CAPABILITY_BOUNDING_CONTROL=UNAVAILABLE"
+            fi
+          else
+            echo "BWRAP_PATH=UNAVAILABLE"
+            echo "BWRAP_VERSION=UNAVAILABLE"
+            echo "BWRAP_CAPABILITY_BOUNDING_CONTROL=UNAVAILABLE"
+          fi
+
+          PID1_COMM=$(cat /proc/1/comm 2>/dev/null || echo UNREADABLE)
+          PID1_EXE=$(readlink -f /proc/1/exe 2>/dev/null || echo UNREADABLE)
+          echo "PID1_COMM=$PID1_COMM"
+          echo "PID1_EXE=$PID1_EXE"
+          if [[ $PID1_COMM == systemd && $(basename "$PID1_EXE") == systemd ]]; then
+            PID1_IS_SYSTEMD=YES
+          else
+            PID1_IS_SYSTEMD=NO
+            mark_unqualified PID1_IS_NOT_SYSTEMD
+          fi
+          SYSTEMD_VERSION=$(/usr/bin/systemd --version 2>&1 | head -n 1 || echo UNAVAILABLE)
+          SYSTEMCTL_VERSION=$(/usr/bin/systemctl --version 2>&1 | head -n 1 || echo UNAVAILABLE)
+          SYSTEMD_PACKAGE=$(dpkg-query -W -f='${binary:Package}=${Version} ${Architecture} source=${source:Package}\n' systemd systemd-sysv 2>/dev/null | tr '\n' ';' || echo UNAVAILABLE)
+          echo "SYSTEMD_VERSION=$SYSTEMD_VERSION"
+          echo "SYSTEMCTL_VERSION=$SYSTEMCTL_VERSION"
+          echo "SYSTEMD_PACKAGE=$SYSTEMD_PACKAGE"
+          set +e
+          SYSTEMD_STATE=$(sudo -n /usr/bin/systemctl is-system-running 2>&1)
+          SYSTEMD_STATE_RC=$?
+          set -e
+          echo "SYSTEMD_STATE=$SYSTEMD_STATE (exit=$SYSTEMD_STATE_RC)"
+          if command -v systemd-analyze >/dev/null 2>&1; then
+            UNIT_PATHS=$(sudo -n /usr/bin/systemd-analyze unit-paths 2>&1 || echo UNAVAILABLE)
+            echo "SYSTEMD_UNIT_PATH=$(printf '%s' "$UNIT_PATHS" | tr '\n' ';')"
+          else
+            echo "SYSTEMD_UNIT_PATH=UNAVAILABLE"
+            mark_unqualified SYSTEMD_ANALYZE_UNAVAILABLE
+          fi
+
+          DYNAMIC_DOC_HITS=
+          DYNAMIC_USER_RANGE_DOCUMENTED=NO
+          for doc in /usr/share/man/man5/systemd.exec.5.gz /usr/share/man/man5/systemd.exec.5; do
+            if [[ -r $doc ]]; then
+              if [[ $doc == *.gz ]]; then
+                hits=$(zgrep -n -E '61184|65519' "$doc" | head -n 8 || true)
+              else
+                hits=$(grep -n -E '61184|65519' "$doc" | head -n 8 || true)
+              fi
+              if [[ $hits == *61184* && $hits == *65519* ]]; then
+                DYNAMIC_DOC_HITS=$doc:$hits
+                DYNAMIC_USER_RANGE_DOCUMENTED=YES
+                break
+              fi
+            fi
+          done
+          HOMED_DOC_HITS=
+          HOMED_RANGE_DOCUMENTED=NO
+          for doc in /usr/share/man/man1/homectl.1.gz /usr/share/man/man1/homectl.1; do
+            if [[ -r $doc ]]; then
+              if [[ $doc == *.gz ]]; then
+                hits=$(zgrep -n -E '60001|60513' "$doc" | head -n 8 || true)
+              else
+                hits=$(grep -n -E '60001|60513' "$doc" | head -n 8 || true)
+              fi
+              if [[ $hits == *60001* && $hits == *60513* ]]; then
+                HOMED_DOC_HITS=$doc:$hits
+                HOMED_RANGE_DOCUMENTED=YES
+                break
+              fi
+            fi
+          done
+          echo "DYNAMIC_USER_RANGE_DOCUMENTED=$DYNAMIC_USER_RANGE_DOCUMENTED"
+          echo "DYNAMIC_USER_RANGE_DOC_EVIDENCE=$(printf '%s' "$DYNAMIC_DOC_HITS" | tr '\n' ';')"
+          echo "HOMED_RANGE_DOCUMENTED=$HOMED_RANGE_DOCUMENTED"
+          echo "HOMED_RANGE_DOC_EVIDENCE=$(printf '%s' "$HOMED_DOC_HITS" | tr '\n' ';')"
+
+          CANDIDATE_REPORT=$(/usr/bin/python3 - "$DYNAMIC_USER_RANGE_DOCUMENTED" "$HOMED_RANGE_DOCUMENTED" <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          dynamic_doc = sys.argv[1] == "YES"
+          homed_doc = sys.argv[2] == "YES"
+
+          def policy(key):
+              try:
+                  for line in open("/etc/login.defs", encoding="ascii"):
+                      parts = line.split()
+                      if len(parts) >= 2 and parts[0] == key:
+                          return int(parts[1])
+              except (OSError, ValueError):
+                  pass
+              return None
+
+          def ids_from_getent(database, field):
+              result = subprocess.run(["getent", database], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+              found = []
+              for line in result.stdout.splitlines():
+                  parts = line.split(":")
+                  try:
+                      found.append((int(parts[field]), parts[0]))
+                  except (ValueError, IndexError):
+                      continue
+              return found
+
+          def subordinate(path):
+              rows = []
+              if not os.path.exists(path):
+                  return "ABSENT", rows
+              try:
+                  for line in open(path, encoding="utf-8"):
+                      parts = line.strip().split(":")
+                      if len(parts) != 3:
+                          continue
+                      try:
+                          start, count = int(parts[1]), int(parts[2])
+                      except ValueError:
+                          continue
+                      if count > 0:
+                          rows.append((parts[0], start, start + count - 1))
+              except OSError:
+                  return "UNREADABLE", []
+              return "PRESENT", rows
+
+          def candidate(start, end, occupied, subids):
+              if start is None or end is None or start > end:
+                  return None, None
+              used = {number for number, _ in occupied if start <= number <= end}
+              for _name, lo, hi in subids:
+                  lo, hi = max(lo, start), min(hi, end)
+                  if lo <= hi:
+                      used.update(range(lo, hi + 1))
+              run = 0
+              run_start = None
+              for number in range(start, end + 1):
+                  if number in used:
+                      run = 0
+                      run_start = None
+                  else:
+                      if run_start is None:
+                          run_start = number
+                      run += 1
+                      if run >= 32:
+                          return (run_start, run_start + 31), number - 31
+              return None, None
+
+          uid_max = policy("UID_MAX")
+          gid_max = policy("GID_MAX")
+          lower_uid = max(60001, uid_max + 1) if uid_max is not None else None
+          lower_gid = max(60001, gid_max + 1) if gid_max is not None else None
+          if homed_doc:
+              lower_uid = max(lower_uid, 60514) if lower_uid is not None else None
+              lower_gid = max(lower_gid, 60514) if lower_gid is not None else None
+          upper = 61183 if dynamic_doc else None
+
+          uids = ids_from_getent("passwd", 2)
+          gids = ids_from_getent("group", 2)
+          subuid_state, subuids = subordinate("/etc/subuid")
+          subgid_state, subgids = subordinate("/etc/subgid")
+          uid_range, uid_candidate = candidate(lower_uid, upper, uids, subuids)
+          gid_range, gid_candidate = candidate(lower_gid, upper, gids, subgids)
+
+          def fmt_range(value):
+              return "NONE" if value is None else "%d-%d" % value
+
+          def fmt_id(value):
+              return "NONE" if value is None else str(value)
+
+          def overlaps(rows, start, end):
+              if start is None or end is None:
+                  return []
+              return ["%s:%d-%d" % (name, lo, hi) for name, lo, hi in rows if lo <= end and hi >= start][:20]
+
+          def ranges(rows):
+              return "first20 of %d:" % len(rows) + (",".join("%s:%d-%d" % (name, lo, hi) for name, lo, hi in rows[:20]) or "NONE")
+
+          occupied_uids = ["%d:%s" % (number, name) for number, name in uids if 60000 <= number <= 65535][:40]
+          occupied_gids = ["%d:%s" % (number, name) for number, name in gids if 60000 <= number <= 65535][:40]
+          print("SUBUID_MAPPING_STATE=%s" % subuid_state)
+          print("SUBUID_MAPPING_RANGES=%s" % ranges(subuids))
+          print("SUBUID_CANDIDATE_OVERLAP=%s" % (",".join(overlaps(subuids, lower_uid, upper)) or "NONE"))
+          print("SUBGID_MAPPING_STATE=%s" % subgid_state)
+          print("SUBGID_MAPPING_RANGES=%s" % ranges(subgids))
+          print("SUBGID_CANDIDATE_OVERLAP=%s" % (",".join(overlaps(subgids, lower_gid, upper)) or "NONE"))
+          print("OCCUPIED_HIGH_UIDS=%s" % (",".join(occupied_uids) or "NONE"))
+          print("OCCUPIED_HIGH_GIDS=%s" % (",".join(occupied_gids) or "NONE"))
+          print("UID_CANDIDATE_RANGE=%s" % fmt_range(uid_range))
+          print("UID_CANDIDATE_ID=%s" % fmt_id(uid_candidate))
+          print("GID_CANDIDATE_RANGE=%s" % fmt_range(gid_range))
+          print("GID_CANDIDATE_ID=%s" % fmt_id(gid_candidate))
+          print("CANDIDATES_DOCUMENTED=%s" % ("YES" if dynamic_doc else "NO_DYNAMIC_RANGE_SOURCE"))
+          PY
+          )
+          printf '%s\n' "$CANDIDATE_REPORT"
+          UID_CANDIDATE=$(printf '%s\n' "$CANDIDATE_REPORT" | sed -n 's/^UID_CANDIDATE_ID=//p' | head -n 1)
+          GID_CANDIDATE=$(printf '%s\n' "$CANDIDATE_REPORT" | sed -n 's/^GID_CANDIDATE_ID=//p' | head -n 1)
+          UID_RANGE=$(printf '%s\n' "$CANDIDATE_REPORT" | sed -n 's/^UID_CANDIDATE_RANGE=//p' | head -n 1)
+          GID_RANGE=$(printf '%s\n' "$CANDIDATE_REPORT" | sed -n 's/^GID_CANDIDATE_RANGE=//p' | head -n 1)
+          echo "COLLISION_FREE_FIXED_ID_CANDIDATES=UID_RANGE:$UID_RANGE;GID_RANGE:$GID_RANGE;UID:$UID_CANDIDATE;GID:$GID_CANDIDATE;NOT_ACCEPTED_PRODUCTION_IDS"
+          if [[ -n $UID_CANDIDATE && -n $GID_CANDIDATE && $UID_CANDIDATE != NONE && $GID_CANDIDATE != NONE ]]; then
+            UID_CANDIDATE_MAP=$(map_candidate_kind /proc/self/uid_map "$UID_CANDIDATE")
+            GID_CANDIDATE_MAP=$(map_candidate_kind /proc/self/gid_map "$GID_CANDIDATE")
+            echo "UID_CANDIDATE_MAP=$UID_CANDIDATE_MAP"
+            echo "GID_CANDIDATE_MAP=$GID_CANDIDATE_MAP"
+            if [[ $UID_CANDIDATE_MAP != IDENTITY || $GID_CANDIDATE_MAP != IDENTITY ]]; then
+              mark_unqualified CANDIDATE_ID_MAP_NOT_IDENTITY
+            fi
+          else
+            UID_CANDIDATE_MAP=UNAVAILABLE
+            GID_CANDIDATE_MAP=UNAVAILABLE
+            mark_unqualified FIXED_ID_CANDIDATE_RANGE_NOT_ESTABLISHED
+          fi
+
+          trap 'status=$?; trap - EXIT; set +e; if [[ $USER_CREATED == 1 ]]; then sudo -n /usr/sbin/userdel "$Q_USER" >/dev/null 2>&1; fi; if [[ $GROUP_CREATED == 1 ]]; then sudo -n /usr/sbin/groupdel "$Q_GROUP" >/dev/null 2>&1; fi; exit "$status"' EXIT
+          if [[ $PID1_IS_SYSTEMD == YES && $SUDO_ROOT_ORCHESTRATION == AVAILABLE ]]; then
+            if [[ -n $UID_CANDIDATE && -n $GID_CANDIDATE && $UID_CANDIDATE != NONE && $GID_CANDIDATE != NONE ]]; then
+              if sudo -n /usr/sbin/groupadd --gid "$GID_CANDIDATE" "$Q_GROUP"; then
+                GROUP_CREATED=1
+                if sudo -n /usr/sbin/useradd --uid "$UID_CANDIDATE" --gid "$Q_GROUP" --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$Q_USER"; then
+                  USER_CREATED=1
+                  QUAL_UID=$(id -u "$Q_USER")
+                  QUAL_GID=$(getent group "$Q_GROUP" | cut -d: -f3)
+                  echo "TEMP_QUALIFICATION_IDENTITY=$Q_USER:$QUAL_UID:$QUAL_GID;NOT_ACCEPTED_PRODUCTION_IDS"
+                  echo "DEDICATED_IDENTITY_CREATION_CAPABLE=YES;explicit numeric account/group creation succeeded"
+                  QUALIFICATION_IDENTITY_CREATED=YES
+                else
+                  mark_unqualified EXPLICIT_NUMERIC_USER_CREATION_FAILED
+                fi
+              else
+                mark_unqualified EXPLICIT_NUMERIC_GROUP_CREATION_FAILED
+              fi
+            else
+              echo "FIXED_CANDIDATE_ID_TEST=UNAVAILABLE"
+              if sudo -n /usr/sbin/groupadd --system "$Q_GROUP"; then
+                GROUP_CREATED=1
+                if sudo -n /usr/sbin/useradd --system --gid "$Q_GROUP" --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$Q_USER"; then
+                  USER_CREATED=1
+                  QUAL_UID=$(id -u "$Q_USER")
+                  QUAL_GID=$(getent group "$Q_GROUP" | cut -d: -f3)
+                  echo "TEMP_QUALIFICATION_IDENTITY=$Q_USER:$QUAL_UID:$QUAL_GID;AUTO_ALLOCATED;NOT_ACCEPTED_PRODUCTION_IDS"
+                  echo "DEDICATED_IDENTITY_CREATION_CAPABLE=YES;root account/group creation succeeded;fixed candidate evidence incomplete"
+                  QUALIFICATION_IDENTITY_CREATED=YES
+                else
+                  mark_unqualified TEMP_QUALIFICATION_USER_CREATION_FAILED
+                fi
+              else
+                mark_unqualified TEMP_QUALIFICATION_GROUP_CREATION_FAILED
+              fi
+            fi
+          fi
+          if [[ $QUALIFICATION_IDENTITY_CREATED != YES ]]; then
+            echo "DEDICATED_IDENTITY_CREATION_CAPABLE=NO"
+            mark_unqualified DEDICATED_IDENTITY_CREATION_NOT_PROVEN
+          fi
+
+          cleanup_objects() {
+            if [[ $CLEANUP_DONE == 1 ]]; then
+              return
+            fi
+            CLEANUP_DONE=1
+            set +e
+            local unit_list state unit remaining_units remaining_pids pid
+            if [[ $UNIT_FILES_CREATED == 1 ]]; then
+              sudo -n /usr/bin/systemctl stop "$SOCKET_UNIT_NAME" >/dev/null 2>&1
+              unit_list=$(sudo -n /usr/bin/systemctl list-units --all --type=service --no-legend --plain "$SERVICE_PREFIX@*.service" 2>/dev/null | awk '{print $1}' || true)
+              if [[ -n $EVENTS_FILE && -r $EVENTS_FILE ]]; then
+                unit_list="$unit_list
+          $(sudo -n /usr/bin/python3 - "$EVENTS_FILE" <<'PY'
+          import json
+          import sys
+          try:
+              for line in open(sys.argv[1], encoding="utf-8"):
+                  try:
+                      print(json.loads(line).get("unit", ""))
+                  except (ValueError, TypeError):
+                      pass
+          except OSError:
+              pass
+          PY
+          )"
+              fi
+              while IFS= read -r unit; do
+                [[ $unit == "$SERVICE_PREFIX"@*.service ]] || continue
+                state=$(sudo -n /usr/bin/systemctl show "$unit" -p ActiveState --value 2>/dev/null || true)
+                if [[ $state == active || $state == activating || $state == deactivating ]]; then
+                  if ! sudo -n /usr/bin/systemctl stop "$unit" >/dev/null 2>&1; then
+                    echo "CLEANUP_SERVICE_STOP=FAIL:$unit"
+                    CLEANUP_OK=0
+                  fi
+                fi
+              done <<< "$unit_list"
+              if ! sudo -n /usr/bin/systemctl stop "$SOCKET_UNIT_NAME" >/dev/null 2>&1; then
+                state=$(sudo -n /usr/bin/systemctl show "$SOCKET_UNIT_NAME" -p ActiveState --value 2>/dev/null || true)
+                if [[ $state == active || $state == activating || $state == deactivating ]]; then
+                  echo "CLEANUP_SOCKET_STOP=FAIL"
+                  CLEANUP_OK=0
+                fi
+              fi
+              if ! sudo -n /usr/bin/rm -f -- "$SOCKET_UNIT_FILE" "$SERVICE_UNIT_FILE"; then
+                echo "CLEANUP_UNIT_FILE_REMOVE=FAIL"
+                CLEANUP_OK=0
+              fi
+              if ! sudo -n /usr/bin/systemctl daemon-reload; then
+                echo "CLEANUP_DAEMON_RELOAD=FAIL"
+                CLEANUP_OK=0
+              fi
+            fi
+            if [[ -n $SERVICE_SCRIPT ]]; then
+              remaining_pids=$(pgrep -f -- "$SERVICE_SCRIPT" 2>/dev/null || true)
+              for pid in $remaining_pids; do
+                sudo -n /usr/bin/kill -TERM "$pid" >/dev/null 2>&1
+              done
+              sleep 0.2
+              remaining_pids=$(pgrep -f -- "$SERVICE_SCRIPT" 2>/dev/null || true)
+              for pid in $remaining_pids; do
+                sudo -n /usr/bin/kill -KILL "$pid" >/dev/null 2>&1
+              done
+            fi
+            remaining_units=$(sudo -n /usr/bin/systemctl list-units --all --type=service --no-legend --plain "$SERVICE_PREFIX@*.service" 2>/dev/null | awk '$3 == "active" || $3 == "activating" || $3 == "deactivating" {print $1}' || true)
+            if [[ -n $remaining_units ]]; then
+              echo "CLEANUP_UNITS=ACTIVE:$remaining_units"
+              CLEANUP_OK=0
+            else
+              if [[ -e $SOCKET_UNIT_FILE || -e $SERVICE_UNIT_FILE ]]; then
+                echo "CLEANUP_UNITS=UNIT_FILES_PRESENT"
+                CLEANUP_OK=0
+              else
+                echo "CLEANUP_UNITS=ABSENT_AND_INACTIVE"
+              fi
+            fi
+            if [[ -n $SOCKET_PATH && -e $SOCKET_PATH ]]; then
+              sudo -n /usr/bin/rm -f -- "$SOCKET_PATH"
+            fi
+            if [[ -n $RUNTIME_DIR && -d $RUNTIME_DIR && ! -L $RUNTIME_DIR && $RUNTIME_DIR == /run/s8-run115.* ]]; then
+              sudo -n /usr/bin/rm -rf -- "$RUNTIME_DIR" || CLEANUP_OK=0
+            elif [[ -n $RUNTIME_DIR && -e $RUNTIME_DIR ]]; then
+              echo "CLEANUP_RUNTIME_PATH=UNEXPECTED_PATH_SHAPE"
+              CLEANUP_OK=0
+            fi
+            remaining_pids=
+            if [[ -n $SERVICE_SCRIPT ]]; then
+              remaining_pids=$(pgrep -f -- "$SERVICE_SCRIPT" 2>/dev/null || true)
+            fi
+            if [[ -n $remaining_pids ]]; then
+              echo "CLEANUP_PROCESSES=REMAINING:$remaining_pids"
+              CLEANUP_OK=0
+            else
+              echo "CLEANUP_PROCESSES=NONE"
+            fi
+            if [[ $USER_CREATED == 1 ]]; then
+              if ! sudo -n /usr/sbin/userdel "$Q_USER"; then
+                echo "CLEANUP_USER=REMOVE_FAILED"
+                CLEANUP_OK=0
+              fi
+            fi
+            if [[ $GROUP_CREATED == 1 ]]; then
+              if ! sudo -n /usr/sbin/groupdel "$Q_GROUP"; then
+                echo "CLEANUP_GROUP=REMOVE_FAILED"
+                CLEANUP_OK=0
+              fi
+            fi
+            if getent passwd "$Q_USER" >/dev/null 2>&1 || { [[ -n $QUAL_UID ]] && getent passwd "$QUAL_UID" >/dev/null 2>&1; }; then
+              echo "CLEANUP_USER_GROUP=USER_STILL_RESOLVES"
+              CLEANUP_OK=0
+            elif getent group "$Q_GROUP" >/dev/null 2>&1 || { [[ -n $QUAL_GID ]] && getent group "$QUAL_GID" >/dev/null 2>&1; }; then
+              echo "CLEANUP_USER_GROUP=GROUP_STILL_RESOLVES"
+              CLEANUP_OK=0
+            else
+              echo "CLEANUP_USER_GROUP=USER_AND_GROUP_ABSENT"
+            fi
+            if [[ -n $SOCKET_PATH && -e $SOCKET_PATH ]]; then
+              echo "CLEANUP_SOCKET=PRESENT"
+              CLEANUP_OK=0
+            else
+              echo "CLEANUP_SOCKET=ABSENT"
+            fi
+            if [[ -n $RUNTIME_DIR && -e $RUNTIME_DIR ]]; then
+              echo "CLEANUP_RUNTIME_PATH=PRESENT"
+              CLEANUP_OK=0
+            else
+              echo "CLEANUP_RUNTIME_PATH=ABSENT"
+            fi
+            if [[ -e /etc/systemd/system/$SOCKET_UNIT_NAME || -e /etc/systemd/system/$SERVICE_TEMPLATE ]]; then
+              echo "CLEANUP_PERSISTENT_PATHS=UNEXPECTED_UNIT_FILE_PRESENT"
+              CLEANUP_OK=0
+            else
+              echo "CLEANUP_PERSISTENT_PATHS=NO_PERSISTENT_UNIT_PATHS_CREATED"
+            fi
+            if [[ $CLEANUP_OK == 1 ]]; then
+              echo "CLEANUP_RESULT=PASS"
+            else
+              echo "CLEANUP_RESULT=FAIL"
+            fi
+            set -e
+          }
+
+          trap 'status=$?; cleanup_objects; exit "$status"' EXIT
+
+          if [[ $PID1_IS_SYSTEMD == YES && $SUDO_ROOT_ORCHESTRATION == AVAILABLE && $QUALIFICATION_IDENTITY_CREATED == YES ]]; then
+            if [[ $SETPRIV_PATH == "" || $NO_NEW_PRIVS_SUPPORTED != YES || $SETPRIV_CAPABILITY_CONTROLS != AVAILABLE ]]; then
+              mark_unqualified REQUIRED_SETPRIV_CONTROLS_UNAVAILABLE
+            fi
+            RUNTIME_DIR=$(sudo -n /usr/bin/mktemp -d /run/s8-run115.XXXXXX)
+            RUNTIME_CREATED=1
+            sudo -n /usr/bin/chown root:root "$RUNTIME_DIR"
+            sudo -n /usr/bin/chmod 0755 "$RUNTIME_DIR"
+            EVENTS_FILE=$RUNTIME_DIR/events.jsonl
+            SERVICE_SCRIPT=$RUNTIME_DIR/service.py
+            CLIENT_SCRIPT=$RUNTIME_DIR/client.py
+            SOCKET_PATH=$RUNTIME_DIR/qual.sock
+
+            if [[ -e $SOCKET_UNIT_FILE || -e $SERVICE_UNIT_FILE || -e /etc/systemd/system/$SOCKET_UNIT_NAME || -e /etc/systemd/system/$SERVICE_TEMPLATE ]]; then
+              mark_unqualified DIAGNOSTIC_UNIT_NAME_COLLISION
+            else
+              sudo -n tee "$SERVICE_SCRIPT" >/dev/null <<'PY'
+          import json
+          import os
+          import socket
+          import struct
+          import time
+
+          def emit(row):
+              data = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+              fd = os.open(os.environ["S8_EVENTS"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+              try:
+                  os.write(fd, data)
+              finally:
+                  os.close(fd)
+
+          try:
+              conn = socket.socket(family=socket.AF_UNIX, type=socket.SOCK_STREAM, fileno=0)
+              family_ok = conn.family == socket.AF_UNIX
+              type_ok = conn.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) == socket.SOCK_STREAM
+              accept_ok = conn.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 0
+              conn.settimeout(5.0)
+              request = b""
+              while len(request) <= 128 and not request.endswith(b"\n"):
+                  part = conn.recv(129 - len(request))
+                  if not part:
+                      break
+                  request += part
+              mode = request.decode("ascii", "strict").strip()
+              if mode not in ("PING", "HOLD") or len(request) > 128:
+                  raise ValueError("bounded diagnostic request invalid")
+              peer_pid, peer_uid, peer_gid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+              unit = os.environ.get("S8_UNIT", "")[:180]
+              invocation = os.environ.get("INVOCATION_ID", "")[:64]
+              row = {
+                  "unit": unit,
+                  "pid": os.getpid(),
+                  "uid": os.getuid(),
+                  "gid": os.getgid(),
+                  "peer_pid": peer_pid,
+                  "peer_uid": peer_uid,
+                  "peer_gid": peer_gid,
+                  "invocation_id": invocation,
+                  "family_ok": family_ok,
+                  "type_ok": type_ok,
+                  "accepted_socket_ok": accept_ok,
+                  "root_service": os.getuid() == 0,
+                  "request": mode,
+              }
+              emit(row)
+              if not all((family_ok, type_ok, accept_ok, row["root_service"], unit, invocation)):
+                  raise RuntimeError("accepted socket or root service proof failed")
+              response = "OK UNIT=%s PID=%d PEER_PID=%d PEER_UID=%d PEER_GID=%d INVOCATION=%s\n" % (
+                  unit, os.getpid(), peer_pid, peer_uid, peer_gid, invocation
+              )
+              conn.sendall(response.encode("ascii"))
+              if mode == "HOLD":
+                  time.sleep(60)
+              conn.close()
+          except Exception:
+              raise
+          PY
+              sudo -n tee "$CLIENT_SCRIPT" >/dev/null <<'PY'
+          import os
+          import socket
+          import sys
+
+          status = {}
+          for line in open("/proc/self/status", encoding="ascii"):
+              if ":" in line:
+                  key, value = line.split(":", 1)
+                  if key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs"):
+                      status[key] = value.strip()
+          for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
+              print("%s=%s" % (key, status.get(key, "MISSING")), flush=True)
+          print("NoNewPrivs=%s" % status.get("NoNewPrivs", "MISSING"), flush=True)
+          print("CLIENT_UID=%d" % os.getuid(), flush=True)
+          print("CLIENT_GID=%d" % os.getgid(), flush=True)
+          print("CLIENT_SUPPLEMENTARY_GROUPS=%s" % (",".join(map(str, os.getgroups())) or "[]"), flush=True)
+          print("CLIENT_PID=%d" % os.getpid(), flush=True)
+          env_keys = sorted(os.environ.keys())
+          print("CLIENT_ENV_KEYS=%s" % (",".join(env_keys) or "[]"), flush=True)
+          path_value = os.environ.get("PATH", "")
+          print("CLIENT_PATH=%s" % path_value, flush=True)
+          allowed_env = set(("PATH", "LC_ALL"))
+          env_ok = set(env_keys) == allowed_env and path_value == "/usr/bin:/bin"
+          print("CLIENT_ENV_ALLOWLIST=%s" % ("PASS" if env_ok else "FAIL"), flush=True)
+
+          paths_ok = True
+          for path in ("/usr/bin", "/bin"):
+              info = os.stat(path)
+              if info.st_uid != 0 or info.st_mode & 0o022:
+                  paths_ok = False
+          executable = os.path.realpath(sys.executable)
+          py_info = os.stat(executable)
+          if py_info.st_uid != 0 or py_info.st_mode & 0o022:
+              paths_ok = False
+          print("CLIENT_EXECUTABLE=%s" % executable, flush=True)
+          print("CLIENT_PATH_AUTHORITY=%s" % ("PASS" if paths_ok else "FAIL"), flush=True)
+
+          caps_ok = all(key in status and int(status[key], 16) == 0 for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"))
+          nnp_ok = status.get("NoNewPrivs") == "1"
+          supplementary_ok = len(os.getgroups()) == 0
+          print("ZERO_CAPABILITY_CLIENT_PROOF=%s" % ("PASS" if caps_ok and nnp_ok and supplementary_ok and env_ok and paths_ok else "FAIL"), flush=True)
+          if not (caps_ok and nnp_ok and supplementary_ok and env_ok and paths_ok):
+              raise SystemExit(70)
+
+          client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          client.settimeout(5.0)
+          client.bind("\0s8g0-run115-" + str(os.getpid()))
+          client.connect(sys.argv[1])
+          client.sendall((sys.argv[2] + "\n").encode("ascii"))
+          response = b""
+          while len(response) < 512 and not response.endswith(b"\n"):
+              chunk = client.recv(512 - len(response))
+              if not chunk:
+                  break
+              response += chunk
+          client.close()
+          print("SERVER_RESPONSE=%s" % response.decode("ascii", "replace").strip(), flush=True)
+          PY
+              sudo -n /usr/bin/chmod 0644 "$SERVICE_SCRIPT" "$CLIENT_SCRIPT"
+              UNIT_FILES_CREATED=1
+              sudo -n tee "$SOCKET_UNIT_FILE" >/dev/null <<EOF
+          [Unit]
+          Description=Run-115 disposable G0 qualification socket
+
+          [Socket]
+          ListenStream=$SOCKET_PATH
+          Accept=yes
+          Service=$SERVICE_TEMPLATE
+          SocketMode=0660
+          SocketUser=root
+          SocketGroup=$Q_GROUP
+          RemoveOnStop=yes
+          EOF
+              sudo -n tee "$SERVICE_UNIT_FILE" >/dev/null <<EOF
+          [Unit]
+          Description=Run-115 disposable per-connection G0 qualification service
+
+          [Service]
+          Type=exec
+          ExecStart=/usr/bin/python3 $SERVICE_SCRIPT
+          StandardInput=socket
+          StandardOutput=journal
+          StandardError=journal
+          User=root
+          Group=root
+          KillMode=control-group
+          TimeoutStartSec=5s
+          TimeoutStopSec=3s
+          Environment=S8_EVENTS=$EVENTS_FILE
+          Environment=S8_UNIT=%n
+          EOF
+              if sudo -n /usr/bin/systemd-analyze verify "$SOCKET_UNIT_FILE" "$SERVICE_UNIT_FILE"; then
+                SYSTEMD_ANALYZE_VERIFY=PASS
+              else
+                SYSTEMD_ANALYZE_VERIFY=FAIL
+                mark_unqualified SYSTEMD_ANALYZE_VERIFY_FAILED
+              fi
+              echo "SYSTEMD_ANALYZE_VERIFY=$SYSTEMD_ANALYZE_VERIFY"
+              if [[ $SYSTEMD_ANALYZE_VERIFY == PASS ]] && sudo -n /usr/bin/systemctl daemon-reload; then
+                DAEMON_RELOAD=PASS
+                if sudo -n /usr/bin/systemctl start "$SOCKET_UNIT_NAME"; then
+                  socket_state=$(sudo -n /usr/bin/systemctl is-active "$SOCKET_UNIT_NAME" 2>&1 || true)
+                  socket_accept=$(sudo -n /usr/bin/systemctl show "$SOCKET_UNIT_NAME" -p Accept --value 2>/dev/null || true)
+                  socket_stat=$(sudo -n /usr/bin/stat -c '%F|%u:%g|%a' "$SOCKET_PATH" 2>/dev/null || echo ABSENT)
+                  echo "SOCKET_UNIT_STATE=$socket_state"
+                  echo "SOCKET_ACCEPT=$socket_accept"
+                  echo "SOCKET_STAT=$socket_stat"
+                  if [[ $socket_state == active && $socket_accept == yes && $socket_stat == "socket|0:$QUAL_GID|660" ]]; then
+                    SOCKET_PROOF=YES
+                    SOCKET_ACTIVATION_ACCEPT_YES=PASS
+                    echo "SOCKET_ACTIVATION_ACCEPT_YES=$SOCKET_ACTIVATION_ACCEPT_YES"
+                  else
+                    mark_unqualified SOCKET_UNIT_PROPERTIES_NOT_PROVEN
+                    SOCKET_ACTIVATION_ACCEPT_YES=FAIL
+                    echo "SOCKET_ACTIVATION_ACCEPT_YES=FAIL"
+                  fi
+
+                  if [[ $SETPRIV_PATH != "" && $NO_NEW_PRIVS_SUPPORTED == YES && $SETPRIV_CAPABILITY_CONTROLS == AVAILABLE ]]; then
+                    run_client PING
+                    response_unit_one=$(response_field "$CLIENT_RESPONSE" UNIT)
+                    event_count_one=$(event_count)
+                    if [[ $CLIENT_RC == 0 && $CLIENT_OUTPUT == *ZERO_CAPABILITY_CLIENT_PROOF=PASS* && $CLIENT_OUTPUT == *"CLIENT_UID=$QUAL_UID"* && $CLIENT_OUTPUT == *"CLIENT_GID=$QUAL_GID"* && $CLIENT_OUTPUT == *"CLIENT_SUPPLEMENTARY_GROUPS=[]"* && $event_count_one == 1 ]] && event_by_index 1; then
+                      unit_one=$event_unit
+                      pid_one=$event_pid
+                      invocation_one=$event_invocation
+                      echo "CONNECTION_ONE_UNIT=$unit_one"
+                      echo "CONNECTION_ONE_SERVICE_PID=$pid_one"
+                      echo "CONNECTION_ONE_INVOCATION_ID=$invocation_one"
+                      echo "PEER_PID=$event_peer_pid"
+                      echo "PEER_UID=$event_peer_uid"
+                      echo "PEER_GID=$event_peer_gid"
+                      STANDARD_SOCKET_HANDOFF="StandardInput=socket;AF_UNIX_STREAM=$event_family;SOCK_STREAM=$event_type;CONNECTED_ACCEPTED_FD=$event_accepted"
+                      echo "STANDARD_SOCKET_HANDOFF=$STANDARD_SOCKET_HANDOFF"
+                      if [[ $unit_one == "$response_unit_one" && $pid_one != "$CLIENT_PID" && $event_uid == 0 && $event_gid == 0 && $event_peer_pid == "$CLIENT_PID" && $event_peer_uid == "$QUAL_UID" && $event_peer_gid == "$QUAL_GID" && $invocation_one != "" && $event_family == True && $event_type == True && $event_accepted == True && $event_root == True && $event_request == PING ]]; then
+                        CLIENT_PROOF=YES
+                        SO_PEERCRED=PASS
+                        echo "SO_PEERCRED=$SO_PEERCRED"
+                        echo "PEER_IDENTITY_MATCHES_KERNEL_AND_CLIENT=PASS"
+                        echo "ZERO_CAPABILITY_CLIENT_PROOF=PASS"
+                        if wait_unit_inactive "$unit_one"; then
+                          echo "FIRST_SERVICE_EXIT=PASS"
+                        else
+                          echo "FIRST_SERVICE_EXIT=FAIL"
+                          mark_unqualified FIRST_SERVICE_DID_NOT_EXIT
+                        fi
+                        socket_after_one=$(sudo -n /usr/bin/systemctl is-active "$SOCKET_UNIT_NAME" 2>&1 || true)
+                        if [[ $socket_after_one == active ]]; then
+                          echo "SOCKET_REMAINS_AVAILABLE_FOR_SECOND_CONNECTION=YES"
+                        else
+                          echo "SOCKET_REMAINS_AVAILABLE_FOR_SECOND_CONNECTION=NO"
+                          mark_unqualified SOCKET_NOT_AVAILABLE_AFTER_FIRST_CONNECTION
+                        fi
+
+                        run_client PING
+                        response_unit_two=$(response_field "$CLIENT_RESPONSE" UNIT)
+                        event_count_two=$(event_count)
+                        if [[ $CLIENT_RC == 0 && $CLIENT_OUTPUT == *ZERO_CAPABILITY_CLIENT_PROOF=PASS* && $CLIENT_OUTPUT == *"CLIENT_UID=$QUAL_UID"* && $CLIENT_OUTPUT == *"CLIENT_GID=$QUAL_GID"* && $CLIENT_OUTPUT == *"CLIENT_SUPPLEMENTARY_GROUPS=[]"* && $event_count_two == 2 ]] && event_by_index 2; then
+                          unit_two=$event_unit
+                          pid_two=$event_pid
+                          invocation_two=$event_invocation
+                          echo "CONNECTION_TWO_UNIT=$unit_two"
+                          echo "CONNECTION_TWO_SERVICE_PID=$pid_two"
+                          echo "CONNECTION_TWO_INVOCATION_ID=$invocation_two"
+                          if [[ $unit_two == "$response_unit_two" && $unit_two != "$unit_one" && $pid_two != "$pid_one" && $invocation_two != "$invocation_one" && $event_peer_pid == "$CLIENT_PID" && $event_peer_uid == "$QUAL_UID" && $event_peer_gid == "$QUAL_GID" && $event_family == True && $event_type == True && $event_accepted == True && $event_root == True && $event_request == PING ]]; then
+                            SECOND_CONNECTION_NEW_INSTANCE=YES
+                            PER_CONNECTION_INSTANCE=PASS
+                            echo "SECOND_CONNECTION_NEW_INSTANCE=$SECOND_CONNECTION_NEW_INSTANCE"
+                            echo "PER_CONNECTION_INSTANCE=$PER_CONNECTION_INSTANCE;one-new-service-event-per-connection"
+                          else
+                            SECOND_CONNECTION_NEW_INSTANCE=NO
+                            PER_CONNECTION_INSTANCE=FAIL
+                            echo "SECOND_CONNECTION_NEW_INSTANCE=$SECOND_CONNECTION_NEW_INSTANCE"
+                            echo "PER_CONNECTION_INSTANCE=$PER_CONNECTION_INSTANCE"
+                            mark_unqualified SECOND_CONNECTION_NOT_A_DISTINCT_INSTANCE
+                          fi
+                          if wait_unit_inactive "$unit_two"; then
+                            echo "SECOND_SERVICE_EXIT=PASS"
+                          else
+                            echo "SECOND_SERVICE_EXIT=FAIL"
+                            mark_unqualified SECOND_SERVICE_DID_NOT_EXIT
+                          fi
+
+                          run_client HOLD
+                          response_unit_three=$(response_field "$CLIENT_RESPONSE" UNIT)
+                          event_count_three=$(event_count)
+                          if [[ $CLIENT_RC == 0 && $CLIENT_OUTPUT == *ZERO_CAPABILITY_CLIENT_PROOF=PASS* && $CLIENT_OUTPUT == *"CLIENT_UID=$QUAL_UID"* && $CLIENT_OUTPUT == *"CLIENT_GID=$QUAL_GID"* && $CLIENT_OUTPUT == *"CLIENT_SUPPLEMENTARY_GROUPS=[]"* && $event_count_three == 3 ]] && event_by_index 3; then
+                            hold_unit=$event_unit
+                            echo "HOLD_CONNECTION_UNIT=$hold_unit"
+                            hold_state=$(sudo -n /usr/bin/systemctl show "$hold_unit" -p ActiveState --value 2>/dev/null || true)
+                            echo "HOLD_SERVICE_STATE_BEFORE_STOP=$hold_state"
+                            if [[ $hold_unit == "$response_unit_three" && $hold_unit != "$unit_one" && $hold_unit != "$unit_two" && $hold_state == active && $event_request == HOLD && $event_root == True ]]; then
+                              if sudo -n /usr/bin/systemctl stop "$SOCKET_UNIT_NAME"; then
+                                stopped_socket_state=$(sudo -n /usr/bin/systemctl is-active "$SOCKET_UNIT_NAME" 2>&1 || true)
+                                set +e
+                                post_stop_output=$(sudo -n "$SETPRIV_PATH" --reuid "$QUAL_UID" --regid "$QUAL_GID" --clear-groups \
+                                  --no-new-privs --inh-caps=-all --bounding-set=-all --ambient-caps=-all \
+                                  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 "$CLIENT_SCRIPT" "$SOCKET_PATH" PING 2>&1)
+                                post_stop_rc=$?
+                                set -e
+                                post_stop_error=$(printf '%s\n' "$post_stop_output" | tail -n 1 | cut -c1-180)
+                                post_stop_event_count=$(event_count)
+                                echo "SOCKET_STATE_AFTER_STOP=$stopped_socket_state"
+                                echo "POST_STOP_CONNECT_EXIT=$post_stop_rc"
+                                echo "POST_STOP_CONNECT_RESULT=$post_stop_error"
+                                echo "POST_STOP_EVENT_COUNT=$post_stop_event_count"
+                                if [[ $stopped_socket_state != active && $post_stop_rc != 0 && $post_stop_event_count == 3 ]]; then
+                                  STOP_PREVENTS_NEW_CONNECTIONS=YES
+                                  echo "STOP_PREVENTS_NEW_CONNECTIONS=YES"
+                                else
+                                  STOP_PREVENTS_NEW_CONNECTIONS=NO
+                                  echo "STOP_PREVENTS_NEW_CONNECTIONS=NO"
+                                  mark_unqualified SOCKET_STOP_DID_NOT_PREVENT_NEW_CONNECTIONS
+                                fi
+                                if sudo -n /usr/bin/systemctl stop "$hold_unit" && wait_unit_inactive "$hold_unit"; then
+                                  hold_after_stop=$(sudo -n /usr/bin/systemctl show "$hold_unit" -p ActiveState --value 2>/dev/null || echo unknown)
+                                  echo "HOLD_SERVICE_TERMINATED_BY_SYSTEMD=YES"
+                                  echo "HOLD_SERVICE_UNIT_STATE_AFTER_STOP=$hold_after_stop"
+                                  SERVICE_LIFECYCLE_PROOF=YES
+                                  SERVICE_LIFECYCLE=PASS
+                                  echo "SERVICE_LIFECYCLE=$SERVICE_LIFECYCLE;one-service-per-connection;bounded-request-exit;second-connection-new-instance;socket-stop-blocks-new-connect;active-instance-stopped-and-read-back"
+                                else
+                                  SERVICE_LIFECYCLE=FAIL
+                                  echo "SERVICE_LIFECYCLE=$SERVICE_LIFECYCLE"
+                                  mark_unqualified ACTIVE_SERVICE_INSTANCE_NOT_DETERMINISTICALLY_STOPPED
+                                fi
+                              else
+                                mark_unqualified SOCKET_UNIT_STOP_FAILED
+                              fi
+                            else
+                              mark_unqualified HOLD_SERVICE_NOT_OBSERVABLY_ACTIVE
+                            fi
+                          else
+                            mark_unqualified THIRD_CONNECTION_EVENT_NOT_RECORDED
+                          fi
+                        else
+                          mark_unqualified SECOND_CONNECTION_EVENT_NOT_RECORDED
+                        fi
+                      else
+                        mark_unqualified FIRST_PEER_OR_HANDOFF_PROOF_FAILED
+                      fi
+                    else
+                      mark_unqualified FIRST_CLIENT_CONNECTION_FAILED
+                    fi
+                  else
+                    mark_unqualified ZERO_CAPABILITY_CLIENT_CONTROLS_UNAVAILABLE
+                  fi
+                else
+                  DAEMON_RELOAD=FAIL
+                  mark_unqualified SYSTEMD_SOCKET_START_FAILED
+                fi
+              else
+                DAEMON_RELOAD=FAIL
+                mark_unqualified SYSTEMD_DAEMON_RELOAD_FAILED
+              fi
+              echo "DAEMON_RELOAD=$DAEMON_RELOAD"
+            fi
+          else
+            mark_unqualified REAL_SYSTEMD_QUALIFICATION_PREREQUISITE_MISSING
+          fi
+
+          echo "DIAGNOSTIC_REQUEST_SEMANTICS=PING_OR_FIXED_HOLD_ONLY;NO_PRODUCT_AUTHORITY_OR_REPLAY"
+          cleanup_objects
+          trap - EXIT
+          SYSTEMD_TARGET_QUALIFICATION=UNQUALIFIED
+          if [[ $ALL_PROOFS == 1 && $CLEANUP_OK == 1 && $SOCKET_PROOF == YES && $CLIENT_PROOF == YES && $SERVICE_LIFECYCLE_PROOF == YES && $UID_MAP_KIND == IDENTITY && $GID_MAP_KIND == IDENTITY && $UID_CANDIDATE_MAP == IDENTITY && $GID_CANDIDATE_MAP == IDENTITY ]]; then
+            SYSTEMD_TARGET_QUALIFICATION=QUALIFIED
+          fi
+          echo "SYSTEMD_TARGET_QUALIFICATION=$SYSTEMD_TARGET_QUALIFICATION"
+          echo "INHERITED_NAMESPACE_DEFECT=OPEN_UNCHANGED"
+          echo "PRODUCT_SEMANTICS_PROVEN_BAD=NO"
+          echo "G3_ATTEMPT_IMPACT=NONE"
+          echo "PRODUCT_MUTATION_PERFORMED=NO"
+          echo "VALIDATION_MUTATION_PERFORMED=NO"
+          echo "DIAGNOSTIC_ONLY_MUTATION=YES"
+          echo "SUBAGENTS_USED=NO"
+          echo "G2_RESUMED=NO"
+          echo "G3_LAUNCHED=NO"
+          echo "G4_LAUNCHED=NO"
+          echo "READY_CHANGED=NO"
+          echo "MERGE_PERFORMED=NO"
+          if [[ $CLEANUP_OK == 1 ]]; then
+            echo "RESULT=G0_EVIDENCE_COMPLETE"
+          else
+            echo "RESULT=G0_EVIDENCE_COMPLETE_WITH_CLEANUP_FAILURE"
+            exit 1
+          fi
