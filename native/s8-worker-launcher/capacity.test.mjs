@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { assertProcessCgroup, processUid, readUnifiedCgroupPath, validateDockerRuntimeInfo } from "./host-state.mjs";
-import { expectedCgroupBudgets, measurePhysicalHost, rootlessCgroupPaths, snapshotCgroupTree } from "./capacity.mjs";
+import { assertWorkerScopesQuiescent, expectedCgroupBudgets, measurePhysicalHost, rootlessCgroupPaths, snapshotCgroupTree } from "./capacity.mjs";
 
 const gib = 1024 ** 3;
 const mb = 1024 ** 2;
@@ -114,6 +114,26 @@ test("live cgroup snapshot binds finite ceilings and rejects an unexpected sibli
     assert.match(first.sha256, /^[0-9a-f]{64}$/u);
     mkdirSync(join(root, "swooshz.slice/swooshz-non-design/swooshz-non-design-uninventoried.slice"), { recursive: true });
     assert.throws(() => snapshotCgroupTree(root, proof), /cgroup-inventory-drift/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("startup rejects an orphaned populated Docker worker scope", () => {
+  const root = mkdtempSync(join(tmpdir(), "s8-worker-scope-"));
+  try {
+    const proof = sampleProof();
+    installCgroupFixture(root, proof);
+    const worker = rootlessCgroupPaths(proof.allocation.rootlessDockerUid).workers;
+    const scope = join(root, worker.slice(1), "docker-" + "a".repeat(64) + ".scope");
+    mkdirSync(scope, { recursive: true });
+    writeFileSync(join(scope, "cgroup.events"), "populated 1\nfrozen 0\n");
+    writeFileSync(join(scope, "cgroup.procs"), "456\n");
+    assert.throws(() => assertWorkerScopesQuiescent(root, proof), /worker-scope-not-quiescent/u);
+    writeFileSync(join(scope, "cgroup.events"), "populated 0\nfrozen 0\n");
+    assert.throws(() => assertWorkerScopesQuiescent(root, proof), /worker-scope-not-quiescent/u);
+    writeFileSync(join(scope, "cgroup.procs"), "\n");
+    assert.doesNotThrow(() => assertWorkerScopesQuiescent(root, proof));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

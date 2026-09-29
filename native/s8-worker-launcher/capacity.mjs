@@ -167,6 +167,22 @@ function assertWorkerScopes(cgroupRoot, logicalPath) {
   if (actual.length > 1 || actual.some((name) => !/^docker-[0-9a-f]{64}\.scope$/u.test(name))) throw new Error("cgroup-inventory-drift");
 }
 
+export function assertWorkerScopesQuiescent(cgroupRoot, proof) {
+  const workers = rootlessCgroupPaths(proof?.allocation?.rootlessDockerUid).workers;
+  const actual = childDirectories(cgroupDir(cgroupRoot, workers));
+  if (actual.length > 1 || actual.some((name) => !/^docker-[0-9a-f]{64}\.scope$/u.test(name))) throw new Error("cgroup-inventory-drift");
+  for (const name of actual) {
+    const scope = workers + "/" + name;
+    const directory = cgroupDir(cgroupRoot, scope);
+    const populated = readText(join(directory, "cgroup.events")).split(/\r?\n/u)
+      .filter((line) => /^populated\s+\d+$/u.test(line));
+    if (populated.length !== 1 || populated[0] !== "populated 0"
+      || readText(join(directory, "cgroup.procs")) !== "" || childDirectories(directory).length !== 0) {
+      throw new Error("worker-scope-not-quiescent");
+    }
+  }
+}
+
 export function snapshotCgroupTree(cgroupRoot, proof) {
   if (!HEX64.test(proof.cgroupTreeSha256)) throw new Error("cgroup-digest");
   const groups = expectedCgroupBudgets(proof);

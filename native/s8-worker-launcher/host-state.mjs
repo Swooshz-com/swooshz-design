@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { verifyCapacityProof, verifyReleaseManifest } from "../s8-worker-common/admission.mjs";
 import { jcs, sha256 } from "../s8-worker-common/protocol.mjs";
 import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "../s8-worker-common/resource-policy.mjs";
-import { assertMeasuredHost, measurePhysicalHost, rootlessCgroupPaths, snapshotCgroupTree } from "./capacity.mjs";
+import { assertMeasuredHost, assertWorkerScopesQuiescent, measurePhysicalHost, rootlessCgroupPaths, snapshotCgroupTree } from "./capacity.mjs";
 import { readJsonFile } from "./config.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -221,5 +221,8 @@ export async function reconcileStartup(config) {
     if (remaining.length !== 0) throw new Error("container-remains");
   }
   await verifyDocker(config);
+  const signedProof = readJsonFile(config.capacityProofFile, 256 * 1024);
+  const capacity = verifyCapacityProof(signedProof, config.capacityAuthorityKeys);
+  assertWorkerScopesQuiescent(config.cgroupRoot, capacity.proof);
   return ids.length;
 }
