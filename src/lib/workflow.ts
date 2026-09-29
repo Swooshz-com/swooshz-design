@@ -47,8 +47,7 @@ import { createS6SourceReader, type S6SourceReader } from "./s6-source";
 import { assertS5MutationAllowed } from "./s5-lock";
 import { S7CadService, type S7PublicationPhaseHook } from "./s7-cad";
 import { S8ExportService, type S8ExportAdapters, type S8PublicationPhaseHook } from "./s8";
-import { readS8RuntimeConfig } from "./s8-fbx-config";
-import type { S8WorkerConfig } from "./s8-fbx-worker";
+import { readS8RuntimeConfig, type S8NativeWorkerConfig } from "./s8-fbx-config";
 
 
 export type WorkflowServiceOptions = {
@@ -74,7 +73,7 @@ export type WorkflowServiceOptions = {
   onS6PublicationPhase?: S6WorkflowServiceOptions["onPublicationPhase"];
   onS7PublicationPhase?: S7PublicationPhaseHook;
   s8Adapters?: S8ExportAdapters;
-  s8WriterConfig?: S8WorkerConfig;
+  s8NativeWorkerConfig?: S8NativeWorkerConfig;
   onS8PublicationPhase?: S8PublicationPhaseHook;
 };
 
@@ -302,7 +301,7 @@ export class WorkflowService {
       processId: this.processId,
       isProcessAlive: this.isProcessAlive,
       adapters: options.s8Adapters,
-      writerConfig: options.s8WriterConfig ?? readS8RuntimeConfig(),
+      nativeWorkerConfig: options.s8NativeWorkerConfig ?? readS8RuntimeConfig(),
       onPublicationPhase: options.onS8PublicationPhase,
     });
     this.s8.recoverPending();

@@ -159,21 +159,41 @@ S7 validation must prove representative export/import preserves units, booth dim
 S7 output is design CAD, not fabrication/shop drawings.
 
 ## Editable 3D / 3ds Max handoff architecture
-S8 derives editable 3D from the same accepted spatial revision used by S7.
 
-The handoff must preserve useful:
-- World units and coordinate convention.
-- Major geometry/dimensions.
-- Object identity/hierarchy/names.
-- Object transforms.
-- Material references/assignments where supported.
-- Cameras/views where useful.
+S8 derives an editable 3D handoff from the accepted S6 spatial revision. The terminal committed S7 artifact and independent readback are same-source cross-output evidence only; DXF is never the 3D geometry authority.
 
-The MVP requirement is a production-useful file that imports into 3ds Max with editable geometry and preserved major dimensions/hierarchy.
+The accepted production/Alpha execution path is:
 
-Native `.max` is not mandatory unless S8 G1/G2 proves a licensed, deterministic and supportable automation path. FBX or another proven editable Max-compatible format may satisfy the accepted contract.
+    accepted S6 source + S7 cross-output evidence
+      -> Design application persists a source-fenced job and attempt
+      -> signed bounded request over private transport
+      -> private Coolify gateway verifies and relays
+      -> narrow host-owned launcher verifies and admits
+      -> dedicated rootless runtime starts a fresh Writer container
+      -> application privately stages and reads back the bounded candidate
+      -> separate fresh Validator container checks those exact bytes
+      -> application independently checks S6/S7 semantics and source freshness
+      -> immutable private object promotion and verified readback
+      -> conditional durable commit and authenticated download
 
-Validation must prove import consistency and explicitly report unsupported/degraded materials or other semantics. No material geometry may silently disappear or be invented.
+The persistent gateway is an admission/streaming relay only. A trusted host-owned launcher controls only its dedicated unprivileged rootless Docker daemon, run as a dedicated systemd user service under a UID-specific, delegated cgroup-v2 subtree. Each Writer and Validator operation uses a new immutable image container. The two operations never share a live container, writable mount, process namespace, or executable state. The application, gateway, Writer, and Validator receive no rootful Docker socket. No local-process, rootful-runtime, public-gateway, or unconfined fallback is permitted.
+
+Writer and Validator retain these hard per-container maxima:
+
+| Operation | CPU maximum | Memory maximum | PID maximum |
+| --- | ---: | ---: | ---: |
+| Writer | 2 CPUs | 4 GiB | 80 |
+| Validator | 1 CPU | 1.5 GiB | 32 |
+
+The initial concurrency limit is one native operation across the complete Design worker. Rootless runtime, cgroup-v2 CPU/memory/PID enforcement, network isolation, seccomp, applicable AppArmor, image digests, teardown, and release identity must be read back by the launcher. Resource ceilings are not inferred from container flags alone.
+
+Native worker admission is CLOSED unless an unexpired Owner-signed host-capacity proof and fresh launcher-signed realization observation prove the allocation, current workload inventory, effective cgroup tree, release manifest, and required contention/resource-limit tests. PROVING permits synthetic operator-controlled capacity tests only. CLOSED and PROVING never dispatch product Writer/Validator jobs. Missing, invalid, or drifted proof remains CLOSED.
+
+Capacity provisioning and numeric shared-host allocation are deferred to issue #70 and are hard prerequisites only for native OPEN. The current 2-vCPU host cannot provide the frozen 2-CPU Writer ceiling plus positive CPU budgets for the Design application, gateway/launcher/runtime, streaming, sibling workloads, and protected host reserve. Instantaneous MemAvailable is not a reservation. This capacity finding does not block repository implementation or Alpha control-plane deployment.
+
+The executable protocol, proof, job/attempt, container, recovery, release, and publication requirements are recorded in the [S8 native worker executable contract](G2_S8_NATIVE_WORKER_CONTRACT.md).
+
+Only the application writes publication state or grants downloads. It commits an artifact only after independent native validation, S6 semantic comparison, exact private-object readback, integrity verification, and a fresh source/claim check. Stale, partial, ambiguous, or unverified outputs remain unavailable.
 
 ## Autodesk APS policy
 Autodesk APS is optional infrastructure, not an MVP outcome and not automatically required for AutoCAD/3ds Max interoperability.

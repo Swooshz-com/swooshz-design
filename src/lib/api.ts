@@ -110,7 +110,7 @@ const PUBLIC_S8_ERROR_CODES = new Set<string>([
   "S8_RUNTIME_IDENTITY_MISMATCH", "S8_EXPORTER_IDENTITY_MISMATCH", "S8_EXPORTER_PATCH_IDENTITY_MISMATCH",
   "S8_NATIVE_READBACK_INVALID", "S8_FBX_PROFILE_INVALID", "S8_PUBLICATION_OBJECT_MISMATCH", "S8_REUSE_FINGERPRINT_INVALID",
   "S8_ARTIFACT_NOT_COMMITTED", "S8_PUBLICATION_FAILED", "S8_PERSISTENCE_INVALID", "S8_CONTROLLER_REQUIRED",
-  "S8_SOURCE_NOT_FOUND", "S8_INTERNAL_ERROR",
+  "S8_SOURCE_NOT_FOUND", "S8_WORKER_ADMISSION_CLOSED", "S8_INTERNAL_ERROR",
 ]);
 const S4_PUBLIC_FIELDS = new Set(["body", "projectId", "baseRevisionId", "expectedSelectionVersion", "primitives", "instructionText", "editId", "targetId", "Idempotency-Key", "x-request-id", "request"]);
 const S4_PUBLIC_FIELD_CODES = new Set(["REQUIRED", "UNKNOWN_FIELD", "JSON_REQUIRED", "JSON_OBJECT_REQUIRED", "BODY_LENGTH_INVALID", "BODY_TOO_LARGE", "EMPTY_BODY_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "UUID_REQUIRED", "INVALID_VALUE", "INVALID_REQUEST"]);
@@ -1417,6 +1417,12 @@ async function handleS8(
   void subjectId;
   const projectId = segments[1] as UUID;
   if (segments.length === 3) throw new AppError(405, "METHOD_NOT_ALLOWED");
+  if (segments.length === 4 && segments[3] === "admission") {
+    if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
+    await requireEmptyBody(request);
+    const admission = await service.s8.getAdmissionStatus();
+    return NextResponse.json({ state: admission.state }, { status: 200, headers: { "cache-control": "no-store" } });
+  }
   if (segments.length === 4 && segments[3] === "handoff") {
     if (method !== "GET") throw new AppError(405, "METHOD_NOT_ALLOWED");
     await requireEmptyBody(request);
@@ -1426,7 +1432,7 @@ async function handleS8(
     if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
     const body = await s8JsonBody(request);
     exactKeys(body, []);
-    const result = service.s8.createExport(projectId, s8IdempotencyKeyFromHeader(request), referenceId);
+    const result = await service.s8.createExport(projectId, s8IdempotencyKeyFromHeader(request), referenceId);
     const status = result.replayed ? 200 : result.export.status === "committed" ? 201 : 202;
     return NextResponse.json(result, { status });
   }

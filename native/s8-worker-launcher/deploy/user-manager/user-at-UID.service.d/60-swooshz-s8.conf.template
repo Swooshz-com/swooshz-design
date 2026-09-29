@@ -1,0 +1,5 @@
+# Install as /etc/systemd/system/user@<rootlessDockerUid>.service.d/60-swooshz-s8.conf
+# This is scoped to the dedicated s8-worker-docker account; do not use user@.service.d.
+[Service]
+Slice=swooshz-design-rootless-docker.slice
+Delegate=cpu memory pids

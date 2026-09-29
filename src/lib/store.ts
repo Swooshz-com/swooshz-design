@@ -159,6 +159,7 @@ export function emptyStoreState(): StoreState {
     s8Artifacts: [],
     s8ValidationReceipts: [],
     s8IdempotencyRecords: [],
+    s8NativeOperationAttempts: [],
   };
 }
 

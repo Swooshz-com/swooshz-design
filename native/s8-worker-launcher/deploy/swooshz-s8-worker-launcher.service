@@ -1,0 +1,42 @@
+[Unit]
+Description=Swooshz S8 native worker host launcher
+After=network.target
+
+[Service]
+Type=simple
+User=s8-worker-launcher
+Group=s8-worker-launcher
+SupplementaryGroups=s8-worker-docker
+Slice=swooshz-design-launcher.slice
+Environment=HOME=/var/lib/swooshz-s8-launcher
+Environment=DOCKER_HOST=unix:///run/swooshz-s8/docker.sock
+EnvironmentFile=/etc/swooshz/s8-worker-launcher.env
+ExecStartPre=/usr/bin/test -r /etc/swooshz/s8-capacity-proof.json
+ExecStart=/usr/bin/node /opt/swooshz/s8-worker-launcher/launcher.mjs
+WorkingDirectory=/opt/swooshz/s8-worker-launcher
+StateDirectory=swooshz-s8-launcher
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/proc /sys
+ReadWritePaths=/var/lib/swooshz-s8-launcher
+
+[Install]
+WantedBy=multi-user.target

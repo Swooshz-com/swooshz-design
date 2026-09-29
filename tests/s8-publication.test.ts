@@ -96,6 +96,7 @@ type FixtureOptions = {
   omitWriterEvidence?: boolean;
   omitValidatorEvidence?: boolean;
   omitValidatorIdentity?: boolean;
+  admissionClosed?: boolean;
   nativeReadback?: S8UfbxReadback;
 };
 
@@ -116,8 +117,10 @@ function serviceFixture(options: FixtureOptions = {}) {
       { name: s8StableName(0, "object-1"), parent: "SWZ_ROOT", sourceObjectId: "object-1", identityKey: "object-1", effectiveScale: [1, 1, 1], nodeToParent: identityMatrix, nodeToWorld: identityMatrix, mesh: null },
     ],
   };
+  let writerCalls = 0;
   const adapters: S8ExportAdapters = {
     writer: (payloadBytes) => {
+      writerCalls += 1;
       const artifact = Buffer.alloc(32, 7);
       const value: Record<string, unknown> = { artifact, stdout: "", stderr: "", receipt: { schemaVersion: "swooshz-fbx-writer-receipt-v1", profile: "swooshz-fbx-static-mesh-v1", payloadSha256: s8Sha256(payloadBytes), writerScriptSha256: hash, artifactSha256: s8Sha256(artifact), artifactByteSize: artifact.length, fbxHeaderVersion: 7400, objectCount: 1, controlPointCount: 8, triangleCount: 12, runtime: {} } };
       if (!options.omitWriterEvidence) value.runnerEvidence = options.writerEvidence ?? runnerEvidence("writer");
@@ -131,14 +134,14 @@ function serviceFixture(options: FixtureOptions = {}) {
     },
     semanticValidator: () => semanticResult(),
   };
-  const service = new S8ExportService({ repository, objects, s6: { getS7Handoff: () => s6 } as never, s7: { getHandoff: () => s7 } as never, adapters, ownerId: "test-owner", processId: process.pid, isProcessAlive: () => false });
-  return { root, repository, objects, service };
+  const service = new S8ExportService({ repository, objects, s6: { getS7Handoff: () => s6 } as never, s7: { getHandoff: () => s7 } as never, adapters, admissionReader: async () => ({ state: options.admissionClosed ? "CLOSED" : "OPEN", reason: options.admissionClosed ? "CAPACITY_NOT_OPEN" : null, proofSha256: options.admissionClosed ? null : hash, observedAt: options.admissionClosed ? null : "2026-09-29T00:00:00.000Z" }), ownerId: "test-owner", processId: process.pid, isProcessAlive: () => false });
+  return { root, repository, objects, service, get writerCalls() { return writerCalls; } };
 }
 
-function rejects(options: FixtureOptions, key: string): void {
+async function rejects(options: FixtureOptions, key: string): Promise<void> {
   const fixture = serviceFixture(options);
   try {
-    assert.throws(() => fixture.service.createExport(projectId, key, "77777777-7777-4777-8777-777777777777"), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
+    await assert.rejects(() => fixture.service.createExport(projectId, key, "77777777-7777-4777-8777-777777777777"), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -155,10 +158,22 @@ function replacePublicationReceipt(fixture: ReturnType<typeof serviceFixture>, a
   });
 }
 
-test("S8 publication binds caller-verified v2 evidence and reuses the immutable graph", () => {
+test("native dispatch remains closed and does not create an export without OPEN admission", async () => {
+  const fixture = serviceFixture({ admissionClosed: true });
+  try {
+    assert.equal((await fixture.service.getAdmissionStatus()).state, "CLOSED");
+    await assert.rejects(() => fixture.service.createExport(projectId, "closed-admission", "77777777-7777-4777-8777-777777777777"), /S8_WORKER_ADMISSION_CLOSED/);
+    assert.equal(fixture.writerCalls, 0);
+    assert.equal(fixture.repository.state().s8ExportJobs?.length ?? 0, 0);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("S8 publication binds caller-verified v2 evidence and reuses the immutable graph", async () => {
   const fixture = serviceFixture();
   try {
-    const first = fixture.service.createExport(projectId, "idempotency-key", "77777777-7777-4777-8777-777777777777");
+    const first = await fixture.service.createExport(projectId, "idempotency-key", "77777777-7777-4777-8777-777777777777");
     assert.equal(first.export.status, "committed");
     assert.equal(first.export.publicationPhase, "commit");
     assert.equal("privateFinalPrefix" in first.export, false);
@@ -172,7 +187,7 @@ test("S8 publication binds caller-verified v2 evidence and reuses the immutable 
     assert.equal(persistedWriterEvidence.verifiedByCaller.receiptSha256, s8Sha256(canonicalS8RunnerReceiptBytes(persistedWriterEvidence)));
     const downloaded = fixture.service.download(projectId, first.export.artifactId);
     assert.equal(downloaded.bytes.length, 32);
-    const replay = fixture.service.createExport(projectId, "idempotency-key", "77777777-7777-4777-8777-777777777777");
+    const replay = await fixture.service.createExport(projectId, "idempotency-key", "77777777-7777-4777-8777-777777777777");
     assert.equal(replay.replayed, true);
     assert.deepEqual(replay.export.objectHashes, first.export.objectHashes);
     assert.deepEqual(replay.export, first.export);
@@ -181,53 +196,53 @@ test("S8 publication binds caller-verified v2 evidence and reuses the immutable 
   }
 });
 
-test("S8 publication rejects every missing or malformed caller evidence layer", () => {
-  rejects({ omitWriterEvidence: true }, "missing-writer-evidence");
-  rejects({ omitValidatorEvidence: true }, "missing-validator-evidence");
-  rejects({ omitValidatorIdentity: true }, "missing-validator-identity");
+test("S8 publication rejects every missing or malformed caller evidence layer", async () => {
+  await rejects({ omitWriterEvidence: true }, "missing-writer-evidence");
+  await rejects({ omitValidatorEvidence: true }, "missing-validator-evidence");
+  await rejects({ omitValidatorIdentity: true }, "missing-validator-identity");
 
   const missingEnvelope = runnerEvidence("writer");
   delete (missingEnvelope as unknown as Record<string, unknown>).verifiedByCaller;
-  rejects({ writerEvidence: missingEnvelope }, "missing-caller-envelope");
+  await rejects({ writerEvidence: missingEnvelope }, "missing-caller-envelope");
 
   const wrongSchema = runnerEvidence("writer");
   (wrongSchema as unknown as Record<string, unknown>).schemaVersion = "s8-process-runner-receipt-v1";
-  rejects({ writerEvidence: wrongSchema }, "wrong-schema");
+  await rejects({ writerEvidence: wrongSchema }, "wrong-schema");
 
   const wrongPolicy = runnerEvidence("writer");
   (wrongPolicy as unknown as Record<string, unknown>).policyId = "wrong-policy";
-  rejects({ writerEvidence: wrongPolicy }, "wrong-policy");
+  await rejects({ writerEvidence: wrongPolicy }, "wrong-policy");
 
   const requestedMismatch = runnerEvidence("writer");
   requestedMismatch.requested.rlimitAsBytes -= 1;
-  rejects({ writerEvidence: requestedMismatch }, "requested-mismatch");
+  await rejects({ writerEvidence: requestedMismatch }, "requested-mismatch");
 
   const childMismatch = runnerEvidence("writer");
   childMismatch.appliedByChild.rlimitFsizeBytes -= 1;
-  rejects({ writerEvidence: childMismatch }, "child-applied-mismatch");
+  await rejects({ writerEvidence: childMismatch }, "child-applied-mismatch");
 
   const parentMismatch = runnerEvidence("validator");
   parentMismatch.observedByRunnerParent.rlimitCpuSeconds -= 1;
-  rejects({ validatorEvidence: parentMismatch }, "parent-observed-mismatch");
+  await rejects({ validatorEvidence: parentMismatch }, "parent-observed-mismatch");
 
   const hashMismatch = runnerEvidence("writer");
   hashMismatch.runnerBinary.selfSha256 = "d".repeat(64);
-  rejects({ writerEvidence: hashMismatch }, "runner-reported-hash-mismatch");
+  await rejects({ writerEvidence: hashMismatch }, "runner-reported-hash-mismatch");
 
   const callerHashDrift = runnerEvidence("writer");
   callerHashDrift.verifiedByCaller.postLaunchSha256 = "e".repeat(64);
-  rejects({ writerEvidence: callerHashDrift }, "pre-post-hash-drift");
+  await rejects({ writerEvidence: callerHashDrift }, "pre-post-hash-drift");
 
   const seccompMissing = runnerEvidence("validator");
   (seccompMissing.appliedByChild as unknown as Record<string, unknown>).seccompMode = 0;
-  rejects({ validatorEvidence: seccompMissing }, "seccomp-missing");
+  await rejects({ validatorEvidence: seccompMissing }, "seccomp-missing");
 });
 
-test("initial publication rejects missing or mismatched physical provenance and root provenance", () => {
+test("initial publication rejects missing or mismatched physical provenance and root provenance", async () => {
   const baseline = serviceFixture();
   let validReadback: S8UfbxReadback;
   try {
-    const created = baseline.service.createExport(projectId, "provenance-positive", "77777777-7777-4777-8777-777777777777");
+    const created = await baseline.service.createExport(projectId, "provenance-positive", "77777777-7777-4777-8777-777777777777");
     assert.equal(created.export.status, "committed");
     const artifact = baseline.repository.state().s8Artifacts!.find((value: S8Artifact) => value.artifactId === created.export.artifactId)!;
     validReadback = JSON.parse(baseline.objects.read(`${artifact.privateFinalPrefix}/native-readback.json`).toString("utf8")) as S8UfbxReadback;
@@ -254,17 +269,17 @@ test("initial publication rejects missing or mismatched physical provenance and 
   for (const [index, nativeReadback] of invalidReadbacks.entries()) {
     const fixture = serviceFixture({ nativeReadback });
     try {
-      assert.throws(() => fixture.service.createExport(projectId, `bad-provenance-${index}`, "88888888-8888-4888-8888-888888888888"), /S8_SOURCE_IDENTITY_MISMATCH/);
+      await assert.rejects(() => fixture.service.createExport(projectId, `bad-provenance-${index}`, "88888888-8888-4888-8888-888888888888"), /S8_SOURCE_IDENTITY_MISMATCH/);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
     }
   }
 });
 
-test("S8 download re-hashes immutable bytes before serving", () => {
+test("S8 download re-hashes immutable bytes before serving", async () => {
   const fixture = serviceFixture();
   try {
-    const created = fixture.service.createExport(projectId, "tamper-key", "88888888-8888-4888-8888-888888888888");
+    const created = await fixture.service.createExport(projectId, "tamper-key", "88888888-8888-4888-8888-888888888888");
     const persisted = fixture.repository.state().s8Artifacts!.find((item: S8Artifact) => item.artifactId === created.export.artifactId)!;
     const finalKey = `${persisted.privateFinalPrefix}/artifact.fbx`;
     fixture.objects.remove(finalKey);
@@ -275,11 +290,11 @@ test("S8 download re-hashes immutable bytes before serving", () => {
   }
 });
 
-test("reuse rejects legacy and copied-only caller verification evidence", () => {
+test("reuse rejects legacy and copied-only caller verification evidence", async () => {
   for (const mode of ["missing", "copied-status-only"] as const) {
     const fixture = serviceFixture();
     try {
-      const created = fixture.service.createExport(projectId, `legacy-evidence-${mode}`, "88888888-8888-4888-8888-888888888888");
+      const created = await fixture.service.createExport(projectId, `legacy-evidence-${mode}`, "88888888-8888-4888-8888-888888888888");
       const artifact = fixture.repository.state().s8Artifacts!.find((item: S8Artifact) => item.artifactId === created.export.artifactId)!;
       const publication = JSON.parse(fixture.objects.read(`${artifact.privateFinalPrefix}/publication-receipt.json`).toString("utf8")) as Record<string, unknown>;
       const identity = publication.identity as { runner: { writer: Record<string, unknown> } };
@@ -293,10 +308,10 @@ test("reuse rejects legacy and copied-only caller verification evidence", () => 
   }
 });
 
-test("reuse revalidates persisted native provenance against current accepted S6", () => {
+test("reuse revalidates persisted native provenance against current accepted S6", async () => {
   const fixture = serviceFixture();
   try {
-    const created = fixture.service.createExport(projectId, "persisted-provenance-key", "88888888-8888-4888-8888-888888888888");
+    const created = await fixture.service.createExport(projectId, "persisted-provenance-key", "88888888-8888-4888-8888-888888888888");
     const artifact = fixture.repository.state().s8Artifacts!.find((item: S8Artifact) => item.artifactId === created.export.artifactId)!;
     const nativeKey = `${artifact.privateFinalPrefix}/native-readback.json`;
     const native = JSON.parse(fixture.objects.read(nativeKey).toString("utf8")) as S8UfbxReadback;
@@ -332,10 +347,10 @@ test("reuse revalidates persisted native provenance against current accepted S6"
   }
 });
 
-test("S8 recovery commits only a complete promoted object", () => {
+test("S8 recovery commits only a complete promoted object", async () => {
   const fixture = serviceFixture();
   try {
-    const created = fixture.service.createExport(projectId, "recovery-key", "99999999-9999-4999-8999-999999999999");
+    const created = await fixture.service.createExport(projectId, "recovery-key", "99999999-9999-4999-8999-999999999999");
     fixture.repository.transact((state) => {
       const job = state.s8ExportJobs!.find((item) => item.artifactId === created.export.artifactId)!;
       const artifact = state.s8Artifacts!.find((item) => item.artifactId === created.export.artifactId)!;

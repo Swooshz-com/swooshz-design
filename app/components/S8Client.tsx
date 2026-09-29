@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import type { S6ToS7Handoff, S7ToS8Handoff } from "../../src/lib/types";
 
+type S8AdmissionState = "CLOSED" | "PROVING" | "OPEN";
+
 type S8Preparation = {
   profile: "swooshz-fbx-static-mesh-v1";
   semanticVersion: "swooshz-fbx-semantic-v1";
@@ -20,8 +22,14 @@ type S8Export = {
 };
 
 async function readJson<T>(response: Response): Promise<T> {
-  const body = await response.json() as T & { error?: { code?: string } };
-  if (!response.ok) throw new Error(body.error?.code ?? "S8_SOURCE_NOT_READY");
+  const body = await response.json() as T & { error?: { code?: string; message?: string; referenceId?: string } };
+  if (!response.ok) {
+    const reference = body.error?.referenceId ?? "unavailable";
+    const message = body.error?.code === "S8_WORKER_ADMISSION_CLOSED"
+      ? "Native export is unavailable until host capacity is approved and verified."
+      : body.error?.message ?? "Something went wrong. Try again or contact support.";
+    throw new Error(`${message} Reference: ${reference}`);
+  }
   return body;
 }
 export function S8Screen({ projectId }: { projectId: string }) {
@@ -31,25 +39,31 @@ export function S8Screen({ projectId }: { projectId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [exportRecord, setExportRecord] = useState<S8Export | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [workerAdmission, setWorkerAdmission] = useState<S8AdmissionState>("CLOSED");
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      const [nextS6, nextS7, nextS8] = await Promise.all([
+      const [nextS6, nextS7, nextS8, admission] = await Promise.all([
         fetch(`/api/projects/${projectId}/s6/handoff`, { cache: "no-store" }).then((response) => readJson<S6ToS7Handoff>(response)),
         fetch(`/api/projects/${projectId}/s7/handoff`, { cache: "no-store" }).then((response) => readJson<S7ToS8Handoff>(response)),
         fetch(`/api/projects/${projectId}/s8/handoff`, { cache: "no-store" }).then((response) => readJson<S8Preparation>(response)),
+        fetch(`/api/projects/${projectId}/s8/admission`, { cache: "no-store" })
+          .then((response) => readJson<{ state: S8AdmissionState }>(response))
+          .catch(() => ({ state: "CLOSED" as const })), // Status transport failure is closed; the server rechecks before every dispatch.
       ]);
       if (nextS7.sourceRevisionId !== nextS6.acceptedRevisionId || nextS7.sourceRevisionHash !== nextS6.acceptedRevisionHash) throw new Error("S8_SOURCE_BINDING_MISMATCH");
       if (nextS8.sourceRevisionId !== nextS6.acceptedRevisionId || nextS8.sourceRevisionHash !== nextS6.acceptedRevisionHash) throw new Error("S8_SOURCE_BINDING_MISMATCH");
       setS6(nextS6);
       setS7(nextS7);
       setS8(nextS8);
+      setWorkerAdmission(admission.state);
     } catch (caught) {
       setS6(null);
       setS7(null);
       setS8(null);
-      setError(caught instanceof Error ? caught.message : "S8_SOURCE_NOT_READY");
+      setWorkerAdmission("CLOSED");
+      setError(caught instanceof Error ? caught.message : "Something went wrong. Try again or contact support.");
     }
   }, [projectId]);
 
@@ -81,11 +95,13 @@ export function S8Screen({ projectId }: { projectId: string }) {
         <p className="muted">The FBX is derived from the accepted S6 spatial model. Blender serializes explicit Swooshz geometry; it does not remodel or repair the booth.</p>
         <p className="muted">Materials are preview materials only. The export contains no UVs, textures, animation, cameras, lights, or native 3ds Max claims.</p>
         <button type="button" onClick={() => void load()}>Refresh source admission</button>
-        <button type="button" onClick={() => void createExport()} disabled={exporting || !s8}>{exporting ? "Publishing FBX..." : "Create FBX export"}</button>
-        {error ? <p role="alert">Source not ready: {error}</p> : null}
+        <button type="button" onClick={() => void createExport()} disabled={exporting || !s8 || workerAdmission !== "OPEN"}>{exporting ? "Publishing FBX..." : "Create FBX export"}</button>
+        {workerAdmission !== "OPEN" ? <p className="muted">Native Writer and Validator export is unavailable until host capacity is approved and verified.</p> : null}
+        {error ? <p role="alert">{error}</p> : null}
         {s6 && s7 ? (
           <dl>
-            <dt>Status</dt><dd>Ready for isolated FBX worker</dd>
+            <dt>Source handoff</dt><dd>Ready</dd>
+            <dt>Native worker admission</dt><dd>{workerAdmission}</dd>
             <dt>S6 revision</dt><dd><code>{s6.acceptedRevisionId}</code></dd>
             <dt>S6 hash</dt><dd><code>{s6.acceptedRevisionHash}</code></dd>
             <dt>S7 cross-output artifact</dt><dd><code>{s7.s7ArtifactId}</code></dd>

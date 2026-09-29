@@ -72,14 +72,9 @@ test("worker refuses to run without the native Linux process boundary", () => {
   }
 });
 
-test("partial runtime configuration fails closed instead of selecting a fallback", () => {
-  assert.throws(() => readS8RuntimeConfig({ S8_BLENDER_RUNTIME_ROOT: "C:/runtime" }), /S8_RUNTIME_CONFIG_INVALID/);
-  assert.throws(() => readS8RuntimeConfig({
-    S8_BLENDER_RUNTIME_ROOT: "/opt/blender", S8_BLENDER_EXECUTABLE: "/opt/blender/blender", S8_WRITER_SCRIPT: "/opt/swooshz/writer.py",
-    S8_PRIVATE_WORK_ROOT: "/var/lib/swooshz/s8", S8_PROCESS_RUNNER_EXECUTABLE: "/usr/local/libexec/swooshz-s8/s8-process-runner",
-    S8_SANDBOX_EXECUTABLE: "/usr/local/libexec/swooshz-s8/s8-sandbox", S8_SANDBOX_POLICY_SHA256: "A".repeat(64),
-    S8_NATIVE_VALIDATOR_EXECUTABLE: "/usr/local/libexec/swooshz-s8/s8-native-validator", S8_BLENDER_EXECUTABLE_SHA256: "1".repeat(64),
-  }), /S8_RUNTIME_CONFIG_INVALID/);
+test("native worker configuration stays absent or CLOSED when gateway trust material is missing", () => {
+  assert.equal(readS8RuntimeConfig({}), undefined);
+  assert.throws(() => readS8RuntimeConfig({ S8_WORKER_GATEWAY_URL: "https://s8-worker-gateway.internal" }), /S8_NATIVE_WORKER_CONFIG_INVALID/);
 });
 
 test("strict v2 caller parsing accepts only canonical, fully evidenced receipts", () => {
