@@ -22,11 +22,30 @@ function recordPath(directory, tuple) {
   return join(directory, `${tuple}.json`);
 }
 
-function ensurePrivateDirectory(directory) {
+function syncDirectoryEntries(directory) {
+  const fd = openSync(directory, "r");
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+function ensurePrivateDirectory(directory, syncDirectory = syncDirectoryEntries) {
+  if (process.platform !== "linux") throw new Error("ledger-platform-unsupported");
   const absolute = resolve(directory);
-  mkdirSync(absolute, { recursive: true, mode: 0o700 });
-  const info = lstatSync(absolute);
-  if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) throw new Error("ledger-permissions");
+  const chain = [];
+  for (let current = absolute; ; current = dirname(current)) {
+    chain.push(current);
+    const parent = dirname(current);
+    if (parent === current) break;
+  }
+  for (const current of chain.reverse()) {
+    try { mkdirSync(current, { mode: 0o700 }); }
+    catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+    }
+    const info = lstatSync(current);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("ledger-permissions");
+    if (current === absolute && (info.mode & 0o077) !== 0) throw new Error("ledger-permissions");
+    syncDirectory(dirname(current));
+  }
   return absolute;
 }
 
@@ -55,31 +74,55 @@ function validateRecord(value, tuple) {
   return value;
 }
 
-function atomicWrite(directory, path, value) {
+function atomicWrite(directory, path, value, syncDirectory = syncDirectoryEntries) {
   const temporary = join(directory, `.tmp-${randomBytes(16).toString("hex")}`);
   const bytes = Buffer.from(JSON.stringify(value), "utf8");
   let fd = -1;
+  let renamed = false;
   try {
     fd = openSync(temporary, "wx", 0o600);
     writeFileSync(fd, bytes);
     fsyncSync(fd);
-    closeSync(fd); fd = -1;
+    const ownedFd = fd;
+    fd = -1;
+    closeSync(ownedFd);
     renameSync(temporary, path);
-    const dirFd = openSync(directory, "r");
-    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    renamed = true;
+    syncDirectory(directory);
   } catch (error) {
     if (fd >= 0) closeSync(fd);
+    if (renamed) {
+      const failure = new Error("ledger-durability-unknown");
+      failure.durabilityUnproven = true;
+      throw failure;
+    }
     try { unlinkSync(temporary); } catch { /* temp may not exist */ }
     throw error;
   }
 }
 
 export class ReplayLedger {
-  constructor(directory) {
-    this.directory = ensurePrivateDirectory(directory);
+  constructor(directory, options = {}) {
+    this.syncDirectory = options.syncDirectory ?? syncDirectoryEntries;
+    this.poisoned = false;
+    this.directory = ensurePrivateDirectory(directory, this.syncDirectory);
+  }
+
+  assertHealthy() {
+    if (this.poisoned) throw new Error("ledger-durability-unknown");
+  }
+
+  write(path, value) {
+    this.assertHealthy();
+    try { atomicWrite(this.directory, path, value, this.syncDirectory); }
+    catch (error) {
+      if (error && typeof error === "object" && error.durabilityUnproven === true) this.poisoned = true;
+      throw error;
+    }
   }
 
   get(body) {
+    this.assertHealthy();
     const tuple = operationTuple(body);
     const path = recordPath(this.directory, tuple);
     try { return readRecordFile(path, tuple); }
@@ -90,6 +133,7 @@ export class ReplayLedger {
   }
 
   begin(body, requestSha256, releaseManifestSha256, resourcePolicySha256, now = new Date().toISOString()) {
+    this.assertHealthy();
     const tuple = operationTuple(body);
     const path = recordPath(this.directory, tuple);
     try {
@@ -122,21 +166,23 @@ export class ReplayLedger {
       failureClass: null,
       signedFailureFrame: null,
     };
-    atomicWrite(this.directory, path, record);
+    this.write(path, record);
     return record;
   }
 
   update(body, update) {
+    this.assertHealthy();
     const tuple = operationTuple(body);
     const path = recordPath(this.directory, tuple);
     const current = this.get(body);
     if (!current) throw new Error("ledger-missing");
     const next = validateRecord({ ...current, ...update, tuple, schemaVersion: RECORD_SCHEMA, updatedAt: new Date().toISOString() }, tuple);
-    atomicWrite(this.directory, path, next);
+    this.write(path, next);
     return next;
   }
 
   reconcileInflight() {
+    this.assertHealthy();
     let changed = 0;
     for (const name of readdirSync(this.directory)) {
       if (!/^[0-9a-f-]{36}\.[12]\.(WRITER|VALIDATOR)\.json$/u.test(name)) throw new Error("ledger-corrupt");
@@ -146,7 +192,7 @@ export class ReplayLedger {
       try { value = readRecordFile(path, tuple); }
       catch { throw new Error("ledger-corrupt"); }
       if (value.state !== "STARTED") continue;
-      atomicWrite(this.directory, path, { ...value, state: "UNKNOWN", outcome: null, disposalState: "UNKNOWN", failureClass: "UNCERTAIN", signedFailureFrame: null, updatedAt: new Date().toISOString() });
+      this.write(path, { ...value, state: "UNKNOWN", outcome: null, disposalState: "UNKNOWN", failureClass: "UNCERTAIN", signedFailureFrame: null, updatedAt: new Date().toISOString() });
       changed += 1;
     }
     return changed;

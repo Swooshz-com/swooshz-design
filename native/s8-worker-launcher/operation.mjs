@@ -28,6 +28,7 @@ export async function runNativeOperation(config, request, startupReady, closeAdm
   const release = snapshot.release;
   config.ledger.begin(request.body, request.requestSha256, release.sha256, S8_NATIVE_RESOURCE_POLICY_SHA256);
   let containerId = null;
+  let running = null;
   let nativeStarted = false;
   let failureClass = "PERMANENT";
   let outcome = "PERMANENT_FAILURE";
@@ -35,16 +36,17 @@ export async function runNativeOperation(config, request, startupReady, closeAdm
     containerId = (await runDocker(config, createArguments(config, snapshot.capacity, release, request.body.operation, request.requestSha256), 30000)).trim();
     if (!/^[0-9a-f]{64}$/u.test(containerId)) throw new Error("container-create-invalid");
     config.ledger.update(request.body, { containerId, disposalState: "RUNNING" });
-    const running = await startContainer(config, containerId, request.payload, request.body.operation);
+    running = await startContainer(config, containerId, request.payload, request.body.operation);
     await inspectAndVerify(config, containerId, release, request.body.operation, workerBudget(snapshot.capacity.proof, request.body.operation), snapshot.capacity);
     await running.release();
     nativeStarted = true;
     const captured = await running.close(Math.max(1000, request.body.deadlineUnixMs - Date.now()));
+    running = null;
     if (captured.overflow || captured.code !== 0 || captured.signal !== null) throw new Error("worker-process-failed");
     const result = parseContainerResult(captured.stdout, request.body.operation);
     const runnerEvidence = verifyRunnerEvidence(result, request.body.operation, release);
     if (request.body.operation === "WRITER") verifyWriterReceipt(result, request, release);
-    if (!await removeContainer(config, containerId)) throw new Error("container-removal-unproven");
+    if (!await removeContainer(config, containerId, snapshot.capacity.proof.allocation.rootlessDockerUid)) throw new Error("container-removal-unproven");
     const releaseHandle = request.body.operation === "WRITER" ? randomBytes(32).toString("base64url") : request.body.releaseHandle;
     const response = createResponse(config, request, release, containerId, "EXIT_0", result.output, result.auxiliary, runnerEvidence, releaseHandle);
     config.ledger.update(request.body, {
@@ -54,9 +56,14 @@ export async function runNativeOperation(config, request, startupReady, closeAdm
     });
     return response.frame;
   } catch (error) {
+    let attachedProcessUnproven = Boolean(error && typeof error === "object" && error.disposalUnproven === true);
+    if (running) {
+      try { await running.abort(); }
+      catch { attachedProcessUnproven = true; }
+    }
     let removed = false;
-    try { removed = await removeContainer(config, containerId); } catch { /* absence remains unproven */ }
-    if (!removed || !containerId) {
+    try { removed = await removeContainer(config, containerId, snapshot.capacity.proof.allocation.rootlessDockerUid); } catch { /* quiescence remains unproven */ }
+    if (!removed || !containerId || attachedProcessUnproven) {
       closeAdmission();
       config.ledger.update(request.body, { state: "UNKNOWN", outcome: null, disposalState: containerId ? "UNKNOWN" : "NOT_STARTED", failureClass: "UNCERTAIN", signedFailureFrame: null });
       throw new Error("disposal-unproven");

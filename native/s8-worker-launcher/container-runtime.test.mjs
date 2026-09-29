@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createArguments, validateContainerSecurityOptions, workerBudget } from "./container-runtime.mjs";
+import { createArguments, removeContainer, startContainer, validateContainerSecurityOptions, workerBudget, workerScopeIsQuiescent } from "./container-runtime.mjs";
+import { rootlessCgroupPaths } from "./capacity.mjs";
+import { assertHostMeasurementRoots } from "./config.mjs";
 import { findRootlessKitPid, validateRootlessKitAppArmorEvidence } from "./host-state.mjs";
 
 const workerCgroupParent = "swooshz-s8-workers.slice";
@@ -113,5 +117,107 @@ test("launcher locates exactly one RootlessKit process in the dedicated daemon c
     assert.throws(() => findRootlessKitPid(procRoot, "/swooshz.slice/rootless-daemon", 12001), /rootlesskit-process-uid-drift/u);
   } finally {
     rmSync(procRoot, { recursive: true, force: true });
+  }
+});
+
+
+function fakeAttachedChild(closeOnRelease = true) {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.killed = false;
+  child.kill = () => {
+    if (!child.killed) {
+      child.killed = true;
+      setTimeout(() => {
+        child.stdout.end();
+        child.stderr.end();
+        child.emit("close", null, "SIGKILL");
+      }, 20);
+    }
+    return true;
+  };
+  if (closeOnRelease) {
+    child.stdin.on("finish", () => setTimeout(() => {
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", 0, null);
+    }, 5));
+  }
+  return child;
+}
+
+test("attached Docker process is waited through close after normal release and forced termination", async () => {
+  const spawnProcess = () => {
+    const child = fakeAttachedChild();
+    setImmediate(() => child.stdout.write(Buffer.from("S8_READY\n", "ascii")));
+    return child;
+  };
+  const running = await startContainer({ ...config, dockerSocket: "/run/swooshz-s8/docker.sock", workerReapTimeoutMs: 100 }, "c".repeat(64), Buffer.from("input"), "WRITER", spawnProcess);
+  await running.release();
+  const closed = await running.close(100);
+  assert.equal(closed.code, 0);
+
+  let killedChild;
+  const forced = await startContainer({ ...config, dockerSocket: "/run/swooshz-s8/docker.sock", workerReapTimeoutMs: 100 }, "c".repeat(64), Buffer.from("input"), "WRITER", () => {
+    killedChild = fakeAttachedChild(false);
+    setImmediate(() => killedChild.stdout.write(Buffer.from("S8_READY\n", "ascii")));
+    return killedChild;
+  });
+  const startedAt = Date.now();
+  const result = await forced.abort();
+  assert.equal(result.signal, "SIGKILL");
+  assert.equal(killedChild.killed, true);
+  assert.ok(Date.now() - startedAt >= 10);
+});
+
+test("an attached process without a close event remains disposal-unknown", async () => {
+  const running = await startContainer({ ...config, dockerSocket: "/run/swooshz-s8/docker.sock", workerReapTimeoutMs: 5 }, "c".repeat(64), Buffer.from("input"), "WRITER", () => {
+    const child = fakeAttachedChild(false);
+    child.kill = () => true;
+    setImmediate(() => child.stdout.write(Buffer.from("S8_READY\n", "ascii")));
+    return child;
+  });
+  await assert.rejects(running.abort(), (error) => error.disposalUnproven === true);
+});
+
+test("missing Docker record is insufficient while its worker cgroup is populated", async () => {
+  const root = mkdtempSync(join(tmpdir(), "s8-worker-disposal-"));
+  const containerId = "d".repeat(64);
+  const uid = 12001;
+  const logicalWorkers = rootlessCgroupPaths(uid).workers;
+  const scope = join(root, ...logicalWorkers.split("/").filter(Boolean), "docker-" + containerId + ".scope");
+  const scopedConfig = { ...config, cgroupRoot: root };
+  const docker = async (_config, args) => args[0] === "ps" ? "" : "";
+  try {
+    assert.equal(workerScopeIsQuiescent(scopedConfig, containerId, uid), true);
+    mkdirSync(scope, { recursive: true });
+    writeFileSync(join(scope, "cgroup.events"), "populated 1\nfrozen 0\n");
+    writeFileSync(join(scope, "cgroup.procs"), "123\n");
+    assert.equal(await removeContainer(scopedConfig, containerId, uid, docker), false);
+    assert.equal(workerScopeIsQuiescent(scopedConfig, containerId, uid), false);
+    writeFileSync(join(scope, "cgroup.events"), "populated 0\nfrozen 0\n");
+    writeFileSync(join(scope, "cgroup.procs"), "");
+    assert.equal(await removeContainer(scopedConfig, containerId, uid, docker), true);
+    mkdirSync(join(scope, "child"));
+    assert.equal(workerScopeIsQuiescent(scopedConfig, containerId, uid), false);
+    assert.equal(await removeContainer(scopedConfig, containerId, uid, async (_config, args) => args[0] === "ps" ? containerId : ""), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("launcher host measurements cannot be redirected to a fabricated proc, sys, etc, or cgroup tree", () => {
+  assert.deepEqual(assertHostMeasurementRoots({ S8_CGROUP_ROOT: "/sys/fs/cgroup" }), {
+    cgroupRoot: "/sys/fs/cgroup",
+    procRoot: "/proc",
+    sysRoot: "/sys",
+    etcRoot: "/etc",
+  });
+  for (const [name, expected] of [["S8_CGROUP_ROOT", "/sys/fs/cgroup"], ["S8_PROC_ROOT", "/proc"], ["S8_SYS_ROOT", "/sys"], ["S8_ETC_ROOT", "/etc"]]) {
+    const environment = { S8_CGROUP_ROOT: "/sys/fs/cgroup" };
+    environment[name] = expected === "/sys/fs/cgroup" ? "/tmp/fake-cgroup" : "/tmp/fake-host";
+    assert.throws(() => assertHostMeasurementRoots(environment), /host-measurement-root-invalid/u);
   }
 });

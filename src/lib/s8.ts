@@ -1,8 +1,9 @@
-import { AppError, type S6ToS7Handoff, type S7ToS8Handoff, type S8Artifact, type S8ExportJob, type S8IdempotencyRecord, type S8NativeOperationAttempt, type S8SourceStamp, type S8ValidationReceipt, type Timestamp, type UUID } from "./types";
+import { AppError, type S6ToS7Handoff, type S7ToS8Handoff, type S8Artifact, type S8ExportJob, type S8IdempotencyRecord, type S8NativeOperationAttempt, type S8SourceStamp, type S8ValidationReceipt, type StoreState, type Timestamp, type UUID } from "./types";
 import { buildS8WriterPayload, canonicalS8SourceJson, type S8WriterPayload } from "./s8-fbx-payload";
 import { assertS8ReadbackProvenance, compareS8UfbxReadback, type S8SemanticResult, type S8UfbxReadback } from "./s8-fbx-semantic";
 import { S8_BLENDER_PIN, S8_EXPORTER_PATCH_PIN, S8_EXPORTER_SETTINGS, S8_FBX_PROFILE, S8_LIMITS, S8_PROCESS_RUNNER_PIN, S8_PROTOCOL_VERSION, S8_RESOURCE_TABLE, S8_REUSE_FINGERPRINT_VERSION, S8_SEMANTIC_VERSION, S8_UFBX_PIN, S8_VALIDATOR_PIN, S8_WRITER_RECEIPT_VERSION, s8Sha256 } from "./s8-fbx-profile";
 import { getS8Collections, sameS8Source, s8FinalPrefix, s8ObjectKey, s8ResourceLimitsHash, s8StagingPrefix, S8_OBJECT_NAMES, S8_STALE_CLAIM_MS } from "./s8-fbx-persistence";
+import { getS7Collections, sameS7Source } from "./s7-persistence";
 import { JsonRepository, PrivateObjectStore } from "./store";
 import { jcs, newUuid, nowUtc, sha256, uuidV4Pattern } from "./utils";
 import { S6WorkflowService } from "./s6";
@@ -618,9 +619,45 @@ export class S8ExportService {
     return this.verifyPublicationState(projectId, artifact).bytes;
   }
 
+  private requireCurrentSourceInCommitState(state: StoreState, expected: S8SourceStamp): void {
+    let currentS6: S6ToS7Handoff;
+    try { currentS6 = this.s6.getS7Handoff(expected.projectId); }
+    catch (error) { throw sourceError(error); }
+    const currentS6Digest = sha256(canonicalS8SourceJson(currentS6));
+    if (currentS6.projectId !== expected.projectId
+      || currentS6.eligibility.currentAccepted !== true
+      || currentS6.eligibility.sourceCurrent !== true
+      || currentS6.eligibility.stale !== false
+      || currentS6.acceptedRevisionId !== expected.sourceRevisionId
+      || currentS6.acceptedRevisionHash !== expected.sourceRevisionHash
+      || currentS6.sourceS5Fingerprint !== expected.sourceS5Fingerprint
+      || currentS6.validationReceipt.receiptId !== expected.s6ValidationReceiptId
+      || currentS6.validationReceipt.validationHash !== expected.s6ValidationHash
+      || currentS6Digest !== expected.s6HandoffDigest) fail(409, "S8_SOURCE_STALE", "source");
+    const currentS7Source = {
+      sourceRevisionId: currentS6.acceptedRevisionId,
+      sourceRevisionHash: currentS6.acceptedRevisionHash,
+      sourceS5Fingerprint: currentS6.sourceS5Fingerprint,
+      validationReceiptId: currentS6.validationReceipt.receiptId,
+      validationHash: currentS6.validationReceipt.validationHash,
+      s6HandoffSchemaVersion: currentS6.schemaVersion,
+      handoffDigest: currentS6Digest,
+    };
+    const currentS7 = getS7Collections(state).exports
+      .filter((item) => item.projectId === expected.projectId && item.status === "committed" && sameS7Source(item.source, currentS7Source))
+      .sort((left, right) => (right.committedAt ?? "").localeCompare(left.committedAt ?? ""))[0];
+    if (!currentS7
+      || currentS7.artifactId !== expected.s7ArtifactId
+      || currentS7.sha256 !== expected.s7ArtifactHash
+      || currentS7.readbackHash !== expected.s7ReadbackHash
+      || currentS7.manifestId !== expected.s7ManifestId
+      || currentS7.manifestHash !== expected.s7ManifestHash) fail(409, "S8_SOURCE_STALE", "source");
+  }
+
   private commit(jobId: UUID, claimToken: UUID, source: S8SourceStamp): S8Artifact {
     this.requireCurrentSource(source.projectId, source);
     return this.repository.transact((state) => {
+      this.requireCurrentSourceInCommitState(state, source);
       const collections = getS8Collections(state);
       const job = collections.jobs.find((item) => item.jobId === jobId);
       const artifact = job ? collections.artifacts.find((item) => item.artifactId === job.artifactId) : undefined;
@@ -649,6 +686,7 @@ export class S8ExportService {
 
       this.updateHeartbeat(job.jobId, activeClaimToken, job.source);
       const written = await this.writer(payload.bytes, context);
+      this.requireCurrentSource(job.projectId, job.source);
       this.validateWriterReceipt(written.receipt, payload.sha256, written.artifact);
       const writerEvidence = assertRunnerEvidence(written.runnerEvidence, expectedWriter());
       const artifactSha256 = s8Sha256(written.artifact);
@@ -668,6 +706,7 @@ export class S8ExportService {
 
       this.updateHeartbeat(job.jobId, activeClaimToken, job.source);
       const native = await this.nativeValidator(stagedArtifact, context, written.releaseHandle, written.releaseManifestSha256);
+      this.requireCurrentSource(job.projectId, job.source);
       if (!native.validatorIdentity || typeof native.validatorIdentity !== "string") fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
       const validatorEvidence = assertRunnerEvidence(native.runnerEvidence, expectedValidator());
       const nativeReadbackBytes = Buffer.from(native.readbackBytes);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,9 +20,13 @@ const requestSha256 = "d".repeat(64);
 const releaseSha256 = "e".repeat(64);
 const policySha256 = "f".repeat(64);
 
-test("metadata ledger is durable, replay fenced, and reconciles inflight attempts closed", { skip: process.platform === "win32" }, () => {
+test("metadata ledger is durable, replay fenced, and reconciles inflight attempts closed", () => {
   const directory = mkdtempSync(join(tmpdir(), "s8-ledger-"));
   try {
+    if (process.platform !== "linux") {
+      assert.throws(() => new ReplayLedger(directory), /ledger-platform-unsupported/u);
+      return;
+    }
     const ledger = new ReplayLedger(directory);
     const started = ledger.begin(body, requestSha256, releaseSha256, policySha256, "2026-09-29T00:00:00.000Z");
     assert.equal(started.state, "STARTED");
@@ -43,12 +47,41 @@ test("metadata ledger is durable, replay fenced, and reconciles inflight attempt
   }
 });
 
-test("ledger reconciliation rejects unknown and interrupted temporary entries", { skip: process.platform === "win32" }, () => {
+test("ledger reconciliation rejects unknown and interrupted temporary entries", () => {
   const directory = mkdtempSync(join(tmpdir(), "s8-ledger-unknown-"));
   try {
+    if (process.platform !== "linux") {
+      assert.throws(() => new ReplayLedger(directory), /ledger-platform-unsupported/u);
+      return;
+    }
     const ledger = new ReplayLedger(directory);
     writeFileSync(join(directory, ".tmp-interrupted"), "partial");
     assert.throws(() => ledger.reconcileInflight(), /ledger-corrupt/u);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("ledger refuses readback after a post-rename directory sync failure", () => {
+  const directory = mkdtempSync(join(tmpdir(), "s8-ledger-sync-failure-"));
+  try {
+    if (process.platform !== "linux") {
+      assert.throws(() => new ReplayLedger(directory), /ledger-platform-unsupported/u);
+      return;
+    }
+    let failSync = false;
+    const syncDirectory = (path) => {
+      if (failSync) throw new Error("injected-directory-sync-failure");
+      const fd = openSync(path, "r");
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+    };
+    const ledger = new ReplayLedger(directory, { syncDirectory });
+    failSync = true;
+    assert.throws(
+      () => ledger.begin(body, requestSha256, releaseSha256, policySha256, "2026-09-29T00:00:00.000Z"),
+      /ledger-durability-unknown/u,
+    );
+    assert.throws(() => ledger.get(body), /ledger-durability-unknown/u);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

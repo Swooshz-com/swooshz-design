@@ -35,6 +35,16 @@ function imageRepository(value) {
   return value;
 }
 
+export function assertHostMeasurementRoots(environment) {
+  if (environment.S8_CGROUP_ROOT !== "/sys/fs/cgroup"
+    || (environment.S8_PROC_ROOT !== undefined && environment.S8_PROC_ROOT !== "/proc")
+    || (environment.S8_SYS_ROOT !== undefined && environment.S8_SYS_ROOT !== "/sys")
+    || (environment.S8_ETC_ROOT !== undefined && environment.S8_ETC_ROOT !== "/etc")) {
+    throw new Error("host-measurement-root-invalid");
+  }
+  return { cgroupRoot: "/sys/fs/cgroup", procRoot: "/proc", sysRoot: "/sys", etcRoot: "/etc" };
+}
+
 export function loadConfig(environment = process.env) {
   const bindAddress = environment.S8_LAUNCHER_BIND_ADDRESS;
   const port = Number(environment.S8_LAUNCHER_PORT);
@@ -49,6 +59,7 @@ export function loadConfig(environment = process.env) {
     "S8_WRITER_IMAGE_REPOSITORY", "S8_VALIDATOR_IMAGE_REPOSITORY",
   ];
   if (required.some((key) => typeof environment[key] !== "string" || environment[key].length === 0)) throw new Error("configuration-incomplete");
+  const hostRoots = assertHostMeasurementRoots(environment);
   const signingKeyId = environment.S8_LAUNCHER_KEY_ID;
   const signingFingerprint = fingerprint(environment.S8_GATEWAY_CLIENT_CERT_SHA256);
   if (!KEY_ID.test(signingKeyId) || !/^[a-f0-9]{64}$/u.test(signingFingerprint)) throw new Error("key-identity-invalid");
@@ -70,10 +81,10 @@ export function loadConfig(environment = process.env) {
     capacityProofFile: resolve(environment.S8_CAPACITY_PROOF_FILE),
     releaseManifestFile: resolve(environment.S8_RELEASE_MANIFEST_FILE),
     workloadInventoryFile: resolve(environment.S8_WORKLOAD_INVENTORY_FILE),
-    cgroupRoot: resolve(environment.S8_CGROUP_ROOT),
-    procRoot: resolve(environment.S8_PROC_ROOT ?? "/proc"),
-    sysRoot: resolve(environment.S8_SYS_ROOT ?? "/sys"),
-    etcRoot: resolve(environment.S8_ETC_ROOT ?? "/etc"),
+    cgroupRoot: hostRoots.cgroupRoot,
+    procRoot: hostRoots.procRoot,
+    sysRoot: hostRoots.sysRoot,
+    etcRoot: hostRoots.etcRoot,
     seccompPolicyFile: resolve(environment.S8_SECCOMP_POLICY_FILE),
     rootlessKitAppArmorProfileFile: resolve(environment.S8_ROOTLESSKIT_APPARMOR_PROFILE_FILE),
     ledger: new ReplayLedger(resolve(environment.S8_LEDGER_DIRECTORY)),

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { join, relative, resolve, sep } from "node:path";
 import { S8_NATIVE_RESOURCE_POLICY } from "../s8-worker-common/resource-policy.mjs";
 import { rootlessCgroupPaths } from "./capacity.mjs";
 import { runDocker, imageReference } from "./host-state.mjs";
@@ -38,8 +38,13 @@ function captureProcess(child, maxStdout) {
   let resolveReady;
   let rejectReady;
   const readyPromise = new Promise((resolvePromise, reject) => { resolveReady = resolvePromise; rejectReady = reject; });
+  readyPromise.catch(() => {});
+  let closedResult = null;
   const closePromise = new Promise((resolvePromise) => {
-    child.once("close", (code, signal) => resolvePromise({ code, signal, overflow, stdout: Buffer.concat(stdout, stdoutBytes), stderrBytes }));
+    child.once("close", (code, signal) => {
+      closedResult = { code, signal, overflow, stdout: Buffer.concat(stdout, stdoutBytes), stderrBytes };
+      resolvePromise(closedResult);
+    });
   });
   closePromise.catch(() => {});
   child.stdout.on("data", (chunk) => {
@@ -66,7 +71,30 @@ function captureProcess(child, maxStdout) {
   });
   child.once("error", (error) => rejectReady(error));
   child.once("close", (code) => { if (!ready) rejectReady(new Error(code === 0 ? "worker-exited-before-ready" : "worker-exited-before-ready")); });
-  return { readyPromise, closePromise, child };
+  return { readyPromise, closePromise, child, get closedResult() { return closedResult; }, set closedResult(value) { closedResult = value; } };
+}
+
+function disposalUnproven() {
+  const error = new Error("worker-process-disposal-unproven");
+  error.disposalUnproven = true;
+  return error;
+}
+
+function waitForClose(capture, timeoutMs) {
+  let timer;
+  return Promise.race([
+    capture.closePromise,
+    new Promise((resolvePromise) => { timer = setTimeout(() => resolvePromise(null), timeoutMs); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function terminateAndReap(capture, timeoutMs) {
+  if (capture.closedResult) return capture.closedResult;
+  try { capture.child.kill("SIGKILL"); } catch { /* close event below is the reaping evidence */ }
+  const result = await waitForClose(capture, timeoutMs);
+  if (!result) throw disposalUnproven();
+  capture.closedResult = result;
+  return result;
 }
 
 async function writeWithBackpressure(stream, bytes) {
@@ -74,31 +102,39 @@ async function writeWithBackpressure(stream, bytes) {
   if (!stream.write(bytes)) await new Promise((resolvePromise, reject) => { stream.once("drain", resolvePromise); stream.once("error", reject); });
 }
 
-export async function startContainer(config, containerId, payload, operation) {
+export async function startContainer(config, containerId, payload, operation, spawnProcess = spawn) {
   const maximum = operation === "WRITER" ? 128 * 1024 * 1024 + 1024 * 1024 + 64 * 1024 + 20 : 8 * 1024 * 1024 + 64 * 1024 + 20;
-  const child = spawn(config.dockerPath, ["--host", `unix://${config.dockerSocket}`, "start", "--attach", "--interactive", containerId], {
-    env: { PATH: "/usr/bin:/bin", HOME: process.env.HOME ?? "/nonexistent", DOCKER_HOST: `unix://${config.dockerSocket}` },
+  const child = spawnProcess(config.dockerPath, ["--host", "unix://" + config.dockerSocket, "start", "--attach", "--interactive", containerId], {
+    env: { PATH: "/usr/bin:/bin", HOME: process.env.HOME ?? "/nonexistent", DOCKER_HOST: "unix://" + config.dockerSocket },
     stdio: ["pipe", "pipe", "pipe"],
   });
   const capture = captureProcess(child, maximum);
   const lengthHeader = Buffer.alloc(8);
   lengthHeader.writeBigUInt64BE(BigInt(payload.length), 0);
-  await writeWithBackpressure(child.stdin, lengthHeader);
-  await writeWithBackpressure(child.stdin, payload);
   let timer;
   try {
-    await Promise.race([capture.readyPromise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("worker-ready-timeout")), 10000); })]);
+    await writeWithBackpressure(child.stdin, lengthHeader);
+    await writeWithBackpressure(child.stdin, payload);
+    await Promise.race([capture.readyPromise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("worker-ready-timeout")), config.workerReadyTimeoutMs ?? 10000); })]);
+  } catch (error) {
+    clearTimeout(timer);
+    await terminateAndReap(capture, config.workerReapTimeoutMs ?? 5000);
+    throw error;
   } finally { clearTimeout(timer); }
   return {
-    release: async () => { await writeWithBackpressure(child.stdin, Buffer.from("R", "ascii")); child.stdin.end(); },
-    close: async (timeoutMs) => {
-      let deadline;
-      try { return await Promise.race([capture.closePromise, new Promise((_, reject) => { deadline = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("worker-timeout")); }, timeoutMs); })]); }
-      finally { clearTimeout(deadline); }
+    release: async () => {
+      try { await writeWithBackpressure(child.stdin, Buffer.from("R", "ascii")); child.stdin.end(); }
+      catch (error) { await terminateAndReap(capture, config.workerReapTimeoutMs ?? 5000); throw error; }
     },
+    close: async (timeoutMs) => {
+      const result = await waitForClose(capture, timeoutMs);
+      if (result) return result;
+      await terminateAndReap(capture, config.workerReapTimeoutMs ?? 5000);
+      throw new Error("worker-timeout");
+    },
+    abort: async () => terminateAndReap(capture, config.workerReapTimeoutMs ?? 5000),
   };
 }
-
 export function validateContainerSecurityOptions(security, config) {
   const expected = ["no-new-privileges:true", "seccomp=" + config.seccompPolicyFile];
   if (!Array.isArray(security) || security.length !== expected.length
@@ -159,11 +195,32 @@ export async function inspectAndVerify(config, containerId, release, operation, 
   return inspect;
 }
 
-export async function removeContainer(config, containerId) {
+export function workerScopeIsQuiescent(config, containerId, rootlessDockerUid) {
+  if (!/^[0-9a-f]{64}$/u.test(containerId) || !Number.isSafeInteger(rootlessDockerUid) || rootlessDockerUid < 1) throw new Error("container-identity-invalid");
+  const root = realpathSync(config.cgroupRoot);
+  const logical = rootlessCgroupPaths(rootlessDockerUid).workers + "/docker-" + containerId + ".scope";
+  const directory = resolve(root, "." + logical);
+  const pathFromRoot = relative(root, directory);
+  if (pathFromRoot === ".." || pathFromRoot.startsWith(".." + sep) || pathFromRoot === "") throw new Error("container-cgroup-parent-drift");
+  let info;
+  try { info = lstatSync(directory); }
+  catch (error) { if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return true; throw error; }
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("container-cgroup-parent-drift");
+  const events = readFileSync(join(directory, "cgroup.events"), "utf8").trim().split(/\r?\n/u);
+  const populated = events.filter((line) => /^populated\s+[01]$/u.test(line));
+  if (populated.length !== 1 || populated[0] !== "populated 0") return false;
+  if (readFileSync(join(directory, "cgroup.procs"), "utf8").trim() !== "") return false;
+  const children = readdirSync(directory, { withFileTypes: true });
+  if (children.some((entry) => entry.isDirectory() || entry.isSymbolicLink())) return false;
+  return true;
+}
+
+export async function removeContainer(config, containerId, rootlessDockerUid, docker = runDocker) {
   if (!containerId) return false;
-  try { await runDocker(config, ["rm", "--force", containerId], 30000); } catch { /* exact inventory below is authoritative */ }
-  const remaining = (await runDocker(config, ["ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + containerId])).split(/\s+/u).filter(Boolean);
-  if (remaining.length === 0) return true;
-  if (remaining.length === 1 && remaining[0] === containerId) return false;
-  throw new Error("container-inventory-invalid");
+  if (!/^[0-9a-f]{64}$/u.test(containerId)) throw new Error("container-identity-invalid");
+  try { await docker(config, ["rm", "--force", containerId], 30000); } catch { /* removal is decided by process and cgroup evidence below */ }
+  const remaining = (await docker(config, ["ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + containerId])).split(/\s+/u).filter(Boolean);
+  if (remaining.length !== 0 && !(remaining.length === 1 && remaining[0] === containerId)) throw new Error("container-inventory-invalid");
+  if (remaining.length !== 0) return false;
+  return workerScopeIsQuiescent(config, containerId, rootlessDockerUid);
 }
