@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { verifyCapacityProof, verifyReleaseManifest } from "../s8-worker-common/admission.mjs";
 import { jcs, sha256 } from "../s8-worker-common/protocol.mjs";
 import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "../s8-worker-common/resource-policy.mjs";
-import { assertMeasuredHost, assertWorkerScopesQuiescent, measurePhysicalHost, rootlessCgroupPaths, snapshotCgroupTree } from "./capacity.mjs";
+import { assertMeasuredHost, assertNestedCgroupLimits, assertWorkerScopesQuiescent, expectedCgroupBudgets, measurePhysicalHost, rootlessCgroupPaths, snapshotCgroupTree } from "./capacity.mjs";
 import { readJsonFile } from "./config.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -78,6 +78,12 @@ export function readUnifiedCgroupPath(procRoot, pid) {
 export function assertProcessCgroup(procRoot, pid, expectedLogicalPath) {
   const actual = readUnifiedCgroupPath(procRoot, pid);
   if (actual !== expectedLogicalPath && !actual.startsWith(expectedLogicalPath + "/")) throw new Error("process-cgroup-drift");
+  return actual;
+}
+
+export function assertEffectiveProcessCgroup(cgroupRoot, procRoot, pid, signedParentPath, budget) {
+  const actual = readUnifiedCgroupPath(procRoot, pid);
+  assertNestedCgroupLimits(cgroupRoot, actual, signedParentPath, budget);
   return actual;
 }
 
@@ -315,10 +321,14 @@ export async function admissionSnapshot(config, startupReady, deadlineUnixMs = n
   const docker = deadlineUnixMs === null ? executeDocker : deadlineBoundDocker(deadlineUnixMs, now, executeDocker);
   const checkDeadline = () => { if (deadlineUnixMs !== null) deadlineRemainingMs(deadlineUnixMs, now); };
   checkDeadline();
+  if (config.ledger.hasUnresolvedOperations()) throw new Error("ledger-unresolved");
   if (!startupReady()) throw new Error("startup-not-reconciled");
-  assertProcessCgroup(config.procRoot, process.pid, config.launcherCgroupLogicalPath);
+
   const signedProof = readJsonFile(config.capacityProofFile, 256 * 1024);
   const capacity = verifyCapacityProof(signedProof, config.capacityAuthorityKeys);
+  const launcherBudget = expectedCgroupBudgets(capacity.proof).find((entry) => entry.logicalPath === config.launcherCgroupLogicalPath);
+  if (!launcherBudget) throw new Error("launcher-cgroup-budget-missing");
+  assertEffectiveProcessCgroup(config.cgroupRoot, config.procRoot, process.pid, config.launcherCgroupLogicalPath, launcherBudget.budget);
   const release = verifyReleaseManifest(readJsonFile(config.releaseManifestFile, 256 * 1024), config.releaseAuthorityKeys);
   checkDeadline();
   if (capacity.proof.releaseManifestSha256 !== release.sha256 || capacity.proof.resourcePolicySha256 !== S8_NATIVE_RESOURCE_POLICY_SHA256) throw new Error("proof-release-drift");
@@ -335,7 +345,7 @@ export async function admissionSnapshot(config, startupReady, deadlineUnixMs = n
   checkDeadline();
   await verifyDocker(config, docker);
   assertEmptyDockerInventory(await docker(config, ["ps", "--all", "--quiet", "--no-trunc"]));
-  assertEmptyDockerVolumeInventory(await docker(config, ["volume", "ls", "--quiet", "--no-trunc"]));
+  assertEmptyDockerVolumeInventory(await docker(config, ["volume", "ls", "--quiet"]));
   checkDeadline();
   assertWorkerScopesQuiescent(config.cgroupRoot, capacity.proof);
   const rootlessUid = capacity.proof.allocation.rootlessDockerUid;
@@ -377,11 +387,13 @@ export async function admissionSnapshot(config, startupReady, deadlineUnixMs = n
     unreconciledContainerCount: 0,
   };
   checkDeadline();
+  if (config.ledger.hasUnresolvedOperations()) throw new Error("ledger-unresolved");
   return { signedProof, capacity, release, host, tree, observation };
 }
 
 export async function reconcileStartup(config) {
   config.ledger.reconcileInflight();
+  if (config.ledger.hasUnresolvedOperations()) throw new Error("ledger-unresolved");
   const ids = dockerContainerIds(await runDocker(config, ["ps", "--all", "--quiet", "--no-trunc"]));
   for (const id of ids) {
     const labels = JSON.parse(await runDocker(config, ["inspect", "--format", "{{json .Config.Labels}}", id]));
@@ -396,6 +408,6 @@ export async function reconcileStartup(config) {
   assertWorkerScopesQuiescent(config.cgroupRoot, capacity.proof);
   assertHostWorkloadPlacement(config.cgroupRoot, config.procRoot, capacity.proof);
   assertEmptyDockerInventory(await runDocker(config, ["ps", "--all", "--quiet", "--no-trunc"]));
-  assertEmptyDockerVolumeInventory(await runDocker(config, ["volume", "ls", "--quiet", "--no-trunc"]));
+  assertEmptyDockerVolumeInventory(await runDocker(config, ["volume", "ls", "--quiet"]));
   return ids.length;
 }

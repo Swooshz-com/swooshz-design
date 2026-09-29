@@ -194,6 +194,51 @@ export function assertWorkerScopesQuiescent(cgroupRoot, proof) {
   }
 }
 
+function readHardLimit(value) {
+  if (value === "max") return null;
+  if (!/^\d+$/u.test(value)) throw new Error("launcher-cgroup-limit");
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("launcher-cgroup-limit");
+  return parsed;
+}
+
+export function assertNestedCgroupLimits(cgroupRoot, actualLogicalPath, signedParentPath, budget) {
+  safeLogicalPath(actualLogicalPath);
+  safeLogicalPath(signedParentPath);
+  if (actualLogicalPath !== signedParentPath && !actualLogicalPath.startsWith(signedParentPath + "/")) throw new Error("launcher-cgroup-drift");
+  if (!budget || ![budget.cpuMilli, budget.memoryBytes, budget.pids].every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error("launcher-cgroup-budget-invalid");
+
+  const descendants = actualLogicalPath === signedParentPath ? [] : actualLogicalPath.slice(signedParentPath.length + 1).split("/");
+  const paths = [signedParentPath];
+  let current = signedParentPath;
+  for (const component of descendants) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9@._-]{0,190}$/u.test(component)) throw new Error("launcher-cgroup-drift");
+    current += "/" + component;
+    paths.push(current);
+  }
+
+  for (let index = 0; index < paths.length; index += 1) {
+    const logicalPath = paths[index];
+    const directory = cgroupDir(cgroupRoot, logicalPath);
+    const cpuParts = readText(join(directory, "cpu.max")).split(/\s+/u);
+    if (cpuParts.length !== 2 || !/^\d+$/u.test(cpuParts[1])) throw new Error("launcher-cgroup-limit");
+    const period = Number(cpuParts[1]);
+    if (!Number.isSafeInteger(period) || period <= 0) throw new Error("launcher-cgroup-limit");
+    const quota = readHardLimit(cpuParts[0]);
+    const memory = readHardLimit(readText(join(directory, "memory.max")));
+    const pids = readHardLimit(readText(join(directory, "pids.max")));
+    if (index === 0) {
+      const expectedQuota = budget.cpuMilli * PERIOD_US / 1000;
+      if (!Number.isSafeInteger(expectedQuota) || quota !== expectedQuota || period !== PERIOD_US
+        || memory !== budget.memoryBytes || pids !== budget.pids) throw new Error("launcher-cgroup-limit");
+      continue;
+    }
+    if ((quota !== null && BigInt(quota) * 1000n < BigInt(budget.cpuMilli) * BigInt(period))
+      || (memory !== null && memory < budget.memoryBytes) || (pids !== null && pids < budget.pids)) throw new Error("launcher-cgroup-limit");
+  }
+  return actualLogicalPath;
+}
+
 export function snapshotCgroupTree(cgroupRoot, proof) {
   if (!HEX64.test(proof.cgroupTreeSha256)) throw new Error("cgroup-digest");
   const groups = expectedCgroupBudgets(proof);

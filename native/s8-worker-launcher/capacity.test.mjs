@@ -3,8 +3,10 @@ import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { assertEmptyDockerInventory, assertHostWorkloadPlacement, assertProcessCgroup, processUid, readUnifiedCgroupPath, validateDockerRuntimeInfo } from "./host-state.mjs";
+import { admissionSnapshot, assertEffectiveProcessCgroup, reconcileStartup, assertEmptyDockerInventory, assertHostWorkloadPlacement, assertProcessCgroup, processUid, readUnifiedCgroupPath, validateDockerRuntimeInfo } from "./host-state.mjs";
 import { assertWorkerScopesQuiescent, expectedCgroupBudgets, measurePhysicalHost, rootlessCgroupPaths, snapshotCgroupTree } from "./capacity.mjs";
+import { ReplayLedger } from "./ledger.mjs";
+import { runNativeOperation } from "./operation.mjs";
 
 const gib = 1024 ** 3;
 const mb = 1024 ** 2;
@@ -280,6 +282,113 @@ test("malformed cgroup task placement fails closed", () => {
     mkdirSync(unknown, { recursive: true });
     writeFileSync(join(unknown, "cgroup.threads"), "not-a-task\n");
     assert.throws(() => assertHostWorkloadPlacement(cgroupRoot, procRoot, proof), /host-workload-inventory-unavailable/u);
+  } finally {
+    rmSync(cgroupRoot, { recursive: true, force: true });
+    rmSync(procRoot, { recursive: true, force: true });
+  }
+});
+
+test("startup and ordinary admission stay closed while unresolved launcher ledger state survives", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "s8-ledger-admission-"));
+  try {
+    if (process.platform !== "linux") {
+      assert.throws(() => new ReplayLedger(directory), /ledger-platform-unsupported/u);
+      return;
+    }
+    const ledger = new ReplayLedger(directory);
+    const body = { projectId: "11111111-1111-4111-8111-111111111111", jobId: "22222222-2222-4222-8222-222222222222", artifactId: "33333333-3333-4333-8333-333333333333", attempt: 1, operation: "WRITER", sourceSha256: "a".repeat(64), inputSha256: "b".repeat(64), nonce: "c".repeat(43) };
+    ledger.begin(body, "d".repeat(64), "e".repeat(64), "f".repeat(64), "2026-09-29T00:00:00.000Z");
+    const restarted = new ReplayLedger(directory);
+
+    await assert.rejects(reconcileStartup({ ledger: restarted }), /ledger-unresolved/u);
+    assert.equal(restarted.hasUnresolvedOperations(), true);
+    await assert.rejects(admissionSnapshot({ ledger: restarted }, () => true), /ledger-unresolved/u);
+
+    restarted.update(body, { state: "FAILED", outcome: "PERMANENT_FAILURE", disposalState: "REAPED_REMOVED", failureClass: "PERMANENT" });
+    assert.equal(restarted.hasUnresolvedOperations(), false);
+    await assert.rejects(reconcileStartup({ ledger: restarted }), (error) => error.message !== "ledger-unresolved");
+    await assert.rejects(admissionSnapshot({ ledger: restarted }, () => true), (error) => error.message !== "ledger-unresolved");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("unresolved launcher ledger rejects before a new ledger begin or Docker create", async () => {
+  let beginCount = 0;
+  let dockerCreateCount = 0;
+  const ledger = {
+    get: () => null,
+    hasUnresolvedOperations: () => true,
+    begin: () => { beginCount += 1; },
+  };
+  const body = {
+    projectId: "11111111-1111-4111-8111-111111111111",
+    jobId: "22222222-2222-4222-8222-222222222222",
+    artifactId: "33333333-3333-4333-8333-333333333333",
+    attempt: 1,
+    operation: "WRITER",
+    sourceSha256: "a".repeat(64),
+    inputSha256: "b".repeat(64),
+    nonce: "c".repeat(43),
+    deadlineUnixMs: Date.now() + 10_000,
+  };
+
+  await assert.rejects(runNativeOperation(
+    { ledger },
+    { body, requestSha256: "d".repeat(64), payload: Buffer.from("payload") },
+    () => true,
+    () => {},
+    Date.now,
+    { docker: async (_config, args) => { if (args[0] === "create") dockerCreateCount += 1; return ""; } },
+  ), /ledger-unresolved/u);
+  assert.equal(beginCount, 0);
+  assert.equal(dockerCreateCount, 0);
+});
+
+test("launcher admission verifies the actual service cgroup effective CPU, memory, and PID ceilings", () => {
+  const proof = sampleProof();
+  const cgroupRoot = mkdtempSync(join(tmpdir(), "s8-launcher-effective-cgroup-"));
+  const procRoot = mkdtempSync(join(tmpdir(), "s8-launcher-effective-proc-"));
+  const signedParentPath = "/swooshz.slice/swooshz-design.slice/swooshz-design-launcher.slice";
+  const servicePath = signedParentPath + "/swooshz-s8-worker-launcher.service";
+  const budget = expectedCgroupBudgets(proof).find((entry) => entry.logicalPath === signedParentPath)?.budget;
+  assert.ok(budget);
+  try {
+    installCgroupFixture(cgroupRoot, proof);
+    const serviceDirectory = join(cgroupRoot, servicePath.slice(1));
+    mkdirSync(serviceDirectory, { recursive: true });
+    writeFileSync(join(serviceDirectory, "cpu.max"), String(budget.cpuMilli * 100) + " 100000\n");
+    writeFileSync(join(serviceDirectory, "memory.max"), String(budget.memoryBytes) + "\n");
+    writeFileSync(join(serviceDirectory, "pids.max"), String(budget.pids) + "\n");
+    mkdirSync(join(procRoot, "456"), { recursive: true });
+    writeFileSync(join(procRoot, "456/cgroup"), "0::" + servicePath + "\n");
+
+    let nativeDispatchCount = 0;
+    assertEffectiveProcessCgroup(cgroupRoot, procRoot, 456, signedParentPath, budget);
+    nativeDispatchCount += 1;
+    assert.equal(nativeDispatchCount, 1);
+
+    const assertRejectedBeforeDispatch = () => {
+      nativeDispatchCount = 0;
+      assert.throws(() => {
+        assertEffectiveProcessCgroup(cgroupRoot, procRoot, 456, signedParentPath, budget);
+        nativeDispatchCount += 1;
+      }, /launcher-cgroup-limit/u);
+      assert.equal(nativeDispatchCount, 0);
+    };
+    writeFileSync(join(serviceDirectory, "pids.max"), String(budget.pids - 1) + "\n");
+    assertRejectedBeforeDispatch();
+    writeFileSync(join(serviceDirectory, "pids.max"), String(budget.pids) + "\n");
+    writeFileSync(join(serviceDirectory, "cpu.max"), String(budget.cpuMilli * 100 - 1) + " 100000\n");
+    assertRejectedBeforeDispatch();
+    writeFileSync(join(serviceDirectory, "cpu.max"), String(budget.cpuMilli * 100) + " 100000\n");
+    writeFileSync(join(serviceDirectory, "memory.max"), String(budget.memoryBytes - 1) + "\n");
+    assertRejectedBeforeDispatch();
+
+    writeFileSync(join(serviceDirectory, "cpu.max"), "max 100000\n");
+    writeFileSync(join(serviceDirectory, "memory.max"), "max\n");
+    writeFileSync(join(serviceDirectory, "pids.max"), "max\n");
+    assert.equal(assertEffectiveProcessCgroup(cgroupRoot, procRoot, 456, signedParentPath, budget), servicePath);
   } finally {
     rmSync(cgroupRoot, { recursive: true, force: true });
     rmSync(procRoot, { recursive: true, force: true });

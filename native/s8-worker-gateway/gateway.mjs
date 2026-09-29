@@ -105,17 +105,77 @@ function collect(request, maximumBytes) {
   });
 }
 
-function launcherRequest(config, method, pathname, body, maximumBytes, timeoutMs, contentType = "application/octet-stream") {
+export function launcherRequest(
+  config,
+  method,
+  pathname,
+  body,
+  maximumBytes,
+  timeoutMs,
+  contentType = "application/octet-stream",
+  { deadlineUnixMs = null, requestImpl = https.request, now = Date.now, inboundRequest = null, downstreamResponse = null } = {},
+) {
   return new Promise((resolve, reject) => {
-    const request = https.request(new URL(pathname, config.launcherUrl), {
+    let settled = false;
+    let wallTimer = null;
+    let abortHandler = null;
+    let disconnectHandler = null;
+    const remaining = deadlineUnixMs === null ? timeoutMs : deadlineUnixMs - now();
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || !Number.isFinite(remaining) || remaining <= 0) {
+      reject(new Error("launcher-deadline-expired"));
+      return;
+    }
+    const boundedTimeout = Math.min(timeoutMs, Math.max(1, Math.ceil(remaining)));
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      if (wallTimer) clearTimeout(wallTimer);
+      if (inboundRequest && abortHandler) inboundRequest.removeListener("aborted", abortHandler);
+      if (downstreamResponse && disconnectHandler) downstreamResponse.removeListener("close", disconnectHandler);
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const request = requestImpl(new URL(pathname, config.launcherUrl), {
       method,
       agent: config.launcherAgent,
       headers: body ? { "content-type": contentType, "content-length": String(body.length) } : undefined,
     }, (response) => {
-      void collect(response, maximumBytes).then((bytes) => resolve({ status: response.statusCode ?? 0, bytes }), reject);
+      void collect(response, maximumBytes).then((bytes) => {
+        try {
+          if (deadlineUnixMs !== null && deadlineUnixMs <= now()) throw new Error("launcher-deadline-expired");
+          finish(null, { status: response.statusCode ?? 0, bytes });
+        } catch (error) {
+          finish(error);
+        }
+      }, (error) => finish(error));
     });
-    request.setTimeout(timeoutMs, () => request.destroy(new Error("launcher-timeout")));
-    request.on("error", reject);
+    request.setTimeout(boundedTimeout, () => request.destroy(new Error("launcher-timeout")));
+    wallTimer = setTimeout(() => request.destroy(new Error("launcher-timeout")), boundedTimeout);
+    request.on("error", (error) => finish(error));
+    if (inboundRequest) {
+      abortHandler = () => request.destroy(new Error("launcher-request-aborted"));
+      if (inboundRequest.aborted) abortHandler();
+      else inboundRequest.once("aborted", abortHandler);
+    }
+    if (downstreamResponse) {
+      disconnectHandler = () => {
+        if (!downstreamResponse.writableEnded) request.destroy(new Error("launcher-client-disconnected"));
+      };
+      if (downstreamResponse.destroyed) disconnectHandler();
+      else downstreamResponse.once("close", disconnectHandler);
+    }
+    if (deadlineUnixMs !== null && deadlineUnixMs <= now()) {
+      const error = new Error("launcher-deadline-expired");
+      finish(error);
+      request.destroy(error);
+      return;
+    }
+    if (inboundRequest?.aborted || downstreamResponse?.destroyed || downstreamResponse?.writableEnded) {
+      const error = new Error("launcher-client-disconnected");
+      finish(error);
+      request.destroy(error);
+      return;
+    }
     if (body) request.end(body); else request.end();
   });
 }
@@ -161,7 +221,7 @@ export function createGatewayServer(config) {
     const url = new URL(request.url ?? "/", "https://gateway.invalid");
     if (request.method === "GET" && url.pathname === "/v1/admission" && url.search === "") {
       try {
-        const result = await launcherRequest(config, "GET", "/v1/admission", null, MAX_ADMISSION_BYTES, 10_000);
+        const result = await launcherRequest(config, "GET", "/v1/admission", null, MAX_ADMISSION_BYTES, 10_000, "application/octet-stream", { inboundRequest: request, downstreamResponse: response });
         if (result.status !== 200) return sendJson(response, 503, { state: "CLOSED", error: "S8_WORKER_ADMISSION_CLOSED" });
         const envelope = JSON.parse(result.bytes.toString("utf8"));
         const verified = verifyAdmissionEnvelope(envelope, { capacityAuthorityKeys: config.capacityAuthorityKeys, launcherKeys: config.launcherKeys });
@@ -178,7 +238,7 @@ export function createGatewayServer(config) {
       try {
         const body = await collect(request, MAX_HEADER_BYTES);
         const statusRequest = verifyStatusRequest(body, config.appKeys);
-        const forwarded = await launcherRequest(config, "POST", "/v1/status", body, MAX_ADMISSION_BYTES, 10000, "application/json");
+        const forwarded = await launcherRequest(config, "POST", "/v1/status", body, MAX_ADMISSION_BYTES, 10000, "application/json", { inboundRequest: request, downstreamResponse: response });
         if (forwarded.status !== 200) return sendJson(response, 503, generic);
         const statusResponse = JSON.parse(forwarded.bytes.toString("utf8"));
         verifyStatusResponse(statusResponse, {
@@ -210,9 +270,10 @@ export function createGatewayServer(config) {
       const maxInput = verified.body.operation === "WRITER" ? MAX_WRITER_INPUT_BYTES : MAX_VALIDATOR_INPUT_BYTES;
       if (verified.payload.length > maxInput || verified.body.profile !== PROFILE || verified.body.protocolVersion !== PROTOCOL_VERSION) return sendJson(response, 400, generic);
       const maxResponse = verified.body.operation === "WRITER" ? MAX_WRITER_OUTPUT_BYTES + MAX_WRITER_RECEIPT_BYTES + MAX_HEADER_BYTES + 20 : MAX_VALIDATOR_OUTPUT_BYTES + MAX_HEADER_BYTES + 20;
-      const forwarded = await launcherRequest(config, "POST", "/v1/operations", frame, maxResponse, verified.body.operation === "WRITER" ? 510_000 : 330_000);
+      const forwarded = await launcherRequest(config, "POST", "/v1/operations", frame, maxResponse, verified.body.operation === "WRITER" ? 510_000 : 330_000, "application/octet-stream", { deadlineUnixMs: verified.body.deadlineUnixMs, inboundRequest: request, downstreamResponse: response });
       if (forwarded.status !== 200) return sendJson(response, 503, generic);
       verifyResponseFrame(forwarded.bytes, responseExpectation(verified, config));
+      if (Date.now() >= verified.body.deadlineUnixMs) throw new Error("launcher-deadline-expired");
       response.writeHead(200, { "content-type": "application/octet-stream", "content-length": String(forwarded.bytes.length), "cache-control": "no-store", "x-content-type-options": "nosniff" });
       response.end(forwarded.bytes);
     } catch {

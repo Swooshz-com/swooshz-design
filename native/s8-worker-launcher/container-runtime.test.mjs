@@ -414,13 +414,13 @@ test("container removal removes and verifies anonymous volume cleanup", async ()
       return "";
     }
     if (args[0] === "ps") return "";
-    if (args[0] === "volume") return volumePresent ? "job-anonymous-volume\n" : "";
+    if (args[0] === "volume") { assert.deepEqual(args, ["volume", "ls", "--quiet"]); return volumePresent ? "job-anonymous-volume\n" : ""; }
     return "";
   };
   try {
     assert.equal(await removeContainer({ ...config, cgroupRoot: root }, containerId, 12001, docker), true);
     assert.equal(removedWithVolumes, true);
-    assert.ok(calls.some((args) => args[0] === "volume" && args[1] === "ls"));
+    assert.deepEqual(calls.filter((args) => args[0] === "volume" && args[1] === "ls"), [["volume", "ls", "--quiet"], ["volume", "ls", "--quiet"]]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -435,7 +435,7 @@ test("an orphan job volume is removed by exact name while the baseline volume is
   const docker = async (_config, args) => {
     if (args[0] === "rm") return "";
     if (args[0] === "ps") return "";
-    if (args[0] === "volume" && args[1] === "ls") return volumes.join("\n") + "\n";
+    if (args[0] === "volume" && args[1] === "ls") { assert.deepEqual(args, ["volume", "ls", "--quiet"]); return volumes.join("\n") + "\n"; }
     if (args[0] === "volume" && args[1] === "rm") {
       removedVolumes.push(args[2]);
       volumes = volumes.filter((name) => name !== args[2]);
@@ -466,7 +466,7 @@ test("a missing container record does not prove that anonymous volumes were remo
       attemptedVolumeRemoval = args[2] === "orphan-anonymous-volume";
       throw new Error("volume-removal-failed");
     }
-    if (args[0] === "volume") return "orphan-anonymous-volume\n";
+    if (args[0] === "volume") { assert.deepEqual(args, ["volume", "ls", "--quiet"]); return "orphan-anonymous-volume\n"; }
     return "";
   };
   try {

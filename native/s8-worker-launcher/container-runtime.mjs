@@ -313,13 +313,13 @@ export async function removeContainer(config, containerId, rootlessDockerUid, do
   if (remaining.length !== 0 && !(remaining.length === 1 && remaining[0] === containerId)) throw new Error("container-inventory-invalid");
   if (remaining.length !== 0) return false;
   const expectedVolumes = new Set(baselineVolumeNames);
-  const volumes = dockerVolumeNames(await docker(config, ["volume", "ls", "--quiet", "--no-trunc"]));
+  const volumes = dockerVolumeNames(await docker(config, ["volume", "ls", "--quiet"]));
   if (baselineVolumeNames.some((name) => !volumes.includes(name))) throw new Error("docker-volume-inventory-drift");
   for (const name of volumes) {
     if (expectedVolumes.has(name)) continue;
     try { await docker(config, ["volume", "rm", name], 30000); } catch { /* exact volume inventory below is authoritative */ }
   }
-  const remainingVolumes = dockerVolumeNames(await docker(config, ["volume", "ls", "--quiet", "--no-trunc"])).sort();
+  const remainingVolumes = dockerVolumeNames(await docker(config, ["volume", "ls", "--quiet"])).sort();
   if (JSON.stringify(remainingVolumes) !== JSON.stringify([...expectedVolumes].sort())) throw new Error("docker-volume-removal-unproven");
   return workerScopeIsQuiescent(config, containerId, rootlessDockerUid);
 }

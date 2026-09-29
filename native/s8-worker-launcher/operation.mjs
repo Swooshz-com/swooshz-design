@@ -22,15 +22,23 @@ function isTimeoutFailure(error) {
   return message.includes("timeout") || message.includes("timed out") || error?.code === "ETIMEDOUT";
 }
 
+const NON_TIMEOUT_TRANSIENT_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAGAIN"]);
+
+export function classifyNativeFailure(error) {
+  if (isTimeoutFailure(error)) return "PERMANENT";
+  const code = error && typeof error === "object" ? error.code : undefined;
+  return NON_TIMEOUT_TRANSIENT_CODES.has(code) ? "TRANSIENT" : "PERMANENT";
+}
+
 function recordTimeoutWithoutResponse(config, body) {
   config.ledger.update(body, {
-    state: "FAILED", outcome: "TRANSIENT_INFRASTRUCTURE_FAILURE", disposalState: "REAPED_REMOVED",
+    state: "FAILED", outcome: "PERMANENT_FAILURE", disposalState: "REAPED_REMOVED",
     responseSha256: null, outputSha256: null, releaseHandle: null,
-    failureClass: "TRANSIENT", signedFailureFrame: null,
+    failureClass: "PERMANENT", signedFailureFrame: null,
   });
 }
 
-export async function runNativeOperation(config, request, startupReady, closeAdmission, now = Date.now) {
+export async function runNativeOperation(config, request, startupReady, closeAdmission, now = Date.now, dependencies = {}) {
   const deadlineUnixMs = request.body.deadlineUnixMs;
   deadlineRemainingMs(deadlineUnixMs, now);
   const previous = config.ledger.get(request.body);
@@ -39,7 +47,8 @@ export async function runNativeOperation(config, request, startupReady, closeAdm
     if (previous.state === "FAILED" && previous.signedFailureFrame) return Buffer.from(previous.signedFailureFrame, "base64url");
     throw new Error("request-reconciliation-required");
   }
-  const snapshot = await admissionSnapshot(config, startupReady, deadlineUnixMs, now);
+  const executeDocker = dependencies.docker ?? runDocker;
+  const snapshot = await admissionSnapshot(config, startupReady, deadlineUnixMs, now, { docker: executeDocker });
   deadlineRemainingMs(deadlineUnixMs, now);
   if (snapshot.capacity.proof.state !== "OPEN") throw new Error("admission-not-open");
   if (request.body.operation === "VALIDATOR") {
@@ -54,8 +63,8 @@ export async function runNativeOperation(config, request, startupReady, closeAdm
   const maximum = request.body.operation === "WRITER" ? MAX_WRITER_INPUT_BYTES : MAX_VALIDATOR_INPUT_BYTES;
   if (request.payload.length < 1 || request.payload.length > maximum) throw new Error("request-size-invalid");
   const release = snapshot.release;
-  const docker = deadlineBoundDocker(deadlineUnixMs, now, runDocker);
-  const volumeBaselineNames = dockerVolumeNames(await docker(config, ["volume", "ls", "--quiet", "--no-trunc"]));
+  const docker = deadlineBoundDocker(deadlineUnixMs, now, executeDocker);
+  const volumeBaselineNames = dockerVolumeNames(await docker(config, ["volume", "ls", "--quiet"]));
   deadlineRemainingMs(deadlineUnixMs, now);
   if (volumeBaselineNames.length !== 0) throw new Error("docker-volume-inventory-not-empty");
   config.ledger.begin(request.body, request.requestSha256, release.sha256, S8_NATIVE_RESOURCE_POLICY_SHA256);
@@ -119,8 +128,7 @@ export async function runNativeOperation(config, request, startupReady, closeAdm
     }
     const message = error instanceof Error ? error.message : "worker-failure";
     if (message.includes("drift") || message.includes("limit") || message.includes("cgroup") || message.includes("security")) closeAdmission();
-    const timeout = isTimeoutFailure(error) || deadlineHasExpired(deadlineUnixMs, now);
-    if (timeout) {
+    if (!deadlineHasExpired(deadlineUnixMs, now) && classifyNativeFailure(error) === "TRANSIENT") {
       outcome = "TRANSIENT_INFRASTRUCTURE_FAILURE";
       failureClass = "TRANSIENT";
     }

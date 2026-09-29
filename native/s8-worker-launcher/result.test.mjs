@@ -4,7 +4,7 @@ import test from "node:test";
 import { sha256, verifyResponseFrame } from "../s8-worker-common/protocol.mjs";
 import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "../s8-worker-common/resource-policy.mjs";
 import { createResponse } from "./result.mjs";
-import { createResponseBeforeDeadline } from "./operation.mjs";
+import { classifyNativeFailure, createResponseBeforeDeadline } from "./operation.mjs";
 
 const keys = generateKeyPairSync("ed25519");
 const publicKey = keys.publicKey.export({ type: "spki", format: "pem" }).toString();
@@ -82,4 +82,13 @@ test("expired response construction is refused and signing that crosses the dead
     return { frame: Buffer.from("late") };
   }), /deadline-expired/u);
   assert.equal(signatures, 2);
+});
+
+
+test("timeouts are permanent while the narrow non-timeout transport classifier remains retryable", () => {
+  assert.equal(classifyNativeFailure(new Error("worker-ready-timeout")), "PERMANENT");
+  assert.equal(classifyNativeFailure(Object.assign(new Error("socket stalled"), { code: "ETIMEDOUT" })), "PERMANENT");
+  assert.equal(classifyNativeFailure(Object.assign(new Error("socket reset"), { code: "ECONNRESET" })), "TRANSIENT");
+  assert.equal(classifyNativeFailure(Object.assign(new Error("socket timed out"), { code: "ECONNRESET" })), "PERMANENT");
+  assert.equal(classifyNativeFailure(new Error("worker-process-failed")), "PERMANENT");
 });

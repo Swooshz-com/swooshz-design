@@ -219,7 +219,11 @@ export function createS8NativeRequestFrame(
   releaseHandle: string | null,
   config: S8NativeWorkerConfig,
   nowMs = Date.now(),
+  suppliedDeadlineUnixMs?: number,
 ): S8NativeRequestFrame {
+  const maximumDurationMs = operation === "WRITER" ? S8_NATIVE_RESOURCE_POLICY.writer.endToEndDeadlineMs : S8_NATIVE_RESOURCE_POLICY.validator.endToEndDeadlineMs;
+  const deadlineUnixMs = suppliedDeadlineUnixMs ?? nowMs + maximumDurationMs;
+  if (!Number.isSafeInteger(nowMs) || !Number.isSafeInteger(deadlineUnixMs) || deadlineUnixMs <= nowMs || deadlineUnixMs > nowMs + maximumDurationMs) fail();
   if (!UUID.test(context.projectId) || !UUID.test(context.jobId) || !UUID.test(context.artifactId)
     || !Number.isSafeInteger(context.attempt) || context.attempt < 1 || context.attempt > 2
     || !digest(context.inputSha256) || sha256(payload) !== context.inputSha256
@@ -242,7 +246,7 @@ export function createS8NativeRequestFrame(
     configSha256: sha256(jcs({ profile: S8_FBX_PROFILE, protocolVersion: S8_NATIVE_WORKER_PROTOCOL_VERSION, resourcePolicySha256: S8_NATIVE_RESOURCE_POLICY_SHA256 })),
     inputSha256: context.inputSha256,
     inputBytes: payload.length,
-    deadlineUnixMs: nowMs + (operation === "WRITER" ? S8_NATIVE_RESOURCE_POLICY.writer.endToEndDeadlineMs : S8_NATIVE_RESOURCE_POLICY.validator.endToEndDeadlineMs),
+    deadlineUnixMs,
     nonce: randomBytes(32).toString("base64url"),
     releaseHandle,
   };

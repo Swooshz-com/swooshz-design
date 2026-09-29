@@ -86,3 +86,31 @@ test("ledger refuses readback after a post-rename directory sync failure", () =>
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("unresolved ledger inspection stays non-mutating across restart and only clears for safe terminal disposal", () => {
+  const directory = mkdtempSync(join(tmpdir(), "s8-ledger-unresolved-"));
+  try {
+    if (process.platform !== "linux") {
+      assert.throws(() => new ReplayLedger(directory), /ledger-platform-unsupported/u);
+      return;
+    }
+    const original = new ReplayLedger(directory);
+    original.begin(body, requestSha256, releaseSha256, policySha256, "2026-09-29T00:00:00.000Z");
+
+    const restarted = new ReplayLedger(directory);
+    assert.equal(restarted.reconcileInflight(), 1);
+    const path = join(directory, readdirSync(directory).find((name) => name.endsWith(".json")));
+    const unknownBytes = readFileSync(path);
+    assert.equal(restarted.hasUnresolvedOperations(), true);
+    assert.deepEqual(readFileSync(path), unknownBytes);
+
+    restarted.update(body, { state: "FAILED", outcome: "PERMANENT_FAILURE", disposalState: "UNKNOWN", failureClass: "UNCERTAIN" });
+    assert.equal(restarted.hasUnresolvedOperations(), true);
+    restarted.update(body, { state: "FAILED", outcome: "PERMANENT_FAILURE", disposalState: "REAPED_REMOVED", failureClass: "PERMANENT" });
+    const terminalBytes = readFileSync(path);
+    assert.equal(restarted.hasUnresolvedOperations(), false);
+    assert.deepEqual(readFileSync(path), terminalBytes);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

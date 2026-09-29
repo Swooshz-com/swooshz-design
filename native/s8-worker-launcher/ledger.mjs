@@ -197,6 +197,20 @@ export class ReplayLedger {
     }
     return changed;
   }
+
+  hasUnresolvedOperations() {
+    this.assertHealthy();
+    let unresolved = false;
+    for (const name of readdirSync(this.directory)) {
+      if (!/^[0-9a-f-]{36}\.[12]\.(WRITER|VALIDATOR)\.json$/u.test(name)) throw new Error("ledger-corrupt");
+      const tuple = name.slice(0, -5);
+      let value;
+      try { value = readRecordFile(recordPath(this.directory, tuple), tuple); }
+      catch { throw new Error("ledger-corrupt"); }
+      if (value.state === "STARTED" || value.state === "UNKNOWN" || value.disposalState !== "REAPED_REMOVED") unresolved = true;
+    }
+    return unresolved;
+  }
 }
 
 const awaitHash = (value) => createHash("sha256").update(value, "utf8").digest("hex");

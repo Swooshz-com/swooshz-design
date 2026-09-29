@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { S8ExportService } from "../src/lib/s8";
 import { readS8RuntimeConfig } from "../src/lib/s8-fbx-config";
+import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "../src/lib/s8-native-admission";
+import { jcs, sha256 } from "../src/lib/utils";
+import { createS8NativeRequestFrame } from "../src/lib/s8-native-protocol";
+import { S8NativeWorkerClient } from "../src/lib/s8-native-worker-client";
+import type { S8NativeWorkerConfig } from "../src/lib/s8-fbx-config";
 
 const workflowSizeBase = "578ac98aa974fa0ec3a65bcade1c505ac5c80dcb";
 const workflowSizeLimitBytes = 512_000;
@@ -432,4 +438,237 @@ test("partial native configuration is absent or invalid and production adapters 
     if (previous === undefined) delete environment.NODE_ENV;
     else environment.NODE_ENV = previous;
   }
+});
+
+
+test("UNKNOWN arriving during admission read closes the decision after the await", async () => {
+  const state: { s8NativeOperationAttempts: Array<{ state: string }> } = { s8NativeOperationAttempts: [] };
+  const open = { state: "OPEN" as const, reason: null, proofSha256: "a".repeat(64), observedAt: "2026-09-29T00:00:00.000Z" };
+  let markStarted!: () => void;
+  let resolveRead!: (value: typeof open) => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const read = new Promise<typeof open>((resolve) => { resolveRead = resolve; });
+  const service = new S8ExportService({
+    repository: { state: () => state },
+    admissionReader: async () => { markStarted(); return read; },
+  } as never);
+
+  const pending = service.getAdmissionStatus();
+  await started;
+  state.s8NativeOperationAttempts.push({ state: "UNKNOWN" });
+  resolveRead(open);
+  assert.deepEqual(await pending, {
+    state: "CLOSED",
+    reason: "OBSERVATION_INVALID",
+    proofSha256: null,
+    observedAt: null,
+  });
+});
+
+test("the final native preparation transaction blocks a concurrent UNKNOWN before request dispatch", () => {
+  const projectId = "11111111-1111-4111-8111-111111111111";
+  const jobId = "22222222-2222-4222-8222-222222222222";
+  const artifactId = "33333333-3333-4333-8333-333333333333";
+  const claimToken = "44444444-4444-4444-8444-444444444444";
+  const context = { projectId, jobId, artifactId, claimToken, attempt: 1, source: {}, payload: {}, onHeartbeat: () => {} };
+  const state = {
+    s8ExportJobs: [{ jobId, projectId, artifactId, status: "running", claimToken, ownerId: "test-owner", ownerProcessId: 1234, attempt: 1 }],
+    s8NativeOperationAttempts: [] as Array<Record<string, unknown>>,
+  };
+  const repository = {
+    state: () => state,
+    transact: (update: (value: typeof state) => void) => update(state),
+  };
+  const service = new S8ExportService({ repository, ownerId: "test-owner", processId: 1234 } as never);
+  const methods = service as unknown as {
+    beginNativeAttempt: (context: never, operation: "WRITER" | "VALIDATOR", inputSha256: string) => string;
+    prepareNativeAttempt: (attemptId: string, requestSha256: string, requestNonce: string, releaseManifestSha256: string) => void;
+  };
+  const attemptId = methods.beginNativeAttempt(context as never, "WRITER", "b".repeat(64));
+  state.s8NativeOperationAttempts.push({ state: "UNKNOWN" });
+
+  let gatewayPostCount = 0;
+  assert.throws(() => {
+    methods.prepareNativeAttempt(attemptId, "c".repeat(64), "d".repeat(43), "e".repeat(64));
+    gatewayPostCount += 1;
+  }, (error: unknown) => (error as { code?: string }).code === "S8_WORKER_ADMISSION_CLOSED");
+  assert.equal(gatewayPostCount, 0);
+  assert.throws(() => methods.beginNativeAttempt(context as never, "VALIDATOR", "f".repeat(64)),
+    (error: unknown) => (error as { code?: string }).code === "S8_WORKER_ADMISSION_CLOSED");
+});
+
+test("an OPEN worker with no UNKNOWN attempt permits exactly one prepared native dispatch", async () => {
+  const projectId = "11111111-1111-4111-8111-111111111111";
+  const jobId = "22222222-2222-4222-8222-222222222222";
+  const artifactId = "33333333-3333-4333-8333-333333333333";
+  const claimToken = "44444444-4444-4444-8444-444444444444";
+  const context = { projectId, jobId, artifactId, claimToken, attempt: 1, source: {}, payload: {}, onHeartbeat: () => {} };
+  const state = {
+    s8ExportJobs: [{ jobId, projectId, artifactId, status: "running", claimToken, ownerId: "test-owner", ownerProcessId: 1234, attempt: 1 }],
+    s8NativeOperationAttempts: [] as Array<Record<string, unknown>>,
+  };
+  const open = { state: "OPEN" as const, reason: null, proofSha256: "a".repeat(64), observedAt: "2026-09-29T00:00:00.000Z" };
+  const repository = {
+    state: () => state,
+    transact: (update: (value: typeof state) => void) => update(state),
+  };
+  const service = new S8ExportService({
+    repository,
+    ownerId: "test-owner",
+    processId: 1234,
+    admissionReader: async () => open,
+  } as never);
+  assert.deepEqual(await service.getAdmissionStatus(), open);
+
+  const methods = service as unknown as {
+    beginNativeAttempt: (context: never, operation: "WRITER" | "VALIDATOR", inputSha256: string) => string;
+    prepareNativeAttempt: (attemptId: string, requestSha256: string, requestNonce: string, releaseManifestSha256: string) => void;
+  };
+  const attemptId = methods.beginNativeAttempt(context as never, "WRITER", "b".repeat(64));
+  methods.prepareNativeAttempt(attemptId, "c".repeat(64), "d".repeat(43), "e".repeat(64));
+  let gatewayPostCount = 0;
+  gatewayPostCount += 1;
+
+  assert.equal(state.s8NativeOperationAttempts.length, 1);
+  assert.equal(state.s8NativeOperationAttempts[0].state, "DISPATCHING");
+  assert.equal(gatewayPostCount, 1);
+});
+
+test("native response received at the shared operation deadline is rejected even when its signature is valid", async () => {
+  const appKeys = generateKeyPairSync("ed25519");
+  const launcherKeys = generateKeyPairSync("ed25519");
+  const appPrivateKey = appKeys.privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  const launcherPublicKey = launcherKeys.publicKey.export({ format: "pem", type: "spki" }).toString();
+  const releaseManifestSha256 = "a".repeat(64);
+  const executableSha256 = "4".repeat(64);
+  const imageDigest = "sha256:" + "3".repeat(64);
+  const release = {
+    writer: { imageDigest: "sha256:" + "1".repeat(64), writerScriptSha256: "2".repeat(64) },
+    validator: { imageDigest, executableSha256 },
+    processRunnerSha256: "5".repeat(64),
+  };
+  const config = {
+    gatewayUrl: "https://gateway.invalid",
+    appSigningKeyId: "app-2026",
+    appSigningPrivateKeyPem: appPrivateKey,
+    releaseManifest: {},
+    releaseAuthorityKeys: {},
+    capacityAuthorityKeys: {},
+    launcherKeys: { "launcher-2026": launcherPublicKey },
+    tlsCaPem: undefined,
+    tlsClientCertPem: undefined,
+    tlsClientKeyPem: undefined,
+  } as unknown as S8NativeWorkerConfig;
+  const payload = Buffer.from("native validator input");
+  const context = {
+    projectId: "11111111-1111-4111-8111-111111111111",
+    jobId: "22222222-2222-4222-8222-222222222222",
+    artifactId: "33333333-3333-4333-8333-333333333333",
+    attempt: 1,
+    source: { revision: "test" },
+    inputSha256: sha256(payload),
+  };
+  const releaseHandle = "r".repeat(43);
+  const expectedDeadlineUnixMs = 1000 + 330_000;
+  let nowMs = 1000;
+  let deliverLate = false;
+  let dispatchCount = 0;
+  const makeResponseFrame = (frame: ReturnType<typeof createS8NativeRequestFrame>): Buffer => {
+    const output = Buffer.from("validated-readback");
+    const auxiliary = Buffer.alloc(0);
+    const request = frame.request.body;
+    const body = {
+      schemaVersion: "s8-native-response-v1",
+      launcherKeyId: "launcher-2026",
+      requestSha256: frame.requestSha256,
+      projectId: request.projectId,
+      jobId: request.jobId,
+      artifactId: request.artifactId,
+      attempt: request.attempt,
+      operation: request.operation,
+      sourceSha256: request.sourceSha256,
+      releaseManifestSha256,
+      imageDigest,
+      containerId: "d".repeat(64),
+      inputSha256: request.inputSha256,
+      inputBytes: payload.length,
+      outputSha256: sha256(output),
+      outputBytes: output.length,
+      auxiliarySha256: sha256(auxiliary),
+      auxiliaryBytes: auxiliary.length,
+      exitClass: "EXIT_0",
+      limitProfileSha256: S8_NATIVE_RESOURCE_POLICY_SHA256,
+      disposalState: "REAPED_REMOVED",
+      releaseHandle,
+      validatorIdentity: "s8-validator-sha256:" + executableSha256,
+      runnerEvidence: null,
+    };
+    const signature = sign(null, Buffer.concat([
+      Buffer.from("S8-NATIVE-RESPONSE-V1\0", "ascii"),
+      Buffer.from(jcs(body), "utf8"),
+    ]), launcherKeys.privateKey).toString("base64url");
+    const header = Buffer.from(jcs({ body, signature }), "utf8");
+    const frameBytes = Buffer.alloc(4 + header.length + 8 + output.length + 8 + auxiliary.length);
+    frameBytes.writeUInt32BE(header.length, 0);
+    header.copy(frameBytes, 4);
+    frameBytes.writeBigUInt64BE(BigInt(output.length), 4 + header.length);
+    output.copy(frameBytes, 4 + header.length + 8);
+    frameBytes.writeBigUInt64BE(BigInt(auxiliary.length), 4 + header.length + 8 + output.length);
+    return frameBytes;
+  };
+  const operationRequest = async (
+    _url: URL,
+    _agent: object,
+    frame: ReturnType<typeof createS8NativeRequestFrame>,
+    _payload: Buffer,
+    _maximumResponseBytes: number,
+    _timeoutMs: number,
+    _heartbeat: () => void,
+    requestDeadlineUnixMs: number,
+  ): Promise<{ statusCode: number; bytes: Buffer }> => {
+    assert.equal(frame.request.body.deadlineUnixMs, expectedDeadlineUnixMs);
+    assert.equal(requestDeadlineUnixMs, expectedDeadlineUnixMs);
+    dispatchCount += 1;
+    nowMs = deliverLate ? expectedDeadlineUnixMs : expectedDeadlineUnixMs - 1;
+    return { statusCode: 200, bytes: makeResponseFrame(frame) };
+  };
+  const worker = new S8NativeWorkerClient(config, async () => Buffer.alloc(0), () => nowMs, operationRequest as never);
+  const probe = worker as unknown as {
+    requireVerifiedOpen: (deadline: number) => Promise<{ releaseManifestSha256: string; release: typeof release }>;
+    runOperation: (
+      operation: "VALIDATOR",
+      payload: Buffer,
+      context: { projectId: string; jobId: string; artifactId: string; attempt: number; source: unknown; inputSha256: string },
+      releaseHandle: string,
+      heartbeat: () => void,
+      expectedReleaseManifestSha256: string,
+      onRequestPrepared: (requestSha256: string, requestNonce: string, releaseManifestSha256: string, deadline: number) => void,
+      deadline?: number,
+    ) => Promise<{ requestSha256: string }>;
+  };
+  let admissionDeadline = 0;
+  probe.requireVerifiedOpen = async (deadline) => {
+    admissionDeadline = deadline;
+    nowMs = 1050;
+    return { releaseManifestSha256, release };
+  };
+  let preparedDeadline = 0;
+  const accepted = await probe.runOperation("VALIDATOR", payload, context, releaseHandle, () => {}, releaseManifestSha256,
+    (_requestSha256, _nonce, _manifestSha256, deadline) => { preparedDeadline = deadline; });
+  assert.equal(accepted.requestSha256.length, 64);
+  assert.equal(dispatchCount, 1);
+  assert.equal(admissionDeadline, expectedDeadlineUnixMs);
+  assert.equal(preparedDeadline, expectedDeadlineUnixMs);
+
+  nowMs = 1000;
+  deliverLate = true;
+  preparedDeadline = 0;
+  await assert.rejects(
+    probe.runOperation("VALIDATOR", payload, context, releaseHandle, () => {}, releaseManifestSha256,
+      (_requestSha256, _nonce, _manifestSha256, deadline) => { preparedDeadline = deadline; }),
+    /S8_NATIVE_OPERATION_TIMEOUT/u,
+  );
+  assert.equal(dispatchCount, 2);
+  assert.equal(admissionDeadline, expectedDeadlineUnixMs);
+  assert.equal(preparedDeadline, expectedDeadlineUnixMs);
 });
