@@ -5,6 +5,58 @@ import { S8_NATIVE_RESOURCE_POLICY, S8_NATIVE_RESOURCE_POLICY_SHA256 } from "./s
 import { AppError } from "./types";
 import type { S8NativeWorkerConfig } from "./s8-fbx-config";
 import { S8_NATIVE_WORKER_PROTOCOL_VERSION } from "./s8-native-release";
+import type { S8RunnerEvidence } from "./s8-fbx-worker";
+
+export function canonicalS8RunnerReceiptBytes(value: S8RunnerEvidence): Buffer {
+  return Buffer.from(JSON.stringify({
+    schemaVersion: value.schemaVersion,
+    protocol: value.protocol,
+    policyId: value.policyId,
+    requested: {
+      rlimitAsBytes: value.requested.rlimitAsBytes,
+      rlimitFsizeBytes: value.requested.rlimitFsizeBytes,
+      rlimitCpuSeconds: value.requested.rlimitCpuSeconds,
+      rlimitNproc: value.requested.rlimitNproc,
+      wallTimeoutMs: value.requested.wallTimeoutMs,
+      stdoutBytes: value.requested.stdoutBytes,
+      stderrBytes: value.requested.stderrBytes,
+      maxChildren: value.requested.maxChildren,
+    },
+    appliedByChild: {
+      rlimitAsBytes: value.appliedByChild.rlimitAsBytes,
+      rlimitFsizeBytes: value.appliedByChild.rlimitFsizeBytes,
+      rlimitCpuSeconds: value.appliedByChild.rlimitCpuSeconds,
+      rlimitNproc: value.appliedByChild.rlimitNproc,
+      noNewPrivs: value.appliedByChild.noNewPrivs,
+      seccompMode: value.appliedByChild.seccompMode,
+    },
+    observedByRunnerParent: {
+      rlimitAsBytes: value.observedByRunnerParent.rlimitAsBytes,
+      rlimitFsizeBytes: value.observedByRunnerParent.rlimitFsizeBytes,
+      rlimitCpuSeconds: value.observedByRunnerParent.rlimitCpuSeconds,
+      rlimitNproc: value.observedByRunnerParent.rlimitNproc,
+      noNewPrivs: value.observedByRunnerParent.noNewPrivs,
+      seccompMode: value.observedByRunnerParent.seccompMode,
+    },
+    runnerParentVerification: {
+      status: value.runnerParentVerification.status,
+      mismatchCode: value.runnerParentVerification.mismatchCode,
+    },
+    runnerBinary: { selfSha256: value.runnerBinary.selfSha256 },
+    result: {
+      code: value.result.code,
+      name: value.result.name,
+      terminationClass: value.result.terminationClass,
+      targetExit: value.result.targetExit,
+      targetSignal: value.result.targetSignal,
+      elapsedMs: value.result.elapsedMs,
+      stdoutBytes: value.result.stdoutBytes,
+      stderrBytes: value.result.stderrBytes,
+      setupStage: value.result.setupStage,
+      evidenceCode: value.result.evidenceCode,
+    },
+  }), "utf8");
+}
 
 export type S8NativeOperation = "WRITER" | "VALIDATOR";
 export type S8NativeOperationContext = {

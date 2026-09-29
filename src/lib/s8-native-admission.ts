@@ -91,7 +91,7 @@ export type S8SignedCapacityProof = {
 };
 
 type S8LauncherObservationBody = {
-  schemaVersion: "s8-launcher-observation-v1";
+  schemaVersion: "s8-launcher-observation-v2";
   proofSha256: string;
   state: S8AdmissionState;
   observedAt: string;
@@ -104,6 +104,10 @@ type S8LauncherObservationBody = {
   cgroupTreeSha256: string;
   releaseManifestSha256: string;
   resourcePolicySha256: string;
+  jobAppArmorMode: "unsupported-not-relied-upon";
+  rootlessKitHostAppArmorMode: "required-profile";
+  rootlessKitHostAppArmorProfileName: string;
+  rootlessKitHostAppArmorProfileSha256: string;
   cgroupV2: true;
   rootlessDocker: true;
   requiredControllers: ["cpu", "memory", "pids"];
@@ -269,9 +273,10 @@ function assertObservationBody(value: unknown, nowMs: number, proof: S8CapacityP
   exactKeys(observation, [
     "schemaVersion", "proofSha256", "state", "observedAt", "launcherKeyId", "hostId", "cpuMilli", "memoryBytes", "pids",
     "workloadInventorySha256", "cgroupTreeSha256", "releaseManifestSha256", "resourcePolicySha256",
+    "jobAppArmorMode", "rootlessKitHostAppArmorMode", "rootlessKitHostAppArmorProfileName", "rootlessKitHostAppArmorProfileSha256",
     "cgroupV2", "rootlessDocker", "requiredControllers", "startupReconciled", "unreconciledContainerCount",
   ]);
-  if (observation.schemaVersion !== "s8-launcher-observation-v1" || !["CLOSED", "PROVING", "OPEN"].includes(String(observation.state))) throw new Error("schema");
+  if (observation.schemaVersion !== "s8-launcher-observation-v2" || !["CLOSED", "PROVING", "OPEN"].includes(String(observation.state))) throw new Error("schema");
   if (typeof observation.launcherKeyId !== "string" || !KEY_ID.test(observation.launcherKeyId)) throw new Error("key-id");
   const observedAt = timestamp(observation.observedAt);
   if (observedAt > nowMs + CLOCK_SKEW_MS || nowMs - observedAt > MAX_OBSERVATION_AGE_MS) throw new Error("freshness");
@@ -279,7 +284,10 @@ function assertObservationBody(value: unknown, nowMs: number, proof: S8CapacityP
     || observation.cpuMilli !== proof.host.cpuMilli || observation.memoryBytes !== proof.host.memoryBytes || observation.pids !== proof.host.pids
     || observation.workloadInventorySha256 !== proof.workloadInventorySha256 || observation.cgroupTreeSha256 !== proof.cgroupTreeSha256
     || observation.releaseManifestSha256 !== proof.releaseManifestSha256 || observation.resourcePolicySha256 !== proof.resourcePolicySha256) throw new Error("drift");
-  if (observation.cgroupV2 !== true || observation.rootlessDocker !== true || observation.startupReconciled !== true || observation.unreconciledContainerCount !== 0) throw new Error("runtime");
+  if (observation.cgroupV2 !== true || observation.rootlessDocker !== true || observation.startupReconciled !== true || observation.unreconciledContainerCount !== 0
+    || observation.jobAppArmorMode !== "unsupported-not-relied-upon" || observation.rootlessKitHostAppArmorMode !== "required-profile"
+    || observation.rootlessKitHostAppArmorProfileName !== "swooshz-s8-rootlesskit-v1"
+    || typeof observation.rootlessKitHostAppArmorProfileSha256 !== "string" || !HEX64.test(observation.rootlessKitHostAppArmorProfileSha256)) throw new Error("runtime");
   const controllers = observation.requiredControllers;
   if (!Array.isArray(controllers) || controllers.length !== 3 || controllers[0] !== "cpu" || controllers[1] !== "memory" || controllers[2] !== "pids") throw new Error("controllers");
   return observation as unknown as S8LauncherObservationBody;
@@ -311,7 +319,7 @@ export function decideS8NativeAdmission(
     const observationRecord = record(launcher.observation);
     const launcherKeyId = observationRecord.launcherKeyId;
     if (typeof launcherKeyId !== "string" || !trust.launcherKeys[launcherKeyId]) return { state: "CLOSED", reason: "TRUST_KEY_MISSING", proofSha256, observedAt: null };
-    if (!verifySignedBody(observationRecord, launcher.signature, trust.launcherKeys[launcherKeyId]!, "S8-LAUNCHER-OBSERVATION-V1")) return { state: "CLOSED", reason: "SIGNATURE_INVALID", proofSha256, observedAt: null };
+    if (!verifySignedBody(observationRecord, launcher.signature, trust.launcherKeys[launcherKeyId]!, "S8-LAUNCHER-OBSERVATION-V2")) return { state: "CLOSED", reason: "SIGNATURE_INVALID", proofSha256, observedAt: null };
     let observation: S8LauncherObservationBody;
     try { observation = assertObservationBody(observationRecord, nowMs, proof, proofSha256); }
     catch (error) {

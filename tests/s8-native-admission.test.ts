@@ -59,7 +59,7 @@ function envelope(state: "CLOSED" | "PROVING" | "OPEN" = "OPEN", cpuMilli = 4000
   const capacity = capacityProof(state, cpuMilli);
   const proofSha256 = sha256(jcs(capacity));
   const observation = {
-    schemaVersion: "s8-launcher-observation-v1",
+    schemaVersion: "s8-launcher-observation-v2",
     proofSha256,
     state,
     observedAt: new Date(now - 500).toISOString(),
@@ -72,6 +72,10 @@ function envelope(state: "CLOSED" | "PROVING" | "OPEN" = "OPEN", cpuMilli = 4000
     cgroupTreeSha256: "d".repeat(64),
     releaseManifestSha256: "e".repeat(64),
     resourcePolicySha256: S8_NATIVE_RESOURCE_POLICY_SHA256,
+    jobAppArmorMode: "unsupported-not-relied-upon",
+    rootlessKitHostAppArmorMode: "required-profile",
+    rootlessKitHostAppArmorProfileName: "swooshz-s8-rootlesskit-v1",
+    rootlessKitHostAppArmorProfileSha256: "1".repeat(64),
     cgroupV2: true,
     rootlessDocker: true,
     requiredControllers: ["cpu", "memory", "pids"] as ["cpu", "memory", "pids"],
@@ -80,7 +84,7 @@ function envelope(state: "CLOSED" | "PROVING" | "OPEN" = "OPEN", cpuMilli = 4000
   };
   return {
     capacity,
-    launcher: { observation, signature: signBody(observation, launcherKeys.privateKey, "S8-LAUNCHER-OBSERVATION-V1") },
+    launcher: { observation, signature: signBody(observation, launcherKeys.privateKey, "S8-LAUNCHER-OBSERVATION-V2") },
   } as S8AdmissionEnvelope;
 }
 
@@ -94,7 +98,7 @@ test("missing proof and missing trust remain CLOSED", () => {
   assert.equal(decideS8NativeAdmission(envelope(), undefined, now).state, "CLOSED");
 });
 
-test("a freshly signed, arithmetically valid realized proof opens admission", () => {
+test("OPEN accepts unsupported-not-relied-upon job AppArmor with a bound RootlessKit host profile", () => {
   const proofEnvelope = envelope();
   const result = decideS8NativeAdmission(proofEnvelope, trust, now);
   assert.deepEqual(result, {
@@ -131,15 +135,27 @@ test("PROVING is observable but cannot dispatch product work", () => {
   assert.throws(() => requireS8NativeAdmissionOpen(result), /S8_WORKER_ADMISSION_CLOSED/);
 });
 
-test("tampered proof and launcher drift fail closed", () => {
+test("the prior launcher observation schema and signature domain are rejected", () => {
+  const oldSchema = envelope();
+  (oldSchema.launcher.observation as unknown as { schemaVersion: string }).schemaVersion = "s8-launcher-observation-v1";
+  oldSchema.launcher.signature = signBody(oldSchema.launcher.observation as unknown as Record<string, unknown>, launcherKeys.privateKey, "S8-LAUNCHER-OBSERVATION-V1");
+  assert.equal(decideS8NativeAdmission(oldSchema, trust, now).reason, "SIGNATURE_INVALID");
+});
+
+test("tampered proof, launcher drift, and impossible AppArmor mode fail closed", () => {
   const tampered = envelope();
   (tampered.capacity.proof.host as { memoryBytes: number }).memoryBytes -= 1;
   assert.equal(decideS8NativeAdmission(tampered, trust, now).reason, "SIGNATURE_INVALID");
 
   const drifted = envelope();
   (drifted.launcher.observation as { cgroupTreeSha256: string }).cgroupTreeSha256 = "a".repeat(64);
-  drifted.launcher.signature = signBody(drifted.launcher.observation as unknown as Record<string, unknown>, launcherKeys.privateKey, "S8-LAUNCHER-OBSERVATION-V1");
+  drifted.launcher.signature = signBody(drifted.launcher.observation as unknown as Record<string, unknown>, launcherKeys.privateKey, "S8-LAUNCHER-OBSERVATION-V2");
   assert.equal(decideS8NativeAdmission(drifted, trust, now).reason, "REALIZATION_DRIFT");
+
+  const wrongJobMode = envelope();
+  (wrongJobMode.launcher.observation as unknown as { jobAppArmorMode: string }).jobAppArmorMode = "required-profile";
+  wrongJobMode.launcher.signature = signBody(wrongJobMode.launcher.observation as unknown as Record<string, unknown>, launcherKeys.privateKey, "S8-LAUNCHER-OBSERVATION-V2");
+  assert.equal(decideS8NativeAdmission(wrongJobMode, trust, now).reason, "REALIZATION_DRIFT");
 });
 
 test("expired proof and stale launcher observation fail closed", () => {
@@ -150,6 +166,6 @@ test("expired proof and stale launcher observation fail closed", () => {
 
   const staleObservation = envelope();
   staleObservation.launcher.observation.observedAt = new Date(now - 31_000).toISOString();
-  staleObservation.launcher.signature = signBody(staleObservation.launcher.observation as unknown as Record<string, unknown>, launcherKeys.privateKey, "S8-LAUNCHER-OBSERVATION-V1");
+  staleObservation.launcher.signature = signBody(staleObservation.launcher.observation as unknown as Record<string, unknown>, launcherKeys.privateKey, "S8-LAUNCHER-OBSERVATION-V2");
   assert.equal(decideS8NativeAdmission(staleObservation, trust, now).reason, "OBSERVATION_STALE");
 });

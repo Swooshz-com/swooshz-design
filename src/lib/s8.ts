@@ -7,7 +7,8 @@ import { JsonRepository, PrivateObjectStore } from "./store";
 import { jcs, newUuid, nowUtc, sha256, uuidV4Pattern } from "./utils";
 import { S6WorkflowService } from "./s6";
 import { S7CadService } from "./s7-cad";
-import { canonicalS8RunnerReceiptBytes, type S8CallerVerification, type S8NativeValidatorResult, type S8RunnerEvidence, type S8WriterReceipt, type S8WriterResult } from "./s8-fbx-worker";
+import type { S8CallerVerification, S8NativeValidatorResult, S8RunnerEvidence, S8WriterReceipt, S8WriterResult } from "./s8-fbx-worker";
+import { canonicalS8RunnerReceiptBytes } from "./s8-native-protocol";
 import { S8NativeWorkerClient } from "./s8-native-worker-client";
 import { S8NativeSignedFailure } from "./s8-native-protocol";
 import { requireS8NativeAdmissionOpen, type S8AdmissionDecision } from "./s8-native-admission";
@@ -26,7 +27,7 @@ export type S8PreparedExport = {
 export type S8PublicArtifact = Omit<S8Artifact, "privateStagingPrefix" | "privateFinalPrefix">;
 export type S8ExportResult = { replayed: boolean; export: S8PublicArtifact; job: Pick<S8ExportJob, "jobId" | "status" | "attempt"> };
 export type S8DownloadResult = { bytes: Buffer; contentType: "application/octet-stream"; fileName: "swooshz-s8-scene.fbx" };
-export type S8NativeValidationResult = S8NativeValidatorResult;
+export type S8NativeValidationResult = Omit<S8NativeValidatorResult, "brokerIdentity" | "brokerMetadata">;
 
 export type S8AdapterContext = { projectId: UUID; jobId: UUID; artifactId: UUID; claimToken: UUID; attempt: number; source: S8SourceStamp; payload: S8WriterPayload; onHeartbeat: () => void };
 export type S8ExportAdapters = {
@@ -226,6 +227,9 @@ export class S8ExportService {
   private startupReconciled = true;
 
   constructor(options: S8ExportServiceOptions) {
+    if (process.env.NODE_ENV === "production" && options.adapters && Object.values(options.adapters).some((adapter) => adapter !== undefined)) {
+      fail(503, "S8_WORKER_ADMISSION_CLOSED");
+    }
     this.repository = options.repository;
     this.objects = options.objects;
     this.s6 = options.s6;
@@ -459,7 +463,7 @@ export class S8ExportService {
       }
     });
   }
-  private async writer(payload: Buffer, context: S8AdapterContext): Promise<S8WriterResult & { releaseHandle?: string; releaseManifestSha256?: string; nativeRequestSha256?: string; nativeResponseSha256?: string }> {
+  private async writer(payload: Buffer, context: S8AdapterContext): Promise<Omit<S8WriterResult, "brokerIdentity" | "brokerMetadata"> & { releaseHandle?: string; releaseManifestSha256?: string; nativeRequestSha256?: string; nativeResponseSha256?: string }> {
     requireS8NativeAdmissionOpen(await this.getAdmissionStatus());
     if (this.adapters.writer) return this.adapters.writer(payload, context);
     if (!this.nativeWorker) fail(503, "S8_WORKER_ADMISSION_CLOSED");

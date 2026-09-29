@@ -45,7 +45,7 @@ export function loadConfig(environment = process.env) {
     "S8_LAUNCHER_TLS_KEY_FILE", "S8_LAUNCHER_TLS_CERT_FILE", "S8_LAUNCHER_CLIENT_CA_FILE", "S8_GATEWAY_CLIENT_CERT_SHA256",
     "S8_LAUNCHER_SIGNING_KEY_FILE", "S8_LAUNCHER_KEY_ID", "S8_CAPACITY_PROOF_FILE", "S8_CAPACITY_AUTHORITY_PUBLIC_KEYS_FILE",
     "S8_RELEASE_MANIFEST_FILE", "S8_RELEASE_PUBLIC_KEYS_FILE", "S8_APP_PUBLIC_KEYS_FILE", "S8_WORKLOAD_INVENTORY_FILE",
-    "S8_CGROUP_ROOT", "S8_SECCOMP_POLICY_FILE", "S8_APPARMOR_PROFILE_FILE", "S8_LEDGER_DIRECTORY",
+    "S8_CGROUP_ROOT", "S8_SECCOMP_POLICY_FILE", "S8_ROOTLESSKIT_APPARMOR_PROFILE_FILE", "S8_LEDGER_DIRECTORY",
     "S8_WRITER_IMAGE_REPOSITORY", "S8_VALIDATOR_IMAGE_REPOSITORY",
   ];
   if (required.some((key) => typeof environment[key] !== "string" || environment[key].length === 0)) throw new Error("configuration-incomplete");
@@ -75,8 +75,7 @@ export function loadConfig(environment = process.env) {
     sysRoot: resolve(environment.S8_SYS_ROOT ?? "/sys"),
     etcRoot: resolve(environment.S8_ETC_ROOT ?? "/etc"),
     seccompPolicyFile: resolve(environment.S8_SECCOMP_POLICY_FILE),
-    appArmorProfileFile: resolve(environment.S8_APPARMOR_PROFILE_FILE),
-    appArmorProfileName: "swooshz-s8-worker-v1",
+    rootlessKitAppArmorProfileFile: resolve(environment.S8_ROOTLESSKIT_APPARMOR_PROFILE_FILE),
     ledger: new ReplayLedger(resolve(environment.S8_LEDGER_DIRECTORY)),
     dockerPath, dockerSocket: socket,
     writerRepository: imageRepository(environment.S8_WRITER_IMAGE_REPOSITORY),

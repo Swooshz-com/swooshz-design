@@ -98,7 +98,7 @@ export function createLauncherServer(config) {
     if (request.method === "GET" && url.pathname === "/v1/admission" && url.search === "") {
       try {
         const snapshot = await admissionSnapshot(config, () => isStartupReady);
-        const launcher = signedBody(config, snapshot.observation, "S8-LAUNCHER-OBSERVATION-V1");
+        const launcher = signedBody(config, snapshot.observation, "S8-LAUNCHER-OBSERVATION-V2");
         return sendJson(response, 200, { capacity: snapshot.signedProof, launcher });
       } catch { return sendJson(response, 503, { state: "CLOSED", error: "S8_WORKER_ADMISSION_CLOSED" }); }
     }

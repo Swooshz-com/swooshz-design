@@ -1,7 +1,8 @@
 import { request as httpsRequest, Agent } from "node:https";
 import { createS8NativeRequestFrame, createS8NativeStatusRequest, parseS8NativeJson, parseS8NativeResponseFrame, parseS8NativeStatusResponse, S8NativeSignedFailure, type S8NativeOperationContext } from "./s8-native-protocol";
 import type { S8NativeValidatorResult, S8RunnerEvidence, S8WriterReceipt, S8WriterResult } from "./s8-fbx-worker";
-import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "./s8-native-admission";
+type NativeWorkerWriterResult = Omit<S8WriterResult, "brokerIdentity" | "brokerMetadata">;
+type NativeWorkerValidatorResult = Omit<S8NativeValidatorResult, "brokerIdentity" | "brokerMetadata">;
 import { jcs, sha256 } from "./utils";
 import { AppError } from "./types";
 import { decideS8NativeAdmission, type S8AdmissionDecision, type S8AdmissionEnvelope } from "./s8-native-admission";
@@ -12,6 +13,18 @@ const ADMISSION_RESPONSE_MAX_BYTES = 64 * 1024;
 const STREAM_CHUNK_BYTES = 256 * 1024;
 const MAX_WRITER_RESPONSE_BYTES = 64 * 1024 + 16 + 128 * 1024 * 1024 + 1024 * 1024;
 const MAX_VALIDATOR_RESPONSE_BYTES = 64 * 1024 + 16 + 8 * 1024 * 1024;
+
+export function assertS8ReleaseAdmissionBinding(envelope: S8AdmissionEnvelope, active: S8VerifiedReleaseManifest): void {
+  const observation = envelope.launcher.observation;
+  const hostAppArmor = active.manifest.sandbox.rootlessKitHostAppArmor;
+  if (envelope.capacity.proof.releaseManifestSha256 !== active.sha256
+    || observation.jobAppArmorMode !== active.manifest.sandbox.jobAppArmorMode
+    || observation.rootlessKitHostAppArmorMode !== hostAppArmor.mode
+    || observation.rootlessKitHostAppArmorProfileName !== hostAppArmor.profileName
+    || observation.rootlessKitHostAppArmorProfileSha256 !== hostAppArmor.profileSha256) {
+    throw new Error("S8_RELEASE_MANIFEST_DRIFT");
+  }
+}
 
 export type S8AdmissionJsonRequest = (url: URL, agent: Agent, timeoutMs: number) => Promise<Buffer>;
 
@@ -180,7 +193,7 @@ export class S8NativeWorkerClient {
 
   private verifyActiveRelease(envelope: S8AdmissionEnvelope): S8VerifiedReleaseManifest {
     const active = verifyS8ReleaseManifest(this.config.releaseManifest, this.config.releaseAuthorityKeys, this.now());
-    if (envelope.capacity.proof.releaseManifestSha256 !== active.sha256) throw new Error("S8_RELEASE_MANIFEST_DRIFT");
+    assertS8ReleaseAdmissionBinding(envelope, active);
     return active;
   }
 
@@ -245,7 +258,7 @@ export class S8NativeWorkerClient {
     heartbeat: () => void,
     expectedReleaseManifestSha256?: string,
     onRequestPrepared?: (requestSha256: string, requestNonce: string, releaseManifestSha256: string) => void,
-  ): Promise<{ output: Buffer; auxiliary: Buffer; response: ReturnType<typeof parseS8NativeResponseFrame>["response"]; metadata: Buffer; requestId: string; requestSha256: string; responseSha256: string; configSha256: string; release: S8ReleaseManifestBody }> {
+  ): Promise<{ output: Buffer; auxiliary: Buffer; response: ReturnType<typeof parseS8NativeResponseFrame>["response"]; requestSha256: string; responseSha256: string; release: S8ReleaseManifestBody }> {
     const admission = await this.requireVerifiedOpen();
     if (expectedReleaseManifestSha256 && expectedReleaseManifestSha256 !== admission.releaseManifestSha256) throw new AppError(503, "S8_WORKER_ADMISSION_CLOSED");
     const frame = createS8NativeRequestFrame(operation, payload, context, releaseHandle, this.config, this.now());
@@ -286,35 +299,19 @@ export class S8NativeWorkerClient {
       output: parsed.output,
       auxiliary: parsed.auxiliary,
       response: parsed.response,
-      metadata: Buffer.from(jcs({ request: frame.request, response: parsed.response }), "utf8"),
-      requestId: frame.request.body.nonce,
       requestSha256: frame.requestSha256,
       responseSha256,
-      configSha256: frame.request.body.configSha256,
       release: admission.release,
     };
   }
 
-  async runWriter(payload: Buffer, context: S8NativeOperationContext, heartbeat: () => void, onRequestPrepared?: (requestSha256: string, requestNonce: string, releaseManifestSha256: string) => void): Promise<S8WriterResult & { releaseHandle: string; releaseManifestSha256: string; nativeRequestSha256: string; nativeResponseSha256: string }> {
+  async runWriter(payload: Buffer, context: S8NativeOperationContext, heartbeat: () => void, onRequestPrepared?: (requestSha256: string, requestNonce: string, releaseManifestSha256: string) => void): Promise<NativeWorkerWriterResult & { releaseHandle: string; releaseManifestSha256: string; nativeRequestSha256: string; nativeResponseSha256: string }> {
     const result = await this.runOperation("WRITER", payload, context, null, heartbeat, undefined, onRequestPrepared);
     const receipt = parseS8NativeJson(result.auxiliary) as unknown as S8WriterReceipt;
     if (receipt.writerScriptSha256 !== result.release.writer.writerScriptSha256) throw new Error("S8_NATIVE_PROTOCOL_INVALID");
     const body = result.response.body;
     const runnerEvidence = body.runnerEvidence as S8RunnerEvidence;
     if (runnerEvidence?.runnerBinary?.selfSha256 !== result.release.processRunnerSha256) throw new AppError(503, "S8_NATIVE_WORKER_RELEASE_MISMATCH");
-    const caller = runnerEvidence?.verifiedByCaller;
-    const brokerIdentity = {
-      requestId: result.requestId,
-      allocationId: null,
-      brokerStatus: 200,
-      launcherStatus: 200,
-      nativeOuterExit: 0,
-      nativeOuterSignal: null,
-      policySha256: S8_NATIVE_RESOURCE_POLICY_SHA256,
-      configSha256: result.configSha256,
-      runnerPreSha256: caller?.preLaunchSha256 ?? null,
-      runnerPostSha256: caller?.postLaunchSha256 ?? null,
-    };
     return {
       artifact: result.output,
       receipt,
@@ -323,8 +320,6 @@ export class S8NativeWorkerClient {
       stderr: "",
       nativeStdout: Buffer.alloc(0),
       nativeStderr: Buffer.alloc(0),
-      brokerIdentity,
-      brokerMetadata: result.metadata,
       releaseHandle: body.releaseHandle!,
       releaseManifestSha256: body.releaseManifestSha256,
       nativeRequestSha256: result.requestSha256,
@@ -332,25 +327,12 @@ export class S8NativeWorkerClient {
     };
   }
 
-  async runValidator(artifact: Buffer, context: S8NativeOperationContext, releaseHandle: string, heartbeat: () => void, expectedReleaseManifestSha256?: string, onRequestPrepared?: (requestSha256: string, requestNonce: string, releaseManifestSha256: string) => void): Promise<S8NativeValidatorResult & { nativeRequestSha256: string; nativeResponseSha256: string; releaseManifestSha256: string }> {
+  async runValidator(artifact: Buffer, context: S8NativeOperationContext, releaseHandle: string, heartbeat: () => void, expectedReleaseManifestSha256?: string, onRequestPrepared?: (requestSha256: string, requestNonce: string, releaseManifestSha256: string) => void): Promise<NativeWorkerValidatorResult & { nativeRequestSha256: string; nativeResponseSha256: string; releaseManifestSha256: string }> {
     const result = await this.runOperation("VALIDATOR", artifact, context, releaseHandle, heartbeat, expectedReleaseManifestSha256, onRequestPrepared);
     const readback = parseS8NativeJson(result.output);
     const body = result.response.body;
     const runnerEvidence = body.runnerEvidence as S8RunnerEvidence;
     if (runnerEvidence?.runnerBinary?.selfSha256 !== result.release.processRunnerSha256) throw new AppError(503, "S8_NATIVE_WORKER_RELEASE_MISMATCH");
-    const caller = runnerEvidence?.verifiedByCaller;
-    const brokerIdentity = {
-      requestId: result.requestId,
-      allocationId: null,
-      brokerStatus: 200,
-      launcherStatus: 200,
-      nativeOuterExit: 0,
-      nativeOuterSignal: null,
-      policySha256: S8_NATIVE_RESOURCE_POLICY_SHA256,
-      configSha256: result.configSha256,
-      runnerPreSha256: caller?.preLaunchSha256 ?? null,
-      runnerPostSha256: caller?.postLaunchSha256 ?? null,
-    };
     return {
       readback: readback as unknown as S8NativeValidatorResult["readback"],
       readbackBytes: result.output,
@@ -360,8 +342,6 @@ export class S8NativeWorkerClient {
       stderr: "",
       nativeStdout: Buffer.alloc(0),
       nativeStderr: Buffer.alloc(0),
-      brokerIdentity,
-      brokerMetadata: result.metadata,
       nativeRequestSha256: result.requestSha256,
       nativeResponseSha256: result.responseSha256,
       releaseManifestSha256: body.releaseManifestSha256,

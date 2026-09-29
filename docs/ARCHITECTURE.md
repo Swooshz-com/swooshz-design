@@ -185,7 +185,7 @@ Writer and Validator retain these hard per-container maxima:
 | Writer | 2 CPUs | 4 GiB | 80 |
 | Validator | 1 CPU | 1.5 GiB | 32 |
 
-The initial concurrency limit is one native operation across the complete Design worker. Rootless runtime, cgroup-v2 CPU/memory/PID enforcement, network isolation, seccomp, applicable AppArmor, image digests, teardown, and release identity must be read back by the launcher. Resource ceilings are not inferred from container flags alone.
+The initial concurrency limit is one native operation across the complete Design worker. Rootless runtime, cgroup-v2 CPU/memory/PID enforcement, network isolation, seccomp, the separately bound RootlessKit host AppArmor profile, image digests, teardown, and release identity must be read back by the launcher. Per-job AppArmor is unsupported and not relied upon for the selected rootless Docker runtime. Resource ceilings are not inferred from container flags alone.
 
 Native worker admission is CLOSED unless an unexpired Owner-signed host-capacity proof and fresh launcher-signed realization observation prove the allocation, current workload inventory, effective cgroup tree, release manifest, and required contention/resource-limit tests. PROVING permits synthetic operator-controlled capacity tests only. CLOSED and PROVING never dispatch product Writer/Validator jobs. Missing, invalid, or drifted proof remains CLOSED.
 

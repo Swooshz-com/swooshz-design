@@ -46,7 +46,8 @@ Canonical signed bodies use the existing RFC 8785 JSON canonicalizer. Protocol s
 - Request: S8-NATIVE-REQUEST-V1 followed by one NUL byte.
 - Response: S8-NATIVE-RESPONSE-V1 followed by one NUL byte.
 - Capacity proof: S8-CAPACITY-PROOF-V1 followed by one NUL byte.
-- Release manifest: S8-RELEASE-MANIFEST-V1 followed by one NUL byte.
+- Launcher observation: S8-LAUNCHER-OBSERVATION-V2 followed by one NUL byte.
+- Release manifest: S8-RELEASE-MANIFEST-V2 followed by one NUL byte.
 
 The signature is Ed25519 over the domain prefix plus canonical JSON of the body without its signature field. Keys are selected by an explicit key ID. Key rotation uses overlapping key IDs; unknown, revoked, expired, malformed, or mismatched keys fail closed. App signing private keys exist only in the application secret store. Launcher response private keys exist only in the host launcher's protected key store. Gateway has only verification keys and TLS transport identity.
 
@@ -89,9 +90,9 @@ The frozen native maxima are exact:
 
 The end-to-end deadlines remain 510 seconds for Writer and 330 seconds for Validator. Temporary filesystem ceilings remain 1 GiB and 256 MiB respectively. Writer stdout and all stderr are capped at 1 MiB; Validator stdout is the bounded readback channel capped at 8 MiB. Initially, the host launcher permits one native operation at a time across the whole Design worker.
 
-Both images run as fixed non-root UIDs, with no supplementary groups, read-only root filesystem, no capabilities, NoNewPrivileges, enforced seccomp, enforced AppArmor where the accepted host supports it, bounded job-local tmpfs only, no bind mounts, no volumes, no devices, no host namespaces, no GPU, network none, no DNS, no inherited secrets, no core dumps, and restart policy disabled. Logs are disabled for payload streams. Fixed launcher-owned arguments/environment are not caller-selectable.
+Both images run as fixed non-root UIDs, with no supplementary groups, read-only root filesystem, no capabilities, NoNewPrivileges, enforced seccomp, bounded job-local tmpfs only, no bind mounts, no volumes, no devices, no host namespaces, no GPU, network none, no DNS, no inherited secrets, no core dumps, and restart policy disabled. Logs are disabled for payload streams. Fixed launcher-owned arguments/environment are not caller-selectable. Per-job Docker AppArmor is `unsupported-not-relied-upon` for the selected rootless runtime and is never emitted as a container option.
 
-The launcher must prove the dedicated rootless Docker daemon and effective cgroup-v2 CPU, memory, and PID controllers before exposing admission. Rootless Docker resource flags require cgroup v2 with the systemd driver, so the launcher rejects cgroupfs and verifies the actual user-manager, daemon, worker-slice, and worker-scope cgroups. The concrete container ceilings must be verified from the realized cgroup hierarchy, not inferred from CLI flags alone. Docker currently [lists AppArmor as unsupported in rootless mode](https://docs.docker.com/engine/security/rootless/troubleshoot/); this contract retains the accepted AppArmor requirement and the launcher fails closed unless the realized runtime can prove enforcement. Missing delegation/controller support, finite-limit readback failure, seccomp/AppArmor mismatch, image drift, runtime drift, or unknown workload inventory keeps admission CLOSED. A rootful daemon or unconfined fallback is forbidden.
+The launcher must prove the dedicated rootless Docker daemon and effective cgroup-v2 CPU, memory, and PID controllers before exposing admission. Rootless Docker resource flags require cgroup v2 with the systemd driver, so the launcher rejects cgroupfs and verifies the actual user-manager, daemon, worker-slice, and worker-scope cgroups. The concrete container ceilings must be verified from the realized cgroup hierarchy, not inferred from CLI flags alone. For rootless operation, the signed release manifest binds the separate RootlessKit host AppArmor profile name and digest; the launcher verifies the profile file, kernel enabled state, loaded enforce-mode profile, and RootlessKit process label on every admission observation. Missing host profile evidence keeps admission CLOSED. Seccomp and NoNewPrivileges remain mandatory; `seccomp=unconfined`, `apparmor=unconfined`, a rootful daemon, or an unconfined fallback is forbidden. Missing delegation/controller support, finite-limit readback failure, seccomp or RootlessKit host-profile drift, image drift, runtime drift, or unknown workload inventory keeps admission CLOSED.
 
 ## CLOSED / PROVING / OPEN and deferred capacity proof
 
@@ -161,7 +162,7 @@ One signed immutable release manifest names both image digests and binds:
 - Writer image digest, Blender archive/version identity, exporter/patch identity, and writer executable hashes;
 - Validator image digest, ufbx version/commit/tree and validator executable hash;
 - protocol/profile and resource-policy versions/digests;
-- seccomp and AppArmor policy digests;
+- the seccomp policy digest, `jobAppArmorMode=unsupported-not-relied-upon`, and separate RootlessKit host profile mode/name/digest (`required-profile`);
 - build provenance and SBOM digests;
 - release sequence, signing key ID, and creation time.
 

@@ -132,9 +132,10 @@ export function verifyAdmissionEnvelope(envelopeValue, trust, nowMs = Date.now()
   exactKeys(observation, [
     "schemaVersion", "proofSha256", "state", "observedAt", "launcherKeyId", "hostId", "cpuMilli", "memoryBytes", "pids",
     "workloadInventorySha256", "cgroupTreeSha256", "releaseManifestSha256", "resourcePolicySha256",
+    "jobAppArmorMode", "rootlessKitHostAppArmorMode", "rootlessKitHostAppArmorProfileName", "rootlessKitHostAppArmorProfileSha256",
     "cgroupV2", "rootlessDocker", "requiredControllers", "startupReconciled", "unreconciledContainerCount",
   ]);
-  if (observation.schemaVersion !== "s8-launcher-observation-v1" || !KEY_ID.test(observation.launcherKeyId)
+  if (observation.schemaVersion !== "s8-launcher-observation-v2" || !KEY_ID.test(observation.launcherKeyId)
     || observation.proofSha256 !== capacity.proofSha256 || observation.state !== capacity.proof.state) throw new Error("observation-binding");
   const observedAt = time(observation.observedAt);
   if (observedAt > nowMs + CLOCK_SKEW_MS || nowMs - observedAt > MAX_OBSERVATION_AGE_MS) throw new Error("observation-freshness");
@@ -145,9 +146,12 @@ export function verifyAdmissionEnvelope(envelopeValue, trust, nowMs = Date.now()
     releaseManifestSha256: capacity.proof.releaseManifestSha256, resourcePolicySha256: capacity.proof.resourcePolicySha256,
   })) if (observation[field] !== value) throw new Error("observation-drift");
   if (observation.cgroupV2 !== true || observation.rootlessDocker !== true || observation.startupReconciled !== true || observation.unreconciledContainerCount !== 0
+    || observation.jobAppArmorMode !== "unsupported-not-relied-upon" || observation.rootlessKitHostAppArmorMode !== "required-profile"
+    || observation.rootlessKitHostAppArmorProfileName !== "swooshz-s8-rootlesskit-v1"
+    || typeof observation.rootlessKitHostAppArmorProfileSha256 !== "string" || !HEX64.test(observation.rootlessKitHostAppArmorProfileSha256)
     || !Array.isArray(observation.requiredControllers) || observation.requiredControllers.join(",") !== "cpu,memory,pids") throw new Error("observation-runtime");
   const launcherKey = trust.launcherKeys[observation.launcherKeyId];
-  if (!launcherKey || !signatureValid(observation, launcher.signature, launcherKey, "S8-LAUNCHER-OBSERVATION-V1")) throw new Error("observation-signature");
+  if (!launcherKey || !signatureValid(observation, launcher.signature, launcherKey, "S8-LAUNCHER-OBSERVATION-V2")) throw new Error("observation-signature");
   return { capacity, launcher, observation };
 }
 
@@ -156,7 +160,7 @@ export function verifyReleaseManifest(signedValue, trustedKeys, nowMs = Date.now
   exactKeys(signed, ["manifest", "signature"]);
   const body = record(signed.manifest);
   exactKeys(body, ["schemaVersion", "releaseId", "sequence", "createdAt", "expiresAt", "signingKeyId", "protocolVersion", "profile", "resourcePolicySha256", "processRunnerSha256", "writer", "validator", "sandbox", "provenanceSha256", "sbomSha256"]);
-  if (body.schemaVersion !== "s8-release-manifest-v1" || typeof body.releaseId !== "string" || !/^[A-Za-z0-9._-]{1,120}$/u.test(body.releaseId)
+  if (body.schemaVersion !== "s8-release-manifest-v2" || typeof body.releaseId !== "string" || !/^[A-Za-z0-9._-]{1,120}$/u.test(body.releaseId)
     || !Number.isSafeInteger(body.sequence) || body.sequence < 1 || typeof body.signingKeyId !== "string" || !KEY_ID.test(body.signingKeyId)
     || body.protocolVersion !== "s8-native-worker-v1" || body.profile !== "swooshz-fbx-static-mesh-v1"
     || body.resourcePolicySha256 !== S8_NATIVE_RESOURCE_POLICY_SHA256) throw new Error("release-schema");
@@ -171,8 +175,17 @@ export function verifyReleaseManifest(signedValue, trustedKeys, nowMs = Date.now
   exactKeys(validator, ["imageDigest", "identity", "ufbxVersion", "ufbxCommit", "ufbxTree", "executableSha256"]);
   if (![writer.imageDigest, validator.imageDigest].every((value) => typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value))) throw new Error("release-image");
   if (![writer.blenderArchiveSha256, writer.exporterPatchSha256, writer.writerScriptSha256, validator.executableSha256].every((value) => typeof value === "string" && HEX64.test(value))) throw new Error("release-executable");
+  const sandbox = record(body.sandbox);
+  exactKeys(sandbox, ["seccompPolicySha256", "jobAppArmorMode", "rootlessKitHostAppArmor"]);
+  if (typeof sandbox.seccompPolicySha256 !== "string" || !HEX64.test(sandbox.seccompPolicySha256)
+    || sandbox.jobAppArmorMode !== "unsupported-not-relied-upon") throw new Error("release-sandbox");
+  const rootlessKitHostAppArmor = record(sandbox.rootlessKitHostAppArmor);
+  exactKeys(rootlessKitHostAppArmor, ["mode", "profileName", "profileSha256"]);
+  if (rootlessKitHostAppArmor.mode !== "required-profile"
+    || rootlessKitHostAppArmor.profileName !== "swooshz-s8-rootlesskit-v1"
+    || typeof rootlessKitHostAppArmor.profileSha256 !== "string" || !HEX64.test(rootlessKitHostAppArmor.profileSha256)) throw new Error("release-sandbox");
   const key = trustedKeys[body.signingKeyId];
-  if (!key || !signatureValid(body, signed.signature, key, "S8-RELEASE-MANIFEST-V1")) throw new Error("release-signature");
+  if (!key || !signatureValid(body, signed.signature, key, "S8-RELEASE-MANIFEST-V2")) throw new Error("release-signature");
   return { signed, manifest: body, sha256: sha256(Buffer.from(jcs(signed), "utf8")) };
 }
 

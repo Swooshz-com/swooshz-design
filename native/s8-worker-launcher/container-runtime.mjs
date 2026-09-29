@@ -16,8 +16,8 @@ export function createArguments(config, capacity, release, operation, requestSha
   const limits = operation === "WRITER" ? S8_NATIVE_RESOURCE_POLICY.writer : S8_NATIVE_RESOURCE_POLICY.validator;
   return [
     "create", "--pull=never", "--interactive", "--read-only", "--user=65532:65532",
-    "--cap-drop=ALL", "--security-opt=no-new-privileges:true", `--security-opt=seccomp=${config.seccompPolicyFile}`,
-    `--security-opt=apparmor=${config.appArmorProfileName}`, "--network=none", "--cpu-period=100000", `--cpu-quota=${budget.cpuMilli * 100}`,
+    "--cap-drop=ALL", "--security-opt=no-new-privileges:true", "--security-opt=seccomp=" + config.seccompPolicyFile,
+    "--network=none", "--cpu-period=100000", "--cpu-quota=" + (budget.cpuMilli * 100),
     `--memory=${budget.memoryBytes}`, `--memory-swap=${budget.memoryBytes}`, `--pids-limit=${budget.pids}`,
     `--tmpfs=/work:rw,noexec,nosuid,nodev,size=${limits.tmpBytes},uid=65532,gid=65532,mode=700`,
     "--cgroup-parent=" + config.workerCgroupParentUnit, "--log-driver=none", "--restart=no",
@@ -99,6 +99,16 @@ export async function startContainer(config, containerId, payload, operation) {
   };
 }
 
+export function validateContainerSecurityOptions(security, config) {
+  const expected = ["no-new-privileges:true", "seccomp=" + config.seccompPolicyFile];
+  if (!Array.isArray(security) || security.length !== expected.length
+    || security.some((value) => typeof value !== "string")
+    || expected.some((value) => !security.includes(value))
+    || security.some((value) => value.startsWith("apparmor=") || value.startsWith("seccomp=unconfined"))) {
+    throw new Error("container-security-drift");
+  }
+}
+
 export async function inspectAndVerify(config, containerId, release, operation, budget, capacity) {
   const list = JSON.parse(await runDocker(config, ["inspect", containerId]));
   const inspect = Array.isArray(list) ? list[0] : null;
@@ -122,9 +132,7 @@ export async function inspectAndVerify(config, containerId, release, operation, 
     || Object.keys(host.Tmpfs ?? {}).join(",") !== "/work" || (host.PortBindings && Object.keys(host.PortBindings).length !== 0)
     || (host.GroupAdd?.length ?? 0) !== 0 || (host.VolumesFrom?.length ?? 0) !== 0
     || host.LogConfig?.Type !== "none" || !["no", ""].includes(host.RestartPolicy?.Name ?? "")) throw new Error("container-limit-drift");
-  const security = host.SecurityOpt ?? [];
-  if (!security.includes("no-new-privileges:true") || !security.includes(`seccomp=${config.seccompPolicyFile}`)
-    || !security.includes(`apparmor=${config.appArmorProfileName}`)) throw new Error("container-security-drift");
+  validateContainerSecurityOptions(host.SecurityOpt ?? [], config);
   const temporary = host.Tmpfs?.["/work"];
   const expectedTmp = operation === "WRITER" ? S8_NATIVE_RESOURCE_POLICY.writer.tmpBytes : S8_NATIVE_RESOURCE_POLICY.validator.tmpBytes;
   const expectedTmpfs = ["rw", "noexec", "nosuid", "nodev", "size=" + expectedTmp, "uid=65532", "gid=65532", "mode=700"].sort();

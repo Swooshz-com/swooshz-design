@@ -4,9 +4,13 @@ import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "./s8-native-admission";
 import { jcs, sha256 } from "./utils";
 
 export const S8_NATIVE_WORKER_PROTOCOL_VERSION = "s8-native-worker-v1" as const;
+export const S8_RELEASE_MANIFEST_VERSION = "s8-release-manifest-v2" as const;
+export const S8_JOB_APPARMOR_MODE = "unsupported-not-relied-upon" as const;
+export const S8_ROOTLESSKIT_APPARMOR_MODE = "required-profile" as const;
+export const S8_ROOTLESSKIT_APPARMOR_PROFILE_NAME = "swooshz-s8-rootlesskit-v1" as const;
 
 export type S8ReleaseManifestBody = {
-  schemaVersion: "s8-release-manifest-v1";
+  schemaVersion: typeof S8_RELEASE_MANIFEST_VERSION;
   releaseId: string;
   sequence: number;
   createdAt: string;
@@ -31,7 +35,15 @@ export type S8ReleaseManifestBody = {
     ufbxTree: string;
     executableSha256: string;
   };
-  sandbox: { seccompPolicySha256: string; appArmorPolicySha256: string };
+  sandbox: {
+    seccompPolicySha256: string;
+    jobAppArmorMode: typeof S8_JOB_APPARMOR_MODE;
+    rootlessKitHostAppArmor: {
+      mode: typeof S8_ROOTLESSKIT_APPARMOR_MODE;
+      profileName: typeof S8_ROOTLESSKIT_APPARMOR_PROFILE_NAME;
+      profileSha256: string;
+    };
+  };
   provenanceSha256: string;
   sbomSha256: string;
 };
@@ -43,7 +55,7 @@ const HEX64 = /^[0-9a-f]{64}$/u;
 const KEY_ID = /^[A-Za-z0-9._-]{1,80}$/u;
 const RELEASE_ID = /^[A-Za-z0-9._-]{1,120}$/u;
 const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/u;
-const RELEASE_DOMAIN = "S8-RELEASE-MANIFEST-V1\0";
+const RELEASE_DOMAIN = "S8-RELEASE-MANIFEST-V2\0";
 const CLOCK_SKEW_MS = 5000;
 const MAX_RELEASE_AGE_MS = 365 * 24 * 60 * 60 * 1000;
 
@@ -85,7 +97,7 @@ export function verifyS8ReleaseManifest(
     "schemaVersion", "releaseId", "sequence", "createdAt", "expiresAt", "signingKeyId", "protocolVersion", "profile",
     "resourcePolicySha256", "processRunnerSha256", "writer", "validator", "sandbox", "provenanceSha256", "sbomSha256",
   ]);
-  if (body.schemaVersion !== "s8-release-manifest-v1" || typeof body.releaseId !== "string" || !RELEASE_ID.test(body.releaseId)
+  if (body.schemaVersion !== S8_RELEASE_MANIFEST_VERSION || typeof body.releaseId !== "string" || !RELEASE_ID.test(body.releaseId)
     || !Number.isSafeInteger(body.sequence) || Number(body.sequence) < 1 || typeof body.signingKeyId !== "string" || !KEY_ID.test(body.signingKeyId)
     || body.protocolVersion !== S8_NATIVE_WORKER_PROTOCOL_VERSION || body.profile !== S8_FBX_PROFILE) throw new Error("release");
   const createdAt = timestamp(body.createdAt);
@@ -114,9 +126,14 @@ export function verifyS8ReleaseManifest(
   assertDigest(validator.executableSha256);
 
   const sandbox = record(body.sandbox);
-  exactKeys(sandbox, ["seccompPolicySha256", "appArmorPolicySha256"]);
+  exactKeys(sandbox, ["seccompPolicySha256", "jobAppArmorMode", "rootlessKitHostAppArmor"]);
   assertDigest(sandbox.seccompPolicySha256);
-  assertDigest(sandbox.appArmorPolicySha256);
+  if (sandbox.jobAppArmorMode !== S8_JOB_APPARMOR_MODE) throw new Error("release");
+  const rootlessKitHostAppArmor = record(sandbox.rootlessKitHostAppArmor);
+  exactKeys(rootlessKitHostAppArmor, ["mode", "profileName", "profileSha256"]);
+  if (rootlessKitHostAppArmor.mode !== S8_ROOTLESSKIT_APPARMOR_MODE
+    || rootlessKitHostAppArmor.profileName !== S8_ROOTLESSKIT_APPARMOR_PROFILE_NAME) throw new Error("release");
+  assertDigest(rootlessKitHostAppArmor.profileSha256);
 
   const keyId = body.signingKeyId;
   const publicKeyPem = trustedKeys[keyId];

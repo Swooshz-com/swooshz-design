@@ -119,11 +119,13 @@ test("live cgroup snapshot binds finite ceilings and rejects an unexpected sibli
   }
 });
 
-test("Docker rootless admission requires cgroup-v2 systemd plus rootless, seccomp, and AppArmor readback", () => {
-  const valid = JSON.stringify(["name=rootless", "name=seccomp,profile=builtin", "name=apparmor"]) + "|2|systemd";
+test("rootless Docker admission requires cgroup-v2 systemd and seccomp but not unsupported job AppArmor", () => {
+  const valid = JSON.stringify(["name=rootless", "name=seccomp,profile=builtin"]) + "|2|systemd";
   assert.doesNotThrow(() => validateDockerRuntimeInfo(valid));
   assert.throws(() => validateDockerRuntimeInfo(valid.replace("|systemd", "|cgroupfs")), /runtime-drift/u);
-  assert.throws(() => validateDockerRuntimeInfo(JSON.stringify(["name=rootless", "name=seccomp"]) + "|2|systemd"), /runtime-drift/u);
+  assert.throws(() => validateDockerRuntimeInfo(JSON.stringify(["name=rootless"]) + "|2|systemd"), /runtime-drift/u);
+  assert.throws(() => validateDockerRuntimeInfo(JSON.stringify(["name=rootless", "name=seccomp,profile=unconfined"]) + "|2|systemd"), /runtime-drift/u);
+  assert.throws(() => validateDockerRuntimeInfo(JSON.stringify(["name=rootless", "name=apparmor,profile=unconfined"]) + "|2|systemd"), /runtime-drift/u);
 });
 
 test("rootless processes must run with an unmodified dedicated UID", () => {

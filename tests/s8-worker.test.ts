@@ -1,341 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
 import test from "node:test";
-import { canonicalS8ConfigBytes, createS8BrokerRequest, parseS8BrokerResponse, parseS8RunnerReceipt, runS8NativeValidator, validateS8BrokerResponseIdentity, type S8RunnerLimits, type S8WorkerConfig } from "../src/lib/s8-fbx-worker";
+import { S8ExportService } from "../src/lib/s8";
 import { readS8RuntimeConfig } from "../src/lib/s8-fbx-config";
-
-type MutableReceipt = {
-  schemaVersion: string;
-  protocol: string;
-  policyId: string;
-  requested: Record<string, unknown>;
-  appliedByChild: Record<string, unknown>;
-  observedByRunnerParent: Record<string, unknown>;
-  runnerParentVerification: Record<string, unknown>;
-  runnerBinary: Record<string, unknown>;
-  result: Record<string, unknown>;
-};
-
-const runnerLimits: S8RunnerLimits = { addressSpaceBytes: 1024, fileBytes: 2048, timeoutMs: 3000, stdoutBytes: 4096, stderrBytes: 4096, maxChildren: 0 };
-const runnerHash = "a".repeat(64);
-
-function receiptValue(): MutableReceipt {
-  return {
-    schemaVersion: "s8-process-runner-receipt-v2",
-    protocol: "s8-process-runner-receipt-v2",
-    policyId: "s8-zero-child-seccomp-x86_64-v2",
-    requested: { rlimitAsBytes: 1024, rlimitFsizeBytes: 2048, rlimitCpuSeconds: 4, rlimitNproc: 64, wallTimeoutMs: 3000, stdoutBytes: 4096, stderrBytes: 4096, maxChildren: 0 },
-    appliedByChild: { rlimitAsBytes: 1024, rlimitFsizeBytes: 2048, rlimitCpuSeconds: 4, rlimitNproc: 64, noNewPrivs: 1, seccompMode: 2 },
-    observedByRunnerParent: { rlimitAsBytes: 1024, rlimitFsizeBytes: 2048, rlimitCpuSeconds: 4, rlimitNproc: 64, noNewPrivs: 1, seccompMode: 2 },
-    runnerParentVerification: { status: "PASS", mismatchCode: null },
-    runnerBinary: { selfSha256: runnerHash },
-    result: { code: 0, name: "S8_RUNNER_SUCCESS", terminationClass: "target-exit-zero", targetExit: 0, targetSignal: null, elapsedMs: 2, stdoutBytes: 0, stderrBytes: 0, setupStage: null, evidenceCode: null },
-  };
-}
-
-function receipt(mutator?: (value: MutableReceipt) => void, targetOutput = "child-output"): Buffer {
-  const value = receiptValue();
-  value.result.stdoutBytes = Buffer.byteLength(targetOutput);
-  mutator?.(value);
-  return Buffer.from(`S8_RUNNER_RECEIPT:${JSON.stringify(value)}\n${targetOutput}`, "utf8");
-}
-
-function invalid(value: Buffer, postHash = runnerHash): void {
-  assert.throws(() => parseS8RunnerReceipt(value, runnerLimits, runnerHash, postHash), /S8_PROCESS_RUNNER_EVIDENCE_INVALID|S8_RUNNER_HASH_DRIFT/);
-}
-
-function config(root: string): S8WorkerConfig {
-  return {
-    blenderRuntimeRoot: root,
-    blenderExecutable: join(root, "blender"),
-    writerScript: join(root, "writer.py"),
-    privateWorkRoot: root,
-    processRunnerExecutable: join(root, "runner"),
-    sandboxExecutable: "/usr/local/libexec/swooshz-s8/s8-sandbox",
-    sandboxPolicySha256: runnerHash,
-    nativeValidatorExecutable: join(root, "validator"),
-    blenderExecutableSha256: runnerHash,
-  };
-}
-
-test("worker refuses to run without the native Linux process boundary", () => {
-  const root = mkdtempSync(join(tmpdir(), "s8-worker-"));
-  try {
-    if (process.platform === "linux" && process.arch === "x64") assert.throws(() => runS8NativeValidator(Buffer.alloc(32), config(root)), /S8_WORKER_PATH_INVALID/);
-    else assert.throws(() => runS8NativeValidator(Buffer.alloc(32), config(root)), /S8_TOOLING_HOLD_PLATFORM/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("native worker configuration stays absent or CLOSED when gateway trust material is missing", () => {
-  assert.equal(readS8RuntimeConfig({}), undefined);
-  assert.throws(() => readS8RuntimeConfig({ S8_WORKER_GATEWAY_URL: "https://s8-worker-gateway.internal" }), /S8_NATIVE_WORKER_CONFIG_INVALID/);
-});
-
-test("strict v2 caller parsing accepts only canonical, fully evidenced receipts", () => {
-  const parsed = parseS8RunnerReceipt(receipt(), runnerLimits, runnerHash);
-  assert.equal(parsed.stdout, "child-output");
-  assert.equal(parsed.evidence.protocol, "s8-process-runner-receipt-v2");
-  assert.equal(parsed.evidence.policyId, "s8-zero-child-seccomp-x86_64-v2");
-  assert.equal(parsed.evidence.verifiedByCaller.status, "VERIFIED_BY_CALLER");
-  assert.equal(parsed.evidence.verifiedByCaller.preLaunchSha256, runnerHash);
-  assert.equal(parsed.evidence.verifiedByCaller.postLaunchSha256, runnerHash);
-  assert.equal(parsed.evidence.verifiedByCaller.runnerReportedSelfSha256, runnerHash);
-  assert.equal(parsed.evidence.verifiedByCaller.receiptSha256.length, 64);
-});
-
-test("v2 receipt negatives fail closed for missing, malformed, duplicate, unknown, and noncanonical input", () => {
-  invalid(Buffer.from("child-output", "utf8"));
-  invalid(Buffer.from("S8_RUNNER_RECEIPT:{not-json}\nchild-output", "utf8"));
-  const validText = receipt().toString("utf8");
-  invalid(Buffer.from(validText.replace(",\"policyId\"", ",\"protocol\":\"s8-process-runner-receipt-v2\",\"policyId\""), "utf8"));
-  invalid(Buffer.from(validText.replace(",\"result\"", ",\"unknown\":1,\"result\""), "utf8"));
-  invalid(Buffer.from(validText.replace(",\"protocol\"", ", \"protocol\""), "utf8"));
-});
-
-test("v2 receipt negatives reject identity, policy, requested, applied, observed, and seccomp mismatches", () => {
-  invalid(receipt((value) => { value.schemaVersion = "s8-process-runner-receipt-v1"; }));
-  invalid(receipt((value) => { value.protocol = "s8-process-runner-receipt-v1"; }));
-  invalid(receipt((value) => { value.policyId = "wrong-policy"; }));
-  invalid(receipt((value) => { value.requested.rlimitAsBytes = 1023; }));
-  invalid(receipt((value) => { value.appliedByChild.rlimitFsizeBytes = 2047; }));
-  invalid(receipt((value) => { value.observedByRunnerParent.rlimitCpuSeconds = 3; }));
-  invalid(receipt((value) => { value.appliedByChild.seccompMode = 0; }));
-  invalid(receipt((value) => { delete value.observedByRunnerParent.seccompMode; }));
-});
-
-test("caller hash verification rejects pre/post drift and runner-reported hash drift", () => {
-  assert.throws(() => parseS8RunnerReceipt(receipt(), runnerLimits, runnerHash, "b".repeat(64)), /S8_RUNNER_HASH_DRIFT/);
-  assert.throws(() => parseS8RunnerReceipt(receipt((value) => { value.runnerBinary.selfSha256 = "b".repeat(64); }), runnerLimits, runnerHash), /S8_RUNNER_HASH_DRIFT/);
-});
-
-test("native v2 code, name, termination, and captured byte counts must agree", () => {
-  invalid(receipt((value) => { value.result.code = 79; }));
-  invalid(receipt((value) => { value.result.name = "S8_RUNNER_TARGET_EXIT_NONZERO"; }));
-  invalid(receipt((value) => { value.result.terminationClass = "target-exit-nonzero"; }));
-  invalid(receipt((value) => { value.result.targetExit = 1; }));
-  invalid(receipt((value) => { value.result.targetSignal = 9; }));
-  invalid(receipt((value) => {
-    value.result.code = 124;
-    value.result.name = "S8_RUNNER_TIMEOUT";
-    value.result.terminationClass = "wall-timeout";
-    value.result.targetExit = 0;
-  }));
-  invalid(receipt((value) => { value.result.stdoutBytes = 0; }));
-});
-
-test("caller records the raw stdout byte count before UTF-8 decoding", () => {
-  const value = receiptValue();
-  value.result.stdoutBytes = 1;
-  const line = Buffer.from(`S8_RUNNER_RECEIPT:${JSON.stringify(value)}\n`, "utf8");
-  const parsed = parseS8RunnerReceipt(Buffer.concat([line, Buffer.from([0xff])]), runnerLimits, runnerHash);
-  assert.equal(parsed.evidence.verifiedByCaller.observedStdoutBytes, 1);
-});
-
-test("native v2 mapping validates every defined runner result and preserves outer observations", () => {
-  const cases: Array<{ code: number; name: string; terminationClass: string; update?: (value: MutableReceipt) => void }> = [
-    { code: 0, name: "S8_RUNNER_SUCCESS", terminationClass: "target-exit-zero" },
-    { code: 70, name: "S8_RUNNER_INTERNAL", terminationClass: "runner-internal", update: (value) => { value.runnerParentVerification = { status: "PASS", mismatchCode: "CAPTURE_INIT" }; } },
-    { code: 71, name: "S8_RUNNER_CHILD_SETUP_FAILED", terminationClass: "child-setup-failed", update: (value) => { value.runnerParentVerification = { status: "FAIL", mismatchCode: null }; value.appliedByChild = { rlimitAsBytes: 0, rlimitFsizeBytes: 0, rlimitCpuSeconds: 0, rlimitNproc: 0, noNewPrivs: 0, seccompMode: 0 }; value.observedByRunnerParent = { rlimitAsBytes: 0, rlimitFsizeBytes: 0, rlimitCpuSeconds: 0, rlimitNproc: 0, noNewPrivs: 0, seccompMode: 0 }; value.result.setupStage = "seccomp"; value.result.stdoutBytes = 0; } },
-    { code: 72, name: "S8_RUNNER_EVIDENCE_INVALID", terminationClass: "evidence-failed", update: (value) => { value.runnerParentVerification = { status: "FAIL", mismatchCode: "CHILD_EVIDENCE_MALFORMED" }; value.result.evidenceCode = "CHILD_EVIDENCE_MALFORMED"; } },
-    { code: 73, name: "S8_RUNNER_EXEC_FAILED", terminationClass: "exec-failed" },
-    { code: 74, name: "S8_RUNNER_STDOUT_LIMIT", terminationClass: "stdout-limit" },
-    { code: 75, name: "S8_RUNNER_STDERR_LIMIT", terminationClass: "stderr-limit" },
-    { code: 76, name: "S8_RUNNER_TARGET_EXIT_NONZERO", terminationClass: "target-exit-nonzero", update: (value) => { value.result.targetExit = 3; } },
-    { code: 77, name: "S8_RUNNER_TARGET_SIGNAL", terminationClass: "target-signal", update: (value) => { value.result.targetSignal = 9; } },
-    { code: 124, name: "S8_RUNNER_TIMEOUT", terminationClass: "wall-timeout" },
-  ];
-  for (const item of cases) {
-    let parsed: ReturnType<typeof parseS8RunnerReceipt>;
-    try {
-      parsed = parseS8RunnerReceipt(
-        receipt((value) => {
-          value.result.code = item.code;
-          value.result.name = item.name;
-          value.result.terminationClass = item.terminationClass;
-          if (item.code !== 0) { value.result.targetExit = null; value.result.targetSignal = null; }
-          item.update?.(value);
-        }, item.code === 71 ? "" : "child-output"),
-        runnerLimits,
-        runnerHash,
-        runnerHash,
-        { status: item.code, signal: null, stderr: Buffer.alloc(0) },
-      );
-    } catch (error) {
-      throw new Error(`native runner result ${item.code} rejected: ${(error as Error).message}`);
-    }
-    assert.equal(parsed.evidence.verifiedByCaller.outerExitStatus, item.code);
-  }
-});
-
-test("outer runner status, signal, stderr count, setup, evidence, and pre-receipt argument failures reject", () => {
-  assert.throws(() => parseS8RunnerReceipt(receipt(), runnerLimits, runnerHash, runnerHash, { status: 1, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-  assert.throws(() => parseS8RunnerReceipt(receipt(), runnerLimits, runnerHash, runnerHash, { status: 0, signal: "SIGKILL", stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-  assert.throws(() => parseS8RunnerReceipt(receipt((value) => { value.result.stderrBytes = 1; }), runnerLimits, runnerHash, runnerHash, { status: 0, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-  assert.throws(() => parseS8RunnerReceipt(receipt((value) => { value.result.code = 71; value.result.name = "S8_RUNNER_CHILD_SETUP_FAILED"; value.result.terminationClass = "child-setup-failed"; }), runnerLimits, runnerHash, runnerHash, { status: 71, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-  assert.throws(() => parseS8RunnerReceipt(receipt((value) => { value.result.code = 72; value.result.name = "S8_RUNNER_EVIDENCE_INVALID"; value.result.terminationClass = "evidence-failed"; }), runnerLimits, runnerHash, runnerHash, { status: 72, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-  assert.throws(() => parseS8RunnerReceipt(Buffer.alloc(0), runnerLimits, runnerHash, runnerHash, { status: 64, signal: null, stderr: Buffer.from("usage") }), /S8_PROCESS_RUNNER_ARGUMENT_INVALID/);
-});
-
-test("native runner internal failures accept only its exact internal mismatch semantics", () => {
-  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
-    value.result.code = 70;
-    value.result.name = "S8_RUNNER_INTERNAL";
-    value.result.terminationClass = "runner-internal";
-    value.runnerParentVerification = { status: "FAIL", mismatchCode: "PARENT_PROC_STATUS" };
-  }), runnerLimits, runnerHash, runnerHash, { status: 70, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
-    value.result.code = 70;
-    value.result.name = "S8_RUNNER_INTERNAL";
-    value.result.terminationClass = "runner-internal";
-    value.runnerParentVerification = { status: "PASS", mismatchCode: "INVENTED" };
-  }), runnerLimits, runnerHash, runnerHash, { status: 70, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
-    value.result.code = 70;
-    value.result.name = "S8_RUNNER_INTERNAL";
-    value.result.terminationClass = "runner-internal";
-    value.runnerParentVerification = { status: "PASS", mismatchCode: "PARENT_SETPGID" };
-  }), runnerLimits, runnerHash, runnerHash, { status: 70, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
-    value.result.code = 72;
-    value.result.name = "S8_RUNNER_EVIDENCE_INVALID";
-    value.result.terminationClass = "evidence-failed";
-    value.result.evidenceCode = "INVENTED";
-    value.runnerParentVerification = { status: "FAIL", mismatchCode: "INVENTED" };
-  }), runnerLimits, runnerHash, runnerHash, { status: 72, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-  assert.throws(() => parseS8RunnerReceipt(receipt((value) => {
-    value.result.code = 76;
-    value.result.name = "S8_RUNNER_TARGET_EXIT_NONZERO";
-    value.result.terminationClass = "target-exit-nonzero";
-    value.result.targetExit = 256;
-  }), runnerLimits, runnerHash, runnerHash, { status: 76, signal: null, stderr: Buffer.alloc(0) }), /S8_PROCESS_RUNNER_EVIDENCE_INVALID/);
-});
-
-test("broker request uses the fixed binary protocol and binds payload, policy, and canonical config", () => {
-  const root = mkdtempSync(join(tmpdir(), "s8-broker-frame-"));
-  try {
-    const workerConfig = config(root);
-    const payload = Buffer.from("original-payload\0bytes", "utf8");
-    const requestId = Buffer.alloc(16, 0x5a);
-    const request = createS8BrokerRequest("WRITER", payload, workerConfig, requestId);
-    assert.equal(request.bytes.length, 160 + payload.length);
-    assert.equal(request.bytes.toString("ascii", 0, 8), "S8BRQ001");
-    assert.equal(request.bytes.readUInt16BE(8), 1);
-    assert.equal(request.bytes[10], 1);
-    assert.equal(request.bytes[11], 0);
-    assert.equal(request.bytes.subarray(12, 28).toString("hex"), requestId.toString("hex"));
-    assert.equal(request.bytes.subarray(28, 60).toString("hex"), workerConfig.sandboxPolicySha256);
-    assert.equal(request.bytes.readBigUInt64BE(92), BigInt(payload.length));
-    assert.equal(request.bytes.subarray(100, 132).toString("hex"), createHash("sha256").update(payload).digest("hex"));
-    assert.equal(request.bytes.subarray(132, 160).every((byte) => byte === 0), true);
-    assert.equal(request.bytes.subarray(160).equals(payload), true);
-    assert.match(request.configSha256, /^[0-9a-f]{64}$/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("final config canonical bytes retain the Run-106 policy digest and fixed Q oracle", () => {
-  const workerConfig: S8WorkerConfig = {
-    blenderRuntimeRoot: "/opt/blender",
-    blenderExecutable: "/opt/blender/blender",
-    writerScript: "/opt/swooshz/writer.py",
-    privateWorkRoot: "/var/lib/swooshz/s8",
-    processRunnerExecutable: "/usr/local/libexec/swooshz-s8/s8-process-runner",
-    sandboxExecutable: "/usr/local/libexec/swooshz-s8/s8-sandbox",
-    nativeValidatorExecutable: "/usr/local/libexec/swooshz-s8/s8-native-validator",
-    blenderExecutableSha256: "1".repeat(64),
-    sandboxPolicySha256: "73fa2120547140c024f40eb43399649949f7da1bb152622b018df588e886013f",
-  };
-  const bytes = canonicalS8ConfigBytes(workerConfig);
-  assert.equal(bytes.length, 561);
-  assert.equal(createHash("sha256").update(bytes).digest("hex"), "f3359c5e130c7806750275d6a2eb01ca9c214a07fb2f472f86db8daa8c2007ce");
-  assert.match(bytes.toString("utf8"), /"nativeValidatorExecutable":.*"blenderExecutableSha256":.*"sandboxPolicySha256":/u);
-  assert.throws(() => canonicalS8ConfigBytes({ ...workerConfig, blenderRuntimeRoot: `/opt/\ud800` }), /S8_BROKER_CONFIG_INVALID/);
-});
-
-test("broker response validates exact header, section lengths, request binding, and section digest", () => {
-  const root = mkdtempSync(join(tmpdir(), "s8-broker-response-"));
-  try {
-    const workerConfig = config(root);
-    const request = createS8BrokerRequest("VALIDATOR", Buffer.from("fbx"), workerConfig, Buffer.alloc(16, 0x22));
-    const metadata = Buffer.from('{"schemaVersion":"s8-sandbox-broker-metadata-v1"}', "utf8");
-    const native = Buffer.from("native-receipt-and-output", "utf8");
-    const sections = [Buffer.alloc(0), Buffer.alloc(0), native, Buffer.alloc(0), metadata];
-    const header = Buffer.alloc(320);
-    header.write("S8BRS001", 0, "ascii");
-    header.writeUInt16BE(1, 8);
-    header[10] = 2;
-    Buffer.from(request.requestId, "hex").copy(header, 12);
-    header.writeUInt16BE(0, 28);
-    header.writeInt32BE(0, 32);
-    header.writeInt32BE(-1, 36);
-    Buffer.alloc(16, 0x44).copy(header, 40);
-    Buffer.from(runnerHash, "hex").copy(header, 56);
-    Buffer.from(runnerHash, "hex").copy(header, 88);
-    Buffer.from(workerConfig.sandboxPolicySha256, "hex").copy(header, 120);
-    Buffer.from(request.configSha256, "hex").copy(header, 152);
-    sections.forEach((section, index) => header.writeBigUInt64BE(BigInt(section.length), 184 + (8 * index)));
-    createHash("sha256").update(Buffer.concat(sections)).digest().copy(header, 224);
-    const frame = Buffer.concat([header, ...sections]);
-    const response = parseS8BrokerResponse(frame, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 });
-    assert.equal(response.brokerStatus, 0);
-    assert.equal(response.identityBound, true);
-    assert.equal(response.allocationId, "44".repeat(16));
-    assert.equal(response.nativeStdout.equals(native), true);
-    assert.equal(response.metadata.equals(metadata), true);
-    assert.throws(() => parseS8BrokerResponse(frame.subarray(0, frame.length - 1), { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 }), /S8_BROKER_RESPONSE_INVALID/);
-    const tampered = Buffer.from(frame);
-    tampered[tampered.length - 1] ^= 1;
-    assert.throws(() => parseS8BrokerResponse(tampered, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 }), /S8_BROKER_RESPONSE_DIGEST_MISMATCH/);
-    const stalePolicy = Buffer.from(frame);
-    stalePolicy[120] ^= 1;
-    const successfulWrongPolicy = parseS8BrokerResponse(stalePolicy, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 });
-    assert.equal(successfulWrongPolicy.brokerStatus, 0);
-    assert.equal(successfulWrongPolicy.identityBound, false);
-    assert.throws(() => validateS8BrokerResponseIdentity(successfulWrongPolicy), /S8_OUTPUT_OR_RECEIPT_INVALID/);
-    const failedWrongPolicy = Buffer.from(stalePolicy);
-    failedWrongPolicy.writeUInt16BE(65, 28);
-    const brokerFailure = parseS8BrokerResponse(failedWrongPolicy, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 });
-    validateS8BrokerResponseIdentity(brokerFailure);
-    assert.equal(brokerFailure.brokerStatus, 65);
-    const staleConfig = Buffer.from(frame);
-    staleConfig[152] ^= 1;
-    const successfulWrongConfig = parseS8BrokerResponse(staleConfig, { operation: "VALIDATOR", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 });
-    assert.equal(successfulWrongConfig.brokerStatus, 0);
-    assert.equal(successfulWrongConfig.identityBound, false);
-    assert.throws(() => validateS8BrokerResponseIdentity(successfulWrongConfig), /S8_OUTPUT_OR_RECEIPT_INVALID/);
-    assert.throws(() => parseS8BrokerResponse(frame, { operation: "WRITER", requestId: request.requestId, policySha256: workerConfig.sandboxPolicySha256, configSha256: request.configSha256 }), /S8_BROKER_RESPONSE_INVALID/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("direct Bubblewrap paths and malformed policy digests fail closed before launch", () => {
-  const root = mkdtempSync(join(tmpdir(), "s8-broker-config-"));
-  try {
-    const payload = Buffer.from("payload");
-    assert.throws(() => createS8BrokerRequest("WRITER", payload, { ...config(root), sandboxExecutable: "/usr/bin/bwrap" }), /S8_WORKER_SANDBOX_REQUIRED/);
-    assert.throws(() => createS8BrokerRequest("WRITER", payload, { ...config(root), sandboxPolicySha256: "not-a-sha" }), /S8_BROKER_POLICY_IDENTITY_INVALID/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 const workflowSizeBase = "578ac98aa974fa0ec3a65bcade1c505ac5c80dcb";
 const workflowSizeLimitBytes = 512_000;
 const workflowSizePath = ".github/workflows/s8-fbx.yml";
-const workflowProofHelperPath = "scripts/s8/s8_application_boundary_proof.mts";
-const workflowProofHelperBytes = 8_966;
-const workflowProofHelperSha256 = "05c7b06a96fe0c45be71a4e2805b29202250130c9dba4bb852a0ef6032aacd31";
-const workflowProofShellPath = "scripts/s8/s8_application_boundary_proof.sh";
-const workflowProofShellBytes = 3_260;
-const workflowProofShellSha256 = "105085a773513c05abdfbc6b0b6da67b74ad8eb811c91c919cc7a08645bd769e";
 const run089Head = "c620d7eda702be8149f69bff546b97e214e2fab6";
 const originalWorkflowHead = "5a78ccdda307dd7dc3052aaaae5d033b7bf06c43";
 
@@ -462,89 +135,6 @@ function emitWorkflowSizeResult(result: WorkflowSizeResult): void {
   for (const record of result.records) console.log(JSON.stringify(record));
 }
 
-const helperSourceLine = 'source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"';
-const helperInstallLine = '/usr/bin/install -m 0600 -- "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.mts" "$app_proof"';
-const oldHelperExecutionLine = '/usr/bin/pnpm exec tsx "$app_proof"';
-const helperExecutionLine = 'COREPACK_ENABLE_AUTO_PIN=0 corepack pnpm@12.6.0 exec tsx "$app_proof"';
-
-function helperExtractionIsValid(workflow: string, helper: Buffer | undefined, shellHelper: Buffer | undefined): boolean {
-  if (!helper || helper.length !== workflowProofHelperBytes || !shellHelper || shellHelper.length !== workflowProofShellBytes) return false;
-  let helperText: string;
-  let shellText: string;
-  try {
-    helperText = decodeUtf8Strict(helper);
-    shellText = decodeUtf8Strict(shellHelper);
-  } catch {
-    return false;
-  }
-  const helperHash = createHash("sha256").update(helper).digest("hex");
-  const shellHash = createHash("sha256").update(shellHelper).digest("hex");
-  return !helperText.includes("\r")
-    && !shellText.includes("\r")
-    && helperHash === workflowProofHelperSha256
-    && shellHash === workflowProofShellSha256
-    && workflow.split(helperSourceLine).length - 1 === 1
-    && workflow.split(helperInstallLine).length - 1 === 0
-    && workflow.split(oldHelperExecutionLine).length - 1 === 0
-    && shellText.split(helperInstallLine).length - 1 === 1
-    && shellText.split(helperExecutionLine).length - 1 === 1
-    && !shellText.includes(oldHelperExecutionLine)
-    && !shellText.includes('cat > "$app_proof" <<\'TS\'');
-}
-
-const toolchainJobMarker = "  s8-pinned-blender:";
-const exactHeadStepMarker = "      - name: Verify exact PR head";
-const hostedAmendmentStepMarker = "      - name: Hosted sandbox environment amendment";
-const setupNodeAction = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
-const setupNodeStep = [
-  "      - name: Setup Node 22 for hosted toolchain",
-  "        id: setup_node",
-  "        uses: " + setupNodeAction,
-  "        with:",
-  "          node-version: 22",
-].join("\n");
-const pinnedPnpm = "corepack pnpm@12.6.0";
-const frozenInstall = pinnedPnpm + " install --frozen-lockfile --ignore-scripts --prod=false";
-
-function countText(source: string, value: string): number {
-  return source.split(value).length - 1;
-}
-
-function hostedToolchainSourceIsValid(workflow: string): boolean {
-  const source = workflow.replace(/\r\n/g, "\n");
-  if (countText(source, toolchainJobMarker) !== 1 || countText(source, hostedAmendmentStepMarker) !== 1) return false;
-  const jobStart = source.indexOf(toolchainJobMarker);
-  const verifyStart = source.indexOf(exactHeadStepMarker, jobStart);
-  const amendmentStart = source.indexOf(hostedAmendmentStepMarker, verifyStart);
-  const verifyEnd = source.indexOf("      - name: ", verifyStart + exactHeadStepMarker.length);
-  if (jobStart < 0 || verifyStart <= jobStart || amendmentStart <= verifyStart
-    || countText(source.slice(jobStart, amendmentStart), exactHeadStepMarker) !== 1
-    || verifyEnd < 0 || verifyEnd > amendmentStart) return false;
-  if (!source.slice(verifyStart, verifyEnd).includes('run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"')) return false;
-  const interval = source.slice(verifyEnd, amendmentStart);
-  if (countText(interval, setupNodeStep) !== 1
-    || countText(interval, "      - name: Classify Node setup failure") !== 1
-    || countText(interval, "      - name: Admit pinned TypeScript toolchain") !== 1
-    || countText(interval, "uses: actions/setup-node@") !== 1
-    || countText(interval, 'COREPACK_ENABLE_AUTO_PIN: "0"') !== 1
-    || !interval.includes("if: $" + "{{ failure() && steps.setup_node.outcome == 'failure' }}")
-    || !interval.includes("node -p 'process.versions.node.split(\".\")[0]'")
-    || !interval.includes("|| hold NODE")
-    || !interval.includes("command -v corepack")
-    || !interval.includes("|| hold COREPACK")
-    || countText(interval, pinnedPnpm + " --version") !== 1
-    || !interval.includes("|| hold PNPM_ACTIVATION")
-    || !interval.includes('[[ "$version" == 12.6.0 ]] || hold PNPM_VERSION')
-    || !interval.includes("[[ -f pnpm-lock.yaml ]] || hold LOCKFILE")
-    || countText(interval, frozenInstall) !== 1
-    || !interval.includes("|| hold FROZEN_INSTALL")
-    || !interval.includes("[[ -x node_modules/.bin/tsx ]] || hold TSX")
-    || countText(interval, pinnedPnpm + ' exec tsx "$smoke"') !== 1
-    || !interval.includes("FAILURE_CLASS=HOSTED_TOOLCHAIN_HOLD")
-    || !interval.includes("TOOLCHAIN_STAGE=SETUP_NODE")) return false;
-  const unpinnedPnpm = interval.replace(/corepack pnpm@12\.6\.0/g, "").replace(/pnpm-lock\.yaml/g, "");
-  return !/\bpnpm\b/.test(unpinnedPnpm);
-}
 
 function fakeWorkflowSizeIo(options: {
   diff?: Buffer;
@@ -671,62 +261,153 @@ test("workflow UTF-8 size gate checks the selected raw bytes and rejects every f
   assert.equal(runWorkflowSizeGate(root, run089Head).pass, false);
 });
 
-test("workflow application proof shell extraction and TypeScript helper integrity remain exact", () => {
+
+const prepublicationJobMarker = "  s8-native-prepublication:";
+const exactHeadStepMarker = "      - name: Verify exact PR head";
+const setupNodeAction = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
+const pinnedPnpm = "corepack pnpm@12.6.0";
+const focusedTypescript = "tests/s8-native-admission.test.ts tests/s8-native-release.test.ts tests/s8-native-policy-crosscheck.test.ts tests/s8-publication.test.ts tests/s8-worker.test.ts";
+const focusedNative = "native/s8-worker-common/protocol.test.mjs native/s8-worker-common/admission.test.mjs native/s8-worker-launcher/capacity.test.mjs native/s8-worker-launcher/ledger.test.mjs native/s8-worker-launcher/container-runtime.test.mjs native/s8-worker-launcher/result.test.mjs native/s8-worker-gateway/gateway.test.mjs";
+
+function countText(source: string, value: string): number {
+  return source.split(value).length - 1;
+}
+
+function nativePrepublicationSourceIsValid(workflow: string): boolean {
+  const source = workflow.replace(/\r\n/g, "\n");
+  if (countText(source, prepublicationJobMarker) !== 1) return false;
+  const start = source.indexOf(prepublicationJobMarker);
+  const job = source.slice(start);
+  const forbiddenClaims = [
+    "G3_RESULT=",
+    "G4_AUTHORISED=YES",
+    "NATIVE_OPEN_PROVEN=YES",
+    "REAL_ROOTLESS_DOCKER_ENFORCEMENT=PASS",
+    "REAL_HOST_CONTENTION=PASS",
+    "APPARMOR_HOST_ENFORCEMENT=PASS",
+  ];
+  if (forbiddenClaims.some((claim) => job.includes(claim))) return false;
+  const required = [
+    "name: S8 native worker repository prepublication",
+    "runs-on: ubuntu-24.04",
+    "timeout-minutes: 25",
+    "uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+    "ref: ${{ github.event.pull_request.head.sha }}",
+    exactHeadStepMarker,
+    "EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}",
+    'run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"',
+    setupNodeAction,
+    "node-version: 22",
+    'COREPACK_ENABLE_AUTO_PIN: "0"',
+    pinnedPnpm + " --version",
+    pinnedPnpm + " install --frozen-lockfile --ignore-scripts --prod=false",
+    pinnedPnpm + ' exec tsx "$smoke"',
+    pinnedPnpm + " exec tsx --test " + focusedTypescript,
+    "node --test " + focusedNative,
+    "git status --porcelain=v1 --untracked-files=all",
+    "status_before=",
+    "status_after=",
+    "trap ",
+    "set -Eeuo pipefail",
+    "HOSTED_SCOPE=REPOSITORY_ONLY",
+    "NATIVE_OPEN_PROVEN=NO",
+    "REAL_HOST_PROOFS=DEFERRED_TO_ISSUE_70",
+  ];
+  const unpinnedPackageManager = job.replaceAll(pinnedPnpm, "").replaceAll("pnpm-lock.yaml", "");
+  const hostOperations = /\\b(?:docker|systemctl|sysctl|apparmor_parser|aa-enforce|aa-disable|mount|umount)\\b/iu;
+  return required.every((value) => job.includes(value))
+    && !/\\bpnpm\\b/u.test(unpinnedPackageManager)
+    && !hostOperations.test(job)
+    && job.indexOf(exactHeadStepMarker) < job.indexOf("Setup Node 22 for hosted toolchain")
+    && job.indexOf("status_after=") > job.indexOf("node --test " + focusedNative);
+}
+
+function mutatePrepublicationJob(workflow: string, mutate: (job: string) => string): string {
+  const normalized = workflow.replace(/\r\n/g, "\n");
+  const start = normalized.indexOf(prepublicationJobMarker);
+  if (start < 0) return normalized;
+  return normalized.slice(0, start) + mutate(normalized.slice(start));
+}
+
+test("native prepublication workflow proves only the repository contract on the exact PR head", () => {
   const root = resolve(process.cwd());
   const workflow = readFileSync(join(root, workflowSizePath), "utf8");
-  const helper = readFileSync(join(root, workflowProofHelperPath));
-  const shellHelper = readFileSync(join(root, workflowProofShellPath));
-  assert.equal(helperExtractionIsValid(workflow, helper, shellHelper), true);
-  assert.equal(workflow.split(workflowProofShellPath).length - 1, 1);
-  assert.equal(shellHelper.toString("utf8").split(workflowProofHelperPath).length - 1, 1);
-  assert.equal(shellHelper.toString("utf8").split(helperInstallLine).length - 1, 1);
-  assert.equal(shellHelper.toString("utf8").split(helperExecutionLine).length - 1, 1);
-  assert.equal(helperExtractionIsValid(workflow, undefined, shellHelper), false);
-  assert.equal(helperExtractionIsValid(workflow, helper, undefined), false);
+  assert.equal(nativePrepublicationSourceIsValid(workflow), true);
+  for (const path of [
+    "tests/s8-native-admission.test.ts",
+    "tests/s8-native-release.test.ts",
+    "tests/s8-native-policy-crosscheck.test.ts",
+    "tests/s8-publication.test.ts",
+    "tests/s8-worker.test.ts",
+    "native/s8-worker-common/protocol.test.mjs",
+    "native/s8-worker-common/admission.test.mjs",
+    "native/s8-worker-launcher/capacity.test.mjs",
+    "native/s8-worker-launcher/ledger.test.mjs",
+    "native/s8-worker-launcher/container-runtime.test.mjs",
+    "native/s8-worker-launcher/result.test.mjs",
+    "native/s8-worker-gateway/gateway.test.mjs",
+  ]) assert.equal(workflow.includes(path), true, path);
 
-  const altered = Buffer.from(helper);
-  altered[0] = altered[0]! ^ 1;
-  assert.equal(helperExtractionIsValid(workflow, altered, shellHelper), false);
-  const alteredShell = Buffer.from(shellHelper);
-  alteredShell[0] = alteredShell[0]! ^ 1;
-  assert.equal(helperExtractionIsValid(workflow, helper, alteredShell), false);
-  assert.equal(helperExtractionIsValid(workflow.replace(helperSourceLine, ""), helper, shellHelper), false);
-  assert.equal(helperExtractionIsValid(workflow + "\n" + helperSourceLine, helper, shellHelper), false);
-  assert.equal(helperExtractionIsValid(workflow, helper, Buffer.from(shellHelper.toString("utf8").replace(helperInstallLine, "").replace(helperExecutionLine, ""), "utf8")), false);
-  assert.equal(shellHelper.toString("utf8").split(oldHelperExecutionLine).length - 1, 0);
-  assert.equal(shellHelper.toString("utf8").includes('cat > "$app_proof" <<\'TS\''), false);
+  assert.equal(nativePrepublicationSourceIsValid(mutatePrepublicationJob(workflow, (job) => job.replace(setupNodeAction, "actions/setup-node@deadbeef"))), false);
+  assert.equal(nativePrepublicationSourceIsValid(mutatePrepublicationJob(workflow, (job) => job.replace("node-version: 22", "node-version: 20"))), false);
+  assert.equal(nativePrepublicationSourceIsValid(mutatePrepublicationJob(workflow, (job) => job.replace("install --frozen-lockfile", "install"))), false);
+  assert.equal(nativePrepublicationSourceIsValid(mutatePrepublicationJob(workflow, (job) => job.replace("tests/s8-native-release.test.ts ", ""))), false);
+  assert.equal(nativePrepublicationSourceIsValid(mutatePrepublicationJob(workflow, (job) => job.replace("status_after=", ""))), false);
+  assert.equal(nativePrepublicationSourceIsValid(mutatePrepublicationJob(workflow, (job) => job.replace("NATIVE_OPEN_PROVEN=NO", "NATIVE_OPEN_PROVEN=YES"))), false);
+  assert.equal(nativePrepublicationSourceIsValid(workflow + "\n" + prepublicationJobMarker), false);
 });
 
-test("hosted toolchain source integrity is bounded to the verified Blender setup", () => {
-  const workflow = readFileSync(join(resolve(process.cwd()), workflowSizePath), "utf8").replace(/\r\n/g, "\n");
-  assert.equal(hostedToolchainSourceIsValid(workflow), true);
-  const installLine = frozenInstall;
-  const smokeLine = pinnedPnpm + ' exec tsx "$smoke"';
-  const verifyStep = exactHeadStepMarker;
-  const amendmentStep = hostedAmendmentStepMarker;
-  const inTargetJob = (mutate: (job: string) => string) => {
-    const start = workflow.indexOf(toolchainJobMarker);
-    return workflow.slice(0, start) + mutate(workflow.slice(start));
-  };
-  const wrongAction = setupNodeStep.replace(setupNodeAction, "actions/setup-node@deadbeef");
+test("legacy broker, Bubblewrap, helper, and deployment routes are not product-selectable", () => {
+  const root = resolve(process.cwd());
+  const app = readFileSync(join(root, "src/lib/s8.ts"), "utf8");
+  const workerClient = readFileSync(join(root, "src/lib/s8-native-worker-client.ts"), "utf8");
+  const configSource = readFileSync(join(root, "src/lib/s8-fbx-config.ts"), "utf8");
+  const workflow = readFileSync(join(root, workflowSizePath), "utf8");
+  const brokerReadme = readFileSync(join(root, "native/s8-sandbox-broker/README.md"), "utf8");
 
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, wrongAction)), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, setupNodeStep.replace("node-version: 22", "node-version: 20"))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(pinnedPnpm + " --version", "corepack pnpm@latest --version")), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(installLine, installLine.replace("--frozen-lockfile ", ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(installLine, installLine.replace("--ignore-scripts ", ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(installLine, installLine.replace("--prod=false", ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(smokeLine, smokeLine + "\n          pnpm --version")), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, "")), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, setupNodeStep + "\n" + setupNodeStep)), false);
-  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(verifyStep, ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(amendmentStep, ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(toolchainJobMarker, "")), false);
-  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(verifyStep, verifyStep + "\n" + verifyStep))), false);
-  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(amendmentStep, amendmentStep + "\n" + amendmentStep))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(toolchainJobMarker, toolchainJobMarker + "\n" + toolchainJobMarker)), false);
-  const reversed = inTargetJob((job) => job.replace(verifyStep, "VERIFY_BOUNDARY_TEMP")
-    .replace(amendmentStep, verifyStep)
-    .replace("VERIFY_BOUNDARY_TEMP", amendmentStep));
-  assert.equal(hostedToolchainSourceIsValid(reversed), false);
+  assert.match(app, /import type .*from "\.\/s8-fbx-worker"/u);
+  assert.doesNotMatch(app, /import\s+\{[^}]*\}\s+from "\.\/s8-fbx-worker"/su);
+  assert.doesNotMatch(app, /(?:createS8BrokerRequest|parseS8BrokerResponse|runS8NativeValidator|sandboxExecutable)/u);
+  assert.match(workerClient, /import type .*from "\.\/s8-fbx-worker"/u);
+  assert.doesNotMatch(workerClient, /(?:createS8BrokerRequest|parseS8BrokerResponse|runS8NativeValidator|brokerIdentity:|brokerMetadata:|execFile|spawn\()/u);
+  assert.match(workerClient, /from "node:https"/u);
+  assert.match(app, /NODE_ENV === "production" && options\.adapters/u);
+  assert.match(app, /fail\(503, "S8_WORKER_ADMISSION_CLOSED"\)/u);
+  assert.doesNotMatch(configSource, /(?:S8_APP_SANDBOX|BUBBLEWRAP|S8_BROKER_SOCKET|ROOT_BROKER)/iu);
+  assert.doesNotMatch(workflow, /s8-pinned-blender|s8_application_boundary_proof|Bubblewrap|s8_runtime_sensitivity|broker-recover|s8-sandbox/u);
+  assert.match(workflow, /s8-native-prepublication/u);
+  assert.match(workflow, /s8-actionlint/u);
+  assert.match(workflow, /s8-static/u);
+  assert.match(workflow, /s8-native:/u);
+  assert.match(brokerReadme, /historical reference only/u);
+  assert.match(brokerReadme, /not used by the application, deployment, or active CI/u);
+
+  for (const path of [
+    "scripts/s8/s8_application_boundary_proof.mts",
+    "scripts/s8/s8_application_boundary_proof.sh",
+    "scripts/s8/s8_runtime_sensitivity.py",
+    "native/s8-sandbox-broker/deploy/s8-sandbox",
+    "native/s8-sandbox-broker/deploy/swooshz-s8-broker-recover.service",
+    "native/s8-sandbox-broker/deploy/swooshz-s8-broker-recover.timer",
+    "native/s8-sandbox-broker/deploy/swooshz-s8-broker.sudoers.in",
+  ]) assert.equal(existsSync(join(root, path)), false, path);
+});
+
+test("partial native configuration is absent or invalid and production adapters fail closed", () => {
+  assert.equal(readS8RuntimeConfig({}), undefined);
+  assert.throws(() => readS8RuntimeConfig({ S8_WORKER_GATEWAY_URL: "https://s8-worker-gateway.internal" }), /S8_NATIVE_WORKER_CONFIG_INVALID/u);
+
+  const environment = process.env as unknown as Record<string, string | undefined>;
+  const previous = environment.NODE_ENV;
+  environment.NODE_ENV = "production";
+  try {
+    const options = { adapters: { writer: () => { throw new Error("unexpected writer adapter call"); }, nativeValidator: () => { throw new Error("unexpected validator adapter call"); } } };
+    assert.throws(() => new S8ExportService(options as never), (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "S8_WORKER_ADMISSION_CLOSED");
+      return true;
+    });
+  } finally {
+    if (previous === undefined) delete environment.NODE_ENV;
+    else environment.NODE_ENV = previous;
+  }
 });

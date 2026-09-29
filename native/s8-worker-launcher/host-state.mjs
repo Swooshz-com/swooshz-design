@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { lstatSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { verifyCapacityProof, verifyReleaseManifest } from "../s8-worker-common/admission.mjs";
 import { jcs, sha256 } from "../s8-worker-common/protocol.mjs";
@@ -74,8 +74,9 @@ export function validateDockerRuntimeInfo(raw) {
   const values = raw.trim().split("|");
   if (values.length !== 3 || values[1] !== "2" || values[2] !== "systemd") throw new Error("runtime-drift");
   const options = JSON.parse(values[0]);
-  if (!Array.isArray(options) || !options.some((value) => String(value).includes("rootless"))
-    || !options.some((value) => String(value).includes("seccomp")) || !options.some((value) => String(value).includes("apparmor"))) throw new Error("runtime-drift");
+  if (!Array.isArray(options) || !options.some((value) => String(value) === "name=rootless")
+    || !options.some((value) => String(value).startsWith("name=seccomp"))
+    || options.some((value) => String(value).includes("unconfined"))) throw new Error("runtime-drift");
 }
 
 async function verifyDocker(config) {
@@ -92,11 +93,65 @@ async function verifyImages(config, manifest) {
   }
 }
 
-function verifySandbox(config, manifest) {
+export function validateRootlessKitAppArmorEvidence(manifest, evidence) {
+  const sandbox = manifest?.sandbox;
+  const hostProfile = sandbox?.rootlessKitHostAppArmor;
+  if (sandbox?.jobAppArmorMode !== "unsupported-not-relied-upon"
+    || hostProfile?.mode !== "required-profile"
+    || hostProfile.profileName !== "swooshz-s8-rootlesskit-v1"
+    || !/^[0-9a-f]{64}$/u.test(hostProfile.profileSha256)
+    || sha256(evidence.profileBytes) !== hostProfile.profileSha256) throw new Error("rootlesskit-apparmor-profile-drift");
+  if (evidence.enabled !== "Y") throw new Error("apparmor-unavailable");
+  const enforcedProfile = hostProfile.profileName + " (enforce)";
+  if (!String(evidence.loadedProfiles).split(/\r?\n/u).some((line) => line.trim() === enforcedProfile)) throw new Error("rootlesskit-apparmor-not-loaded");
+  if (String(evidence.processProfile).trim() !== enforcedProfile) throw new Error("rootlesskit-apparmor-drift");
+  return {
+    jobAppArmorMode: sandbox.jobAppArmorMode,
+    rootlessKitHostAppArmorMode: hostProfile.mode,
+    rootlessKitHostAppArmorProfileName: hostProfile.profileName,
+    rootlessKitHostAppArmorProfileSha256: hostProfile.profileSha256,
+  };
+}
+
+export function findRootlessKitPid(procRoot, expectedLogicalPath, expectedUid) {
+  let entries;
+  try { entries = readdirSync(procRoot, { withFileTypes: true }); }
+  catch { throw new Error("rootlesskit-process-inventory-unavailable"); }
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+    let command;
+    try { command = readFileSync(join(procRoot, entry.name, "comm"), "utf8").trim(); }
+    catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ESRCH") continue;
+      throw new Error("rootlesskit-process-inventory-unavailable");
+    }
+    if (command !== "rootlesskit") continue;
+    let cgroup;
+    try { cgroup = readUnifiedCgroupPath(procRoot, entry.name); }
+    catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ESRCH") continue;
+      throw new Error("rootlesskit-process-cgroup-unavailable");
+    }
+    if (cgroup !== expectedLogicalPath && !cgroup.startsWith(expectedLogicalPath + "/")) continue;
+    if (processUid(procRoot, entry.name) !== expectedUid) throw new Error("rootlesskit-process-uid-drift");
+    matches.push(Number(entry.name));
+  }
+  if (matches.length !== 1) throw new Error("rootlesskit-process-inventory-drift");
+  return matches[0];
+}
+
+function verifySandbox(config, manifest, rootlessKitPid) {
   const seccomp = readFileSync(config.seccompPolicyFile);
-  const appArmor = readFileSync(config.appArmorProfileFile);
-  if (sha256(seccomp) !== manifest.sandbox.seccompPolicySha256 || sha256(appArmor) !== manifest.sandbox.appArmorPolicySha256) throw new Error("sandbox-drift");
-  if (readFileSync(join(config.sysRoot, "module/apparmor/parameters/enabled"), "utf8").trim().toUpperCase() !== "Y") throw new Error("apparmor-unavailable");
+  if (sha256(seccomp) !== manifest.sandbox.seccompPolicySha256) throw new Error("seccomp-drift");
+  const profileBytes = readFileSync(config.rootlessKitAppArmorProfileFile);
+  const evidence = {
+    profileBytes,
+    enabled: readFileSync(join(config.sysRoot, "module/apparmor/parameters/enabled"), "utf8").trim().toUpperCase(),
+    loadedProfiles: readFileSync(join(config.sysRoot, "kernel/security/apparmor/profiles"), "utf8"),
+    processProfile: readFileSync(join(config.procRoot, String(rootlessKitPid), "attr/current"), "utf8"),
+  };
+  return validateRootlessKitAppArmorEvidence(manifest, evidence);
 }
 
 export async function admissionSnapshot(config, startupReady) {
@@ -114,7 +169,6 @@ export async function admissionSnapshot(config, startupReady) {
     || sha256(Buffer.from(jcs(inventory), "utf8")) !== capacity.proof.workloadInventorySha256) throw new Error("inventory-drift");
   const tree = snapshotCgroupTree(config.cgroupRoot, capacity.proof);
   if (tree.sha256 !== capacity.proof.cgroupTreeSha256) throw new Error("cgroup-drift");
-  verifySandbox(config, release.manifest);
   await verifyDocker(config);
   const rootlessUid = capacity.proof.allocation.rootlessDockerUid;
   const rootlessPaths = rootlessCgroupPaths(rootlessUid);
@@ -125,9 +179,11 @@ export async function admissionSnapshot(config, startupReady) {
   const daemonPid = readRootlessDaemonPid(config.rootlessDockerPidFile);
   assertProcessCgroup(config.procRoot, daemonPid, rootlessPaths.daemon);
   if (processUid(config.procRoot, daemonPid) !== rootlessUid) throw new Error("rootless-daemon-uid-drift");
+  const rootlessKitPid = findRootlessKitPid(config.procRoot, rootlessPaths.daemon, rootlessUid);
+  const appArmor = verifySandbox(config, release.manifest, rootlessKitPid);
   await verifyImages(config, release.manifest);
   const observation = {
-    schemaVersion: "s8-launcher-observation-v1",
+    schemaVersion: "s8-launcher-observation-v2",
     proofSha256: capacity.proofSha256,
     state: capacity.proof.state,
     observedAt: new Date().toISOString(),
@@ -140,6 +196,10 @@ export async function admissionSnapshot(config, startupReady) {
     cgroupTreeSha256: tree.sha256,
     releaseManifestSha256: release.sha256,
     resourcePolicySha256: S8_NATIVE_RESOURCE_POLICY_SHA256,
+    jobAppArmorMode: appArmor.jobAppArmorMode,
+    rootlessKitHostAppArmorMode: appArmor.rootlessKitHostAppArmorMode,
+    rootlessKitHostAppArmorProfileName: appArmor.rootlessKitHostAppArmorProfileName,
+    rootlessKitHostAppArmorProfileSha256: appArmor.rootlessKitHostAppArmorProfileSha256,
     cgroupV2: true,
     rootlessDocker: true,
     requiredControllers: ["cpu", "memory", "pids"],
