@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { assertEmptyDockerInventory, assertProcessCgroup, processUid, readUnifiedCgroupPath, validateDockerRuntimeInfo } from "./host-state.mjs";
+import { assertEmptyDockerInventory, assertHostWorkloadPlacement, assertProcessCgroup, processUid, readUnifiedCgroupPath, validateDockerRuntimeInfo } from "./host-state.mjs";
 import { assertWorkerScopesQuiescent, expectedCgroupBudgets, measurePhysicalHost, rootlessCgroupPaths, snapshotCgroupTree } from "./capacity.mjs";
 
 const gib = 1024 ** 3;
@@ -59,6 +59,26 @@ function installCgroupFixture(root, proof) {
   }
 }
 
+function installCgroupThreadInventory(root, memberships = new Map()) {
+  const pending = [{ directory: root, logicalPath: "/" }];
+  while (pending.length !== 0) {
+    const current = pending.pop();
+    writeFileSync(join(current.directory, "cgroup.threads"), memberships.get(current.logicalPath) ?? "");
+    const children = readdirSync(current.directory, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    for (const child of children) {
+      const logicalPath = current.logicalPath === "/" ? "/" + child.name : current.logicalPath + "/" + child.name;
+      pending.push({ directory: join(current.directory, child.name), logicalPath });
+    }
+  }
+}
+
+function installProcTask(procRoot, tgid, tid, kthread = 0) {
+  const directory = join(procRoot, String(tgid), "task", String(tid));
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, "status"), "Name:\ttask\nTgid:\t" + tgid + "\nPid:\t" + tid + "\nKthread:\t" + kthread + "\n");
+}
+
+
 test("streaming reserve is enforced as 30/30/40 across app, gateway, and launcher", () => {
   const proof = sampleProof();
   const groups = new Map(expectedCgroupBudgets(proof).map((entry) => [entry.logicalPath, entry.budget]));
@@ -79,7 +99,7 @@ test("rootless Docker cgroups use an isolated systemd user manager and reject in
   assert.throws(() => rootlessCgroupPaths(0), /rootless-uid/u);
 });
 
-test("physical host measurement uses online CPUs, MemTotal, and pid_max", () => {
+test("physical host measurement uses the conservative task ceiling from threads-max and pid_max", () => {
   const root = mkdtempSync(join(tmpdir(), "s8-host-measure-"));
   try {
     const proc = join(root, "proc");
@@ -89,6 +109,7 @@ test("physical host measurement uses online CPUs, MemTotal, and pid_max", () => 
     mkdirSync(join(sys, "devices/system/cpu"), { recursive: true });
     mkdirSync(etc, { recursive: true });
     writeFileSync(join(proc, "meminfo"), "MemTotal: 8192 kB\nMemAvailable: 1 kB\n");
+    writeFileSync(join(proc, "sys/kernel/threads-max"), "32768\n");
     writeFileSync(join(proc, "sys/kernel/pid_max"), "4194304\n");
     writeFileSync(join(sys, "devices/system/cpu/online"), "0-1\n");
     writeFileSync(join(etc, "machine-id"), "0123456789abcdef0123456789abcdef\n");
@@ -97,7 +118,13 @@ test("physical host measurement uses online CPUs, MemTotal, and pid_max", () => 
     const second = measurePhysicalHost({ procRoot: proc, sysRoot: sys, etcRoot: etc });
     assert.equal(first.cpuMilli, 2000);
     assert.equal(first.memoryBytes, 8192 * 1024);
-    assert.equal(first.pids, 4194304);
+    assert.equal(first.pids, 32768);
+    writeFileSync(join(proc, "sys/kernel/pid_max"), "16384\n");
+    assert.equal(measurePhysicalHost({ procRoot: proc, sysRoot: sys, etcRoot: etc }).pids, 16384);
+    writeFileSync(join(proc, "sys/kernel/threads-max"), "8192\n");
+    assert.equal(measurePhysicalHost({ procRoot: proc, sysRoot: sys, etcRoot: etc }).pids, 8192);
+    writeFileSync(join(proc, "sys/kernel/threads-max"), "max\n");
+    assert.throws(() => measurePhysicalHost({ procRoot: proc, sysRoot: sys, etcRoot: etc }), /physical-task-capacity/u);
     assert.equal(first.hostId, second.hostId);
     assert.equal(first.memoryBytes, second.memoryBytes);
   } finally {
@@ -178,5 +205,83 @@ test("launcher and rootless Docker processes must remain inside their allocated 
     assert.equal(readUnifiedCgroupPath(root, "123"), "/swooshz.slice/swooshz-design.slice/swooshz-design-launcher.slice/swooshz-s8-worker-launcher.service");
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("host placement accepts bounded workloads and identified system tasks", () => {
+  const proof = sampleProof();
+  const cgroupRoot = mkdtempSync(join(tmpdir(), "s8-placement-cgroup-"));
+  const procRoot = mkdtempSync(join(tmpdir(), "s8-placement-proc-"));
+  try {
+    installCgroupFixture(cgroupRoot, proof);
+    mkdirSync(join(cgroupRoot, "init.scope"), { recursive: true });
+    const n8n = "/swooshz.slice/swooshz-non-design.slice/swooshz-non-design-n8n.slice";
+    installCgroupThreadInventory(cgroupRoot, new Map([
+      ["/", "2\n"],
+      ["/init.scope", "1\n"],
+      [n8n, "20\n21\n"],
+    ]));
+    installProcTask(procRoot, 1, 1, 0);
+    installProcTask(procRoot, 2, 2, 1);
+    installProcTask(procRoot, 20, 20, 0);
+    installProcTask(procRoot, 20, 21, 0);
+    assert.equal(assertHostWorkloadPlacement(cgroupRoot, procRoot, proof), true);
+  } finally {
+    rmSync(cgroupRoot, { recursive: true, force: true });
+    rmSync(procRoot, { recursive: true, force: true });
+  }
+});
+
+test("an unlisted system sibling blocks admission even when the Swooshz tree hash is unchanged", () => {
+  const proof = sampleProof();
+  const cgroupRoot = mkdtempSync(join(tmpdir(), "s8-placement-cgroup-"));
+  const procRoot = mkdtempSync(join(tmpdir(), "s8-placement-proc-"));
+  try {
+    installCgroupFixture(cgroupRoot, proof);
+    mkdirSync(join(cgroupRoot, "init.scope"), { recursive: true });
+    const n8n = "/swooshz.slice/swooshz-non-design.slice/swooshz-non-design-n8n.slice";
+    installCgroupThreadInventory(cgroupRoot, new Map([
+      ["/", "2\n"],
+      ["/init.scope", "1\n"],
+      [n8n, "20\n"],
+    ]));
+    installProcTask(procRoot, 1, 1, 0);
+    installProcTask(procRoot, 2, 2, 1);
+    installProcTask(procRoot, 20, 20, 0);
+    const boundedTreeSha256 = snapshotCgroupTree(cgroupRoot, proof).sha256;
+    const extra = join(cgroupRoot, "system.slice", "docker-unlisted.scope");
+    mkdirSync(extra, { recursive: true });
+    writeFileSync(join(cgroupRoot, "system.slice", "cgroup.threads"), "");
+    writeFileSync(join(extra, "cgroup.threads"), "30\n");
+    installProcTask(procRoot, 30, 30, 0);
+    assert.equal(snapshotCgroupTree(cgroupRoot, proof).sha256, boundedTreeSha256);
+    assert.throws(() => assertHostWorkloadPlacement(cgroupRoot, procRoot, proof), /host-workload-placement-unbounded/u);
+  } finally {
+    rmSync(cgroupRoot, { recursive: true, force: true });
+    rmSync(procRoot, { recursive: true, force: true });
+  }
+});
+
+test("malformed cgroup task placement fails closed", () => {
+  const proof = sampleProof();
+  const cgroupRoot = mkdtempSync(join(tmpdir(), "s8-placement-cgroup-"));
+  const procRoot = mkdtempSync(join(tmpdir(), "s8-placement-proc-"));
+  try {
+    installCgroupFixture(cgroupRoot, proof);
+    mkdirSync(join(cgroupRoot, "init.scope"), { recursive: true });
+    installCgroupThreadInventory(cgroupRoot, new Map([
+      ["/", "2\n"],
+      ["/init.scope", "1\n"],
+    ]));
+    installProcTask(procRoot, 1, 1, 0);
+    installProcTask(procRoot, 2, 2, 1);
+    const unknown = join(cgroupRoot, "system.slice");
+    mkdirSync(unknown, { recursive: true });
+    writeFileSync(join(unknown, "cgroup.threads"), "not-a-task\n");
+    assert.throws(() => assertHostWorkloadPlacement(cgroupRoot, procRoot, proof), /host-workload-inventory-unavailable/u);
+  } finally {
+    rmSync(cgroupRoot, { recursive: true, force: true });
+    rmSync(procRoot, { recursive: true, force: true });
   }
 });

@@ -3,7 +3,7 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { S8_NATIVE_RESOURCE_POLICY } from "../s8-worker-common/resource-policy.mjs";
 import { rootlessCgroupPaths } from "./capacity.mjs";
-import { runDocker, imageReference } from "./host-state.mjs";
+import { deadlineRemainingMs, dockerVolumeNames, runDocker, imageReference } from "./host-state.mjs";
 
 const READY = Buffer.from("S8_READY\n", "ascii");
 
@@ -27,7 +27,7 @@ export function createArguments(config, capacity, release, operation, requestSha
   ];
 }
 
-function captureProcess(child, maxStdout) {
+function captureProcess(child, maxStdout, now) {
   const stdout = [];
   let stdoutBytes = 0;
   let stderrBytes = 0;
@@ -42,7 +42,7 @@ function captureProcess(child, maxStdout) {
   let closedResult = null;
   const closePromise = new Promise((resolvePromise) => {
     child.once("close", (code, signal) => {
-      closedResult = { code, signal, overflow, stdout: Buffer.concat(stdout, stdoutBytes), stderrBytes };
+      closedResult = { code, signal, overflow, stdout: Buffer.concat(stdout, stdoutBytes), stderrBytes, closedAtMs: now() };
       resolvePromise(closedResult);
     });
   });
@@ -88,6 +88,31 @@ function waitForClose(capture, timeoutMs) {
   ]).finally(() => clearTimeout(timer));
 }
 
+async function waitBeforeDeadline(promise, deadlineUnixMs, now, timeoutError, phaseLimitMs = Infinity) {
+  const remaining = deadlineRemainingMs(deadlineUnixMs, now);
+  const timeoutMs = Math.min(remaining, phaseLimitMs);
+  let timer;
+  try {
+    const value = await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMs === remaining ? "deadline-expired" : timeoutError)), timeoutMs);
+      }),
+    ]);
+    deadlineRemainingMs(deadlineUnixMs, now);
+    return value;
+  } finally { clearTimeout(timer); }
+}
+
+function remainingCleanupMs(deadlineUnixMs, now) {
+  const remaining = deadlineUnixMs - now();
+  return Number.isFinite(remaining) ? Math.max(0, Math.floor(remaining)) : 0;
+}
+
+async function terminateWithinDeadline(capture, maximumMs, deadlineUnixMs, now) {
+  return terminateAndReap(capture, Math.min(maximumMs, remainingCleanupMs(deadlineUnixMs, now)));
+}
+
 async function terminateAndReap(capture, timeoutMs) {
   if (capture.closedResult) return capture.closedResult;
   try { capture.child.kill("SIGKILL"); } catch { /* close event below is the reaping evidence */ }
@@ -97,42 +122,57 @@ async function terminateAndReap(capture, timeoutMs) {
   return result;
 }
 
-async function writeWithBackpressure(stream, bytes) {
+async function writeWithBackpressure(stream, bytes, deadlineUnixMs, now) {
+  deadlineRemainingMs(deadlineUnixMs, now);
   if (stream.destroyed) throw new Error("worker-stdin-closed");
-  if (!stream.write(bytes)) await new Promise((resolvePromise, reject) => { stream.once("drain", resolvePromise); stream.once("error", reject); });
+  if (!stream.write(bytes)) {
+    await waitBeforeDeadline(new Promise((resolvePromise, reject) => {
+      stream.once("drain", resolvePromise);
+      stream.once("error", reject);
+    }), deadlineUnixMs, now, "worker-input-timeout");
+  }
+  deadlineRemainingMs(deadlineUnixMs, now);
 }
 
-export async function startContainer(config, containerId, payload, operation, spawnProcess = spawn) {
+export async function startContainer(config, containerId, payload, operation, spawnProcess = spawn, deadlineUnixMs, now = Date.now) {
+  deadlineRemainingMs(deadlineUnixMs, now);
   const maximum = operation === "WRITER" ? 128 * 1024 * 1024 + 1024 * 1024 + 64 * 1024 + 20 : 8 * 1024 * 1024 + 64 * 1024 + 20;
   const child = spawnProcess(config.dockerPath, ["--host", "unix://" + config.dockerSocket, "start", "--attach", "--interactive", containerId], {
     env: { PATH: "/usr/bin:/bin", HOME: process.env.HOME ?? "/nonexistent", DOCKER_HOST: "unix://" + config.dockerSocket },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  const capture = captureProcess(child, maximum);
+  const capture = captureProcess(child, maximum, now);
   const lengthHeader = Buffer.alloc(8);
   lengthHeader.writeBigUInt64BE(BigInt(payload.length), 0);
-  let timer;
   try {
-    await writeWithBackpressure(child.stdin, lengthHeader);
-    await writeWithBackpressure(child.stdin, payload);
-    await Promise.race([capture.readyPromise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("worker-ready-timeout")), config.workerReadyTimeoutMs ?? 10000); })]);
+    deadlineRemainingMs(deadlineUnixMs, now);
+    await writeWithBackpressure(child.stdin, lengthHeader, deadlineUnixMs, now);
+    await writeWithBackpressure(child.stdin, payload, deadlineUnixMs, now);
+    await waitBeforeDeadline(capture.readyPromise, deadlineUnixMs, now, "worker-ready-timeout", config.workerReadyTimeoutMs ?? 10000);
   } catch (error) {
-    clearTimeout(timer);
-    await terminateAndReap(capture, config.workerReapTimeoutMs ?? 5000);
+    try { await terminateWithinDeadline(capture, config.workerReapTimeoutMs ?? 5000, deadlineUnixMs, now); }
+    catch { throw disposalUnproven(); }
     throw error;
-  } finally { clearTimeout(timer); }
+  }
+  deadlineRemainingMs(deadlineUnixMs, now);
   return {
     release: async () => {
-      try { await writeWithBackpressure(child.stdin, Buffer.from("R", "ascii")); child.stdin.end(); }
-      catch (error) { await terminateAndReap(capture, config.workerReapTimeoutMs ?? 5000); throw error; }
+      try {
+        await writeWithBackpressure(child.stdin, Buffer.from("R", "ascii"), deadlineUnixMs, now);
+        child.stdin.end();
+        deadlineRemainingMs(deadlineUnixMs, now);
+      } catch (error) {
+        try { await terminateWithinDeadline(capture, config.workerReapTimeoutMs ?? 5000, deadlineUnixMs, now); }
+        catch { throw disposalUnproven(); }
+        throw error;
+      }
     },
-    close: async (timeoutMs) => {
-      const result = await waitForClose(capture, timeoutMs);
-      if (result) return result;
-      await terminateAndReap(capture, config.workerReapTimeoutMs ?? 5000);
-      throw new Error("worker-timeout");
+    close: async () => {
+      const result = await waitBeforeDeadline(capture.closePromise, deadlineUnixMs, now, "worker-timeout");
+      if (result.closedAtMs > deadlineUnixMs) throw new Error("deadline-expired");
+      return result;
     },
-    abort: async () => terminateAndReap(capture, config.workerReapTimeoutMs ?? 5000),
+    abort: async () => terminateWithinDeadline(capture, config.workerReapTimeoutMs ?? 5000, deadlineUnixMs, now),
   };
 }
 export function validateContainerSecurityOptions(security, config) {
@@ -145,9 +185,57 @@ export function validateContainerSecurityOptions(security, config) {
   }
 }
 
-export async function inspectAndVerify(config, containerId, release, operation, budget, capacity) {
-  const list = JSON.parse(await runDocker(config, ["inspect", containerId]));
-  const inspect = Array.isArray(list) ? list[0] : null;
+function emptyNullableObject(value) {
+  return value === null || (value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0);
+}
+
+function emptyNullableArray(value) {
+  return value === null || (Array.isArray(value) && value.length === 0);
+}
+
+export function assertContainerVolumeAuthority(inspect, { requireMountInventory = false } = {}) {
+  const config = inspect?.Config;
+  const host = inspect?.HostConfig;
+  const tmpfs = host?.Tmpfs;
+  if (!config || !emptyNullableObject(config.Volumes) || !host
+    || !emptyNullableArray(host.Binds) || !emptyNullableArray(host.Mounts) || !emptyNullableArray(host.VolumesFrom)
+    || !tmpfs || typeof tmpfs !== "object" || Array.isArray(tmpfs) || Object.keys(tmpfs).join(",") !== "/work") {
+    throw new Error("container-volume-drift");
+  }
+  const mounts = inspect.Mounts;
+  if (mounts === undefined || mounts === null) {
+    if (requireMountInventory) throw new Error("container-volume-drift");
+    return inspect;
+  }
+  if (!Array.isArray(mounts)) throw new Error("container-volume-drift");
+  let workTmpfsCount = 0;
+  for (const mount of mounts) {
+    if (!mount || typeof mount !== "object" || Array.isArray(mount) || !["tmpfs"].includes(mount.Type)) {
+      throw new Error("container-volume-drift");
+    }
+    if (mount.Destination === "/work") {
+      if (mount.RW !== true) throw new Error("container-volume-drift");
+      workTmpfsCount += 1;
+    } else if (mount.Destination !== "/dev/shm") {
+      throw new Error("container-volume-drift");
+    }
+  }
+  if (workTmpfsCount > 1 || (requireMountInventory && workTmpfsCount !== 1)) throw new Error("container-volume-drift");
+  return inspect;
+}
+
+export async function inspectCreatedContainer(config, containerId, docker = runDocker) {
+  if (!/^[0-9a-f]{64}$/u.test(containerId)) throw new Error("container-identity-invalid");
+  const list = JSON.parse(await docker(config, ["inspect", containerId]));
+  const inspect = Array.isArray(list) && list.length === 1 ? list[0] : null;
+  if (!inspect || inspect.Id !== containerId) throw new Error("container-identity-invalid");
+  return assertContainerVolumeAuthority(inspect);
+}
+export async function inspectAndVerify(config, containerId, release, operation, budget, capacity, docker = runDocker) {
+  const list = JSON.parse(await docker(config, ["inspect", containerId]));
+  const inspect = Array.isArray(list) && list.length === 1 ? list[0] : null;
+  if (!inspect || inspect.Id !== containerId) throw new Error("container-identity-invalid");
+  assertContainerVolumeAuthority(inspect, { requireMountInventory: true });
   const host = inspect?.HostConfig;
   const image = imageReference(config, release.manifest, operation);
   const rootlessPaths = rootlessCgroupPaths(capacity.proof.allocation.rootlessDockerUid);
@@ -215,12 +303,23 @@ export function workerScopeIsQuiescent(config, containerId, rootlessDockerUid) {
   return true;
 }
 
-export async function removeContainer(config, containerId, rootlessDockerUid, docker = runDocker) {
+export async function removeContainer(config, containerId, rootlessDockerUid, docker = runDocker, baselineVolumeNames = []) {
   if (!containerId) return false;
   if (!/^[0-9a-f]{64}$/u.test(containerId)) throw new Error("container-identity-invalid");
-  try { await docker(config, ["rm", "--force", containerId], 30000); } catch { /* removal is decided by process and cgroup evidence below */ }
+  if (!Array.isArray(baselineVolumeNames) || baselineVolumeNames.some((name) => typeof name !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/u.test(name))
+    || new Set(baselineVolumeNames).size !== baselineVolumeNames.length) throw new Error("docker-volume-inventory-invalid");
+  try { await docker(config, ["rm", "--force", "--volumes", containerId], 30000); } catch { /* removal is decided by process and cgroup evidence below */ }
   const remaining = (await docker(config, ["ps", "--all", "--quiet", "--no-trunc", "--filter", "id=" + containerId])).split(/\s+/u).filter(Boolean);
   if (remaining.length !== 0 && !(remaining.length === 1 && remaining[0] === containerId)) throw new Error("container-inventory-invalid");
   if (remaining.length !== 0) return false;
+  const expectedVolumes = new Set(baselineVolumeNames);
+  const volumes = dockerVolumeNames(await docker(config, ["volume", "ls", "--quiet", "--no-trunc"]));
+  if (baselineVolumeNames.some((name) => !volumes.includes(name))) throw new Error("docker-volume-inventory-drift");
+  for (const name of volumes) {
+    if (expectedVolumes.has(name)) continue;
+    try { await docker(config, ["volume", "rm", name], 30000); } catch { /* exact volume inventory below is authoritative */ }
+  }
+  const remainingVolumes = dockerVolumeNames(await docker(config, ["volume", "ls", "--quiet", "--no-trunc"])).sort();
+  if (JSON.stringify(remainingVolumes) !== JSON.stringify([...expectedVolumes].sort())) throw new Error("docker-volume-removal-unproven");
   return workerScopeIsQuiescent(config, containerId, rootlessDockerUid);
 }

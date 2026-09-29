@@ -3,6 +3,7 @@ import { generateKeyPairSync, sign } from "node:crypto";
 import test from "node:test";
 import { decideS8NativeAdmission, requireS8NativeAdmissionOpen, S8_NATIVE_RESOURCE_POLICY, S8_NATIVE_RESOURCE_POLICY_SHA256, type S8AdmissionEnvelope } from "../src/lib/s8-native-admission";
 import { jcs, sha256 } from "../src/lib/utils";
+import { hasUnknownS8NativeAttempt } from "../src/lib/s8-fbx-persistence";
 
 const now = Date.parse("2026-09-29T00:00:00.000Z");
 const capacityKeys = generateKeyPairSync("ed25519");
@@ -110,6 +111,10 @@ test("OPEN accepts unsupported-not-relied-upon job AppArmor with a bound Rootles
   assert.doesNotThrow(() => requireS8NativeAdmissionOpen(result));
 });
 
+test("global native admission treats any persisted UNKNOWN attempt as unresolved", () => {
+  assert.equal(hasUnknownS8NativeAttempt([{ state: "SUCCEEDED" }, { state: "FAILED" }]), false);
+  assert.equal(hasUnknownS8NativeAttempt([{ state: "SUCCEEDED" }, { state: "UNKNOWN" }]), true);
+});
 test("capacity proofs must itemize protected sibling workload budgets", () => {
   const value = envelope();
   (value.capacity.proof.allocation as unknown as { nonDesignWorkloads: unknown[] }).nonDesignWorkloads = [];

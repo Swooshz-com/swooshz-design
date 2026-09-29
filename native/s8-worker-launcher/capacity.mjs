@@ -31,13 +31,24 @@ function parseCpuOnline(value) {
   return online.size;
 }
 
+function readPositiveTaskLimit(path) {
+  let raw;
+  try { raw = readFileSync(path, "utf8").trim(); }
+  catch { throw new Error("physical-task-capacity"); }
+  const value = Number(raw);
+  if (!/^\d+$/u.test(raw) || !Number.isSafeInteger(value) || value <= 0) throw new Error("physical-task-capacity");
+  return value;
+}
+
 export function measurePhysicalHost({ procRoot = "/proc", sysRoot = "/sys", etcRoot = "/etc" } = {}) {
   const cpuMilli = parseCpuOnline(readFileSync(join(sysRoot, "devices/system/cpu/online"), "utf8")) * 1000;
   const memInfo = readFileSync(join(procRoot, "meminfo"), "utf8");
   const memoryMatch = /^MemTotal:\s+(\d+)\s+kB\s*$/mu.exec(memInfo);
   if (!memoryMatch) throw new Error("physical-memory");
   const memoryBytes = Number(memoryMatch[1]) * 1024;
-  const pids = Number(readFileSync(join(procRoot, "sys/kernel/pid_max"), "utf8").trim());
+  const taskCeiling = readPositiveTaskLimit(join(procRoot, "sys/kernel/threads-max"));
+  const pidRangeCeiling = readPositiveTaskLimit(join(procRoot, "sys/kernel/pid_max"));
+  const pids = Math.min(taskCeiling, pidRangeCeiling);
   const machineId = readFileSync(join(etcRoot, "machine-id"), "utf8").trim();
   if (!Number.isSafeInteger(memoryBytes) || memoryBytes <= 0 || !Number.isSafeInteger(pids) || pids <= 0 || !/^[0-9a-f]{32}$/u.test(machineId)) throw new Error("physical-measurement");
   return {

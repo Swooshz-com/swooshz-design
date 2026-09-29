@@ -4,6 +4,7 @@ import test from "node:test";
 import { sha256, verifyResponseFrame } from "../s8-worker-common/protocol.mjs";
 import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "../s8-worker-common/resource-policy.mjs";
 import { createResponse } from "./result.mjs";
+import { createResponseBeforeDeadline } from "./operation.mjs";
 
 const keys = generateKeyPairSync("ed25519");
 const publicKey = keys.publicKey.export({ type: "spki", format: "pem" }).toString();
@@ -55,4 +56,30 @@ test("successful Writer response issues the opaque handle needed to bind Validat
   assert.equal(verified.body.releaseHandle, handle);
   assert.equal(verified.body.outputSha256, sha256(output));
   assert.equal(created.responseSha256.length, 64);
+});
+
+
+test("expired response construction is refused and signing that crosses the deadline is not accepted", () => {
+  let now = 100;
+  let signatures = 0;
+  assert.throws(() => createResponseBeforeDeadline(100, () => now, () => {
+    signatures += 1;
+    return { frame: Buffer.from("late") };
+  }), /deadline-expired/u);
+  assert.equal(signatures, 0);
+
+  now = 200;
+  const onTime = createResponseBeforeDeadline(201, () => now, () => {
+    signatures += 1;
+    return { frame: Buffer.from("on-time") };
+  });
+  assert.equal(onTime.frame.toString(), "on-time");
+
+  now = 300;
+  assert.throws(() => createResponseBeforeDeadline(301, () => now, () => {
+    signatures += 1;
+    now = 301;
+    return { frame: Buffer.from("late") };
+  }), /deadline-expired/u);
+  assert.equal(signatures, 2);
 });

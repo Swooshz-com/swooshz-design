@@ -111,6 +111,10 @@ export function getS8Collections(state: StoreState): {
   };
 }
 
+export function hasUnknownS8NativeAttempt(attempts: readonly Pick<S8NativeOperationAttempt, "state">[]): boolean {
+  return attempts.some((attempt) => attempt.state === "UNKNOWN");
+}
+
 function validateSource(value: unknown): void {
   const item = record(value);
   exactKeys(item, ["projectId", "sourceRevisionId", "sourceRevisionHash", "sourceS5Fingerprint", "s6ValidationReceiptId", "s6ValidationHash", "s6HandoffDigest", "s7ArtifactId", "s7ArtifactHash", "s7ReadbackHash", "s7ManifestId", "s7ManifestHash", "s8Profile", "s8ProtocolVersion"], "S8_PERSISTENCE_INVALID");

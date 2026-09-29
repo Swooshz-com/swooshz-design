@@ -103,7 +103,7 @@ PROVING permits only operator-controlled synthetic capacity and enforcement prob
 OPEN requires all of the following:
 
 1. Issue #70 has an Owner-approved capacity solution and its result is accepted.
-2. The realized physical host has been freshly measured; CPU is based on online CPU capacity, memory on physical MemTotal, and PIDs on the host process ceiling. Instantaneous MemAvailable and sampled spare CPU are not reservations.
+2. The realized physical host has been freshly measured; CPU is based on online CPU capacity, memory on physical MemTotal, and the finite host task ceiling is the conservative minimum of kernel threads-max and pid_max. threads-max bounds task creation; pid_max contributes only the PID-number-range upper bound. Instantaneous MemAvailable and sampled spare CPU are not reservations.
 3. A current Owner-signed capacity proof and launcher-signed live observation are valid and match the realized host, cgroup tree, release, and resource policy.
 4. The allocation arithmetic below passes.
 5. Rootless cgroup-v2, finite ceilings, complete workload inventory, host-reserve protection, sibling bounds, and the Design hierarchy are freshly read back.
@@ -170,6 +170,6 @@ Images are built and verified out of band, then preloaded through an operator-co
 
 ## G2 validation boundary and deferred host proof
 
-Repository validation covers protocol canonicalization/signature/replay negatives, bounded framing and hashing, proof arithmetic and fail-closed states, physical-host measurement from online CPUs/MemTotal/pid_max, exact cgroup inventory/readback, launcher/rootless process placement, durable attempt transitions, source/claim fencing, publication recovery, fixed container arguments, image/manifest admission, private gateway routing, and generic error/log redaction.
+Repository validation covers protocol canonicalization/signature/replay negatives, bounded framing and hashing, proof arithmetic and fail-closed states, physical-host measurement from online CPUs/MemTotal and the effective task ceiling (min(threads-max, pid_max)), exact cgroup inventory/readback, launcher/rootless process placement, durable attempt transitions, source/claim fencing, publication recovery, fixed container arguments, image/manifest admission, private gateway routing, and generic error/log redaction.
 
 No Docker daemon, Coolify resource, VPS, cgroup tree, sibling service, capacity proof, or production workload is mutated in this repository task. Real rootless/cgroup enforcement, current/future sibling ceilings, contention/resource-limit demonstrations, realized-host measurement, and CLOSED -> PROVING -> OPEN remain issue #70 pre-OPEN requirements.

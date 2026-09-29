@@ -393,6 +393,28 @@ test("legacy broker, Bubblewrap, helper, and deployment routes are not product-s
   ]) assert.equal(existsSync(join(root, path)), false, path);
 });
 
+test("a persisted UNKNOWN native attempt globally overrides a fresh OPEN worker admission observation", async () => {
+  let admissionReads = 0;
+  const open = { state: "OPEN" as const, reason: null, proofSha256: "a".repeat(64), observedAt: "2026-09-29T00:00:00.000Z" };
+  const blocked = new S8ExportService({
+    repository: { state: () => ({ s8NativeOperationAttempts: [{ state: "UNKNOWN", projectId: "another-project" }] }) },
+    admissionReader: async () => { admissionReads += 1; return open; },
+  } as never);
+
+  assert.deepEqual(await blocked.getAdmissionStatus(), {
+    state: "CLOSED",
+    reason: "OBSERVATION_INVALID",
+    proofSha256: null,
+    observedAt: null,
+  });
+  assert.equal(admissionReads, 0);
+
+  const reconciled = new S8ExportService({
+    repository: { state: () => ({ s8NativeOperationAttempts: [{ state: "FAILED" }, { state: "SUCCEEDED" }] }) },
+    admissionReader: async () => open,
+  } as never);
+  assert.deepEqual(await reconciled.getAdmissionStatus(), open);
+});
 test("partial native configuration is absent or invalid and production adapters fail closed", () => {
   assert.equal(readS8RuntimeConfig({}), undefined);
   assert.throws(() => readS8RuntimeConfig({ S8_WORKER_GATEWAY_URL: "https://s8-worker-gateway.internal" }), /S8_NATIVE_WORKER_CONFIG_INVALID/u);

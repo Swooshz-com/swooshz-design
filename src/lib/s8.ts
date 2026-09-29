@@ -2,7 +2,7 @@ import { AppError, type S6ToS7Handoff, type S7ToS8Handoff, type S8Artifact, type
 import { buildS8WriterPayload, canonicalS8SourceJson, type S8WriterPayload } from "./s8-fbx-payload";
 import { assertS8ReadbackProvenance, compareS8UfbxReadback, type S8SemanticResult, type S8UfbxReadback } from "./s8-fbx-semantic";
 import { S8_BLENDER_PIN, S8_EXPORTER_PATCH_PIN, S8_EXPORTER_SETTINGS, S8_FBX_PROFILE, S8_LIMITS, S8_PROCESS_RUNNER_PIN, S8_PROTOCOL_VERSION, S8_RESOURCE_TABLE, S8_REUSE_FINGERPRINT_VERSION, S8_SEMANTIC_VERSION, S8_UFBX_PIN, S8_VALIDATOR_PIN, S8_WRITER_RECEIPT_VERSION, s8Sha256 } from "./s8-fbx-profile";
-import { getS8Collections, sameS8Source, s8FinalPrefix, s8ObjectKey, s8ResourceLimitsHash, s8StagingPrefix, S8_OBJECT_NAMES, S8_STALE_CLAIM_MS } from "./s8-fbx-persistence";
+import { getS8Collections, hasUnknownS8NativeAttempt, sameS8Source, s8FinalPrefix, s8ObjectKey, s8ResourceLimitsHash, s8StagingPrefix, S8_OBJECT_NAMES, S8_STALE_CLAIM_MS } from "./s8-fbx-persistence";
 import { getS7Collections, sameS7Source } from "./s7-persistence";
 import { JsonRepository, PrivateObjectStore } from "./store";
 import { jcs, newUuid, nowUtc, sha256, uuidV4Pattern } from "./utils";
@@ -248,6 +248,9 @@ export class S8ExportService {
 
   async getAdmissionStatus(): Promise<S8AdmissionDecision> {
     if (!this.startupReconciled) return { state: "CLOSED", reason: "OBSERVATION_INVALID", proofSha256: null, observedAt: null };
+    if (hasUnknownS8NativeAttempt(getS8Collections(this.repository.state()).operationAttempts)) {
+      return { state: "CLOSED", reason: "OBSERVATION_INVALID", proofSha256: null, observedAt: null };
+    }
     if (this.admissionReader) {
       try { return await this.admissionReader(); } catch { return { state: "CLOSED", reason: "OBSERVATION_INVALID", proofSha256: null, observedAt: null }; }
     }
