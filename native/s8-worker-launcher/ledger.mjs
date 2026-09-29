@@ -1,5 +1,5 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, lstatSync, unlinkSync, writeFileSync, readdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 
 const RECORD_SCHEMA = "s8-launcher-ledger-record-v1";
