@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { assertProcessCgroup, processUid, readUnifiedCgroupPath, validateDockerRuntimeInfo } from "./host-state.mjs";
+import { assertEmptyDockerInventory, assertProcessCgroup, processUid, readUnifiedCgroupPath, validateDockerRuntimeInfo } from "./host-state.mjs";
 import { assertWorkerScopesQuiescent, expectedCgroupBudgets, measurePhysicalHost, rootlessCgroupPaths, snapshotCgroupTree } from "./capacity.mjs";
 
 const gib = 1024 ** 3;
@@ -137,6 +137,13 @@ test("startup rejects an orphaned populated Docker worker scope", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("admission rejects any retained Docker container inventory", () => {
+  assert.doesNotThrow(() => assertEmptyDockerInventory(""));
+  assert.doesNotThrow(() => assertEmptyDockerInventory("\n"));
+  assert.throws(() => assertEmptyDockerInventory("a".repeat(64)), /worker-container-inventory-not-empty/u);
+  assert.throws(() => assertEmptyDockerInventory("not-a-container"), /container-id-invalid/u);
 });
 
 test("rootless Docker admission requires cgroup-v2 systemd and seccomp but not unsupported job AppArmor", () => {

@@ -19,6 +19,17 @@ export async function runDocker(config, args, timeout = 15000) {
   return String(result.stdout ?? "");
 }
 
+export function dockerContainerIds(output) {
+  if (typeof output !== "string") throw new Error("container-inventory-invalid");
+  const ids = output.split(/\s+/u).filter(Boolean);
+  if (ids.some((id) => !/^[0-9a-f]{64}$/u.test(id))) throw new Error("container-id-invalid");
+  return ids;
+}
+
+export function assertEmptyDockerInventory(output) {
+  if (dockerContainerIds(output).length !== 0) throw new Error("worker-container-inventory-not-empty");
+}
+
 export function readUnifiedCgroupPath(procRoot, pid) {
   if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) throw new Error("process-id-invalid");
   const lines = readFileSync(join(procRoot, String(pid), "cgroup"), "utf8").trim().split("\n");
@@ -170,6 +181,8 @@ export async function admissionSnapshot(config, startupReady) {
   const tree = snapshotCgroupTree(config.cgroupRoot, capacity.proof);
   if (tree.sha256 !== capacity.proof.cgroupTreeSha256) throw new Error("cgroup-drift");
   await verifyDocker(config);
+  assertEmptyDockerInventory(await runDocker(config, ["ps", "--all", "--quiet", "--no-trunc"]));
+  assertWorkerScopesQuiescent(config.cgroupRoot, capacity.proof);
   const rootlessUid = capacity.proof.allocation.rootlessDockerUid;
   const rootlessPaths = rootlessCgroupPaths(rootlessUid);
   const managerPid = await systemdMainPid(config, "user@" + rootlessUid + ".service");
@@ -211,9 +224,8 @@ export async function admissionSnapshot(config, startupReady) {
 
 export async function reconcileStartup(config) {
   config.ledger.reconcileInflight();
-  const ids = (await runDocker(config, ["ps", "--all", "--quiet", "--no-trunc"])).split(/\s+/u).filter(Boolean);
+  const ids = dockerContainerIds(await runDocker(config, ["ps", "--all", "--quiet", "--no-trunc"]));
   for (const id of ids) {
-    if (!/^[0-9a-f]{64}$/u.test(id)) throw new Error("container-id-invalid");
     const labels = JSON.parse(await runDocker(config, ["inspect", "--format", "{{json .Config.Labels}}", id]));
     if (labels?.["s8.owner"] !== "swooshz-s8-launcher") throw new Error("foreign-container");
     try { await runDocker(config, ["rm", "--force", id], 30000); } catch { /* exact inventory below is authoritative */ }
@@ -224,5 +236,6 @@ export async function reconcileStartup(config) {
   const signedProof = readJsonFile(config.capacityProofFile, 256 * 1024);
   const capacity = verifyCapacityProof(signedProof, config.capacityAuthorityKeys);
   assertWorkerScopesQuiescent(config.cgroupRoot, capacity.proof);
+  assertEmptyDockerInventory(await runDocker(config, ["ps", "--all", "--quiet", "--no-trunc"]));
   return ids.length;
 }
