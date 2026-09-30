@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { assertContainerVolumeAuthority, createArguments, inspectCreatedContainer, removeContainer, startContainer, validateContainerSecurityOptions, workerBudget, workerScopeIsQuiescent } from "./container-runtime.mjs";
+import { classifyNativeFailure } from "./operation.mjs";
 import { rootlessCgroupPaths } from "./capacity.mjs";
 import { assertHostMeasurementRoots } from "./config.mjs";
 import { assertEmptyDockerVolumeInventory, assertImageHasNoVolumes, deadlineBoundDocker, dockerVolumeNames, findRootlessKitPid, validateRootlessKitAppArmorEvidence } from "./host-state.mjs";
@@ -492,4 +493,64 @@ test("launcher host measurements cannot be redirected to a fabricated proc, sys,
     environment[name] = expected === "/sys/fs/cgroup" ? "/tmp/fake-cgroup" : "/tmp/fake-host";
     assert.throws(() => assertHostMeasurementRoots(environment), /host-measurement-root-invalid/u);
   }
+});
+test("attached worker EPIPE is reaped and remains nonretryable", async () => {
+  const child = fakeSynchronousKillChild();
+  const error = Object.assign(new Error("attached worker pipe closed"), { code: "EPIPE" });
+  child.stdin.write = () => { throw error; };
+  let spawnCount = 0;
+  let observed;
+  await assert.rejects(
+    startContainer(
+      { ...config, dockerSocket: "/run/swooshz-s8/docker.sock", workerReapTimeoutMs: 100 },
+      "c".repeat(64),
+      Buffer.from("input"),
+      "WRITER",
+      () => { spawnCount += 1; return child; },
+      Date.now() + 5000,
+    ),
+    (caught) => { observed = caught; return caught === error; },
+  );
+  assert.equal(spawnCount, 1);
+  assert.equal(child.killed, true);
+  assert.equal(classifyNativeFailure(observed), "PERMANENT");
+});
+
+test("attached process EAGAIN remains nonretryable and does not spawn twice", async () => {
+  const error = Object.assign(new Error("resource temporarily unavailable"), { code: "EAGAIN" });
+  let spawnCount = 0;
+  let observed;
+  await assert.rejects(
+    startContainer(
+      { ...config, dockerSocket: "/run/swooshz-s8/docker.sock" },
+      "c".repeat(64),
+      Buffer.from("input"),
+      "WRITER",
+      () => { spawnCount += 1; throw error; },
+      Date.now() + 5000,
+    ),
+    (caught) => { observed = caught; return caught === error; },
+  );
+  assert.equal(spawnCount, 1);
+  assert.equal(classifyNativeFailure(observed), "PERMANENT");
+});
+
+test("readiness phase timeout is reaped and remains nonretryable", async () => {
+  let child;
+  let spawnCount = 0;
+  let observed;
+  await assert.rejects(
+    startContainer(
+      { ...config, dockerSocket: "/run/swooshz-s8/docker.sock", workerReadyTimeoutMs: 5, workerReapTimeoutMs: 100 },
+      "c".repeat(64),
+      Buffer.from("input"),
+      "WRITER",
+      () => { spawnCount += 1; child = fakeSynchronousKillChild(); return child; },
+      Date.now() + 5000,
+    ),
+    (error) => { observed = error; return error.message === "worker-ready-timeout"; },
+  );
+  assert.equal(spawnCount, 1);
+  assert.equal(child.killed, true);
+  assert.equal(classifyNativeFailure(observed), "PERMANENT");
 });

@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { MAX_WRITER_INPUT_BYTES, MAX_VALIDATOR_INPUT_BYTES } from "../s8-worker-common/protocol.mjs";
 import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "../s8-worker-common/resource-policy.mjs";
-import { admissionSnapshot, deadlineBoundDocker, deadlineRemainingMs, dockerVolumeNames, runDocker } from "./host-state.mjs";
+import { admissionSnapshot, deadlineBoundDocker, deadlineRemainingMs, DockerControlPlaneUnavailable, dockerVolumeNames, runDocker } from "./host-state.mjs";
 import { createArguments, inspectAndVerify, inspectCreatedContainer, removeContainer, startContainer, workerBudget } from "./container-runtime.mjs";
 import { createResponse, parseContainerResult, verifyRunnerEvidence, verifyWriterReceipt } from "./result.mjs";
 
@@ -22,12 +22,9 @@ function isTimeoutFailure(error) {
   return message.includes("timeout") || message.includes("timed out") || error?.code === "ETIMEDOUT";
 }
 
-const NON_TIMEOUT_TRANSIENT_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAGAIN"]);
-
 export function classifyNativeFailure(error) {
   if (isTimeoutFailure(error)) return "PERMANENT";
-  const code = error && typeof error === "object" ? error.code : undefined;
-  return NON_TIMEOUT_TRANSIENT_CODES.has(code) ? "TRANSIENT" : "PERMANENT";
+  return error instanceof DockerControlPlaneUnavailable ? "TRANSIENT" : "PERMANENT";
 }
 
 function recordTimeoutWithoutResponse(config, body) {

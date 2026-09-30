@@ -4,6 +4,7 @@ import test from "node:test";
 import { sha256, verifyResponseFrame } from "../s8-worker-common/protocol.mjs";
 import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "../s8-worker-common/resource-policy.mjs";
 import { createResponse } from "./result.mjs";
+import { DockerControlPlaneUnavailable, identifyDockerControlPlaneFailure } from "./host-state.mjs";
 import { classifyNativeFailure, createResponseBeforeDeadline } from "./operation.mjs";
 
 const keys = generateKeyPairSync("ed25519");
@@ -85,10 +86,32 @@ test("expired response construction is refused and signing that crosses the dead
 });
 
 
-test("timeouts are permanent while the narrow non-timeout transport classifier remains retryable", () => {
+test("raw worker and resource error codes are permanent; only identified Docker control failure is transient", () => {
+  for (const code of ["EPIPE", "EAGAIN", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT"]) {
+    assert.equal(classifyNativeFailure(Object.assign(new Error("raw " + code), { code })), "PERMANENT", code);
+  }
   assert.equal(classifyNativeFailure(new Error("worker-ready-timeout")), "PERMANENT");
-  assert.equal(classifyNativeFailure(Object.assign(new Error("socket stalled"), { code: "ETIMEDOUT" })), "PERMANENT");
-  assert.equal(classifyNativeFailure(Object.assign(new Error("socket reset"), { code: "ECONNRESET" })), "TRANSIENT");
+  for (const phase of ["worker-input-timeout", "worker-timeout", "deadline-expired"]) {
+    assert.equal(classifyNativeFailure(new Error(phase)), "PERMANENT", phase);
+  }
   assert.equal(classifyNativeFailure(Object.assign(new Error("socket timed out"), { code: "ECONNRESET" })), "PERMANENT");
   assert.equal(classifyNativeFailure(new Error("worker-process-failed")), "PERMANENT");
+
+  const socket = "/run/user/12001/docker.sock";
+  const identified = identifyDockerControlPlaneFailure(Object.assign(new Error("docker exited"), {
+    code: 1,
+    stderr: `Cannot connect to the Docker daemon at unix://${socket}. Is the docker daemon running?`,
+  }), socket);
+  assert.ok(identified instanceof DockerControlPlaneUnavailable);
+  assert.equal(classifyNativeFailure(identified), "TRANSIENT");
+
+  const wrongSocket = identifyDockerControlPlaneFailure(Object.assign(new Error("docker exited"), {
+    code: 1,
+    stderr: "Cannot connect to the Docker daemon at unix:///unrelated/docker.sock. Is the docker daemon running?",
+  }), socket);
+  assert.equal(classifyNativeFailure(wrongSocket), "PERMANENT");
+  assert.equal(classifyNativeFailure(Object.assign(new Error("resource pressure"), {
+    code: "EAGAIN",
+    stderr: `Cannot connect to the Docker daemon at unix://${socket}. Is the docker daemon running?`,
+  })), "PERMANENT");
 });

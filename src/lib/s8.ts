@@ -428,6 +428,8 @@ export class S8ExportService {
       attempt.disposalState = "REAPED_REMOVED";
       attempt.updatedAt = at;
       attempt.completedAt = at;
+    }, () => {
+      if (!Number.isSafeInteger(deadlineUnixMs) || Date.now() >= deadlineUnixMs) fail(503, "S8_NATIVE_OPERATION_TIMEOUT");
     });
   }
   private failNativeAttempt(attemptId: UUID, error?: unknown): void {

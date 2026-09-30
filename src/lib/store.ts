@@ -1200,7 +1200,7 @@ export class JsonRepository {
     }
   }
 
-  private commit(state: StoreState): void {
+  private commit(state: StoreState, commitFence?: () => void): void {
     const temporary = this.statePath + "." + randomUUID() + ".tmp";
     let descriptor: number | null = null;
     let renamed = false;
@@ -1211,11 +1211,7 @@ export class JsonRepository {
       fsyncSync(descriptor);
       closeSync(descriptor);
       descriptor = null;
-      renameSync(temporary, this.statePath);
-      renamed = true;
-      this.syncDirectory(dirname(this.statePath));
     } catch {
-      if (renamed) this.poisoned = true;
       if (descriptor !== null) {
         try { closeSync(descriptor); } catch { /* Preserve the persistence failure. */ }
       }
@@ -1226,9 +1222,33 @@ export class JsonRepository {
       }
       throw new AppError(500, "PERSISTENCE_FAILED");
     }
+    try {
+      // Fence the canonical replacement after the candidate file is durable.
+      commitFence?.();
+    } catch (error) {
+      try {
+        rmSync(temporary, { force: true });
+      } catch {
+        // Preserve the fence error without exposing a path.
+      }
+      throw error;
+    }
+    try {
+      renameSync(temporary, this.statePath);
+      renamed = true;
+      this.syncDirectory(dirname(this.statePath));
+    } catch {
+      if (renamed) this.poisoned = true;
+      try {
+        rmSync(temporary, { force: true });
+      } catch {
+        // Preserve the original persistence failure without exposing a path.
+      }
+      throw new AppError(500, "PERSISTENCE_FAILED");
+    }
   }
 
-  transact<T>(mutation: (state: StoreState) => T): T {
+  transact<T>(mutation: (state: StoreState) => T, commitFence?: () => void): T {
     if (this.poisoned || this.transactionState !== null) {
       throw new AppError(500, "PERSISTENCE_FAILED");
     }
@@ -1251,7 +1271,7 @@ export class JsonRepository {
       } catch {
         throw new AppError(500, "PERSISTENCE_FAILED");
       }
-      this.commit(fresh);
+      this.commit(fresh, commitFence);
       this.current = fresh;
       return result;
     } finally {

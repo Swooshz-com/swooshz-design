@@ -187,7 +187,17 @@ function validateNativeAttempt(value: unknown): void {
   if (item.completedAt !== null) requiredTimestamp(item.completedAt);
   if (item.state === "DISPATCHING" && (item.completedAt !== null || item.failureClass !== null)) fail("S8_PERSISTENCE_INVALID", 500);
   if (item.state === "SUCCEEDED" && (item.completedAt === null || item.failureClass !== null || item.requestSha256 === null || item.requestNonce === null || item.responseSha256 === null || item.releaseManifestSha256 === null || item.disposalState !== "REAPED_REMOVED")) fail("S8_PERSISTENCE_INVALID", 500);
-  if (item.state === "FAILED" && (item.completedAt === null || item.failureClass !== "PERMANENT" || item.disposalState === "UNKNOWN")) fail("S8_PERSISTENCE_INVALID", 500);
+  if (item.state === "FAILED") {
+    if (item.completedAt === null) fail("S8_PERSISTENCE_INVALID", 500);
+    if (item.failureClass === "PERMANENT") {
+      if (item.disposalState === "UNKNOWN") fail("S8_PERSISTENCE_INVALID", 500);
+    } else if (item.failureClass === "TRANSIENT") {
+      if (item.disposalState !== "REAPED_REMOVED" || item.requestSha256 === null || item.requestNonce === null
+        || item.responseSha256 === null || item.releaseManifestSha256 === null) fail("S8_PERSISTENCE_INVALID", 500);
+    } else {
+      fail("S8_PERSISTENCE_INVALID", 500);
+    }
+  }
   if (item.state === "UNKNOWN" && (item.completedAt === null || item.failureClass !== "UNCERTAIN" || item.disposalState !== "UNKNOWN")) fail("S8_PERSISTENCE_INVALID", 500);
 }
 function validateIdempotency(value: unknown): void {

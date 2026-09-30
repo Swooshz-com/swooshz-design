@@ -10,11 +10,32 @@ import { readJsonFile } from "./config.mjs";
 
 const execFileAsync = promisify(execFile);
 
+export class DockerControlPlaneUnavailable extends Error {
+  constructor() {
+    super("docker-control-plane-unavailable");
+    this.name = "DockerControlPlaneUnavailable";
+    this.code = "S8_DOCKER_CONTROL_PLANE_UNAVAILABLE";
+  }
+}
+
+export function identifyDockerControlPlaneFailure(error, dockerSocket) {
+  if (!error || typeof error !== "object" || !Number.isInteger(error.code) || error.code === 0 || typeof dockerSocket !== "string") return error;
+  const stderr = typeof error.stderr === "string" ? error.stderr : Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "";
+  const endpoint = `Cannot connect to the Docker daemon at unix://${dockerSocket}`;
+  if (!stderr.includes(endpoint) || !/Is the docker daemon running\?/iu.test(stderr)) return error;
+  return new DockerControlPlaneUnavailable();
+}
+
 export async function runDocker(config, args, timeout = 15000) {
-  const result = await execFileAsync(config.dockerPath, ["--host", `unix://${config.dockerSocket}`, ...args], {
-    timeout, maxBuffer: 2 * 1024 * 1024, encoding: "utf8", windowsHide: true,
-    env: { PATH: "/usr/bin:/bin", HOME: process.env.HOME ?? "/nonexistent", DOCKER_HOST: `unix://${config.dockerSocket}` },
-  });
+  let result;
+  try {
+    result = await execFileAsync(config.dockerPath, ["--host", `unix://${config.dockerSocket}`, ...args], {
+      timeout, maxBuffer: 2 * 1024 * 1024, encoding: "utf8", windowsHide: true,
+      env: { PATH: "/usr/bin:/bin", HOME: process.env.HOME ?? "/nonexistent", DOCKER_HOST: `unix://${config.dockerSocket}` },
+    });
+  } catch (error) {
+    throw identifyDockerControlPlaneFailure(error, config.dockerSocket);
+  }
   if (Buffer.byteLength(result.stderr ?? "", "utf8") > 1024 * 1024) throw new Error("docker-output-limit");
   return String(result.stdout ?? "");
 }

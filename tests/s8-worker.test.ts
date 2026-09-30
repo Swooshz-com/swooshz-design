@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
 import { S8ExportService } from "../src/lib/s8";
+import { S8_FBX_PROFILE, S8_PROTOCOL_VERSION } from "../src/lib/s8-fbx-profile";
+import { JsonRepository } from "../src/lib/store";
 import { readS8RuntimeConfig } from "../src/lib/s8-fbx-config";
 import { S8_NATIVE_RESOURCE_POLICY_SHA256 } from "../src/lib/s8-native-admission";
 import { jcs, sha256 } from "../src/lib/utils";
-import { createS8NativeRequestFrame } from "../src/lib/s8-native-protocol";
+import { createS8NativeRequestFrame, S8NativeSignedFailure } from "../src/lib/s8-native-protocol";
 import { S8NativeWorkerClient } from "../src/lib/s8-native-worker-client";
 import type { S8NativeWorkerConfig } from "../src/lib/s8-fbx-config";
 
@@ -671,4 +674,487 @@ test("native response received at the shared operation deadline is rejected even
   assert.equal(dispatchCount, 2);
   assert.equal(admissionDeadline, expectedDeadlineUnixMs);
   assert.equal(preparedDeadline, expectedDeadlineUnixMs);
+});
+
+test("writer deadline fence prevents a late durable success and permits an in-deadline success once", async () => {
+  const originalDateNow = Date.now;
+  const projectId = "11111111-1111-4111-8111-111111111111";
+  const sourceRevisionId = "22222222-2222-4222-8222-222222222222";
+  const s6ValidationReceiptId = "33333333-3333-4333-8333-333333333333";
+  const s7ArtifactId = "44444444-4444-4444-8444-444444444444";
+  const s7ManifestId = "55555555-5555-4555-8555-555555555555";
+  const jobId = "66666666-6666-4666-8666-666666666666";
+  const artifactId = "77777777-7777-4777-8777-777777777777";
+  const claimToken = "88888888-8888-4888-8888-888888888888";
+  const source = {
+    projectId,
+    sourceRevisionId,
+    sourceRevisionHash: "a".repeat(64),
+    sourceS5Fingerprint: "b".repeat(64),
+    s6ValidationReceiptId,
+    s6ValidationHash: "c".repeat(64),
+    s6HandoffDigest: "d".repeat(64),
+    s7ArtifactId,
+    s7ArtifactHash: "e".repeat(64),
+    s7ReadbackHash: "f".repeat(64),
+    s7ManifestId,
+    s7ManifestHash: "1".repeat(64),
+    s8Profile: S8_FBX_PROFILE,
+    s8ProtocolVersion: S8_PROTOCOL_VERSION,
+  } as const;
+  const now = "2026-09-30T00:00:00.000Z";
+  const fixtureRoots: string[] = [];
+
+  const makeFixture = (advanceAtCommitFence: boolean) => {
+    const root = mkdtempSync(join(tmpdir(), "s8-writer-deadline-"));
+    fixtureRoots.push(root);
+    let nowMs = 10_000;
+    let fenceDeadline = 0;
+    let advanceFence = false;
+    const repository = new JsonRepository(root, {
+      syncDirectory: () => {},
+      beforeCommit: () => {
+        if (!advanceFence) return;
+        advanceFence = false;
+        nowMs = fenceDeadline;
+      },
+    });
+    repository.transact((state) => {
+      state.s8ExportJobs!.push({
+        schemaVersion: "s8-export-job-v2",
+        jobId, projectId, artifactId, source, inputHash: "2".repeat(64), idempotencyKey: "deadline-fence-test",
+        status: "running", publicationPhase: "private_staging", attempt: 1, claimToken, ownerId: "test-owner", ownerProcessId: 1234,
+        claimedAt: now, heartbeatAt: now, createdAt: now, updatedAt: now, terminalAt: null, failureCode: null,
+      });
+      state.s8Artifacts!.push({
+        schemaVersion: "s8-artifact-v2",
+        artifactId, projectId, jobId, source, inputHash: "2".repeat(64), profile: S8_FBX_PROFILE,
+        format: "fbx", mimeType: "application/octet-stream", downloadFileName: "swooshz-s8-scene.fbx",
+        status: "running", publicationPhase: "private_staging", payloadSha256: null, objectHashes: null,
+        writerReceiptHash: null, nativeReadbackHash: null, semanticReceiptHash: null, publicationReceiptHash: null,
+        validationReceiptId: null, validationReceiptHash: null, immutableReuseFingerprint: null,
+        privateStagingPrefix: "private/projects/test/staging", privateFinalPrefix: "private/projects/test/final",
+        attempt: 1, retryOfArtifactId: null, failureCode: null, createdAt: now, updatedAt: now, committedAt: null, staleAt: null,
+      });
+    });
+    const service = new S8ExportService({
+      repository,
+      objects: {} as never,
+      s6: {} as never,
+      s7: {} as never,
+      clock: () => now,
+      ownerId: "test-owner",
+      processId: 1234,
+      admissionReader: async () => ({ state: "OPEN", reason: null, proofSha256: "3".repeat(64), observedAt: now }),
+    });
+    let dispatchCount = 0;
+    const nativeWorker = {
+      runWriter: async (
+        _payload: Buffer,
+        _context: unknown,
+        _heartbeat: () => void,
+        onRequestPrepared: (requestSha256: string, requestNonce: string, manifestSha256: string, deadline: number) => void,
+        _deadline: number,
+      ) => {
+        dispatchCount += 1;
+        onRequestPrepared("4".repeat(64), "n".repeat(43), "5".repeat(64), _deadline);
+        if (advanceAtCommitFence) {
+          fenceDeadline = _deadline;
+          nowMs = _deadline - 1;
+          advanceFence = true;
+        } else {
+          nowMs = _deadline - 1;
+        }
+        return {
+          nativeRequestSha256: "4".repeat(64),
+          nativeResponseSha256: "6".repeat(64),
+          releaseManifestSha256: "5".repeat(64),
+        } as never;
+      },
+    };
+    (service as unknown as { nativeWorker: typeof nativeWorker }).nativeWorker = nativeWorker;
+    const context = { projectId, jobId, artifactId, claimToken, attempt: 1, source, payload: {}, onHeartbeat: () => {} };
+    const write = (service as unknown as { writer: (payload: Buffer, context: never) => Promise<unknown> }).writer;
+    return { root, repository, service, nowMs: () => nowMs, dispatchCount: () => dispatchCount, write: () => write.call(service, Buffer.from("native writer input"), context as never) };
+  };
+
+  try {
+    const late = makeFixture(true);
+    Date.now = () => late.nowMs();
+    await assert.rejects(late.write(), (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "S8_NATIVE_OPERATION_TIMEOUT");
+      return true;
+    });
+    assert.equal(late.dispatchCount(), 1, "timeout must not trigger a retry");
+    const lateReload = new JsonRepository(late.root);
+    const lateState = lateReload.state();
+    assert.equal(lateState.s8NativeOperationAttempts?.length, 1);
+    assert.equal(lateState.s8NativeOperationAttempts?.[0]?.state, "UNKNOWN");
+    assert.equal(lateState.s8NativeOperationAttempts?.some((attempt) => attempt.state === "SUCCEEDED"), false);
+    assert.equal(lateState.s8Artifacts?.[0]?.status, "running");
+    assert.equal(lateState.s8Artifacts?.[0]?.objectHashes, null);
+    assert.equal(lateState.s8Artifacts?.[0]?.committedAt, null);
+
+    const withinDeadline = makeFixture(false);
+    Date.now = () => withinDeadline.nowMs();
+    const accepted = await withinDeadline.write();
+    assert.ok(accepted);
+    assert.equal(withinDeadline.dispatchCount(), 1);
+    const successReload = new JsonRepository(withinDeadline.root);
+    const successState = successReload.state();
+    assert.equal(successState.s8NativeOperationAttempts?.length, 1);
+    assert.equal(successState.s8NativeOperationAttempts?.filter((attempt) => attempt.state === "SUCCEEDED").length, 1);
+    assert.equal(successState.s8NativeOperationAttempts?.[0]?.disposalState, "REAPED_REMOVED");
+    assert.equal(successState.s8Artifacts?.[0]?.objectHashes, null);
+  } finally {
+    Date.now = originalDateNow;
+    for (const root of fixtureRoots) rmSync(root, { recursive: true, force: true });
+  }
+});
+test("a bound signed transient survives persistence, retries once, and uses a fresh signed attempt", async () => {
+  const appKeys = generateKeyPairSync("ed25519");
+  const launcherKeys = generateKeyPairSync("ed25519");
+  const appPrivateKey = appKeys.privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  const launcherPublicKey = launcherKeys.publicKey.export({ format: "pem", type: "spki" }).toString();
+  const releaseManifestSha256 = "a".repeat(64);
+  const release = {
+    writer: { imageDigest: "sha256:" + "1".repeat(64), writerScriptSha256: "2".repeat(64) },
+    validator: { imageDigest: "sha256:" + "3".repeat(64), executableSha256: "4".repeat(64) },
+    processRunnerSha256: "5".repeat(64),
+  };
+  const config = {
+    gatewayUrl: "https://gateway.invalid",
+    appSigningKeyId: "app-2026",
+    appSigningPrivateKeyPem: appPrivateKey,
+    releaseManifest: {},
+    releaseAuthorityKeys: {},
+    capacityAuthorityKeys: {},
+    launcherKeys: { "launcher-2026": launcherPublicKey },
+    tlsCaPem: undefined,
+    tlsClientCertPem: undefined,
+    tlsClientKeyPem: undefined,
+  } as unknown as S8NativeWorkerConfig;
+  const source = {
+    projectId: "11111111-1111-4111-8111-111111111111",
+    sourceRevisionId: "22222222-2222-4222-8222-222222222222",
+    sourceRevisionHash: "a".repeat(64),
+    sourceS5Fingerprint: "b".repeat(64),
+    s6ValidationReceiptId: "33333333-3333-4333-8333-333333333333",
+    s6ValidationHash: "c".repeat(64),
+    s6HandoffDigest: "d".repeat(64),
+    s7ArtifactId: "44444444-4444-4444-8444-444444444444",
+    s7ArtifactHash: "e".repeat(64),
+    s7ReadbackHash: "f".repeat(64),
+    s7ManifestId: "55555555-5555-4555-8555-555555555555",
+    s7ManifestHash: "1".repeat(64),
+    s8Profile: S8_FBX_PROFILE,
+    s8ProtocolVersion: S8_PROTOCOL_VERSION,
+  } as const;
+  const projectId = source.projectId;
+  const jobId = "66666666-6666-4666-8666-666666666666";
+  const artifactId = "77777777-7777-4777-8777-777777777777";
+  const claimToken = "88888888-8888-4888-8888-888888888888";
+  const stagingPrefix = "private/projects/test/staging";
+  const now = "2026-09-30T00:00:00.000Z";
+  const payload = Buffer.from("native writer input");
+  const root = mkdtempSync(join(tmpdir(), "s8-transient-retry-"));
+
+  try {
+    const repository = new JsonRepository(root, { syncDirectory: () => {} });
+    repository.transact((state) => {
+      state.s8ExportJobs!.push({
+        schemaVersion: "s8-export-job-v2",
+        jobId, projectId, artifactId, source, inputHash: "2".repeat(64), idempotencyKey: "transient-retry-test",
+        status: "running", publicationPhase: "private_staging", attempt: 1, claimToken, ownerId: "test-owner", ownerProcessId: 1234,
+        claimedAt: now, heartbeatAt: now, createdAt: now, updatedAt: now, terminalAt: null, failureCode: null,
+      });
+      state.s8Artifacts!.push({
+        schemaVersion: "s8-artifact-v2",
+        artifactId, projectId, jobId, source, inputHash: "2".repeat(64), profile: S8_FBX_PROFILE,
+        format: "fbx", mimeType: "application/octet-stream", downloadFileName: "swooshz-s8-scene.fbx",
+        status: "running", publicationPhase: "private_staging", payloadSha256: null, objectHashes: null,
+        writerReceiptHash: null, nativeReadbackHash: null, semanticReceiptHash: null, publicationReceiptHash: null,
+        validationReceiptId: null, validationReceiptHash: null, immutableReuseFingerprint: null,
+        privateStagingPrefix: stagingPrefix, privateFinalPrefix: "private/projects/test/final",
+        attempt: 1, retryOfArtifactId: null, failureCode: null, createdAt: now, updatedAt: now, committedAt: null, staleAt: null,
+      });
+    });
+
+    let exitClass: "TRANSIENT_INFRASTRUCTURE_FAILURE" | "EXIT_0" = "TRANSIENT_INFRASTRUCTURE_FAILURE";
+    const frames: ReturnType<typeof createS8NativeRequestFrame>[] = [];
+    const makeResponseFrame = (frame: ReturnType<typeof createS8NativeRequestFrame>): Buffer => {
+      const succeeded = exitClass === "EXIT_0";
+      const output = succeeded ? Buffer.from("Kaydara FBX Binary  \0" + "0".repeat(40), "ascii") : Buffer.alloc(0);
+      const auxiliary = succeeded
+        ? Buffer.from(jcs({ writerScriptSha256: release.writer.writerScriptSha256 }), "utf8")
+        : Buffer.alloc(0);
+      const request = frame.request.body;
+      const body = {
+        schemaVersion: "s8-native-response-v1",
+        launcherKeyId: "launcher-2026",
+        requestSha256: frame.requestSha256,
+        projectId: request.projectId,
+        jobId: request.jobId,
+        artifactId: request.artifactId,
+        attempt: request.attempt,
+        operation: request.operation,
+        sourceSha256: request.sourceSha256,
+        releaseManifestSha256,
+        imageDigest: release.writer.imageDigest,
+        containerId: "d".repeat(64),
+        inputSha256: request.inputSha256,
+        inputBytes: payload.length,
+        outputSha256: sha256(output),
+        outputBytes: output.length,
+        auxiliarySha256: sha256(auxiliary),
+        auxiliaryBytes: auxiliary.length,
+        exitClass,
+        limitProfileSha256: S8_NATIVE_RESOURCE_POLICY_SHA256,
+        disposalState: "REAPED_REMOVED",
+        releaseHandle: succeeded ? "r".repeat(43) : null,
+        validatorIdentity: null,
+        runnerEvidence: succeeded ? { runnerBinary: { selfSha256: release.processRunnerSha256 } } : null,
+      };
+      const signature = sign(null, Buffer.concat([
+        Buffer.from("S8-NATIVE-RESPONSE-V1\0", "ascii"),
+        Buffer.from(jcs(body), "utf8"),
+      ]), launcherKeys.privateKey).toString("base64url");
+      const header = Buffer.from(jcs({ body, signature }), "utf8");
+      const frameBytes = Buffer.alloc(4 + header.length + 8 + output.length + 8 + auxiliary.length);
+      frameBytes.writeUInt32BE(header.length, 0);
+      header.copy(frameBytes, 4);
+      frameBytes.writeBigUInt64BE(BigInt(output.length), 4 + header.length);
+      output.copy(frameBytes, 4 + header.length + 8);
+      frameBytes.writeBigUInt64BE(BigInt(auxiliary.length), 4 + header.length + 8 + output.length);
+      auxiliary.copy(frameBytes, 4 + header.length + 8 + output.length + 8);
+      return frameBytes;
+    };
+    const operationRequest = async (
+      _url: URL,
+      _agent: object,
+      frame: ReturnType<typeof createS8NativeRequestFrame>,
+    ): Promise<{ statusCode: number; bytes: Buffer }> => {
+      frames.push(frame);
+      return { statusCode: 200, bytes: makeResponseFrame(frame) };
+    };
+    const nativeWorker = new S8NativeWorkerClient(config, async () => Buffer.alloc(0), () => Date.now(), operationRequest as never);
+    const workerInternals = nativeWorker as unknown as {
+      requireVerifiedOpen: (deadline: number) => Promise<{ releaseManifestSha256: string; release: typeof release }>;
+    };
+    workerInternals.requireVerifiedOpen = async (deadline) => {
+      assert.ok(deadline > Date.now());
+      return { releaseManifestSha256, release };
+    };
+
+    const service = new S8ExportService({
+      repository,
+      objects: {} as never,
+      s6: {} as never,
+      s7: {} as never,
+      clock: () => now,
+      ownerId: "test-owner",
+      processId: 1234,
+      admissionReader: async () => ({ state: "OPEN", reason: null, proofSha256: "3".repeat(64), observedAt: now }),
+    });
+    const serviceInternals = service as unknown as {
+      nativeWorker: S8NativeWorkerClient;
+      writer: (payload: Buffer, context: never) => Promise<unknown>;
+      scheduleNativeRetry: (jobId: string, claimToken: string, stagingPrefix: string, error: S8NativeSignedFailure) => boolean;
+      claim: (jobId: string) => {
+        acquired: boolean;
+        job: { attempt: number };
+        source: { source: unknown };
+        claimToken: string | null;
+      };
+      admitSource: (projectId: string) => { source: unknown };
+      requireCurrentSource: (projectId: string, expected: unknown) => void;
+      cleanupStaging: (prefix: string) => void;
+    };
+    serviceInternals.nativeWorker = nativeWorker;
+    let sourceFenceCalls = 0;
+    serviceInternals.admitSource = (candidateProjectId) => {
+      assert.equal(candidateProjectId, projectId);
+      return { source };
+    };
+    serviceInternals.requireCurrentSource = (candidateProjectId, expected) => {
+      sourceFenceCalls += 1;
+      assert.equal(candidateProjectId, projectId);
+      assert.deepEqual(expected, source);
+    };
+    let cleanupCalls = 0;
+    serviceInternals.cleanupStaging = (prefix) => {
+      cleanupCalls += 1;
+      assert.equal(prefix, stagingPrefix);
+    };
+
+    const firstContext = { projectId, jobId, artifactId, claimToken, attempt: 1, source, payload, onHeartbeat: () => {} };
+    let signedFailure: unknown;
+    await assert.rejects(
+      serviceInternals.writer.call(service, payload, firstContext as never),
+      (error: unknown) => {
+        signedFailure = error;
+        return error instanceof S8NativeSignedFailure && error.failureClass === "TRANSIENT";
+      },
+    );
+    assert.ok(signedFailure instanceof S8NativeSignedFailure);
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0]!.request.body.attempt, 1);
+    assert.equal(frames[0]!.request.signature.length, 86);
+
+    const firstReload = new JsonRepository(root);
+    const firstState = firstReload.state();
+    assert.equal(firstState.s8NativeOperationAttempts?.length, 1);
+    const firstAttempt = firstState.s8NativeOperationAttempts![0]!;
+    assert.equal(firstAttempt.state, "FAILED");
+    assert.equal(firstAttempt.failureClass, "TRANSIENT");
+    assert.equal(firstAttempt.disposalState, "REAPED_REMOVED");
+    assert.ok(firstAttempt.completedAt);
+    assert.equal(firstAttempt.requestSha256, frames[0]!.requestSha256);
+    assert.equal(firstAttempt.requestNonce, frames[0]!.request.body.nonce);
+    assert.equal(firstAttempt.responseSha256, (signedFailure as S8NativeSignedFailure).responseSha256);
+    assert.equal(firstAttempt.releaseManifestSha256, releaseManifestSha256);
+
+    const invalidTransientMutations = [
+      { label: "NOT_STARTED disposal", patch: { disposalState: "NOT_STARTED" } },
+      { label: "UNKNOWN disposal", patch: { disposalState: "UNKNOWN" } },
+      { label: "missing request hash", patch: { requestSha256: null } },
+      { label: "missing request nonce", patch: { requestNonce: null } },
+      { label: "missing response hash", patch: { responseSha256: null } },
+      { label: "missing release manifest hash", patch: { releaseManifestSha256: null } },
+    ] as const;
+    for (const invalid of invalidTransientMutations) {
+      assert.throws(() => repository.transact((state) => {
+        const attempt = state.s8NativeOperationAttempts?.find((item) => item.attemptId === firstAttempt.attemptId);
+        assert.ok(attempt);
+        Object.assign(attempt, invalid.patch);
+      }), (error: unknown) => (error as { code?: string }).code === "PERSISTENCE_FAILED", invalid.label);
+      assert.deepEqual(new JsonRepository(root).state().s8NativeOperationAttempts?.[0], firstAttempt, invalid.label);
+    }
+
+    const retry = serviceInternals.scheduleNativeRetry(jobId, claimToken, stagingPrefix, signedFailure as S8NativeSignedFailure);
+    assert.equal(retry, true);
+    assert.equal(serviceInternals.scheduleNativeRetry(jobId, claimToken, stagingPrefix, signedFailure as S8NativeSignedFailure), false);
+    assert.equal(sourceFenceCalls, 1);
+    assert.equal(cleanupCalls, 1);
+    const retriedState = new JsonRepository(root).state();
+    assert.equal(retriedState.s8ExportJobs?.[0]?.attempt, 2);
+    assert.equal(retriedState.s8ExportJobs?.[0]?.status, "queued");
+    assert.equal(retriedState.s8Artifacts?.[0]?.attempt, 2);
+    assert.equal(retriedState.s8Artifacts?.[0]?.status, "queued");
+    assert.equal(retriedState.s8NativeOperationAttempts?.length, 1);
+    assert.equal(retriedState.s8NativeOperationAttempts?.[0]?.requestSha256, firstAttempt.requestSha256);
+
+    const claimed = serviceInternals.claim(jobId);
+    assert.equal(claimed.acquired, true);
+    assert.equal(claimed.job.attempt, 2);
+    assert.ok(claimed.claimToken);
+    assert.notEqual(claimed.claimToken, claimToken);
+    exitClass = "EXIT_0";
+    const secondContext = {
+      projectId,
+      jobId,
+      artifactId,
+      claimToken: claimed.claimToken,
+      attempt: 2,
+      source: claimed.source.source,
+      payload,
+      onHeartbeat: () => {},
+    };
+    await serviceInternals.writer.call(service, payload, secondContext as never);
+
+    assert.equal(frames.length, 2);
+    assert.equal(frames[1]!.request.body.attempt, 2);
+    assert.equal(frames[1]!.request.signature.length, 86);
+    assert.equal(frames[1]!.request.body.nonce.length, 43);
+    assert.notEqual(frames[1]!.requestSha256, frames[0]!.requestSha256);
+    assert.notEqual(frames[1]!.request.body.nonce, frames[0]!.request.body.nonce);
+    const finalState = new JsonRepository(root).state();
+    assert.equal(finalState.s8NativeOperationAttempts?.length, 2);
+    const secondAttempt = finalState.s8NativeOperationAttempts?.find((attempt) => attempt.attempt === 2);
+    assert.equal(secondAttempt?.state, "SUCCEEDED");
+    assert.equal(secondAttempt?.disposalState, "REAPED_REMOVED");
+    assert.equal(secondAttempt?.requestSha256, frames[1]!.requestSha256);
+    assert.equal(secondAttempt?.requestNonce, frames[1]!.request.body.nonce);
+    assert.equal(finalState.s8ExportJobs?.[0]?.attempt, 2);
+    assert.equal(finalState.s8Artifacts?.[0]?.objectHashes, null);
+
+    const eagainJobId = "99999999-9999-4999-8999-999999999999";
+    const eagainArtifactId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const eagainClaimToken = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const epipeJobId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const epipeArtifactId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const epipeClaimToken = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const addFailureFixture = (failureJobId: string, failureArtifactId: string, failureClaimToken: string, prefix: string) => {
+      repository.transact((state) => {
+        state.s8ExportJobs!.push({
+          schemaVersion: "s8-export-job-v2",
+          jobId: failureJobId, projectId, artifactId: failureArtifactId, source, inputHash: "2".repeat(64), idempotencyKey: prefix,
+          status: "running", publicationPhase: "private_staging", attempt: 1, claimToken: failureClaimToken, ownerId: "test-owner", ownerProcessId: 1234,
+          claimedAt: now, heartbeatAt: now, createdAt: now, updatedAt: now, terminalAt: null, failureCode: null,
+        });
+        state.s8Artifacts!.push({
+          schemaVersion: "s8-artifact-v2",
+          artifactId: failureArtifactId, projectId, jobId: failureJobId, source, inputHash: "2".repeat(64), profile: S8_FBX_PROFILE,
+          format: "fbx", mimeType: "application/octet-stream", downloadFileName: "swooshz-s8-scene.fbx",
+          status: "running", publicationPhase: "private_staging", payloadSha256: null, objectHashes: null,
+          writerReceiptHash: null, nativeReadbackHash: null, semanticReceiptHash: null, publicationReceiptHash: null,
+          validationReceiptId: null, validationReceiptHash: null, immutableReuseFingerprint: null,
+          privateStagingPrefix: prefix, privateFinalPrefix: "private/projects/test/final",
+          attempt: 1, retryOfArtifactId: null, failureCode: null, createdAt: now, updatedAt: now, committedAt: null, staleAt: null,
+        });
+      });
+    };
+    const eagainStagingPrefix = "private/projects/test/eagain";
+    const epipeStagingPrefix = "private/projects/test/epipe";
+    addFailureFixture(eagainJobId, eagainArtifactId, eagainClaimToken, eagainStagingPrefix);
+    addFailureFixture(epipeJobId, epipeArtifactId, epipeClaimToken, epipeStagingPrefix);
+
+    const rawFailureCalls = new Map<string, number>();
+    serviceInternals.nativeWorker = {
+      runWriter: async (
+        _payload: Buffer,
+        context: { jobId: string },
+        _heartbeat: () => void,
+        onRequestPrepared: (requestSha256: string, requestNonce: string, manifestSha256: string, deadline: number) => void,
+        deadline: number,
+      ) => {
+        rawFailureCalls.set(context.jobId, (rawFailureCalls.get(context.jobId) ?? 0) + 1);
+        if (context.jobId === eagainJobId) throw Object.assign(new Error("resource temporarily unavailable"), { code: "EAGAIN" });
+        onRequestPrepared("f".repeat(64), "N".repeat(43), releaseManifestSha256, deadline);
+        throw Object.assign(new Error("attached worker pipe closed"), { code: "EPIPE" });
+      },
+    } as unknown as S8NativeWorkerClient;
+    await assert.rejects(
+      serviceInternals.writer.call(service, payload, {
+        projectId, jobId: eagainJobId, artifactId: eagainArtifactId, claimToken: eagainClaimToken,
+        attempt: 1, source, payload, onHeartbeat: () => {},
+      } as never),
+      (error: unknown) => (error as { code?: string }).code === "EAGAIN",
+    );
+    await assert.rejects(
+      serviceInternals.writer.call(service, payload, {
+        projectId, jobId: epipeJobId, artifactId: epipeArtifactId, claimToken: epipeClaimToken,
+        attempt: 1, source, payload, onHeartbeat: () => {},
+      } as never),
+      (error: unknown) => (error as { code?: string }).code === "EPIPE",
+    );
+    const rawFailureState = new JsonRepository(root).state();
+    const eagainAttempt = rawFailureState.s8NativeOperationAttempts?.find((attempt) => attempt.jobId === eagainJobId);
+    assert.equal(eagainAttempt?.state, "FAILED");
+    assert.equal(eagainAttempt?.failureClass, "PERMANENT");
+    assert.equal(eagainAttempt?.disposalState, "NOT_STARTED");
+    const epipeAttempt = rawFailureState.s8NativeOperationAttempts?.find((attempt) => attempt.jobId === epipeJobId);
+    assert.equal(epipeAttempt?.state, "UNKNOWN");
+    assert.equal(epipeAttempt?.failureClass, "UNCERTAIN");
+    assert.equal(epipeAttempt?.disposalState, "UNKNOWN");
+    assert.equal(rawFailureState.s8ExportJobs?.find((job) => job.jobId === eagainJobId)?.attempt, 1);
+    assert.equal(rawFailureState.s8ExportJobs?.find((job) => job.jobId === epipeJobId)?.attempt, 1);
+    assert.equal(rawFailureState.s8NativeOperationAttempts?.filter((attempt) => attempt.jobId === eagainJobId).length, 1);
+    assert.equal(rawFailureState.s8NativeOperationAttempts?.filter((attempt) => attempt.jobId === epipeJobId).length, 1);
+    assert.equal(rawFailureCalls.get(eagainJobId), 1);
+    assert.equal(rawFailureCalls.get(epipeJobId), 1);
+    assert.equal((await service.getAdmissionStatus()).state, "CLOSED");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
