@@ -1,13 +1,19 @@
-import { AppError, type S6ToS7Handoff, type S7ToS8Handoff, type S8Artifact, type S8ExportJob, type S8IdempotencyRecord, type S8SourceStamp, type S8ValidationReceipt, type Timestamp, type UUID } from "./types";
+import { AppError, type S6ToS7Handoff, type S7ToS8Handoff, type S8Artifact, type S8ExportJob, type S8IdempotencyRecord, type S8NativeOperationAttempt, type S8SourceStamp, type S8ValidationReceipt, type StoreState, type Timestamp, type UUID } from "./types";
 import { buildS8WriterPayload, canonicalS8SourceJson, type S8WriterPayload } from "./s8-fbx-payload";
 import { assertS8ReadbackProvenance, compareS8UfbxReadback, type S8SemanticResult, type S8UfbxReadback } from "./s8-fbx-semantic";
 import { S8_BLENDER_PIN, S8_EXPORTER_PATCH_PIN, S8_EXPORTER_SETTINGS, S8_FBX_PROFILE, S8_LIMITS, S8_PROCESS_RUNNER_PIN, S8_PROTOCOL_VERSION, S8_RESOURCE_TABLE, S8_REUSE_FINGERPRINT_VERSION, S8_SEMANTIC_VERSION, S8_UFBX_PIN, S8_VALIDATOR_PIN, S8_WRITER_RECEIPT_VERSION, s8Sha256 } from "./s8-fbx-profile";
-import { getS8Collections, sameS8Source, s8FinalPrefix, s8ObjectKey, s8ResourceLimitsHash, s8StagingPrefix, S8_OBJECT_NAMES, S8_STALE_CLAIM_MS } from "./s8-fbx-persistence";
+import { getS8Collections, hasUnknownS8NativeAttempt, sameS8Source, s8FinalPrefix, s8ObjectKey, s8ResourceLimitsHash, s8StagingPrefix, S8_OBJECT_NAMES, S8_STALE_CLAIM_MS } from "./s8-fbx-persistence";
+import { getS7Collections, sameS7Source } from "./s7-persistence";
 import { JsonRepository, PrivateObjectStore } from "./store";
 import { jcs, newUuid, nowUtc, sha256, uuidV4Pattern } from "./utils";
 import { S6WorkflowService } from "./s6";
 import { S7CadService } from "./s7-cad";
-import { canonicalS8RunnerReceiptBytes, runS8BlenderWriter, runS8NativeValidator, type S8CallerVerification, type S8NativeValidatorResult, type S8RunnerEvidence, type S8WorkerConfig, type S8WriterReceipt, type S8WriterResult } from "./s8-fbx-worker";
+import type { S8CallerVerification, S8NativeValidatorResult, S8RunnerEvidence, S8WriterReceipt, S8WriterResult } from "./s8-fbx-worker";
+import { canonicalS8RunnerReceiptBytes } from "./s8-native-protocol";
+import { S8NativeWorkerClient } from "./s8-native-worker-client";
+import { S8NativeSignedFailure } from "./s8-native-protocol";
+import { requireS8NativeAdmissionOpen, S8_NATIVE_RESOURCE_POLICY, type S8AdmissionDecision } from "./s8-native-admission";
+import type { S8NativeWorkerConfig } from "./s8-fbx-config";
 
 export type S8PreparedExport = {
   profile: typeof S8_FBX_PROFILE;
@@ -22,9 +28,9 @@ export type S8PreparedExport = {
 export type S8PublicArtifact = Omit<S8Artifact, "privateStagingPrefix" | "privateFinalPrefix">;
 export type S8ExportResult = { replayed: boolean; export: S8PublicArtifact; job: Pick<S8ExportJob, "jobId" | "status" | "attempt"> };
 export type S8DownloadResult = { bytes: Buffer; contentType: "application/octet-stream"; fileName: "swooshz-s8-scene.fbx" };
-export type S8NativeValidationResult = S8NativeValidatorResult;
+export type S8NativeValidationResult = Omit<S8NativeValidatorResult, "brokerIdentity" | "brokerMetadata">;
 
-export type S8AdapterContext = { projectId: UUID; jobId: UUID; artifactId: UUID; source: S8SourceStamp; payload: S8WriterPayload; onHeartbeat: () => void };
+export type S8AdapterContext = { projectId: UUID; jobId: UUID; artifactId: UUID; claimToken: UUID; attempt: number; source: S8SourceStamp; payload: S8WriterPayload; onHeartbeat: () => void };
 export type S8ExportAdapters = {
   writer?: (payloadBytes: Buffer, context: S8AdapterContext) => S8WriterResult;
   nativeValidator?: (artifact: Buffer, context: S8AdapterContext) => S8NativeValidationResult;
@@ -42,7 +48,8 @@ export type S8ExportServiceOptions = {
   processId?: number;
   isProcessAlive?: (processId: number) => boolean;
   adapters?: S8ExportAdapters;
-  writerConfig?: S8WorkerConfig;
+  nativeWorkerConfig?: S8NativeWorkerConfig;
+  admissionReader?: () => Promise<S8AdmissionDecision>;
   onPublicationPhase?: S8PublicationPhaseHook;
 };
 
@@ -215,10 +222,15 @@ export class S8ExportService {
   private readonly processId: number;
   private readonly isProcessAlive: (processId: number) => boolean;
   private readonly adapters: S8ExportAdapters;
-  private readonly writerConfig: S8WorkerConfig | undefined;
+  private readonly nativeWorker: S8NativeWorkerClient | undefined;
+  private readonly admissionReader: (() => Promise<S8AdmissionDecision>) | undefined;
   private readonly onPublicationPhase: S8PublicationPhaseHook | undefined;
+  private startupReconciled = true;
 
   constructor(options: S8ExportServiceOptions) {
+    if (process.env.NODE_ENV === "production" && options.adapters && Object.values(options.adapters).some((adapter) => adapter !== undefined)) {
+      fail(503, "S8_WORKER_ADMISSION_CLOSED");
+    }
     this.repository = options.repository;
     this.objects = options.objects;
     this.s6 = options.s6;
@@ -229,10 +241,27 @@ export class S8ExportService {
     this.processId = options.processId ?? process.pid;
     this.isProcessAlive = options.isProcessAlive ?? ownerIsAliveDefault;
     this.adapters = options.adapters ?? {};
-    this.writerConfig = options.writerConfig;
+    this.nativeWorker = options.nativeWorkerConfig ? new S8NativeWorkerClient(options.nativeWorkerConfig) : undefined;
+    this.admissionReader = options.admissionReader;
     this.onPublicationPhase = options.onPublicationPhase;
   }
 
+  async getAdmissionStatus(deadlineUnixMs?: number): Promise<S8AdmissionDecision> {
+    const unavailable: S8AdmissionDecision = { state: "CLOSED", reason: "OBSERVATION_INVALID", proofSha256: null, observedAt: null };
+    const unresolved = () => hasUnknownS8NativeAttempt(getS8Collections(this.repository.state()).operationAttempts);
+    if (!this.startupReconciled || unresolved()) return unavailable;
+
+    let decision: S8AdmissionDecision;
+    if (this.admissionReader) {
+      try { decision = await this.admissionReader(); } catch { decision = unavailable; }
+    } else if (this.nativeWorker) {
+      decision = await this.nativeWorker.getAdmission(deadlineUnixMs);
+    } else {
+      decision = { state: "CLOSED", reason: "PROOF_MISSING", proofSha256: null, observedAt: null };
+    }
+    if ((deadlineUnixMs !== undefined && Date.now() >= deadlineUnixMs) || unresolved()) return unavailable;
+    return decision;
+  }
   private projectExists(projectId: UUID): void {
     if (!this.repository.state().projects.some((project) => project.projectId === projectId)) fail(404, "S8_UNAUTHORIZED_OR_NOT_FOUND", "project");
   }
@@ -339,18 +368,172 @@ export class S8ExportService {
     return { ...claimed, source };
   }
 
-  private writer(payload: Buffer, context: S8AdapterContext): S8WriterResult {
+  private beginNativeAttempt(context: S8AdapterContext, operation: "WRITER" | "VALIDATOR", inputSha256: string): UUID {
+    const attemptId = this.uuid();
+    const at = this.clock();
+    const attempt: S8NativeOperationAttempt = {
+      schemaVersion: "s8-native-operation-attempt-v1",
+      attemptId,
+      projectId: context.projectId,
+      jobId: context.jobId,
+      artifactId: context.artifactId,
+      claimToken: context.claimToken,
+      attempt: context.attempt,
+      operation,
+      state: "DISPATCHING",
+      inputSha256,
+      requestSha256: null,
+      requestNonce: null,
+      responseSha256: null,
+      releaseManifestSha256: null,
+      failureClass: null,
+      disposalState: "NOT_STARTED",
+      createdAt: at,
+      updatedAt: at,
+      completedAt: null,
+    };
+    this.repository.transact((state) => {
+      state.s8NativeOperationAttempts ??= [];
+      if (hasUnknownS8NativeAttempt(state.s8NativeOperationAttempts)) fail(503, "S8_WORKER_ADMISSION_CLOSED");
+      const job = state.s8ExportJobs?.find((item) => item.jobId === context.jobId);
+      const expectedStatus = operation === "WRITER" ? "running" : "staged";
+      if (!job || job.status !== expectedStatus || job.claimToken !== context.claimToken || job.ownerId !== this.ownerId || job.ownerProcessId !== this.processId || job.attempt !== context.attempt || job.projectId !== context.projectId || job.artifactId !== context.artifactId) fail(409, "S8_CLAIM_FENCED");
+      if (state.s8NativeOperationAttempts.some((item) => item.jobId === context.jobId && item.attempt === context.attempt && item.operation === operation)) fail(409, "S8_CLAIM_FENCED");
+      state.s8NativeOperationAttempts.push(attempt);
+    });
+    return attemptId;
+  }
+  private prepareNativeAttempt(attemptId: UUID, requestSha256: string, requestNonce: string, releaseManifestSha256: string): void {
+    this.repository.transact((state) => {
+      if (hasUnknownS8NativeAttempt(state.s8NativeOperationAttempts ?? [])) fail(503, "S8_WORKER_ADMISSION_CLOSED");
+      const attempt = state.s8NativeOperationAttempts?.find((item) => item.attemptId === attemptId);
+      const job = state.s8ExportJobs?.find((item) => item.jobId === attempt?.jobId);
+      if (!attempt || attempt.state !== "DISPATCHING" || attempt.requestSha256 !== null || !job || job.status !== (attempt.operation === "WRITER" ? "running" : "staged") || job.claimToken !== attempt.claimToken || job.ownerId !== this.ownerId || job.ownerProcessId !== this.processId || !HEX64.test(requestSha256) || !/^[A-Za-z0-9_-]{43}$/u.test(requestNonce) || !HEX64.test(releaseManifestSha256)) fail(409, "S8_CLAIM_FENCED");
+      attempt.requestSha256 = requestSha256;
+      attempt.requestNonce = requestNonce;
+      attempt.releaseManifestSha256 = releaseManifestSha256;
+      attempt.disposalState = "UNKNOWN";
+      attempt.updatedAt = this.clock();
+    });
+  }
+  private completeNativeAttempt(attemptId: UUID, requestSha256: string, responseSha256: string, releaseManifestSha256: string, deadlineUnixMs: number): void {
+    this.repository.transact((state) => {
+      if (!Number.isSafeInteger(deadlineUnixMs) || Date.now() >= deadlineUnixMs) fail(503, "S8_NATIVE_OPERATION_TIMEOUT");
+      const attempt = state.s8NativeOperationAttempts?.find((item) => item.attemptId === attemptId);
+      const job = state.s8ExportJobs?.find((item) => item.jobId === attempt?.jobId);
+      if (!attempt || attempt.state !== "DISPATCHING" || attempt.requestSha256 !== requestSha256 || attempt.releaseManifestSha256 !== releaseManifestSha256 || !job || job.status !== (attempt.operation === "WRITER" ? "running" : "staged") || job.claimToken !== attempt.claimToken || job.ownerId !== this.ownerId || job.ownerProcessId !== this.processId || !HEX64.test(responseSha256)) fail(409, "S8_CLAIM_FENCED");
+      const at = this.clock();
+      attempt.state = "SUCCEEDED";
+      attempt.responseSha256 = responseSha256;
+      attempt.disposalState = "REAPED_REMOVED";
+      attempt.updatedAt = at;
+      attempt.completedAt = at;
+    }, () => {
+      if (!Number.isSafeInteger(deadlineUnixMs) || Date.now() >= deadlineUnixMs) fail(503, "S8_NATIVE_OPERATION_TIMEOUT");
+    });
+  }
+  private failNativeAttempt(attemptId: UUID, error?: unknown): void {
+    try {
+      this.repository.transact((state) => {
+        const attempt = state.s8NativeOperationAttempts?.find((item) => item.attemptId === attemptId);
+        if (!attempt || attempt.state !== "DISPATCHING") return;
+        const at = this.clock();
+        if (error instanceof S8NativeSignedFailure && attempt.requestSha256 === error.requestSha256 && attempt.releaseManifestSha256 === error.releaseManifestSha256 && attempt.operation === error.operation && HEX64.test(error.responseSha256)) {
+          attempt.state = "FAILED";
+          attempt.failureClass = error.failureClass;
+          attempt.responseSha256 = error.responseSha256;
+          attempt.disposalState = "REAPED_REMOVED";
+        } else if (attempt.requestSha256 === null) {
+          attempt.state = "FAILED";
+          attempt.failureClass = "PERMANENT";
+          attempt.disposalState = "NOT_STARTED";
+        } else {
+          attempt.state = "UNKNOWN";
+          attempt.failureClass = "UNCERTAIN";
+          attempt.disposalState = "UNKNOWN";
+        }
+        attempt.updatedAt = at;
+        attempt.completedAt = at;
+      });
+    } catch {
+      // A remaining DISPATCHING record is reconciled to UNKNOWN during recovery and blocks replay.
+    }
+  }
+
+  private markUncertainNativeAttempts(jobId: UUID): void {
+    this.repository.transact((state) => {
+      const at = this.clock();
+      for (const attempt of state.s8NativeOperationAttempts ?? []) {
+        if (attempt.jobId !== jobId || attempt.state !== "DISPATCHING") continue;
+        attempt.state = "UNKNOWN";
+        attempt.failureClass = "UNCERTAIN";
+        attempt.disposalState = "UNKNOWN";
+        attempt.updatedAt = at;
+        attempt.completedAt = at;
+      }
+    });
+  }
+  private async writer(payload: Buffer, context: S8AdapterContext): Promise<Omit<S8WriterResult, "brokerIdentity" | "brokerMetadata"> & { releaseHandle?: string; releaseManifestSha256?: string; nativeRequestSha256?: string; nativeResponseSha256?: string }> {
+    const deadlineUnixMs = Date.now() + S8_NATIVE_RESOURCE_POLICY.writer.endToEndDeadlineMs;
+    requireS8NativeAdmissionOpen(await this.getAdmissionStatus(deadlineUnixMs));
+    if (Date.now() >= deadlineUnixMs) fail(503, "S8_NATIVE_OPERATION_TIMEOUT");
     if (this.adapters.writer) return this.adapters.writer(payload, context);
-    if (!this.writerConfig) fail(503, "S8_TOOLING_UNAVAILABLE");
-    return runS8BlenderWriter(payload, this.writerConfig, context.onHeartbeat);
+    if (!this.nativeWorker) fail(503, "S8_WORKER_ADMISSION_CLOSED");
+    const inputSha256 = s8Sha256(payload);
+    const attemptId = this.beginNativeAttempt(context, "WRITER", inputSha256);
+    let preparedDeadlineUnixMs = deadlineUnixMs;
+    try {
+      const result = await this.nativeWorker.runWriter(payload, {
+        projectId: context.projectId,
+        jobId: context.jobId,
+        artifactId: context.artifactId,
+        attempt: context.attempt,
+        source: context.source,
+        inputSha256,
+      }, context.onHeartbeat, (requestSha256, requestNonce, releaseManifestSha256, preparedDeadline) => {
+        preparedDeadlineUnixMs = preparedDeadline;
+        this.prepareNativeAttempt(attemptId, requestSha256, requestNonce, releaseManifestSha256);
+      }, deadlineUnixMs);
+      this.completeNativeAttempt(attemptId, result.nativeRequestSha256, result.nativeResponseSha256, result.releaseManifestSha256, preparedDeadlineUnixMs);
+      return result;
+    } catch (error) {
+      this.failNativeAttempt(attemptId, error);
+      throw error;
+    }
   }
-
-  private nativeValidator(artifact: Buffer, context: S8AdapterContext): S8NativeValidationResult {
+  private async nativeValidator(
+    artifact: Buffer,
+    context: S8AdapterContext,
+    releaseHandle?: string,
+    expectedReleaseManifestSha256?: string,
+  ): Promise<S8NativeValidationResult & { releaseManifestSha256?: string; nativeRequestSha256?: string; nativeResponseSha256?: string }> {
+    const deadlineUnixMs = Date.now() + S8_NATIVE_RESOURCE_POLICY.validator.endToEndDeadlineMs;
+    requireS8NativeAdmissionOpen(await this.getAdmissionStatus(deadlineUnixMs));
+    if (Date.now() >= deadlineUnixMs) fail(503, "S8_NATIVE_OPERATION_TIMEOUT");
     if (this.adapters.nativeValidator) return this.adapters.nativeValidator(artifact, context);
-    if (!this.writerConfig?.nativeValidatorExecutable) fail(503, "S8_NATIVE_VALIDATOR_UNAVAILABLE");
-    return runS8NativeValidator(artifact, this.writerConfig, context.onHeartbeat);
+    if (!this.nativeWorker || !releaseHandle) fail(503, "S8_WORKER_ADMISSION_CLOSED");
+    const inputSha256 = s8Sha256(artifact);
+    const attemptId = this.beginNativeAttempt(context, "VALIDATOR", inputSha256);
+    let preparedDeadlineUnixMs = deadlineUnixMs;
+    try {
+      const result = await this.nativeWorker.runValidator(artifact, {
+        projectId: context.projectId,
+        jobId: context.jobId,
+        artifactId: context.artifactId,
+        attempt: context.attempt,
+        source: context.source,
+        inputSha256,
+      }, releaseHandle, context.onHeartbeat, expectedReleaseManifestSha256, (requestSha256, requestNonce, releaseManifestSha256, preparedDeadline) => {
+        preparedDeadlineUnixMs = preparedDeadline;
+        this.prepareNativeAttempt(attemptId, requestSha256, requestNonce, releaseManifestSha256);
+      }, deadlineUnixMs);
+      this.completeNativeAttempt(attemptId, result.nativeRequestSha256, result.nativeResponseSha256, result.releaseManifestSha256, preparedDeadlineUnixMs);
+      return result;
+    } catch (error) {
+      this.failNativeAttempt(attemptId, error);
+      throw error;
+    }
   }
-
   private semanticValidator(s6: S6ToS7Handoff, s7: S7ToS8Handoff, readback: S8UfbxReadback): S8SemanticResult {
     return this.adapters.semanticValidator ? this.adapters.semanticValidator(s6, s7, readback) : compareS8UfbxReadback(s6, s7, readback);
   }
@@ -452,9 +635,45 @@ export class S8ExportService {
     return this.verifyPublicationState(projectId, artifact).bytes;
   }
 
+  private requireCurrentSourceInCommitState(state: StoreState, expected: S8SourceStamp): void {
+    let currentS6: S6ToS7Handoff;
+    try { currentS6 = this.s6.getS7Handoff(expected.projectId); }
+    catch (error) { throw sourceError(error); }
+    const currentS6Digest = sha256(canonicalS8SourceJson(currentS6));
+    if (currentS6.projectId !== expected.projectId
+      || currentS6.eligibility.currentAccepted !== true
+      || currentS6.eligibility.sourceCurrent !== true
+      || currentS6.eligibility.stale !== false
+      || currentS6.acceptedRevisionId !== expected.sourceRevisionId
+      || currentS6.acceptedRevisionHash !== expected.sourceRevisionHash
+      || currentS6.sourceS5Fingerprint !== expected.sourceS5Fingerprint
+      || currentS6.validationReceipt.receiptId !== expected.s6ValidationReceiptId
+      || currentS6.validationReceipt.validationHash !== expected.s6ValidationHash
+      || currentS6Digest !== expected.s6HandoffDigest) fail(409, "S8_SOURCE_STALE", "source");
+    const currentS7Source = {
+      sourceRevisionId: currentS6.acceptedRevisionId,
+      sourceRevisionHash: currentS6.acceptedRevisionHash,
+      sourceS5Fingerprint: currentS6.sourceS5Fingerprint,
+      validationReceiptId: currentS6.validationReceipt.receiptId,
+      validationHash: currentS6.validationReceipt.validationHash,
+      s6HandoffSchemaVersion: currentS6.schemaVersion,
+      handoffDigest: currentS6Digest,
+    };
+    const currentS7 = getS7Collections(state).exports
+      .filter((item) => item.projectId === expected.projectId && item.status === "committed" && sameS7Source(item.source, currentS7Source))
+      .sort((left, right) => (right.committedAt ?? "").localeCompare(left.committedAt ?? ""))[0];
+    if (!currentS7
+      || currentS7.artifactId !== expected.s7ArtifactId
+      || currentS7.sha256 !== expected.s7ArtifactHash
+      || currentS7.readbackHash !== expected.s7ReadbackHash
+      || currentS7.manifestId !== expected.s7ManifestId
+      || currentS7.manifestHash !== expected.s7ManifestHash) fail(409, "S8_SOURCE_STALE", "source");
+  }
+
   private commit(jobId: UUID, claimToken: UUID, source: S8SourceStamp): S8Artifact {
     this.requireCurrentSource(source.projectId, source);
     return this.repository.transact((state) => {
+      this.requireCurrentSourceInCommitState(state, source);
       const collections = getS8Collections(state);
       const job = collections.jobs.find((item) => item.jobId === jobId);
       const artifact = job ? collections.artifacts.find((item) => item.artifactId === job.artifactId) : undefined;
@@ -466,10 +685,11 @@ export class S8ExportService {
     });
   }
 
-  private runClaimedExport(jobId: UUID): S8Artifact {
+  private async runClaimedExport(jobId: UUID): Promise<S8Artifact> {
     let claimToken: UUID | null = null;
     let stagingPrefix: string | null = null;
     try {
+      requireS8NativeAdmissionOpen(await this.getAdmissionStatus());
       const claimed = this.claim(jobId);
       if (!claimed.acquired) return claimed.artifact;
       const activeClaimToken = claimed.claimToken;
@@ -478,10 +698,11 @@ export class S8ExportService {
       stagingPrefix = claimed.artifact.privateStagingPrefix;
       const { job, source } = claimed;
       const payload = source.prepared;
-      const context: S8AdapterContext = { projectId: job.projectId, jobId: job.jobId, artifactId: job.artifactId, source: job.source, payload: payload.payload, onHeartbeat: () => this.updateHeartbeat(job.jobId, activeClaimToken, job.source) };
+      const context: S8AdapterContext = { projectId: job.projectId, jobId: job.jobId, artifactId: job.artifactId, claimToken: activeClaimToken, attempt: job.attempt, source: job.source, payload: payload.payload, onHeartbeat: () => this.updateHeartbeat(job.jobId, activeClaimToken, job.source) };
 
       this.updateHeartbeat(job.jobId, activeClaimToken, job.source);
-      const written = this.writer(payload.bytes, context);
+      const written = await this.writer(payload.bytes, context);
+      this.requireCurrentSource(job.projectId, job.source);
       this.validateWriterReceipt(written.receipt, payload.sha256, written.artifact);
       const writerEvidence = assertRunnerEvidence(written.runnerEvidence, expectedWriter());
       const artifactSha256 = s8Sha256(written.artifact);
@@ -495,10 +716,13 @@ export class S8ExportService {
         currentArtifact.payloadSha256 = payload.sha256; currentArtifact.privateFinalPrefix = finalPrefix; currentArtifact.updatedAt = this.clock();
       });
       this.stage(stagingPrefix, new Map<S8ObjectName, Buffer>([["artifact.fbx", written.artifact], ["writer-receipt.json", writerReceiptBytes]]));
+      const stagedArtifact = Buffer.from(this.objects.read(s8ObjectKey(stagingPrefix, "artifact.fbx")));
+      if (stagedArtifact.length !== written.artifact.length || !stagedArtifact.equals(written.artifact) || s8Sha256(stagedArtifact) !== artifactSha256) fail(409, "S8_PUBLICATION_OBJECT_MISMATCH");
       this.fence(job.projectId, job.source, "private_staging", "staged", job.jobId, activeClaimToken);
 
       this.updateHeartbeat(job.jobId, activeClaimToken, job.source);
-      const native = this.nativeValidator(written.artifact, context);
+      const native = await this.nativeValidator(stagedArtifact, context, written.releaseHandle, written.releaseManifestSha256);
+      this.requireCurrentSource(job.projectId, job.source);
       if (!native.validatorIdentity || typeof native.validatorIdentity !== "string") fail(422, "S8_PROCESS_RUNNER_EVIDENCE_INVALID");
       const validatorEvidence = assertRunnerEvidence(native.runnerEvidence, expectedValidator());
       const nativeReadbackBytes = Buffer.from(native.readbackBytes);
@@ -548,8 +772,20 @@ export class S8ExportService {
       this.cleanupStaging(stagingPrefix);
       return committed;
     } catch (error) {
+      if (claimToken !== null && error instanceof S8NativeSignedFailure && error.failureClass === "TRANSIENT") {
+        try {
+          if (stagingPrefix && this.scheduleNativeRetry(jobId, claimToken, stagingPrefix, error)) {
+            claimToken = null;
+            stagingPrefix = null;
+            return await this.runClaimedExport(jobId);
+          }
+        } catch (retryError) {
+          this.markFailure(jobId, claimToken, retryError);
+          throw retryError;
+        }
+      }
       if (claimToken !== null) this.markFailure(jobId, claimToken, error);
-      if (stagingPrefix && error instanceof AppError && ["S8_SOURCE_STALE", "S8_SOURCE_NOT_READY"].includes(error.code)) this.cleanupStaging(stagingPrefix);
+      if (stagingPrefix) this.cleanupStaging(stagingPrefix);
       throw error;
     }
   }
@@ -562,7 +798,7 @@ export class S8ExportService {
     return { job, artifact, idempotency };
   }
 
-  createExport(projectId: UUID, idempotencyKey: string, requestReferenceId?: UUID): S8ExportResult {
+  async createExport(projectId: UUID, idempotencyKey: string, requestReferenceId?: UUID): Promise<S8ExportResult> {
     assertOpaqueKey(idempotencyKey); assertReference(requestReferenceId);
     const admitted = this.admitSource(projectId);
     this.reconcileCommittedSupersession(projectId, admitted.source);
@@ -575,12 +811,13 @@ export class S8ExportService {
       if (!job || !artifact || job.artifactId !== artifact.artifactId || artifact.jobId !== job.jobId || artifact.status !== job.status) fail(500, "S8_PERSISTENCE_INVALID");
       if (artifact.status === "committed") { this.verifyReuse(projectId, artifact); return { replayed: true, export: publicArtifact(artifact), job: { jobId: job.jobId, status: job.status, attempt: job.attempt } }; }
       if (artifact.status === "queued") {
-        const current = this.runClaimedExport(job.jobId); const latestJob = getS8Collections(this.repository.state()).jobs.find((item) => item.jobId === job.jobId)!;
+        const current = await this.runClaimedExport(job.jobId); const latestJob = getS8Collections(this.repository.state()).jobs.find((item) => item.jobId === job.jobId)!;
         return { replayed: true, export: publicArtifact(current), job: { jobId: latestJob.jobId, status: latestJob.status, attempt: latestJob.attempt } };
       }
       return { replayed: true, export: publicArtifact(artifact), job: { jobId: job.jobId, status: job.status, attempt: job.attempt } };
     }
 
+    requireS8NativeAdmissionOpen(await this.getAdmissionStatus());
     const records = this.createRecords(projectId, idempotencyKey, admitted.source, inputHash);
     try {
       this.emitAdmission(projectId, records.job.jobId, records.artifact.artifactId, admitted.source);
@@ -597,7 +834,7 @@ export class S8ExportService {
         const artifact = getS8Collections(this.repository.state()).artifacts.find((item) => item.artifactId === admission.artifactId);
         if (!job || !artifact) fail(500, "S8_PERSISTENCE_INVALID");
         if (artifact.status === "committed") this.verifyReuse(projectId, artifact);
-        if (artifact.status === "queued") this.runClaimedExport(job.jobId);
+        if (artifact.status === "queued") { requireS8NativeAdmissionOpen(await this.getAdmissionStatus()); await this.runClaimedExport(job.jobId); }
         const currentJob = getS8Collections(this.repository.state()).jobs.find((item) => item.jobId === job.jobId)!;
         const currentArtifact = getS8Collections(this.repository.state()).artifacts.find((item) => item.artifactId === artifact.artifactId)!;
         return { replayed: true, export: publicArtifact(currentArtifact), job: { jobId: currentJob.jobId, status: currentJob.status, attempt: currentJob.attempt } };
@@ -606,7 +843,7 @@ export class S8ExportService {
       this.markFailure(records.job.jobId, null, error);
       throw error;
     }
-    const current = this.runClaimedExport(records.job.jobId); const latestJob = getS8Collections(this.repository.state()).jobs.find((item) => item.jobId === records.job.jobId);
+    const current = await this.runClaimedExport(records.job.jobId); const latestJob = getS8Collections(this.repository.state()).jobs.find((item) => item.jobId === records.job.jobId);
     if (!latestJob) fail(500, "S8_PERSISTENCE_INVALID");
     return { replayed: false, export: publicArtifact(current), job: { jobId: latestJob.jobId, status: latestJob.status, attempt: latestJob.attempt } };
   }
@@ -655,7 +892,42 @@ export class S8ExportService {
     });
   }
 
+  private failRecoveredClaim(job: S8ExportJob, code: string): void {
+    this.repository.transact((state) => {
+      const collections = getS8Collections(state);
+      const currentJob = collections.jobs.find((item) => item.jobId === job.jobId);
+      const artifact = currentJob ? collections.artifacts.find((item) => item.artifactId === currentJob.artifactId) : undefined;
+      if (!currentJob || !artifact || currentJob.claimToken !== job.claimToken || currentJob.ownerId !== job.ownerId || currentJob.ownerProcessId !== job.ownerProcessId) return;
+      if (["committed", "stale", "failed_terminal"].includes(currentJob.status)) return;
+      const at = this.clock();
+      currentJob.status = "failed_terminal"; currentJob.failureCode = code; currentJob.terminalAt = at; currentJob.updatedAt = at; currentJob.claimToken = null; currentJob.ownerId = null; currentJob.ownerProcessId = null; currentJob.claimedAt = null; currentJob.heartbeatAt = null;
+      artifact.status = "failed_terminal"; artifact.failureCode = code; artifact.updatedAt = at;
+    });
+  }
+
+  private scheduleNativeRetry(jobId: UUID, claimToken: UUID, stagingPrefix: string, error: S8NativeSignedFailure): boolean {
+    const snapshot = getS8Collections(this.repository.state()).jobs.find((item) => item.jobId === jobId);
+    if (!snapshot || snapshot.attempt !== 1) return false;
+    this.requireCurrentSource(snapshot.projectId, snapshot.source);
+    this.cleanupStaging(stagingPrefix);
+    return this.repository.transact((state) => {
+      const collections = getS8Collections(state);
+      const job = collections.jobs.find((item) => item.jobId === jobId);
+      const artifact = job ? collections.artifacts.find((item) => item.artifactId === job.artifactId) : undefined;
+      const attempts = collections.operationAttempts.filter((item) => item.jobId === jobId && item.attempt === 1);
+      const failedAttempt = attempts.find((item) => item.operation === error.operation && item.state === "FAILED" && item.failureClass === "TRANSIENT" && item.responseSha256 === error.responseSha256 && item.releaseManifestSha256 === error.releaseManifestSha256 && item.disposalState === "REAPED_REMOVED");
+      if (!job || !artifact || job.status !== (error.operation === "WRITER" ? "running" : "staged") || job.claimToken !== claimToken || job.ownerId !== this.ownerId || job.ownerProcessId !== this.processId || job.attempt !== 1 || artifact.privateStagingPrefix !== stagingPrefix || !failedAttempt || attempts.some((item) => item !== failedAttempt && item.state !== "SUCCEEDED")) return false;
+      if (error.operation === "VALIDATOR" && !attempts.some((item) => item.operation === "WRITER" && item.state === "SUCCEEDED" && item.releaseManifestSha256 === error.releaseManifestSha256)) return false;
+      if (artifact.validationReceiptId !== null) { const receiptIndex = collections.receipts.findIndex((item) => item.receiptId === artifact.validationReceiptId); if (receiptIndex >= 0) collections.receipts.splice(receiptIndex, 1); }
+      const at = this.clock();
+      job.attempt = 2; job.status = "queued"; job.publicationPhase = "source_admission"; job.claimToken = null; job.ownerId = null; job.ownerProcessId = null; job.claimedAt = null; job.heartbeatAt = null; job.terminalAt = null; job.failureCode = null; job.updatedAt = at;
+      artifact.attempt = 2; artifact.status = "queued"; artifact.publicationPhase = "source_admission"; artifact.payloadSha256 = null; artifact.objectHashes = null; artifact.writerReceiptHash = null; artifact.nativeReadbackHash = null; artifact.semanticReceiptHash = null; artifact.publicationReceiptHash = null; artifact.validationReceiptId = null; artifact.validationReceiptHash = null; artifact.immutableReuseFingerprint = null; artifact.privateStagingPrefix = s8StagingPrefix(artifact.projectId, artifact.artifactId, "unclaimed"); artifact.privateFinalPrefix = s8FinalPrefix(artifact.projectId, artifact.source.sourceRevisionHash, "0".repeat(64)); artifact.failureCode = null; artifact.committedAt = null; artifact.staleAt = null; artifact.updatedAt = at;
+      return true;
+    });
+  }
+
   recoverPending(): number {
+    this.startupReconciled = false;
     const candidates = getS8Collections(this.repository.state()).jobs.filter((job) => ["running", "staged", "validated", "promoted"].includes(job.status) && job.claimToken !== null && job.ownerProcessId !== null);
     let recovered = 0;
     for (const candidate of candidates) {
@@ -664,6 +936,7 @@ export class S8ExportService {
       let alive = true; try { alive = this.isProcessAlive(candidate.ownerProcessId!); } catch { alive = true; }
       if (alive) continue;
       const artifact = getS8Collections(this.repository.state()).artifacts.find((item) => item.artifactId === candidate.artifactId); if (!artifact) continue;
+      this.markUncertainNativeAttempts(candidate.jobId);
       const oldStaging = artifact.privateStagingPrefix;
       if (phaseIndex(candidate.publicationPhase) >= phaseIndex("immutable_promotion")) {
         try {
@@ -681,10 +954,17 @@ export class S8ExportService {
         }
         recovered += 1; continue;
       }
-      this.cleanupStaging(oldStaging); this.resetAfterDeadClaim(candidate);
-      try { this.runClaimedExport(candidate.jobId); } catch { /* failure is durably recorded by the production path */ }
+      const hasNativeAttempts = getS8Collections(this.repository.state()).operationAttempts.some((attempt) => attempt.jobId === candidate.jobId);
+      if (hasNativeAttempts) {
+        this.failRecoveredClaim(candidate, "S8_WORKER_RECONCILIATION_REQUIRED");
+        this.cleanupStaging(oldStaging);
+      } else {
+        this.resetAfterDeadClaim(candidate);
+        this.cleanupStaging(oldStaging);
+      }
       recovered += 1;
     }
+    this.startupReconciled = true;
     return recovered;
   }
 }

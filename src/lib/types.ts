@@ -335,6 +335,7 @@ export type StoreState = {
   s8Artifacts?: S8Artifact[];
   s8ValidationReceipts?: S8ValidationReceipt[];
   s8IdempotencyRecords?: S8IdempotencyRecord[];
+  s8NativeOperationAttempts?: S8NativeOperationAttempt[];
 };
 
 export type S6RevisionStatus =
@@ -1364,7 +1365,7 @@ export type S8ExportJob = {
   idempotencyKey: string;
   status: S8ExportStatus;
   publicationPhase: S8PublicationPhase;
-  attempt: 1;
+  attempt: 1 | 2;
   claimToken: UUID | null;
   ownerId: string | null;
   ownerProcessId: number | null;
@@ -1376,6 +1377,27 @@ export type S8ExportJob = {
   failureCode: string | null;
 };
 
+export type S8NativeOperationAttempt = {
+  schemaVersion: "s8-native-operation-attempt-v1";
+  attemptId: UUID;
+  projectId: UUID;
+  jobId: UUID;
+  artifactId: UUID;
+  claimToken: UUID;
+  attempt: number;
+  operation: "WRITER" | "VALIDATOR";
+  state: "DISPATCHING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
+  inputSha256: Sha256;
+  requestSha256: Sha256 | null;
+  requestNonce: string | null;
+  responseSha256: Sha256 | null;
+  releaseManifestSha256: Sha256 | null;
+  failureClass: "PERMANENT" | "TRANSIENT" | "UNCERTAIN" | null;
+  disposalState: "NOT_STARTED" | "REAPED_REMOVED" | "UNKNOWN";
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  completedAt: Timestamp | null;
+};
 export type S8ArtifactObjectHashes = {
   artifactSha256: Sha256;
   artifactByteSize: number;
@@ -1409,7 +1431,7 @@ export type S8Artifact = {
   immutableReuseFingerprint: Sha256 | null;
   privateStagingPrefix: string;
   privateFinalPrefix: string;
-  attempt: 1;
+  attempt: 1 | 2;
   retryOfArtifactId: UUID | null;
   failureCode: string | null;
   createdAt: Timestamp;

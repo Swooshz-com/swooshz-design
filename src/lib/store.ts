@@ -30,6 +30,53 @@ const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
 
 const MUTEX_FLAGS = "exnb" as const;
+type DirectorySync = (directory: string) => void;
+
+function syncDirectoryEntries(directory: string): void {
+  const descriptor = openSync(directory, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+const durableDirectoryIds = new Map<string, string>();
+
+function ensureDurableDirectory(
+  directory: string,
+  syncDirectory: DirectorySync = syncDirectoryEntries,
+): string {
+  const absolute = resolve(directory);
+  const chain: string[] = [];
+  for (let current = absolute; ; current = dirname(current)) {
+    chain.push(current);
+    const parent = dirname(current);
+    if (parent === current) break;
+  }
+
+  for (const current of chain.reverse()) {
+    if (!existsSync(current)) {
+      try {
+        mkdirSync(current);
+      } catch (error) {
+        const code = typeof error === "object" && error !== null && "code" in error
+          ? (error as { code?: unknown }).code
+          : undefined;
+        if (code !== "EEXIST" || !existsSync(current)) throw error;
+      }
+    }
+    const info = statSync(current);
+    if (!info.isDirectory()) throw new Error("Persistence directory is not a directory");
+    const identity = `${info.dev}:${info.ino}`;
+    if (durableDirectoryIds.get(current) !== identity) {
+      syncDirectory(dirname(current));
+      durableDirectoryIds.set(current, identity);
+    }
+  }
+  return absolute;
+}
+
 export type RepositoryLockRecord = {
   protocol?: typeof LOCK_PROTOCOL;
   ownerToken: string;
@@ -159,6 +206,7 @@ export function emptyStoreState(): StoreState {
     s8Artifacts: [],
     s8ValidationReceipts: [],
     s8IdempotencyRecords: [],
+    s8NativeOperationAttempts: [],
   };
 }
 
@@ -606,10 +654,11 @@ function assertPrivateKey(key: string): string[] {
 
 export class PrivateObjectStore {
   readonly root: string;
+  private readonly syncDirectory: DirectorySync;
 
-  constructor(root: string) {
-    this.root = resolve(root);
-    mkdirSync(this.root, { recursive: true });
+  constructor(root: string, options: { syncDirectory?: DirectorySync } = {}) {
+    this.syncDirectory = options.syncDirectory ?? syncDirectoryEntries;
+    this.root = ensureDurableDirectory(root, this.syncDirectory);
   }
 
   private pathFor(key: string): string {
@@ -624,9 +673,48 @@ export class PrivateObjectStore {
     return path;
   }
 
+  private syncParentDirectory(path: string): void {
+    try {
+      this.syncDirectory(dirname(path));
+    } catch {
+      throw new AppError(500, "PERSISTENCE_FAILED");
+    }
+  }
+
+  private assertExistingExact(
+    key: string,
+    expected: Uint8Array,
+    mismatchCode: "PERSISTENCE_FAILED" | "PUBLICATION_OBJECT_MISMATCH",
+  ): void {
+    const path = this.pathFor(key);
+    let actual: Buffer;
+    try {
+      actual = this.read(key);
+    } catch {
+      throw new AppError(500, "PERSISTENCE_FAILED");
+    }
+    if (!actual.equals(Buffer.from(expected))) {
+      throw new AppError(500, mismatchCode);
+    }
+
+    let descriptor: number | null = null;
+    try {
+      descriptor = openSync(path, "r+");
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = null;
+      this.syncParentDirectory(path);
+    } catch {
+      if (descriptor !== null) {
+        try { closeSync(descriptor); } catch { /* Preserve the persistence failure. */ }
+      }
+      throw new AppError(500, "PERSISTENCE_FAILED");
+    }
+  }
+
   put(key: string, bytes: Uint8Array): void {
     const path = this.pathFor(key);
-    mkdirSync(dirname(path), { recursive: true });
+    ensureDurableDirectory(dirname(path), this.syncDirectory);
     const temporary = path + "." + randomUUID() + ".tmp";
     let descriptor: number | null = null;
     try {
@@ -636,13 +724,17 @@ export class PrivateObjectStore {
       closeSync(descriptor);
       descriptor = null;
       linkSync(temporary, path);
+      this.syncParentDirectory(path);
       rmSync(temporary, { force: true });
+      this.syncParentDirectory(path);
     } catch {
-      if (descriptor !== null) closeSync(descriptor);
+      if (descriptor !== null) {
+        try { closeSync(descriptor); } catch { /* Preserve the persistence failure. */ }
+      }
       try {
         rmSync(temporary, { force: true });
       } catch {
-        // Preserve the original persistence failure without exposing a path.
+        // The operation remains failed; an unreferenced temporary file is not published.
       }
       throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: key });
     }
@@ -651,52 +743,42 @@ export class PrivateObjectStore {
   promote(stagingKey: string, finalKey: string): void {
     const source = this.pathFor(stagingKey);
     const target = this.pathFor(finalKey);
-    mkdirSync(dirname(target), { recursive: true });
+    ensureDurableDirectory(dirname(target), this.syncDirectory);
     try {
       linkSync(source, target);
+      this.syncParentDirectory(target);
+      rmSync(source, { force: false });
+      this.syncParentDirectory(source);
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: finalKey });
-    }
-    try {
-      rmSync(source, { force: false });
-    } catch {
-      // The final link is already exclusive and complete; recovery can clean staging.
     }
   }
 
   putExact(key: string, bytes: Uint8Array): void {
     const expected = Buffer.from(bytes);
     if (this.exists(key)) {
-      let actual: Buffer;
-      try { actual = this.read(key); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
-      if (!actual.equals(expected)) throw new AppError(500, "PERSISTENCE_FAILED");
+      this.assertExistingExact(key, expected, "PERSISTENCE_FAILED");
       return;
     }
     try {
       this.put(key, expected);
     } catch (error) {
       if (!this.exists(key)) throw error;
-      let actual: Buffer;
-      try { actual = this.read(key); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
-      if (!actual.equals(expected)) throw new AppError(500, "PERSISTENCE_FAILED");
+      this.assertExistingExact(key, expected, "PERSISTENCE_FAILED");
     }
   }
 
   promoteExact(stagingKey: string, finalKey: string, expected: Uint8Array): void {
     const bytes = Buffer.from(expected);
     if (this.exists(finalKey)) {
-      let actual: Buffer;
-      try { actual = this.read(finalKey); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
-      if (!actual.equals(bytes)) throw new AppError(500, "PUBLICATION_OBJECT_MISMATCH");
+      this.assertExistingExact(finalKey, bytes, "PUBLICATION_OBJECT_MISMATCH");
       return;
     }
     try {
       this.promote(stagingKey, finalKey);
     } catch (error) {
       if (!this.exists(finalKey)) throw error;
-      let actual: Buffer;
-      try { actual = this.read(finalKey); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
-      if (!actual.equals(bytes)) throw new AppError(500, "PUBLICATION_OBJECT_MISMATCH");
+      this.assertExistingExact(finalKey, bytes, "PUBLICATION_OBJECT_MISMATCH");
     }
   }
 
@@ -732,8 +814,11 @@ export class JsonRepository {
   readonly statePath: string;
   readonly lockPath: string;
   private current: StoreState;
+  private transactionState: StoreState | null = null;
+  private poisoned = false;
   readonly mutexPath: string;
   private readonly beforeCommit: (() => void) | undefined;
+  private readonly syncDirectory: DirectorySync;
   private readonly lockWaitMs: number;
   private readonly processId: number;
   private readonly isProcessAlive: ProcessLiveness;
@@ -743,13 +828,15 @@ export class JsonRepository {
     root: string,
     options: {
       beforeCommit?: () => void;
+      syncDirectory?: DirectorySync;
       lockWaitMs?: number;
       processId?: number;
       isProcessAlive?: ProcessLiveness;
       onLockPhase?: LockPhaseHook;
     } = {},
   ) {
-    this.root = resolve(root);
+    this.syncDirectory = options.syncDirectory ?? syncDirectoryEntries;
+    this.root = ensureDurableDirectory(root, this.syncDirectory);
     this.statePath = join(this.root, "state.json");
     this.lockPath = join(this.root, "state.json.lock");
     this.mutexPath = join(this.root, "state.json.mutex");
@@ -758,7 +845,6 @@ export class JsonRepository {
     this.processId = options.processId ?? process.pid;
     this.isProcessAlive = options.isProcessAlive ?? processIsAlive;
     this.onLockPhase = options.onLockPhase;
-    mkdirSync(this.root, { recursive: true });
     this.current = this.load();
   }
 
@@ -798,6 +884,8 @@ export class JsonRepository {
   }
 
   state(): StoreState {
+    if (this.poisoned) throw new AppError(500, "PERSISTENCE_FAILED");
+    if (this.transactionState !== null) return this.transactionState;
     this.current = this.load();
     return this.current;
   }
@@ -1112,9 +1200,10 @@ export class JsonRepository {
     }
   }
 
-  private commit(state: StoreState): void {
+  private commit(state: StoreState, commitFence?: () => void): void {
     const temporary = this.statePath + "." + randomUUID() + ".tmp";
     let descriptor: number | null = null;
+    let renamed = false;
     try {
       this.beforeCommit?.();
       descriptor = openSync(temporary, "wx");
@@ -1122,9 +1211,34 @@ export class JsonRepository {
       fsyncSync(descriptor);
       closeSync(descriptor);
       descriptor = null;
-      renameSync(temporary, this.statePath);
     } catch {
-      if (descriptor !== null) closeSync(descriptor);
+      if (descriptor !== null) {
+        try { closeSync(descriptor); } catch { /* Preserve the persistence failure. */ }
+      }
+      try {
+        rmSync(temporary, { force: true });
+      } catch {
+        // Preserve the original persistence failure without exposing a path.
+      }
+      throw new AppError(500, "PERSISTENCE_FAILED");
+    }
+    try {
+      // Fence the canonical replacement after the candidate file is durable.
+      commitFence?.();
+    } catch (error) {
+      try {
+        rmSync(temporary, { force: true });
+      } catch {
+        // Preserve the fence error without exposing a path.
+      }
+      throw error;
+    }
+    try {
+      renameSync(temporary, this.statePath);
+      renamed = true;
+      this.syncDirectory(dirname(this.statePath));
+    } catch {
+      if (renamed) this.poisoned = true;
       try {
         rmSync(temporary, { force: true });
       } catch {
@@ -1134,10 +1248,14 @@ export class JsonRepository {
     }
   }
 
-  transact<T>(mutation: (state: StoreState) => T): T {
+  transact<T>(mutation: (state: StoreState) => T, commitFence?: () => void): T {
+    if (this.poisoned || this.transactionState !== null) {
+      throw new AppError(500, "PERSISTENCE_FAILED");
+    }
     const lock = this.acquireLock();
     try {
       const fresh = this.load();
+      this.transactionState = fresh;
       const result = mutation(fresh);
       try {
         validateS2Graph(fresh);
@@ -1153,10 +1271,11 @@ export class JsonRepository {
       } catch {
         throw new AppError(500, "PERSISTENCE_FAILED");
       }
-      this.commit(fresh);
+      this.commit(fresh, commitFence);
       this.current = fresh;
       return result;
     } finally {
+      this.transactionState = null;
       this.releaseLock(lock);
     }
   }

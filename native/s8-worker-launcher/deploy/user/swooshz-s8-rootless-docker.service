@@ -1,0 +1,33 @@
+[Unit]
+Description=S8 dedicated rootless Docker daemon (systemd user service)
+After=network.target
+RequiresMountsFor=/var/lib/swooshz-s8-docker /run/swooshz-s8
+
+[Service]
+Type=simple
+Slice=app.slice
+Environment=HOME=/var/lib/swooshz-s8-docker
+ExecStartPre=/usr/bin/test -r /etc/swooshz/s8-capacity-proof.json
+ExecStart=/usr/bin/dockerd-rootless.sh --host=unix:///run/swooshz-s8/docker.sock --group=s8-worker-launcher --data-root=/var/lib/swooshz-s8-docker --exec-root=/run/swooshz-s8/exec --pidfile=/run/swooshz-s8/dockerd.pid --containerd=/run/swooshz-s8/containerd/containerd.sock --storage-driver=overlay2 --iptables=false --ip6tables=false --bridge=none --userland-proxy=false --exec-opt=native.cgroupdriver=systemd --cgroup-parent=swooshz-s8-workers.slice --log-level=error
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillMode=mixed
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/var/lib/swooshz-s8-docker /run/swooshz-s8
+
+[Install]
+WantedBy=default.target

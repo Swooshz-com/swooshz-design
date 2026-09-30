@@ -1,4 +1,4 @@
-import { AppError, type S8Artifact, type S8ExportJob, type S8IdempotencyRecord, type S8PublicationPhase, type S8SourceStamp, type S8ValidationReceipt, type StoreState } from "./types";
+import { AppError, type S8Artifact, type S8ExportJob, type S8IdempotencyRecord, type S8NativeOperationAttempt, type S8PublicationPhase, type S8SourceStamp, type S8ValidationReceipt, type StoreState } from "./types";
 import { jcs, sha256, uuidV4Pattern } from "./utils";
 import { S8_FBX_PROFILE, S8_LIMITS, S8_PROTOCOL_VERSION, S8_REUSE_FINGERPRINT_VERSION } from "./s8-fbx-profile";
 
@@ -100,13 +100,19 @@ export function getS8Collections(state: StoreState): {
   artifacts: S8Artifact[];
   receipts: S8ValidationReceipt[];
   idempotency: S8IdempotencyRecord[];
+  operationAttempts: S8NativeOperationAttempt[];
 } {
   return {
     jobs: state.s8ExportJobs ?? [],
     artifacts: state.s8Artifacts ?? [],
     receipts: state.s8ValidationReceipts ?? [],
     idempotency: state.s8IdempotencyRecords ?? [],
+    operationAttempts: state.s8NativeOperationAttempts ?? [],
   };
+}
+
+export function hasUnknownS8NativeAttempt(attempts: readonly Pick<S8NativeOperationAttempt, "state">[]): boolean {
+  return attempts.some((attempt) => attempt.state === "UNKNOWN");
 }
 
 function validateSource(value: unknown): void {
@@ -124,7 +130,7 @@ function validateJob(value: unknown): void {
   requiredUuid(item.jobId); requiredUuid(item.projectId); requiredUuid(item.artifactId); validateSource(item.source); requiredSha(item.inputHash); requiredString(item.idempotencyKey, 240);
   if (!["queued", "running", "staged", "validated", "promoted", "committed", "stale", "failed_retryable", "failed_terminal", "aborted"].includes(String(item.status))) fail("S8_PERSISTENCE_INVALID", 500);
   if (!["source_admission", "claim", "private_staging", "independent_validation", "source_claim_recheck", "immutable_promotion", "verified_readback", "commit"].includes(String(item.publicationPhase))) fail("S8_PERSISTENCE_INVALID", 500);
-  if (item.attempt !== 1) fail("S8_PERSISTENCE_INVALID", 500);
+  if (item.attempt !== 1 && item.attempt !== 2) fail("S8_PERSISTENCE_INVALID", 500);
   if (item.claimToken !== null) requiredUuid(item.claimToken);
   if (item.ownerId !== null) requiredString(item.ownerId, 240);
   if (item.ownerProcessId !== null && (!Number.isSafeInteger(item.ownerProcessId) || Number(item.ownerProcessId) <= 0)) fail("S8_PERSISTENCE_INVALID", 500);
@@ -149,7 +155,7 @@ function validateArtifact(value: unknown): void {
     if (!Number.isSafeInteger(hashes.artifactByteSize) || Number(hashes.artifactByteSize) <= 27 || Number(hashes.artifactByteSize) > S8_LIMITS.artifactBytes) fail("S8_PERSISTENCE_INVALID", 500);
   }
   requiredString(item.privateStagingPrefix, 2000); requiredString(item.privateFinalPrefix, 2000);
-  if (item.attempt !== 1 || item.retryOfArtifactId !== null) fail("S8_PERSISTENCE_INVALID", 500);
+  if ((item.attempt !== 1 && item.attempt !== 2) || item.retryOfArtifactId !== null) fail("S8_PERSISTENCE_INVALID", 500);
   requiredTimestamp(item.createdAt); requiredTimestamp(item.updatedAt); if (item.committedAt !== null) requiredTimestamp(item.committedAt); if (item.staleAt !== null) requiredTimestamp(item.staleAt);
   if (item.failureCode !== null) requiredString(item.failureCode, 240);
 }
@@ -164,6 +170,36 @@ function validateReceipt(value: unknown): void {
   requiredTimestamp(item.checkedAt);
 }
 
+function validateNativeAttempt(value: unknown): void {
+  const item = record(value);
+  exactKeys(item, ["schemaVersion", "attemptId", "projectId", "jobId", "artifactId", "claimToken", "attempt", "operation", "state", "inputSha256", "requestSha256", "requestNonce", "responseSha256", "releaseManifestSha256", "failureClass", "disposalState", "createdAt", "updatedAt", "completedAt"], "S8_PERSISTENCE_INVALID");
+  if (item.schemaVersion !== "s8-native-operation-attempt-v1") fail("S8_PERSISTENCE_INVALID", 500);
+  requiredUuid(item.attemptId); requiredUuid(item.projectId); requiredUuid(item.jobId); requiredUuid(item.artifactId); requiredUuid(item.claimToken);
+  if (!Number.isSafeInteger(item.attempt) || Number(item.attempt) < 1 || Number(item.attempt) > 2) fail("S8_PERSISTENCE_INVALID", 500);
+  if (item.operation !== "WRITER" && item.operation !== "VALIDATOR") fail("S8_PERSISTENCE_INVALID", 500);
+  if (!["DISPATCHING", "SUCCEEDED", "FAILED", "UNKNOWN"].includes(String(item.state))) fail("S8_PERSISTENCE_INVALID", 500);
+  requiredSha(item.inputSha256);
+  for (const key of ["requestSha256", "responseSha256", "releaseManifestSha256"]) if (item[key] !== null) requiredSha(item[key]);
+  if (item.requestNonce !== null && (typeof item.requestNonce !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(item.requestNonce))) fail("S8_PERSISTENCE_INVALID", 500);
+  if (item.failureClass !== null && !["PERMANENT", "TRANSIENT", "UNCERTAIN"].includes(String(item.failureClass))) fail("S8_PERSISTENCE_INVALID", 500);
+  if (!["NOT_STARTED", "REAPED_REMOVED", "UNKNOWN"].includes(String(item.disposalState))) fail("S8_PERSISTENCE_INVALID", 500);
+  requiredTimestamp(item.createdAt); requiredTimestamp(item.updatedAt);
+  if (item.completedAt !== null) requiredTimestamp(item.completedAt);
+  if (item.state === "DISPATCHING" && (item.completedAt !== null || item.failureClass !== null)) fail("S8_PERSISTENCE_INVALID", 500);
+  if (item.state === "SUCCEEDED" && (item.completedAt === null || item.failureClass !== null || item.requestSha256 === null || item.requestNonce === null || item.responseSha256 === null || item.releaseManifestSha256 === null || item.disposalState !== "REAPED_REMOVED")) fail("S8_PERSISTENCE_INVALID", 500);
+  if (item.state === "FAILED") {
+    if (item.completedAt === null) fail("S8_PERSISTENCE_INVALID", 500);
+    if (item.failureClass === "PERMANENT") {
+      if (item.disposalState === "UNKNOWN") fail("S8_PERSISTENCE_INVALID", 500);
+    } else if (item.failureClass === "TRANSIENT") {
+      if (item.disposalState !== "REAPED_REMOVED" || item.requestSha256 === null || item.requestNonce === null
+        || item.responseSha256 === null || item.releaseManifestSha256 === null) fail("S8_PERSISTENCE_INVALID", 500);
+    } else {
+      fail("S8_PERSISTENCE_INVALID", 500);
+    }
+  }
+  if (item.state === "UNKNOWN" && (item.completedAt === null || item.failureClass !== "UNCERTAIN" || item.disposalState !== "UNKNOWN")) fail("S8_PERSISTENCE_INVALID", 500);
+}
 function validateIdempotency(value: unknown): void {
   const item = record(value);
   exactKeys(item, ["schemaVersion", "projectId", "operation", "idempotencyKey", "inputHash", "source", "jobId", "artifactId", "createdAt"], "S8_PERSISTENCE_INVALID");
@@ -172,7 +208,7 @@ function validateIdempotency(value: unknown): void {
 }
 
 export function validateS8Collections(parsed: Record<string, unknown>, merged: StoreState): void {
-  const validators: Readonly<Record<string, (value: unknown) => void>> = { s8ExportJobs: validateJob, s8Artifacts: validateArtifact, s8ValidationReceipts: validateReceipt, s8IdempotencyRecords: validateIdempotency };
+  const validators: Readonly<Record<string, (value: unknown) => void>> = { s8ExportJobs: validateJob, s8Artifacts: validateArtifact, s8ValidationReceipts: validateReceipt, s8IdempotencyRecords: validateIdempotency, s8NativeOperationAttempts: validateNativeAttempt };
   for (const [name, validate] of Object.entries(validators)) {
     if (Object.prototype.hasOwnProperty.call(parsed, name)) {
       const values = parsed[name];
@@ -188,6 +224,8 @@ export function validateS8Graph(state: StoreState): void {
   const jobs = new Map(collections.jobs.map((item) => [item.jobId, item]));
   const artifacts = new Map(collections.artifacts.map((item) => [item.artifactId, item]));
   const receipts = new Map(collections.receipts.map((item) => [item.receiptId, item]));
+  const operationAttemptIds = new Set<string>();
+  const operationKeys = new Set<string>();
   const idempotency = new Set<string>();
   if (jobs.size !== collections.jobs.length || artifacts.size !== collections.artifacts.length || receipts.size !== collections.receipts.length) fail("S8_PERSISTENCE_INVALID", 500);
   for (const job of collections.jobs) {
@@ -197,6 +235,19 @@ export function validateS8Graph(state: StoreState): void {
   for (const artifact of collections.artifacts) if (artifact.validationReceiptId !== null) {
     const receipt = receipts.get(artifact.validationReceiptId);
     if (!receipt || receipt.artifactId !== artifact.artifactId || receipt.projectId !== artifact.projectId || receipt.receiptHash !== artifact.validationReceiptHash) fail("S8_PERSISTENCE_INVALID", 500);
+  }
+  for (const attempt of collections.operationAttempts) {
+    const job = jobs.get(attempt.jobId);
+    const artifact = artifacts.get(attempt.artifactId);
+    const key = attempt.jobId + ":" + String(attempt.attempt) + ":" + attempt.operation;
+    if (operationAttemptIds.has(attempt.attemptId) || operationKeys.has(key) || !job || !artifact || artifact.jobId !== job.jobId || artifact.projectId !== attempt.projectId
+      || job.projectId !== attempt.projectId || attempt.attempt > job.attempt) fail("S8_PERSISTENCE_INVALID", 500);
+    operationAttemptIds.add(attempt.attemptId);
+    operationKeys.add(key);
+    if (attempt.operation === "VALIDATOR") {
+      const writer = collections.operationAttempts.find((item) => item.jobId === attempt.jobId && item.attempt === attempt.attempt && item.operation === "WRITER");
+      if (!writer || writer.state !== "SUCCEEDED" || writer.releaseManifestSha256 !== attempt.releaseManifestSha256) fail("S8_PERSISTENCE_INVALID", 500);
+    }
   }
   for (const item of collections.idempotency) {
     const key = `${item.projectId}\u0000${item.idempotencyKey}`;
