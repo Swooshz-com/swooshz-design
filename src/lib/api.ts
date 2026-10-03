@@ -108,7 +108,7 @@ const PUBLIC_S8_ERROR_CODES = new Set<string>([
   "S8_PAYLOAD_RESOURCE_LIMIT", "S8_ARTIFACT_RESOURCE_LIMIT", "S8_WRITER_RECEIPT_LIMIT", "S8_NATIVE_READBACK_LIMIT",
   "S8_RESOURCE_LIMIT", "S8_SEMANTIC_VALIDATION_FAILED", "S8_SEMANTIC_RECEIPT_LIMIT", "S8_PUBLICATION_RECEIPT_LIMIT", "S8_WRITER_RECEIPT_INVALID", "S8_WRITER_RECEIPT_BINDING_MISMATCH",
   "S8_RUNTIME_IDENTITY_MISMATCH", "S8_EXPORTER_IDENTITY_MISMATCH", "S8_EXPORTER_PATCH_IDENTITY_MISMATCH",
-  "S8_NATIVE_READBACK_INVALID", "S8_FBX_PROFILE_INVALID", "S8_PUBLICATION_OBJECT_MISMATCH", "S8_REUSE_FINGERPRINT_INVALID",
+  "S8_NATIVE_READBACK_INVALID", "S8_FBX_PROFILE_INVALID", "S8_REUSE_FINGERPRINT_INVALID",
   "S8_ARTIFACT_NOT_COMMITTED", "S8_PUBLICATION_FAILED", "S8_PERSISTENCE_INVALID", "S8_CONTROLLER_REQUIRED",
   "S8_SOURCE_NOT_FOUND", "S8_INTERNAL_ERROR",
 ]);
@@ -1426,7 +1426,7 @@ async function handleS8(
     if (method !== "POST") throw new AppError(405, "METHOD_NOT_ALLOWED");
     const body = await s8JsonBody(request);
     exactKeys(body, []);
-    const result = service.s8.createExport(projectId, s8IdempotencyKeyFromHeader(request), referenceId);
+    const result = await service.s8.createExport(projectId, s8IdempotencyKeyFromHeader(request), referenceId);
     const status = result.replayed ? 200 : result.export.status === "committed" ? 201 : 202;
     return NextResponse.json(result, { status });
   }

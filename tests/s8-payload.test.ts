@@ -64,3 +64,35 @@ test("S7 cannot replace or drift from the accepted S6 source", () => {
   assert.throws(() => buildS8WriterPayload(s6, { ...s7, sourceRevisionHash: hashB }), /S8_SOURCE_BINDING_MISMATCH/);
   assert.throws(() => canonicalS8Json({ bad: 1.5 }), /S8_PAYLOAD_NON_INTEGER/);
 });
+
+test("Run-137 accepts exactly the three resolved object provenance kinds without rewriting their fields", () => {
+  for (const kind of ["confirmed_project_input", "user_confirmed_design_decision", "bounded_design_inference"] as const) {
+    const { s6, s7 } = sources();
+    const provenance = { kind, sourceRef: "S6 accepted model", sourceFingerprint: hashB, acceptedByUser: false, note: "Bounded" };
+    s6.objects[0]!.provenance = provenance;
+    const before = structuredClone(s6.objects[0]!.provenance);
+    assert.doesNotThrow(() => buildS8WriterPayload(s6, s7));
+    assert.deepEqual(s6.objects[0]!.provenance, before);
+  }
+});
+
+test("Run-137 rejects unresolved, malformed, mismatched, missing, and extra provenance", () => {
+  const invalid = [
+    { kind: "unknown_unresolved", sourceRef: "x", sourceFingerprint: hashB, acceptedByUser: true, note: null },
+    { kind: "future_kind", sourceRef: "x", sourceFingerprint: hashB, acceptedByUser: true, note: null },
+    { kind: "bounded_design_inference", sourceFingerprint: hashB, acceptedByUser: true, note: null },
+    { kind: "bounded_design_inference", sourceRef: "x", sourceFingerprint: hashB, acceptedByUser: true, note: null, extra: false },
+    { kind: "bounded_design_inference", sourceRef: "", sourceFingerprint: hashB, acceptedByUser: true, note: null },
+    { kind: "bounded_design_inference", sourceRef: "x\u0000bad", sourceFingerprint: hashB, acceptedByUser: true, note: null },
+    { kind: "bounded_design_inference", sourceRef: "x", sourceFingerprint: null, acceptedByUser: true, note: null },
+    { kind: "bounded_design_inference", sourceRef: "x", sourceFingerprint: hash, acceptedByUser: true, note: null },
+    { kind: "bounded_design_inference", sourceRef: "x", sourceFingerprint: hashB, acceptedByUser: "false", note: null },
+    { kind: "bounded_design_inference", sourceRef: "x", sourceFingerprint: hashB, acceptedByUser: true, note: "" },
+    { kind: "bounded_design_inference", sourceRef: "x", sourceFingerprint: hashB, acceptedByUser: true, note: "bad\u007ftext" },
+  ];
+  for (const provenance of invalid) {
+    const { s6, s7 } = sources();
+    s6.objects[0]!.provenance = provenance as never;
+    assert.throws(() => buildS8WriterPayload(s6, s7), /S8_RIGID_PROVENANCE_REQUIRED/);
+  }
+});

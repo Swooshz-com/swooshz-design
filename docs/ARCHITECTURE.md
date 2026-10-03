@@ -121,6 +121,46 @@ The MVP does not require a complete browser CAD editor. The chosen correction in
 
 Corrections create new spatial revisions.
 
+### Requirement satisfaction and current validation authority
+
+The accepted Run-140 contract binds S2 requirements through the production S5
+projection to one shared resolver and evaluator in `src/lib/s6-validation.ts`.
+The compiler consumes the same resolver. Requirement IDs associate evidence with
+a requirement; they do not prove that the requirement is satisfied.
+
+- The four canonical geometry requirements use exact confirmed source, booth,
+  floor, enclosure and transformed-height evidence. They never use object tags.
+- Functional requirements use compatible metric objects or explicitly resolved
+  zones. `present` means at least one, `exact_count` means exactly the confirmed
+  count of distinct allocations, and `absent` checks the complete scene.
+- Mandatory and free-text requirements resolve only when their complete meaning
+  has supported object, zone or deterministic scene evidence. Unsupported or
+  partially understood meaning remains blocking.
+- Prohibitions inspect the complete scene independently of tags. `No enclosed
+  ceiling.` rejects closed overheads and remains unresolved for ambiguous
+  potential ceiling geometry.
+- `Keep the entry clear.` uses `entry-clear-v1`: a centered 900 mm wide, 900 mm
+  inward, 2100 mm high volume on every confirmed open side. The tangential lower
+  coordinate is `floor((sideLength - 900) / 2)`. Full fit is required; positive
+  volume intersection with physical world geometry blocks, while boundary-only
+  contact passes. Only the immutable floor and nonphysical zone regions are
+  excluded. Qualified clearance language requires its own supported meaning.
+
+Typed corrections must change the evidence enough to satisfy the constraint.
+Notes, review confirmation and simplification cannot waive wrong geometry,
+counts, clearance or unresolved meaning. Derived evaluation is recomputed from
+the current source/model and is never persisted as a reusable approval flag.
+
+New receipts use `s6-validator-v2` and `s6-validation-order-v1`. Historical v1
+receipts remain readable and unchanged, but cannot authorize current acceptance
+or an S6-to-S7 handoff. Handoff construction requires current v2 authority and
+re-evaluates satisfaction using the shared evaluator.
+
+The production regression preserves the confirmed requirements through S5
+approval and committed outputs, S6 generation/correction/validation/acceptance,
+equal direct and delegated handoffs, committed S7 export, and S8 publication.
+See the accepted amendments in [the native worker contract](G2_S8_NATIVE_WORKER_CONTRACT.md#accepted-successor-amendments).
+
 ## Coherent additional views
 Additional views are derived from or strongly conditioned by the same accepted spatial model.
 
@@ -174,6 +214,8 @@ The MVP requirement is a production-useful file that imports into 3ds Max with e
 Native `.max` is not mandatory unless S8 G1/G2 proves a licensed, deterministic and supportable automation path. FBX or another proven editable Max-compatible format may satisfy the accepted contract.
 
 Validation must prove import consistency and explicitly report unsupported/degraded materials or other semantics. No material geometry may silently disappear or be invented.
+
+S8 persisted status and publication-phase fields are descriptive compatibility data. The repository derives S8 lifecycle from the exact native attempts, signed acceptance receipts, ordered proof checkpoints, validation receipts, source view, and byte-verified private objects while holding its persistence mutex. Legacy progress without the complete successor proof is quarantined; a pristine queued record may be migrated without creating proof. Native worker admission remains closed until the separate capacity gate supplies current verified admission evidence. See [the accepted S8 native worker contract](G2_S8_NATIVE_WORKER_CONTRACT.md) for the executable schema and lifecycle rules.
 
 ## Autodesk APS policy
 Autodesk APS is optional infrastructure, not an MVP outcome and not automatically required for AutoCAD/3ds Max interoperability.

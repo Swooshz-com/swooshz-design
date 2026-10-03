@@ -1,2 +1,0 @@
-Defaults!/usr/local/libexec/swooshz-s8/s8-sandbox-broker env_reset
-@S8_HOST_USER@ ALL=(root) NOSETENV: /usr/local/libexec/swooshz-s8/s8-sandbox-broker --stdio-v1

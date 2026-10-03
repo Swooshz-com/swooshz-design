@@ -72,14 +72,10 @@ test("worker refuses to run without the native Linux process boundary", () => {
   }
 });
 
-test("partial runtime configuration fails closed instead of selecting a fallback", () => {
-  assert.throws(() => readS8RuntimeConfig({ S8_BLENDER_RUNTIME_ROOT: "C:/runtime" }), /S8_RUNTIME_CONFIG_INVALID/);
-  assert.throws(() => readS8RuntimeConfig({
-    S8_BLENDER_RUNTIME_ROOT: "/opt/blender", S8_BLENDER_EXECUTABLE: "/opt/blender/blender", S8_WRITER_SCRIPT: "/opt/swooshz/writer.py",
-    S8_PRIVATE_WORK_ROOT: "/var/lib/swooshz/s8", S8_PROCESS_RUNNER_EXECUTABLE: "/usr/local/libexec/swooshz-s8/s8-process-runner",
-    S8_SANDBOX_EXECUTABLE: "/usr/local/libexec/swooshz-s8/s8-sandbox", S8_SANDBOX_POLICY_SHA256: "A".repeat(64),
-    S8_NATIVE_VALIDATOR_EXECUTABLE: "/usr/local/libexec/swooshz-s8/s8-native-validator", S8_BLENDER_EXECUTABLE_SHA256: "1".repeat(64),
-  }), /S8_RUNTIME_CONFIG_INVALID/);
+test("partial native worker configuration fails closed and local executable settings cannot activate it", () => {
+  assert.throws(() => readS8RuntimeConfig({ S8_WORKER_GATEWAY_URL: "https://worker.example" }), /S8_NATIVE_WORKER_CONFIG_INVALID/);
+  assert.equal(readS8RuntimeConfig({ S8_APP_SIGNING_KEY_ID: "application-key", S8_APP_SIGNING_PRIVATE_KEY_PEM: "application-key-material" }), undefined);
+  assert.equal(readS8RuntimeConfig({ S8_BLENDER_RUNTIME_ROOT: "C:/runtime" }), undefined);
 });
 
 test("strict v2 caller parsing accepts only canonical, fully evidenced receipts", () => {
@@ -335,12 +331,6 @@ test("direct Bubblewrap paths and malformed policy digests fail closed before la
 const workflowSizeBase = "578ac98aa974fa0ec3a65bcade1c505ac5c80dcb";
 const workflowSizeLimitBytes = 512_000;
 const workflowSizePath = ".github/workflows/s8-fbx.yml";
-const workflowProofHelperPath = "scripts/s8/s8_application_boundary_proof.mts";
-const workflowProofHelperBytes = 8_966;
-const workflowProofHelperSha256 = "05c7b06a96fe0c45be71a4e2805b29202250130c9dba4bb852a0ef6032aacd31";
-const workflowProofShellPath = "scripts/s8/s8_application_boundary_proof.sh";
-const workflowProofShellBytes = 3_260;
-const workflowProofShellSha256 = "105085a773513c05abdfbc6b0b6da67b74ad8eb811c91c919cc7a08645bd769e";
 const run089Head = "c620d7eda702be8149f69bff546b97e214e2fab6";
 const originalWorkflowHead = "5a78ccdda307dd7dc3052aaaae5d033b7bf06c43";
 
@@ -467,90 +457,46 @@ function emitWorkflowSizeResult(result: WorkflowSizeResult): void {
   for (const record of result.records) console.log(JSON.stringify(record));
 }
 
-const helperSourceLine = 'source "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.sh"';
-const helperInstallLine = '/usr/bin/install -m 0600 -- "$GITHUB_WORKSPACE/scripts/s8/s8_application_boundary_proof.mts" "$app_proof"';
-const oldHelperExecutionLine = '/usr/bin/pnpm exec tsx "$app_proof"';
-const helperExecutionLine = 'COREPACK_ENABLE_AUTO_PIN=0 corepack pnpm@12.6.0 exec tsx "$app_proof"';
-
-function helperExtractionIsValid(workflow: string, helper: Buffer | undefined, shellHelper: Buffer | undefined): boolean {
-  if (!helper || helper.length !== workflowProofHelperBytes || !shellHelper || shellHelper.length !== workflowProofShellBytes) return false;
-  let helperText: string;
-  let shellText: string;
-  try {
-    helperText = decodeUtf8Strict(helper);
-    shellText = decodeUtf8Strict(shellHelper);
-  } catch {
-    return false;
-  }
-  const helperHash = createHash("sha256").update(helper).digest("hex");
-  const shellHash = createHash("sha256").update(shellHelper).digest("hex");
-  return !helperText.includes("\r")
-    && !shellText.includes("\r")
-    && helperHash === workflowProofHelperSha256
-    && shellHash === workflowProofShellSha256
-    && workflow.split(helperSourceLine).length - 1 === 1
-    && workflow.split(helperInstallLine).length - 1 === 0
-    && workflow.split(oldHelperExecutionLine).length - 1 === 0
-    && shellText.split(helperInstallLine).length - 1 === 1
-    && shellText.split(helperExecutionLine).length - 1 === 1
-    && !shellText.includes(oldHelperExecutionLine)
-    && !shellText.includes('cat > "$app_proof" <<\'TS\'');
-}
-
-const toolchainJobMarker = "  s8-pinned-blender:";
+const workerJobMarker = "  s8-workers:";
 const exactHeadStepMarker = "      - name: Verify exact PR head";
-const hostedAmendmentStepMarker = "      - name: Hosted sandbox environment amendment";
 const setupNodeAction = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
 const setupNodeStep = [
-  "      - name: Setup Node 22 for hosted toolchain",
-  "        id: setup_node",
+  "      - name: Setup Node 22",
   "        uses: " + setupNodeAction,
   "        with:",
   "          node-version: 22",
 ].join("\n");
-const pinnedPnpm = "corepack pnpm@12.6.0";
-const frozenInstall = pinnedPnpm + " install --frozen-lockfile --ignore-scripts --prod=false";
+const workerRegressionStep = [
+  "      - name: Native worker protocol and launcher regressions",
+  "        shell: bash",
+  "        run: |",
+  "          set -euo pipefail",
+  "          node --test native/s8-worker-common/*.test.mjs native/s8-worker-gateway/*.test.mjs native/s8-worker-launcher/*.test.mjs",
+].join("\n");
 
 function countText(source: string, value: string): number {
   return source.split(value).length - 1;
 }
 
-function hostedToolchainSourceIsValid(workflow: string): boolean {
+function workerWorkflowSourceIsValid(workflow: string): boolean {
   const source = workflow.replace(/\r\n/g, "\n");
-  if (countText(source, toolchainJobMarker) !== 1 || countText(source, hostedAmendmentStepMarker) !== 1) return false;
-  const jobStart = source.indexOf(toolchainJobMarker);
-  const verifyStart = source.indexOf(exactHeadStepMarker, jobStart);
-  const amendmentStart = source.indexOf(hostedAmendmentStepMarker, verifyStart);
-  const verifyEnd = source.indexOf("      - name: ", verifyStart + exactHeadStepMarker.length);
-  if (jobStart < 0 || verifyStart <= jobStart || amendmentStart <= verifyStart
-    || countText(source.slice(jobStart, amendmentStart), exactHeadStepMarker) !== 1
-    || verifyEnd < 0 || verifyEnd > amendmentStart) return false;
-  if (!source.slice(verifyStart, verifyEnd).includes('run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"')) return false;
-  const interval = source.slice(verifyEnd, amendmentStart);
-  if (countText(interval, setupNodeStep) !== 1
-    || countText(interval, "      - name: Classify Node setup failure") !== 1
-    || countText(interval, "      - name: Admit pinned TypeScript toolchain") !== 1
-    || countText(interval, "uses: actions/setup-node@") !== 1
-    || countText(interval, 'COREPACK_ENABLE_AUTO_PIN: "0"') !== 1
-    || !interval.includes("if: $" + "{{ failure() && steps.setup_node.outcome == 'failure' }}")
-    || !interval.includes("node -p 'process.versions.node.split(\".\")[0]'")
-    || !interval.includes("|| hold NODE")
-    || !interval.includes("command -v corepack")
-    || !interval.includes("|| hold COREPACK")
-    || countText(interval, pinnedPnpm + " --version") !== 1
-    || !interval.includes("|| hold PNPM_ACTIVATION")
-    || !interval.includes('[[ "$version" == 12.6.0 ]] || hold PNPM_VERSION')
-    || !interval.includes("[[ -f pnpm-lock.yaml ]] || hold LOCKFILE")
-    || countText(interval, frozenInstall) !== 1
-    || !interval.includes("|| hold FROZEN_INSTALL")
-    || !interval.includes("[[ -x node_modules/.bin/tsx ]] || hold TSX")
-    || countText(interval, pinnedPnpm + ' exec tsx "$smoke"') !== 1
-    || !interval.includes("FAILURE_CLASS=HOSTED_TOOLCHAIN_HOLD")
-    || !interval.includes("TOOLCHAIN_STAGE=SETUP_NODE")) return false;
-  const unpinnedPnpm = interval.replace(/corepack pnpm@12\.6\.0/g, "").replace(/pnpm-lock\.yaml/g, "");
-  return !/\bpnpm\b/.test(unpinnedPnpm);
+  if (countText(source, workerJobMarker) !== 1) return false;
+  const job = source.slice(source.indexOf(workerJobMarker));
+  const checkout = job.indexOf("uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683");
+  const verify = job.indexOf(exactHeadStepMarker);
+  const setup = job.indexOf(setupNodeStep);
+  const regressions = job.indexOf(workerRegressionStep);
+  const writer = job.indexOf("      - name: Writer contract regression");
+  const python = job.indexOf("      - name: Python syntax");
+  if (checkout < 0 || verify <= checkout || setup <= verify || regressions <= setup || writer <= regressions || python <= writer) return false;
+  if (!job.slice(verify, setup).includes('run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"')) return false;
+  if (countText(job, setupNodeStep) !== 1 || countText(job, workerRegressionStep) !== 1 ||
+      countText(job, "node --test native/s8-worker-common/*.test.mjs native/s8-worker-gateway/*.test.mjs native/s8-worker-launcher/*.test.mjs") !== 1 ||
+      countText(job, "run: python3 scripts/s8/blender_writer_contract_regression.py") !== 1 ||
+      countText(job, "run: python3 -m py_compile blender/s8-fbx-writer/writer.py scripts/s8/*.py") !== 1 ||
+      job.includes("s8_application_boundary_proof") || job.includes("s8_runtime_sensitivity")) return false;
+  return true;
 }
-
 function fakeWorkflowSizeIo(options: {
   diff?: Buffer;
   untracked?: Buffer;
@@ -676,62 +622,51 @@ test("workflow UTF-8 size gate checks the selected raw bytes and rejects every f
   assert.equal(runWorkflowSizeGate(root, run089Head).pass, false);
 });
 
-test("workflow application proof shell extraction and TypeScript helper integrity remain exact", () => {
+test("workflow runs the successor proof boundary and no deleted local-broker helper", () => {
   const root = resolve(process.cwd());
-  const workflow = readFileSync(join(root, workflowSizePath), "utf8");
-  const helper = readFileSync(join(root, workflowProofHelperPath));
-  const shellHelper = readFileSync(join(root, workflowProofShellPath));
-  assert.equal(helperExtractionIsValid(workflow, helper, shellHelper), true);
-  assert.equal(workflow.split(workflowProofShellPath).length - 1, 1);
-  assert.equal(shellHelper.toString("utf8").split(workflowProofHelperPath).length - 1, 1);
-  assert.equal(shellHelper.toString("utf8").split(helperInstallLine).length - 1, 1);
-  assert.equal(shellHelper.toString("utf8").split(helperExecutionLine).length - 1, 1);
-  assert.equal(helperExtractionIsValid(workflow, undefined, shellHelper), false);
-  assert.equal(helperExtractionIsValid(workflow, helper, undefined), false);
-
-  const altered = Buffer.from(helper);
-  altered[0] = altered[0]! ^ 1;
-  assert.equal(helperExtractionIsValid(workflow, altered, shellHelper), false);
-  const alteredShell = Buffer.from(shellHelper);
-  alteredShell[0] = alteredShell[0]! ^ 1;
-  assert.equal(helperExtractionIsValid(workflow, helper, alteredShell), false);
-  assert.equal(helperExtractionIsValid(workflow.replace(helperSourceLine, ""), helper, shellHelper), false);
-  assert.equal(helperExtractionIsValid(workflow + "\n" + helperSourceLine, helper, shellHelper), false);
-  assert.equal(helperExtractionIsValid(workflow, helper, Buffer.from(shellHelper.toString("utf8").replace(helperInstallLine, "").replace(helperExecutionLine, ""), "utf8")), false);
-  assert.equal(shellHelper.toString("utf8").split(oldHelperExecutionLine).length - 1, 0);
-  assert.equal(shellHelper.toString("utf8").includes('cat > "$app_proof" <<\'TS\''), false);
+  const workflow = readFileSync(join(root, workflowSizePath), "utf8").replace(/\r\n/g, "\n");
+  const service = readFileSync(join(root, "src/lib/s8.ts"), "utf8");
+  const store = readFileSync(join(root, "src/lib/store.ts"), "utf8");
+  const proof = readFileSync(join(root, "src/lib/s8-native-proof.ts"), "utf8");
+  for (const retiredPath of [
+    "scripts/s8/s8_application_boundary_proof.mts",
+    "scripts/s8/s8_application_boundary_proof.sh",
+    "scripts/s8/s8_runtime_sensitivity.py",
+  ]) assert.equal(workflow.includes(retiredPath), false, `${retiredPath} must remain deleted and unused`);
+  assert.match(workflow, /name: Successor proof boundary guard/u);
+  assert.match(workflow, /node --test native\/s8-worker-common\/\*\.test\.mjs native\/s8-worker-gateway\/\*\.test\.mjs native\/s8-worker-launcher\/\*\.test\.mjs/u);
+  assert.match(workflow, /run: pnpm test/u);
+  assert.match(workflow, /ctest --test-dir "\$RUNNER_TEMP\/s8-runner"/u);
+  assert.match(workflow, /ctest --test-dir "\$RUNNER_TEMP\/s8-validator"/u);
+  assert.match(workflow, /Secret preflight/u);
+  assert.match(workflow, /s8-actionlint/u);
+  assert.doesNotMatch(service, /repository\.transact\s*\(/u);
+  assert.match(store, /S8_COMMAND_REQUIRED/u);
+  for (const command of ["createQueued", "claimQueued", "beginNativeAttempt", "prepareNativeAttempt", "persistNativeAcceptance",
+    "persistNativeFailure", "stageAcceptedWriter", "validateAcceptedPair", "promoteValidated", "commitPromoted",
+    "recordTerminalFailure", "scheduleRetry", "reclaimPublication", "reconcilePreparedAttempt"]) {
+    assert.equal(proof.includes(`"${command}"`), true, `missing repository-owned command ${command}`);
+  }
 });
 
-test("hosted toolchain source integrity is bounded to the verified Blender setup", () => {
+test("hosted worker workflow runs exact-head proof and native regressions", () => {
   const workflow = readFileSync(join(resolve(process.cwd()), workflowSizePath), "utf8").replace(/\r\n/g, "\n");
-  assert.equal(hostedToolchainSourceIsValid(workflow), true);
-  const installLine = frozenInstall;
-  const smokeLine = pinnedPnpm + ' exec tsx "$smoke"';
-  const verifyStep = exactHeadStepMarker;
-  const amendmentStep = hostedAmendmentStepMarker;
-  const inTargetJob = (mutate: (job: string) => string) => {
-    const start = workflow.indexOf(toolchainJobMarker);
+  assert.equal(workerWorkflowSourceIsValid(workflow), true);
+  const wrongAction = setupNodeStep.replace(setupNodeAction, "actions/setup-node@deadbeef");
+  const inWorkerJob = (mutate: (job: string) => string) => {
+    const start = workflow.indexOf(workerJobMarker);
     return workflow.slice(0, start) + mutate(workflow.slice(start));
   };
-  const wrongAction = setupNodeStep.replace(setupNodeAction, "actions/setup-node@deadbeef");
-
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, wrongAction)), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, setupNodeStep.replace("node-version: 22", "node-version: 20"))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(pinnedPnpm + " --version", "corepack pnpm@latest --version")), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(installLine, installLine.replace("--frozen-lockfile ", ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(installLine, installLine.replace("--ignore-scripts ", ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(installLine, installLine.replace("--prod=false", ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(smokeLine, smokeLine + "\n          pnpm --version")), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, "")), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(setupNodeStep, setupNodeStep + "\n" + setupNodeStep)), false);
-  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(verifyStep, ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(amendmentStep, ""))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(toolchainJobMarker, "")), false);
-  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(verifyStep, verifyStep + "\n" + verifyStep))), false);
-  assert.equal(hostedToolchainSourceIsValid(inTargetJob((job) => job.replace(amendmentStep, amendmentStep + "\n" + amendmentStep))), false);
-  assert.equal(hostedToolchainSourceIsValid(workflow.replace(toolchainJobMarker, toolchainJobMarker + "\n" + toolchainJobMarker)), false);
-  const reversed = inTargetJob((job) => job.replace(verifyStep, "VERIFY_BOUNDARY_TEMP")
-    .replace(amendmentStep, verifyStep)
-    .replace("VERIFY_BOUNDARY_TEMP", amendmentStep));
-  assert.equal(hostedToolchainSourceIsValid(reversed), false);
+  assert.equal(workerWorkflowSourceIsValid(workflow.replace(setupNodeStep, wrongAction)), false);
+  assert.equal(workerWorkflowSourceIsValid(workflow.replace(setupNodeStep, setupNodeStep.replace("node-version: 22", "node-version: 20"))), false);
+  assert.equal(workerWorkflowSourceIsValid(workflow.replace(workerRegressionStep, workerRegressionStep.replace("node --test", "node test"))), false);
+  assert.equal(workerWorkflowSourceIsValid(workflow.replace(setupNodeStep, "")), false);
+  assert.equal(workerWorkflowSourceIsValid(workflow.replace(workerJobMarker, "")), false);
+  assert.equal(workerWorkflowSourceIsValid(inWorkerJob((job) => job.replace(exactHeadStepMarker, ""))), false);
+  assert.equal(workerWorkflowSourceIsValid(inWorkerJob((job) => job.replace(setupNodeStep, setupNodeStep + "\n" + setupNodeStep))), false);
+  assert.equal(workerWorkflowSourceIsValid(inWorkerJob((job) => job.replace(workerRegressionStep, workerRegressionStep + "\n" + workerRegressionStep))), false);
+  const reversed = inWorkerJob((job) => job.replace(exactHeadStepMarker, "VERIFY_BOUNDARY_TEMP")
+    .replace("      - name: Setup Node 22", exactHeadStepMarker)
+    .replace("VERIFY_BOUNDARY_TEMP", "      - name: Setup Node 22"));
+  assert.equal(workerWorkflowSourceIsValid(reversed), false);
 });

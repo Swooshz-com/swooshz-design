@@ -648,19 +648,34 @@ test("fresh S2 persistence rejects present malformed or unknown records and keep
     const legacy = new JsonRepository(root);
     assert.deepEqual(legacy.state().s2Operations, []);
     const valid = legacy.state();
-    valid.s2Drafts.push({
+    const snapshot = legacy.snapshot();
+    assert.equal(Object.isFrozen(valid), true);
+    assert.equal(Object.isFrozen(valid.s2Drafts), true);
+    assert.equal(Object.isFrozen(snapshot), true);
+    assert.equal(Object.isFrozen(snapshot.s2Operations), true);
+    assert.throws(() => valid.s2Drafts.push({
+      id: randomUUID(), projectId: randomUUID(), revision: 1, status: "editable",
+      referenceAssetIds: [], logoAssetIds: [], updatedAt: new Date(0).toISOString(),
+      frozenAt: null, frozenByQaRunId: null,
+    }), TypeError);
+    assert.throws(() => { (snapshot as any).s2Operations = []; }, TypeError);
+
+    const malformedRecord = cloneJson(valid);
+    malformedRecord.s2Drafts.push({
       id: randomUUID(), projectId: randomUUID(), revision: 1, status: "editable",
       referenceAssetIds: [], logoAssetIds: [], updatedAt: new Date(0).toISOString(),
       frozenAt: null, frozenByQaRunId: null,
     });
-    writeFileSync(legacy.statePath, JSON.stringify(valid), "utf8");
+    writeFileSync(legacy.statePath, JSON.stringify(malformedRecord), "utf8");
     assert.throws(() => new JsonRepository(root), (error) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
 
-    const withUnknown = { ...valid, s2Drafts: [{ ...valid.s2Drafts[0], unexpected: true }] };
+    const withUnknown = cloneJson(malformedRecord) as any;
+    withUnknown.s2Drafts = [{ ...malformedRecord.s2Drafts[0], unexpected: true }];
     writeFileSync(legacy.statePath, JSON.stringify(withUnknown), "utf8");
     assert.throws(() => new JsonRepository(root), (error) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
 
-    const withMalformedCollection = { ...valid, s2Operations: { not: "an array" } };
+    const withMalformedCollection = cloneJson(malformedRecord) as any;
+    withMalformedCollection.s2Operations = { not: "an array" };
     writeFileSync(legacy.statePath, JSON.stringify(withMalformedCollection), "utf8");
     assert.throws(() => new JsonRepository(root), (error) => error instanceof AppError && error.code === "PERSISTENCE_FAILED");
   } finally {
@@ -3806,8 +3821,18 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
     const brief = state.briefVersions.find((version) => version.briefVersionId === input.confirmedBriefVersionId)!;
     const requirements = independentRequirementsForEvidence(brief.data, input.geometrySnapshot);
     const rules = independentRulesForEvidence(input.geometrySnapshot);
-    const requirementsSnapshotMatches = JSON.stringify(requirements) === JSON.stringify(input.canonicalRequirements);
-    const rulesSnapshotMatches = JSON.stringify(rules) === JSON.stringify(input.designRuleSnapshot);
+    const reverseObjectKeyOrder = (value: any): any => Array.isArray(value)
+      ? value.map(reverseObjectKeyOrder)
+      : value !== null && typeof value === "object"
+        ? Object.fromEntries(Object.entries(value).reverse().map(([key, child]) => [key, reverseObjectKeyOrder(child)]))
+        : value;
+    const requirementsSnapshotMatches = jcs(requirements) === jcs(input.canonicalRequirements);
+    const rulesSnapshotMatches = jcs(rules) === jcs(input.designRuleSnapshot);
+    const requirementsKeyOrderEquivalent = jcs(requirements) === jcs(reverseObjectKeyOrder(requirements));
+    const rulesKeyOrderEquivalent = jcs(rules) === jcs(reverseObjectKeyOrder(rules));
+    const semanticallyMutatedRequirements = cloneJson(requirements);
+    semanticallyMutatedRequirements[0]!.expectedValue = String(semanticallyMutatedRequirements[0]!.expectedValue) + " changed";
+    const semanticMutationEquivalent = jcs(requirements) === jcs(semanticallyMutatedRequirements);
     const selectedReferenceAssets = input.referenceAssetIds.map((id, index) => {
       const asset = state.s2Assets.find((item) => item.id === id)!;
       return { assetId: id, normalizedSha256: asset.normalizedSha256, width: asset.width, height: asset.height, normalizedBytes: asset.normalizedBytes, slot: index + 1 };
@@ -3865,14 +3890,14 @@ test("execution-bound Section-24 matrix proves every revised claim with measured
         "BIND-003/geometry-snapshot": () => { assert.equal(input.geometrySnapshot.widthMm, 9000); assert.equal(input.geometrySnapshot.depthMm, 6000); assert.deepEqual(input.geometrySnapshot.openSides, ["north", "west"]); assert.equal(input.geometrySnapshot.maxHeightMm, null); },
       });
     await prove(claimIds("BIND-004", ["input-hash", "requirement-hash", "binding-hash", "independent-jcs"]), "bind canonical hashes", "Persisted input, requirement, geometry, and binding hashes checked with canonical JSON.",
-      { inputHash: input.inputHash, recomputedInputHash, inputHashMatches, requirementHash: input.requirementHash, recomputedRequirementHash, requirementHashMatches, bindingHash: input.bindingHash, recomputedBindingHash, bindingHashMatches, geometryHash: input.geometryHash, recomputedGeometryHash, requirementsCount: requirements.length, rulesCount: rules.length, requirementsSnapshotMatches, rulesSnapshotMatches, sourceProjectionMeasured: true, result: "independently-recomputed" },
-      "The test independently rebuilt the canonical input, requirement and binding objects from persisted immutable inputs, then recomputed all hashes with jcs and sha256.",
-      () => { assert.equal(inputHashMatches, true); assert.equal(requirementHashMatches, true); assert.equal(bindingHashMatches, true); assert.equal(recomputedGeometryHash, input.geometryHash); assert.equal(requirementsSnapshotMatches, true); assert.equal(rulesSnapshotMatches, true); }, undefined,
+      { inputHash: input.inputHash, recomputedInputHash, inputHashMatches, requirementHash: input.requirementHash, recomputedRequirementHash, requirementHashMatches, bindingHash: input.bindingHash, recomputedBindingHash, bindingHashMatches, geometryHash: input.geometryHash, recomputedGeometryHash, requirementsCount: requirements.length, rulesCount: rules.length, requirementsSnapshotMatches, rulesSnapshotMatches, requirementsKeyOrderEquivalent, rulesKeyOrderEquivalent, semanticMutationEquivalent, sourceProjectionMeasured: true, result: "independently-recomputed" },
+      "The test independently rebuilt the canonical input, requirement and binding objects from persisted immutable inputs, confirmed reordered object keys remain equivalent while a changed value does not, then recomputed all hashes with jcs and sha256.",
+      () => { assert.equal(inputHashMatches, true); assert.equal(requirementHashMatches, true); assert.equal(bindingHashMatches, true); assert.equal(recomputedGeometryHash, input.geometryHash); assert.equal(requirementsSnapshotMatches, true); assert.equal(rulesSnapshotMatches, true); assert.equal(requirementsKeyOrderEquivalent, true); assert.equal(rulesKeyOrderEquivalent, true); assert.equal(semanticMutationEquivalent, false); }, undefined,
       {
         "BIND-004/input-hash": () => assert.equal(recomputedInputHash, input.inputHash),
         "BIND-004/requirement-hash": () => assert.equal(recomputedRequirementHash, input.requirementHash),
         "BIND-004/binding-hash": () => assert.equal(recomputedBindingHash, input.bindingHash),
-        "BIND-004/independent-jcs": () => { assert.equal(recomputedGeometryHash, input.geometryHash); assert.equal(requirementsSnapshotMatches, true); assert.equal(rulesSnapshotMatches, true); assert.equal(inputHashMatches, true); assert.equal(requirementHashMatches, true); assert.equal(bindingHashMatches, true); },
+        "BIND-004/independent-jcs": () => { assert.equal(recomputedGeometryHash, input.geometryHash); assert.equal(requirementsSnapshotMatches, true); assert.equal(rulesSnapshotMatches, true); assert.equal(requirementsKeyOrderEquivalent, true); assert.equal(rulesKeyOrderEquivalent, true); assert.equal(semanticMutationEquivalent, false); assert.equal(inputHashMatches, true); assert.equal(requirementHashMatches, true); assert.equal(bindingHashMatches, true); },
       });
     await prove(claimIds("BIND-005", ["input-one", "run-one", "four-queued-transaction"]), "bind one-input transaction", "One real bind created one input, one QA run, and four initial persisted QA operations.",
       { inputCount: state.s2Inputs.length, runCount: state.s2QaRuns.length, operationCount: operations.length, inputVersionId: bound.inputVersionId, qaRunId: bound.qaRun.id, result: "one-transaction" },

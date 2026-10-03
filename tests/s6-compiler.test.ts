@@ -106,6 +106,32 @@ test("unresolved semantic requirements create blocking mapping unknowns", () => 
   assert.ok(model.unknowns.some((item) => item.kind === "requirement_mapping" && item.blocking && item.requirementId === "brief.functional.001"));
 });
 
+test("compiler keeps scene constraints and prohibitions out of object mappings", () => {
+  const source = makeS6Source({ requirements: [
+    { name: "Keep the entry clear", category: "mandatory", expected: "present" },
+    { name: "No enclosed ceiling", category: "prohibited", expected: "absent" },
+    { name: "Screen-free entry", category: "functional", expected: "present" },
+  ] });
+  const model = compile(source);
+  const entryId = source.canonicalRequirements[0]!.requirementId;
+  const ceilingId = source.canonicalRequirements[1]!.requirementId;
+  const unsupportedId = source.canonicalRequirements[2]!.requirementId;
+  assert.equal(model.objects.some((object) => object.requirementIds.includes(entryId)), false);
+  assert.equal(model.objects.some((object) => object.requirementIds.includes(ceilingId)), false);
+  assert.equal(model.objects.some((object) => object.objectType === "overhead_volume"), false);
+  assert.equal(model.objects.some((object) => object.objectType === "screen"), false);
+  assert.equal(model.unknowns.some((unknown) => unknown.requirementId === entryId || unknown.requirementId === ceilingId), false);
+  assert.ok(model.unknowns.some((unknown) => unknown.kind === "requirement_mapping" && unknown.requirementId === unsupportedId));
+});
+
+test("invalid exact counts are retained as blocking unknowns instead of clamped", () => {
+  const source = makeS6Source({ requirements: [{ name: "Display plinths", expected: "exact_count", expectedCount: 1 }] });
+  source.canonicalRequirements[0]!.expectedCount = -1;
+  const model = compile(source);
+  assert.equal(model.objects.some((object) => object.requirementIds.includes(source.canonicalRequirements[0]!.requirementId)), false);
+  assert.ok(model.unknowns.some((unknown) => unknown.kind === "requirement_mapping" && unknown.requirementId === source.canonicalRequirements[0]!.requirementId));
+});
+
 test("S5 conceptual Q16 coordinates never become metric compiler coordinates", () => {
   const source = makeS6Source();
   const conceptual = source.layoutPlan.zones.flatMap((zone) => zone.instances)[0];

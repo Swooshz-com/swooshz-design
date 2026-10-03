@@ -1,0 +1,91 @@
+services:
+  s8-native-gateway:
+    image: "${S8_GATEWAY_IMAGE:?set an immutable repository@sha256 gateway image}"
+    platform: linux/amd64
+    user: "65532:65532"
+    read_only: true
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    expose:
+      - "8443"
+    cgroup_parent: swooshz-design-gateway.slice
+    environment:
+      S8_GATEWAY_BIND_ADDRESS: "0.0.0.0"
+      S8_GATEWAY_PORT: "8443"
+      S8_LAUNCHER_URL: "https://${S8_LAUNCHER_PRIVATE_IP:?set the launcher private IPv4 address}:9443/"
+      S8_GATEWAY_TLS_KEY_FILE: /run/s8-secrets/gateway.key
+      S8_GATEWAY_TLS_CERT_FILE: /run/s8-secrets/gateway.crt
+      S8_GATEWAY_CLIENT_CA_FILE: /run/s8-secrets/app-client-ca.pem
+      S8_APP_CLIENT_CERT_SHA256S_JSON: "${S8_APP_CLIENT_CERT_SHA256S_JSON:?set the app mTLS certificate fingerprints}"
+      S8_LAUNCHER_TLS_CA_FILE: /run/s8-secrets/launcher-ca.pem
+      S8_LAUNCHER_TLS_CERT_FILE: /run/s8-secrets/gateway-launcher-client.crt
+      S8_LAUNCHER_TLS_KEY_FILE: /run/s8-secrets/gateway-launcher-client.key
+      S8_LAUNCHER_SERVER_CERT_SHA256: ${S8_LAUNCHER_SERVER_CERT_SHA256:?set the launcher server certificate fingerprint}
+      S8_APP_PUBLIC_KEYS_FILE: /run/s8-trust/app-public-keys.json
+      S8_LAUNCHER_PUBLIC_KEYS_FILE: /run/s8-trust/launcher-public-keys.json
+      S8_CAPACITY_AUTHORITY_PUBLIC_KEYS_FILE: /run/s8-trust/capacity-authority-public-keys.json
+      S8_RELEASE_PUBLIC_KEYS_FILE: /run/s8-trust/release-public-keys.json
+      S8_RELEASE_MANIFEST_FILE: /run/s8-trust/release-manifest.json
+    volumes:
+      - type: bind
+        source: ${S8_GATEWAY_TLS_KEY_HOST_FILE:?set the gateway TLS key file}
+        target: /run/s8-secrets/gateway.key
+        read_only: true
+      - type: bind
+        source: ${S8_GATEWAY_TLS_CERT_HOST_FILE:?set the gateway TLS certificate file}
+        target: /run/s8-secrets/gateway.crt
+        read_only: true
+      - type: bind
+        source: ${S8_GATEWAY_APP_CA_HOST_FILE:?set the app client CA file}
+        target: /run/s8-secrets/app-client-ca.pem
+        read_only: true
+      - type: bind
+        source: ${S8_GATEWAY_LAUNCHER_CA_HOST_FILE:?set the launcher server CA file}
+        target: /run/s8-secrets/launcher-ca.pem
+        read_only: true
+      - type: bind
+        source: ${S8_GATEWAY_LAUNCHER_CERT_HOST_FILE:?set the gateway launcher client certificate file}
+        target: /run/s8-secrets/gateway-launcher-client.crt
+        read_only: true
+      - type: bind
+        source: ${S8_GATEWAY_LAUNCHER_KEY_HOST_FILE:?set the gateway launcher client key file}
+        target: /run/s8-secrets/gateway-launcher-client.key
+        read_only: true
+      - type: bind
+        source: ${S8_APP_PUBLIC_KEYS_HOST_FILE:?set the app public key file}
+        target: /run/s8-trust/app-public-keys.json
+        read_only: true
+      - type: bind
+        source: ${S8_LAUNCHER_PUBLIC_KEYS_HOST_FILE:?set the launcher public key file}
+        target: /run/s8-trust/launcher-public-keys.json
+        read_only: true
+      - type: bind
+        source: ${S8_CAPACITY_PUBLIC_KEYS_HOST_FILE:?set the capacity authority public key file}
+        target: /run/s8-trust/capacity-authority-public-keys.json
+        read_only: true
+      - type: bind
+        source: ${S8_RELEASE_PUBLIC_KEYS_HOST_FILE:?set the release authority public key file}
+        target: /run/s8-trust/release-public-keys.json
+        read_only: true
+      - type: bind
+        source: ${S8_RELEASE_MANIFEST_HOST_FILE:?set the signed release manifest file}
+        target: /run/s8-trust/release-manifest.json
+        read_only: true
+    networks:
+      - app_gateway
+      - gateway_launcher
+    logging:
+      driver: none
+
+networks:
+  app_gateway:
+    external: true
+    name: ${S8_APP_GATEWAY_NETWORK:?set the private app-to-gateway network}
+  gateway_launcher:
+    external: true
+    name: ${S8_GATEWAY_LAUNCHER_NETWORK:?set the private gateway-to-launcher network}

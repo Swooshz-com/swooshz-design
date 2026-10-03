@@ -1,5 +1,6 @@
 import { AppError, type S5ToS6Projection, type S6SpatialModelRecord, type S6ToS7Handoff, type S6ValidationReceipt, type S6Dimensions, type S6GeometryPrimitive, type UUID } from "./types";
-import { deriveS6Footprint, deriveS6WorldGeometry, hashS6Model, hashS6ValidationReceipt, normalizeS6Geometry, S6_HANDOFF_SCHEMA_VERSION, S6_OPEN_SIDE_ORDER, S6_SPATIAL_SCHEMA_VERSION } from "./s6-canonical";
+import { deriveS6Footprint, deriveS6WorldGeometry, hashS6Model, hashS6ValidationReceipt, normalizeS6Geometry, S6_HANDOFF_SCHEMA_VERSION, S6_OPEN_SIDE_ORDER, S6_SPATIAL_SCHEMA_VERSION, S6_VALIDATION_ORDER_VERSION, S6_VALIDATOR_VERSION } from "./s6-canonical";
+import { validateS6Model } from "./s6-validation";
 import { cloneJson } from "./utils";
 
 function reject(code: string): never {
@@ -45,6 +46,8 @@ function assertEligible(model: S6SpatialModelRecord, receipt: S6ValidationReceip
     receipt.revisionId !== model.modelRevisionId ||
     receipt.revisionHash !== model.modelHash ||
     receipt.sourceS5Fingerprint !== source.sourceFingerprint ||
+    receipt.validatorVersion !== S6_VALIDATOR_VERSION ||
+    receipt.orderVersion !== S6_VALIDATION_ORDER_VERSION ||
     (receipt.outcome !== "pass" && receipt.outcome !== "pass_with_warnings") ||
     receipt.errors.length > 0 ||
     hashS6ValidationReceipt(receipt) !== receipt.validationHash
@@ -65,6 +68,13 @@ function assertEligible(model: S6SpatialModelRecord, receipt: S6ValidationReceip
     reject("S6_DESIGN_FORM_UNREVIEWED");
   }
   if (hashS6Model(model).modelHash !== model.modelHash) reject("S6_ACCEPTANCE_CONFLICT");
+  try {
+    const recomputed = validateS6Model(model, { source, priorModels: [], expectedSourceFingerprint: source.sourceFingerprint });
+    if (recomputed.validatorVersion !== S6_VALIDATOR_VERSION || recomputed.orderVersion !== S6_VALIDATION_ORDER_VERSION ||
+        recomputed.errors.length > 0 || (recomputed.outcome !== "pass" && recomputed.outcome !== "pass_with_warnings")) reject("S6_ACCEPTANCE_CONFLICT");
+  } catch {
+    reject("S6_ACCEPTANCE_CONFLICT");
+  }
   try {
     deriveS6WorldGeometry(model);
   } catch {
