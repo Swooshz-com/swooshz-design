@@ -2,7 +2,9 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  fstatSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -13,23 +15,36 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { flockSync } from "fs-ext-extra-prebuilt";
 import { AppError, type StoreState } from "./types";
-import { codePointLength, uuidV4Pattern } from "./utils";
+import { cloneJson, codePointLength, jcs, sha256, uuidV4Pattern } from "./utils";
 import { validateS2Graph } from "./s2-persistence";
 import { validateS3Collections, validateS3Graph } from "./s3-persistence";
 import { validateS4Collections, validateS4Graph } from "./s4-persistence";
 import { validateS5Collections, validateS5Graph } from "./s5-persistence";
 import { validateS6Collections, validateS6Graph } from "./s6-persistence";
 import { validateS7Collections, validateS7Graph } from "./s7-persistence";
-import { validateS8Collections, validateS8Graph } from "./s8-fbx-persistence";
+import { parseStrictJson, readS8ApplicationTrust, readS8RuntimeConfig } from "./s8-fbx-config";
+import { createS8NativeProofAuthority, type S8ImmutableApplicationTrust, type S8RepositoryCommand, type S8RepositoryCommandSession, type S8RepositoryProofAuthority, type S8RepositoryProofBinding, type S8RepositoryLease } from "./s8-native-proof";
+import { readS6ToS7Handoff } from "./s6";
+import { readS7ToS8Handoff } from "./s7-cad";
+import { canonicalS8SourceJson } from "./s8-fbx-payload";
+import { S8_FBX_PROFILE, S8_PROTOCOL_VERSION } from "./s8-fbx-profile";
 
+const registeredProofBindings = new WeakMap<object, object>();
+export function isRegisteredS8RepositoryProofBinding(value: unknown): value is S8RepositoryProofBinding { return typeof value === "object" && value !== null && registeredProofBindings.has(value); }
 const LOCK_WAIT_MS = 15_000;
 const LOCK_PROTOCOL = "swooshz-repository-lock-v2" as const;
 
 const MUTEX_FLAGS = "exnb" as const;
+
+function fsyncDirectory(path: string): void {
+  const descriptor = openSync(path, fsConstants.O_RDONLY);
+  try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+}
 export type RepositoryLockRecord = {
   protocol?: typeof LOCK_PROTOCOL;
   ownerToken: string;
@@ -155,13 +170,74 @@ export function emptyStoreState(): StoreState {
     s7CadIdempotency: [],
     s7CadManifests: [],
     s7CadReadbackReceipts: [],
+    s8NativeEvidenceVersion: 3,
+    s8NativeProofSchemaVersion: "s8-native-proof-v1",
     s8ExportJobs: [],
     s8Artifacts: [],
     s8ValidationReceipts: [],
+    s8ValidationReceiptBytes: [],
     s8IdempotencyRecords: [],
+    s8NativeOperationAttempts: [],
+    s8NativeProofCheckpoints: [],
+    s8NativeTerminalOutcomes: [],
+    s8NativeAttemptQuarantines: [],
   };
 }
 
+function readS8SourceView(state: StoreState, objects: PrivateObjectStore, projectId: string): unknown {
+  try {
+    const s6 = readS6ToS7Handoff(state, objects, projectId);
+    const s7 = readS7ToS8Handoff(state, objects, projectId);
+    return {
+      sourceDisposition: "CURRENT",
+      source: {
+        projectId: s6.projectId,
+        sourceRevisionId: s6.acceptedRevisionId,
+        sourceRevisionHash: s6.acceptedRevisionHash,
+        sourceS5Fingerprint: s6.sourceS5Fingerprint,
+        s6ValidationReceiptId: s6.validationReceipt.receiptId,
+        s6ValidationHash: s6.validationReceipt.validationHash,
+        s6HandoffDigest: sha256(canonicalS8SourceJson(s6)),
+        s7ArtifactId: s7.s7ArtifactId,
+        s7ArtifactHash: s7.s7ArtifactHash,
+        s7ReadbackHash: s7.readbackHash,
+        s7ManifestId: s7.manifestId,
+        s7ManifestHash: s7.manifestHash,
+        s8Profile: S8_FBX_PROFILE,
+        s8ProtocolVersion: S8_PROTOCOL_VERSION,
+      },
+    };
+  } catch (error) {
+    const code = error instanceof AppError ? error.code : "";
+    return { sourceDisposition: ["S6_SOURCE_STALE", "S7_SOURCE_STALE"].includes(code) ? "STALE" : "NOT_READY", source: null };
+  }
+}
+
+function deepFreezeState<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Buffer.isBuffer(value) || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value as Record<string, unknown>)) deepFreezeState(child);
+  return Object.freeze(value);
+}
+
+function orderedStoreState(state: StoreState): StoreState {
+  return Object.assign(emptyStoreState(), state);
+}
+
+function s8GraphFingerprint(state: StoreState): string {
+  return jcs({
+    s8NativeEvidenceVersion: state.s8NativeEvidenceVersion,
+    s8NativeProofSchemaVersion: state.s8NativeProofSchemaVersion,
+    s8ExportJobs: state.s8ExportJobs,
+    s8Artifacts: state.s8Artifacts,
+    s8ValidationReceipts: state.s8ValidationReceipts,
+    s8ValidationReceiptBytes: state.s8ValidationReceiptBytes,
+    s8IdempotencyRecords: state.s8IdempotencyRecords,
+    s8NativeOperationAttempts: state.s8NativeOperationAttempts,
+    s8NativeProofCheckpoints: state.s8NativeProofCheckpoints,
+    s8NativeTerminalOutcomes: state.s8NativeTerminalOutcomes,
+    s8NativeAttemptQuarantines: state.s8NativeAttemptQuarantines,
+  });
+}
 type PersistedRecord = Record<string, unknown>;
 const PERSISTED_SHA256 = /^[0-9a-f]{64}$/;
 const PERSISTED_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -637,6 +713,7 @@ export class PrivateObjectStore {
       descriptor = null;
       linkSync(temporary, path);
       rmSync(temporary, { force: true });
+      fsyncDirectory(dirname(path));
     } catch {
       if (descriptor !== null) closeSync(descriptor);
       try {
@@ -654,14 +731,13 @@ export class PrivateObjectStore {
     mkdirSync(dirname(target), { recursive: true });
     try {
       linkSync(source, target);
+      fsyncDirectory(dirname(target));
     } catch {
       throw new AppError(500, "PERSISTENCE_FAILED", [], { storageKey: finalKey });
     }
-    try {
-      rmSync(source, { force: false });
-    } catch {
-      // The final link is already exclusive and complete; recovery can clean staging.
-    }
+    try { rmSync(source, { force: false }); }
+    catch { return; }
+    fsyncDirectory(dirname(source));
   }
 
   putExact(key: string, bytes: Uint8Array): void {
@@ -688,6 +764,11 @@ export class PrivateObjectStore {
       let actual: Buffer;
       try { actual = this.read(finalKey); } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
       if (!actual.equals(bytes)) throw new AppError(500, "PUBLICATION_OBJECT_MISMATCH");
+      try {
+        const descriptor = openSync(this.pathFor(finalKey), fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+        try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+        fsyncDirectory(dirname(this.pathFor(finalKey)));
+      } catch { throw new AppError(500, "PERSISTENCE_FAILED"); }
       return;
     }
     try {
@@ -701,10 +782,24 @@ export class PrivateObjectStore {
   }
 
   read(key: string): Buffer {
+    let descriptor: number | null = null;
     try {
-      return readFileSync(this.pathFor(key));
+      const path = this.pathFor(key);
+      const before = lstatSync(path);
+      if (!before.isFile()) throw new Error("object is not a regular file");
+      descriptor = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+      const opened = fstatSync(descriptor);
+      if (!opened.isFile() || (before.ino !== 0 && opened.ino !== 0 &&
+          (before.ino !== opened.ino || before.dev !== opened.dev))) throw new Error("object identity changed");
+      const bytes = readFileSync(descriptor);
+      const after = lstatSync(path);
+      if (!after.isFile() || (opened.ino !== 0 && after.ino !== 0 &&
+          (opened.ino !== after.ino || opened.dev !== after.dev))) throw new Error("object identity changed");
+      return bytes;
     } catch {
       throw new AppError(404, "ASSET_NOT_FOUND");
+    } finally {
+      if (descriptor !== null) closeSync(descriptor);
     }
   }
 
@@ -738,6 +833,15 @@ export class JsonRepository {
   private readonly processId: number;
   private readonly isProcessAlive: ProcessLiveness;
   private readonly onLockPhase: LockPhaseHook | undefined;
+  readonly #repositoryIdentity = Object.freeze({});
+  readonly #proofLeases = new WeakSet<object>();
+  readonly #commandSessions = new WeakSet<object>();
+  readonly #proofObjects: PrivateObjectStore;
+  readonly #proofAuthority: S8RepositoryProofAuthority;
+  readonly #proofBinding: S8RepositoryProofBinding;
+  private activeTransactionBaseline: StoreState | null = null;
+  private activeProofLease: S8RepositoryLease | null = null;
+  private poisoned = false;
 
   constructor(
     root: string,
@@ -759,13 +863,62 @@ export class JsonRepository {
     this.isProcessAlive = options.isProcessAlive ?? processIsAlive;
     this.onLockPhase = options.onLockPhase;
     mkdirSync(this.root, { recursive: true });
-    this.current = this.load();
+    this.#proofObjects = new PrivateObjectStore(join(this.root, "objects"));
+    const trust: S8ImmutableApplicationTrust = readS8ApplicationTrust();
+    const nativeRuntime = readS8RuntimeConfig();
+    if (nativeRuntime && (trust.currentKeyId === null || trust.signingKey === null)) {
+      throw new AppError(500, "S8_RUNTIME_CONFIG_INVALID");
+    }
+    const bindingRecord = Object.freeze({
+      repositoryIdentity: this.#repositoryIdentity,
+      canonicalRoot: this.root,
+      objectRoot: this.#proofObjects.root,
+      trust,
+      readObjectExact: (reference: unknown) => {
+        if (typeof reference !== "object" || reference === null || Array.isArray(reference) ||
+            typeof (reference as Record<string, unknown>).key !== "string") throw new AppError(500, "S8_PROOF_INVALID");
+        return this.#proofObjects.read((reference as Record<string, unknown>).key as string);
+      },
+      readSourceView: (state: StoreState, projectId: string) => readS8SourceView(state, this.#proofObjects, projectId),
+      assertLiveLease: (lease: S8RepositoryLease) => {
+        if (!this.#proofLeases.has(lease)) throw new AppError(500, "S8_PROOF_INVALID");
+      },
+    });
+    const binding = Object.freeze({ resolveBindingRecord: () => registeredProofBindings.get(binding) }) as S8RepositoryProofBinding;
+    registeredProofBindings.set(binding, bindingRecord);
+    this.#proofBinding = binding;
+    this.#proofAuthority = createS8NativeProofAuthority(binding);
+    const bootstrapLease = this.acquireLock();
+    this.#proofLeases.add(bootstrapLease);
+    try {
+      const initial = this.load(bootstrapLease);
+      this.current = deepFreezeState(cloneJson(initial));
+    } finally {
+      this.#proofLeases.delete(bootstrapLease);
+      this.releaseLock(bootstrapLease);
+    }
   }
 
-  private load(): StoreState {
-    if (!existsSync(this.statePath)) return emptyStoreState();
+  private load(lease: S8RepositoryLease): StoreState {
+    if (this.poisoned) throw new AppError(500, "PERSISTENCE_FAILED");
+    let descriptor: number | null = null;
     try {
-      const parsed: unknown = JSON.parse(readFileSync(this.statePath, "utf8"));
+      let before: ReturnType<typeof lstatSync> | null = null;
+      try { before = lstatSync(this.statePath); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (before === null) {
+        const empty = emptyStoreState();
+        this.#proofAuthority.validateLocked(lease, empty, empty);
+        return empty;
+      }
+      if (!before.isFile()) throw new Error("canonical state is not a regular file");
+      descriptor = openSync(this.statePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+      const opened = fstatSync(descriptor);
+      if (!opened.isFile() || (before.ino !== 0 && opened.ino !== 0 &&
+          (before.ino !== opened.ino || before.dev !== opened.dev))) throw new Error("canonical state identity changed");
+      const parsed: unknown = parseStrictJson(readFileSync(descriptor));
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
         throw new Error("invalid state");
       }
@@ -783,23 +936,90 @@ export class JsonRepository {
       validateS5Collections(parsedRecord, merged);
       validateS6Collections(parsedRecord, merged);
       validateS7Collections(parsedRecord, merged);
-      validateS8Collections(parsedRecord, merged);
       validateS2Graph(merged);
       validateS3Graph(merged);
       validateS4Graph(merged);
       validateS5Graph(merged);
       validateS6Graph(merged);
       validateS7Graph(merged);
-      validateS8Graph(merged);
-      return merged;
-    } catch {
+      const migrated = this.#proofAuthority.migrateLocked(lease, parsedRecord);
+      validateS2Graph(migrated);
+      validateS3Graph(migrated);
+      validateS4Graph(migrated);
+      validateS5Graph(migrated);
+      validateS6Graph(migrated);
+      validateS7Graph(migrated);
+      this.#proofAuthority.validateLocked(lease, migrated, migrated);
+      const after = lstatSync(this.statePath);
+      if (!after.isFile() || (opened.ino !== 0 && after.ino !== 0 &&
+          (opened.ino !== after.ino || opened.dev !== after.dev))) throw new Error("canonical state replaced during read");
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = null;
+      if (jcs(merged) !== jcs(migrated)) this.commit(migrated);
+      else fsyncDirectory(dirname(this.statePath));
+      return migrated;
+    } catch (error) {
+      this.poisoned = true;
+      if (error instanceof AppError &&
+          (error.code === "PERSISTENCE_FAILED" || error.code === "S8_PUBLICATION_OBJECT_MISMATCH")) throw error;
       throw new AppError(500, "PERSISTENCE_FAILED");
+    } finally {
+      if (descriptor !== null) closeSync(descriptor);
     }
   }
 
   state(): StoreState {
-    this.current = this.load();
-    return this.current;
+    if (this.activeTransactionBaseline !== null) {
+      return deepFreezeState(cloneJson(orderedStoreState(this.activeTransactionBaseline)));
+    }
+    const lease = this.acquireLock();
+    this.#proofLeases.add(lease);
+    try {
+      const baseline = orderedStoreState(this.load(lease));
+      this.current = deepFreezeState(cloneJson(baseline));
+      return deepFreezeState(cloneJson(baseline));
+    } finally {
+      this.#proofLeases.delete(lease);
+      this.releaseLock(lease);
+    }
+  }
+
+  snapshot(): StoreState {
+    return this.state();
+  }
+
+  createS8CommandSession(): S8RepositoryCommandSession {
+    const session = Object.freeze({});
+    this.#commandSessions.add(session);
+    return session;
+  }
+
+  runS8Command<T>(session: S8RepositoryCommandSession, command: S8RepositoryCommand, mutation: (state: StoreState) => T): T {
+    if (typeof session !== "object" || session === null || !this.#commandSessions.has(session)) {
+      throw new AppError(409, "S8_PROOF_REQUIRED");
+    }
+    return this.executeTransaction(mutation, command);
+  }
+
+  readS8(projectId: string, artifactId: string) {
+    if (this.activeTransactionBaseline !== null) {
+      const lease = this.activeProofLease;
+      if (lease === null) throw new AppError(500, "PERSISTENCE_FAILED");
+      const baseline = cloneJson(this.activeTransactionBaseline);
+      const validated = this.#proofAuthority.validateLocked(lease, baseline, baseline);
+      return this.#proofAuthority.projectLocked(lease, validated, projectId, artifactId);
+    }
+    const lease = this.acquireLock();
+    this.#proofLeases.add(lease);
+    try {
+      const baseline = this.load(lease);
+      const validated = this.#proofAuthority.validateLocked(lease, baseline, baseline);
+      return this.#proofAuthority.projectLocked(lease, validated, projectId, artifactId);
+    } finally {
+      this.#proofLeases.delete(lease);
+      this.releaseLock(lease);
+    }
   }
 
   private parseLockRecord(value: unknown): RepositoryLockRecord | null {
@@ -1115,16 +1335,20 @@ export class JsonRepository {
   private commit(state: StoreState): void {
     const temporary = this.statePath + "." + randomUUID() + ".tmp";
     let descriptor: number | null = null;
+    let canonicalReplaced = false;
     try {
       this.beforeCommit?.();
       descriptor = openSync(temporary, "wx");
-      writeFileSync(descriptor, JSON.stringify(state), { encoding: "utf8" });
+      writeFileSync(descriptor, jcs(state), { encoding: "utf8" });
       fsyncSync(descriptor);
       closeSync(descriptor);
       descriptor = null;
       renameSync(temporary, this.statePath);
+      canonicalReplaced = true;
+      fsyncDirectory(dirname(this.statePath));
     } catch {
       if (descriptor !== null) closeSync(descriptor);
+      if (canonicalReplaced) this.poisoned = true;
       try {
         rmSync(temporary, { force: true });
       } catch {
@@ -1134,31 +1358,57 @@ export class JsonRepository {
     }
   }
 
-  transact<T>(mutation: (state: StoreState) => T): T {
-    const lock = this.acquireLock();
+  private executeTransaction<T>(mutation: (state: StoreState) => T, command: S8RepositoryCommand | null): T {
+    if (this.activeTransactionBaseline !== null) throw new AppError(409, "PERSISTENCE_FAILED");
+    const lease = this.acquireLock();
+    this.#proofLeases.add(lease);
     try {
-      const fresh = this.load();
-      const result = mutation(fresh);
+      const loaded = this.load(lease);
+      const baseline = deepFreezeState(cloneJson(loaded));
+      const working = cloneJson(loaded);
+      this.activeTransactionBaseline = baseline;
+      this.activeProofLease = lease;
+      let result: T;
       try {
-        validateS2Graph(fresh);
-        validateS3Graph(fresh);
-        validateS4Graph(fresh);
-        validateS5Graph(fresh);
-        validateS6Collections(fresh, fresh);
-        validateS6Graph(fresh);
-        validateS7Collections(fresh, fresh);
-        validateS7Graph(fresh);
-        validateS8Collections(fresh, fresh);
-        validateS8Graph(fresh);
+        result = mutation(working);
+        if (typeof result === "object" && result !== null && "then" in result &&
+            typeof (result as { then?: unknown }).then === "function") {
+          throw new AppError(500, "PERSISTENCE_FAILED");
+        }
+        const s8Changed = s8GraphFingerprint(working) !== s8GraphFingerprint(baseline);
+        if (s8Changed && command === null) throw new AppError(409, "S8_COMMAND_REQUIRED");
+        if (command !== null) this.#proofAuthority.applyLocked(lease, baseline, working, command);
+      } finally {
+        deepFreezeState(working);
+        this.activeTransactionBaseline = null;
+        this.activeProofLease = null;
+      }
+      try {
+        validateS2Graph(working);
+        validateS3Graph(working);
+        validateS4Graph(working);
+        validateS5Graph(working);
+        validateS6Collections(working, working);
+        validateS6Graph(working);
+        validateS7Collections(working, working);
+        validateS7Graph(working);
+        this.#proofAuthority.validateLocked(lease, working, baseline);
       } catch {
         throw new AppError(500, "PERSISTENCE_FAILED");
       }
-      this.commit(fresh);
-      this.current = fresh;
-      return result;
+      this.commit(working);
+      this.current = deepFreezeState(cloneJson(working));
+      return result === undefined ? result : cloneJson(result);
     } finally {
-      this.releaseLock(lock);
+      this.activeTransactionBaseline = null;
+      this.activeProofLease = null;
+      this.#proofLeases.delete(lease);
+      this.releaseLock(lease);
     }
+  }
+
+  transact<T>(mutation: (state: StoreState) => T): T {
+    return this.executeTransaction(mutation, null);
   }
 }
 

@@ -32,7 +32,7 @@ import {
   type UUID,
 } from "./types";
 import { JsonRepository, PrivateObjectStore } from "./store";
-import { assertUuid, cloneJson, newUuid, nowUtc, sha256 } from "./utils";
+import { assertUuid, cloneJson, newUuid, nowUtc, sha256, uuidV4Pattern } from "./utils";
 import {
   canonicalS6Json,
   hashS6Model,
@@ -46,7 +46,8 @@ import { buildS6Cameras } from "./s6-camera";
 import { renderS6View } from "./s6-renderer";
 import { checkS6ViewPreservation } from "./s6-preservation";
 import { validateS6Model } from "./s6-validation";
-import { type S6SourceReader } from "./s6-source";
+import { s6SourceFingerprint, type S6SourceReader } from "./s6-source";
+import { readS5ToS6Projection } from "./s5";
 import {
   canonicalS6ModelBytes,
   promoteS6Exact,
@@ -286,6 +287,22 @@ function reviewReady(model: S6SpatialModelRecord): boolean {
 function fixedViewId(value: S6ViewId): S6ViewId {
   if (!VIEW_IDS.includes(value)) return fail(400, "S6_INVALID_REQUEST", "viewId");
   return value;
+}
+
+export function readS6ToS7Handoff(state: StoreState, objects: PrivateObjectStore, projectId: UUID): S6ToS7Handoff {
+  projectIn(state, projectId);
+  const source = readS5ToS6Projection(state, objects, projectId);
+  if (source.projectId !== projectId || source.readOnly !== true || source.readiness !== "ready" ||
+      !uuidV4Pattern.test(source.approvalEventId) || !uuidV4Pattern.test(source.activeAsset.assetId) ||
+      source.activeAsset.width !== 1536 || source.activeAsset.height !== 1024 || source.activeAsset.pixelCount !== 1_572_864 ||
+      source.sourceFingerprint !== s6SourceFingerprint(source)) return fail(409, "S6_SOURCE_NOT_READY");
+  const model = currentAccepted(state, projectId, source.sourceFingerprint);
+  if (!model) return fail(409, "S6_ACCEPTANCE_CONFLICT");
+  const receipt = model.validationReceiptId === null
+    ? null
+    : state.s6ValidationReceipts.find((item) => item.receiptId === model.validationReceiptId) ?? null;
+  if (!receipt) return fail(409, "S6_ACCEPTANCE_CONFLICT");
+  return buildS6ToS7Handoff(model, receipt, source);
 }
 
 export class S6WorkflowService {
@@ -1267,18 +1284,8 @@ export class S6WorkflowService {
   }
 
   getS7Handoff(projectId: UUID): S6ToS7Handoff {
-    const source = this.source(projectId);
-    const state = this.repository.state();
-    projectIn(state, projectId);
-    const model = currentAccepted(state, projectId, source.sourceFingerprint);
-    if (!model) return fail(409, "S6_ACCEPTANCE_CONFLICT");
-    const receipt = model.validationReceiptId === null
-      ? null
-      : state.s6ValidationReceipts.find((item) => item.receiptId === model.validationReceiptId) ?? null;
-    if (!receipt) return fail(409, "S6_ACCEPTANCE_CONFLICT");
-    return buildS6ToS7Handoff(model, receipt, source);
+    return readS6ToS7Handoff(this.repository.state(), this.objects, projectId);
   }
-
   private ownerIsLive(job: S6JobState): boolean {
     if (job.status !== "running") return false;
     if (job.processId === null || job.claimToken === null) return true;

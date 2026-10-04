@@ -703,13 +703,12 @@ test("repository locks use owner identity, do not steal live owners, and reclaim
   try {
     writeFileSync(lockPath, JSON.stringify({ ownerToken: "live-owner", processId: 101, acquiredAt: 0 }));
     utimesSync(lockPath, new Date(0), new Date(0));
-    const liveContender = new JsonRepository(root, {
-      lockWaitMs: 25,
-      processId: 202,
-      isProcessAlive: (processId) => processId === 101,
-    });
     assert.throws(
-      () => liveContender.transact(() => "not committed"),
+      () => new JsonRepository(root, {
+        lockWaitMs: 25,
+        processId: 202,
+        isProcessAlive: (processId) => processId === 101,
+      }),
       (error: any) => error?.code === "PERSISTENCE_BUSY",
     );
 
@@ -747,7 +746,20 @@ test("malformed canonical recovery is serialized against successor publication",
   let contenderBlocked = false;
   let contenderRan = false;
   let successorObserved = false;
-  const successor = new JsonRepository(root, {
+  let successor!: JsonRepository;
+  const observer = new JsonRepository(root, {
+    processId: 8401,
+    isProcessAlive: () => false,
+    onLockPhase: (phase) => {
+      if (phase !== "before-malformed-recovery") return;
+      assert.equal(lockText(lockPath), malformed);
+      assertBusy(() => new JsonRepository(root, { processId: 8402, lockWaitMs: 0, isProcessAlive: () => false }));
+      contenderBlocked = true;
+      assert.equal(contenderRan, false);
+      assert.equal(lockText(lockPath), malformed);
+    },
+  });
+  successor = new JsonRepository(root, {
     processId: 8402,
     lockWaitMs: 0,
     isProcessAlive: () => false,
@@ -757,21 +769,6 @@ test("malformed canonical recovery is serialized against successor publication",
       assert.ok(canonical);
       assert.equal(JSON.parse(canonical).ownerToken, record.ownerToken);
       successorObserved = true;
-    },
-  });
-  const observer = new JsonRepository(root, {
-    processId: 8401,
-    isProcessAlive: () => false,
-    onLockPhase: (phase) => {
-      if (phase !== "before-malformed-recovery") return;
-      assert.equal(lockText(lockPath), malformed);
-      assertBusy(() => successor.transact((state) => {
-        contenderRan = true;
-        return state.projects.length;
-      }));
-      contenderBlocked = true;
-      assert.equal(contenderRan, false);
-      assert.equal(lockText(lockPath), malformed);
     },
   });
   try {
@@ -803,11 +800,7 @@ test("dead-owner stale recovery cannot interleave with successor publication", (
   writeFileSync(lockPath, encoded);
   let contenderBlocked = false;
   let contenderRan = false;
-  const successor = new JsonRepository(root, {
-    processId: 8503,
-    lockWaitMs: 0,
-    isProcessAlive: () => false,
-  });
+  let successor!: JsonRepository;
   const observer = new JsonRepository(root, {
     processId: 8502,
     isProcessAlive: () => false,
@@ -815,15 +808,13 @@ test("dead-owner stale recovery cannot interleave with successor publication", (
       if (phase !== "before-dead-owner-recovery") return;
       assert.equal(record.ownerToken, deadRecord.ownerToken);
       assert.equal(lockText(lockPath), encoded);
-      assertBusy(() => successor.transact((state) => {
-        contenderRan = true;
-        return state.projects.length;
-      }));
+      assertBusy(() => new JsonRepository(root, { processId: 8503, lockWaitMs: 0, isProcessAlive: () => false }));
       contenderBlocked = true;
       assert.equal(contenderRan, false);
       assert.equal(lockText(lockPath), encoded);
     },
   });
+  successor = new JsonRepository(root, { processId: 8503, lockWaitMs: 0, isProcessAlive: () => false });
   try {
     observer.transact((state) => {
       addLockTestProject(state, "dead observer winner");
@@ -895,15 +886,14 @@ test("unknown repository-lock liveness remains bounded busy and does not reclaim
     acquiredAt: 0,
   });
   writeFileSync(lockPath, encoded);
-  const uncertain = new JsonRepository(root, {
-    processId: 8702,
-    lockWaitMs: 25,
-    isProcessAlive: () => {
-      throw new Error("unexpected liveness probe failure");
-    },
-  });
   try {
-    assertBusy(() => uncertain.transact(() => "must hold"));
+    assertBusy(() => new JsonRepository(root, {
+      processId: 8702,
+      lockWaitMs: 25,
+      isProcessAlive: () => {
+        throw new Error("unexpected liveness probe failure");
+      },
+    }));
     assert.equal(lockText(lockPath), encoded);
   } finally {
     cleanup(root);
@@ -920,24 +910,23 @@ test("live partial candidate is not swept while its writer holds the serializati
     lockWaitMs: 0,
     isProcessAlive: () => true,
   });
-  const writer = new JsonRepository(root, {
-    processId: 8801,
-    onLockPhase: (phase, _record, path) => {
-      if (phase !== "owner-data-partial") return;
-      candidatePath = path;
-      assert.ok(lockText(path));
-      assertBusy(() => sweeper.transact((state) => {
-        sweeperRan = true;
-        return state.projects.length;
-      }));
-      sweeperBlocked = true;
-      assert.equal(sweeperRan, false);
-      assert.ok(lockText(path));
-      throw new Error("simulated live writer pause");
-    },
-  });
   try {
-    assert.throws(() => writer.transact(() => "not reached"), /simulated live writer pause/);
+    assert.throws(() => new JsonRepository(root, {
+      processId: 8801,
+      onLockPhase: (phase, _record, path) => {
+        if (phase !== "owner-data-partial") return;
+        candidatePath = path;
+        assert.ok(lockText(path));
+        assertBusy(() => sweeper.transact((state) => {
+          sweeperRan = true;
+          return state.projects.length;
+        }));
+        sweeperBlocked = true;
+        assert.equal(sweeperRan, false);
+        assert.ok(lockText(path));
+        throw new Error("simulated live writer pause");
+      },
+    }), /simulated live writer pause/);
     assert.equal(sweeperBlocked, true);
     assert.ok(candidatePath);
     assert.ok(lockText(candidatePath));
@@ -963,26 +952,19 @@ test("two recovery actors have one serialized recovery owner", () => {
   writeFileSync(lockPath, encoded);
   let loserBlocked = false;
   let loserRan = false;
-  const loser = new JsonRepository(root, {
-    processId: 8903,
-    lockWaitMs: 0,
-    isProcessAlive: () => false,
-  });
   const winner = new JsonRepository(root, {
     processId: 8902,
     isProcessAlive: () => false,
     onLockPhase: (phase, record) => {
       if (phase !== "before-dead-owner-recovery") return;
       assert.equal(record.ownerToken, "dead-shared-owner");
-      assertBusy(() => loser.transact((state) => {
-        loserRan = true;
-        return state.projects.length;
-      }));
+      assertBusy(() => new JsonRepository(root, { processId: 8903, lockWaitMs: 0, isProcessAlive: () => false }));
       loserBlocked = true;
       assert.equal(loserRan, false);
       assert.equal(lockText(lockPath), encoded);
     },
   });
+  const loser = new JsonRepository(root, { processId: 8903, lockWaitMs: 0, isProcessAlive: () => false });
   try {
     winner.transact((state) => {
       addLockTestProject(state, "recovery winner");
@@ -1449,31 +1431,26 @@ test("a live v2 owner cannot be stolen after canonical claim", () => {
   const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-live-v2-"));
   const lockPath = join(root, "state.json.lock");
   let interrupted = false;
-  const owner = new JsonRepository(root, {
-    processId: 8101,
-    isProcessAlive: (processId) => processId === 8101,
-    onLockPhase: (phase) => {
-      if (phase === "before-acquisition-return" && !interrupted) {
-        interrupted = true;
-        throw new Error("simulated owner termination");
-      }
-    },
-  });
   try {
-    assert.throws(() => owner.transact(() => "not reached"), /simulated owner termination/);
+    assert.throws(() => new JsonRepository(root, {
+      processId: 8101,
+      isProcessAlive: (processId) => processId === 8101,
+      onLockPhase: (phase) => {
+        if (phase === "before-acquisition-return" && !interrupted) {
+          interrupted = true;
+          throw new Error("simulated owner termination");
+        }
+      },
+    }), /simulated owner termination/);
     const record = JSON.parse(readFileSync(lockPath, "utf8"));
     assert.equal(record.protocol, "swooshz-repository-lock-v2");
     assert.equal(record.processId, 8101);
 
-    const contender = new JsonRepository(root, {
+    assert.throws(() => new JsonRepository(root, {
       processId: 8102,
       lockWaitMs: 35,
       isProcessAlive: (processId) => processId === 8101,
-    });
-    assert.throws(
-      () => contender.transact(() => "must not steal"),
-      (error: any) => error?.code === "PERSISTENCE_BUSY",
-    );
+    }), (error: any) => error?.code === "PERSISTENCE_BUSY");
     assert.equal(JSON.parse(readFileSync(lockPath, "utf8")).processId, 8101);
   } finally {
     cleanup(root);
@@ -1496,19 +1473,17 @@ test("every ownership-publication interruption phase recovers without an anonymo
   for (const phaseToInterrupt of phases) {
     const root = mkdtempSync(join(tmpdir(), "swooshz-design-lock-crash-window-"));
     const lockPath = join(root, "state.json.lock");
-    const owner = new JsonRepository(root, {
-      processId: 8201,
-      isProcessAlive: (processId) => processId === 8201,
-      onLockPhase: (phase) => {
-        if (phase === phaseToInterrupt) {
-          throw new Error("simulated process termination at " + phase);
-        }
-      },
-    });
-
     try {
       assert.throws(
-        () => owner.transact(() => "not reached"),
+        () => new JsonRepository(root, {
+          processId: 8201,
+          isProcessAlive: (processId) => processId === 8201,
+          onLockPhase: (phase) => {
+            if (phase === phaseToInterrupt) {
+              throw new Error("simulated process termination at " + phase);
+            }
+          },
+        }),
         (error: any) => error instanceof Error && error.message.includes(phaseToInterrupt),
       );
 

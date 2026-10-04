@@ -331,10 +331,17 @@ export type StoreState = {
   s7CadIdempotency?: S7CadIdempotency[];
   s7CadManifests?: S7CadManifestRecord[];
   s7CadReadbackReceipts?: S7CadReadbackReceipt[];
-  s8ExportJobs?: S8ExportJob[];
-  s8Artifacts?: S8Artifact[];
-  s8ValidationReceipts?: S8ValidationReceipt[];
-  s8IdempotencyRecords?: S8IdempotencyRecord[];
+  s8NativeEvidenceVersion?: 1 | 2 | 3;
+  s8NativeProofSchemaVersion?: "s8-native-proof-v1";
+  s8ExportJobs?: S8ExportJobV3[];
+  s8Artifacts?: S8ArtifactV3[];
+  s8ValidationReceipts?: S8ValidationReceiptV3[];
+  s8ValidationReceiptBytes?: S8ValidationReceiptBytesV1[];
+  s8IdempotencyRecords?: S8IdempotencyRecordV2[];
+  s8NativeOperationAttempts?: Array<S8NativeOperationAttemptV1 | S8NativeAttemptV2>;
+  s8NativeProofCheckpoints?: S8Checkpoint[];
+  s8NativeTerminalOutcomes?: S8TerminalOutcome[];
+  s8NativeAttemptQuarantines?: Array<S8NativeLegacyQuarantineV1 | S8QuarantineV2>;
 };
 
 export type S6RevisionStatus =
@@ -677,6 +684,37 @@ export type S6ValidationIssue = {
   detail: string;
 };
 
+export type S6RequirementEvidenceKind =
+  | "booth_fields"
+  | "object_family"
+  | "zone_region"
+  | "scene_predicate"
+  | "prohibited_absence"
+  | "unresolved";
+
+export type S6RequirementOutcome = "satisfied" | "unsatisfied" | "unresolved";
+
+/** A deterministic, recomputed view of current requirement evidence. Never persist as authority. */
+export type S6RequirementEvaluation = {
+  requirementId: string;
+  sourceFingerprint: Sha256;
+  evidenceKind: S6RequirementEvidenceKind;
+  predicateVersion: string | null;
+  outcome: S6RequirementOutcome;
+  objectIds: string[];
+  zoneIds: string[];
+  boothFields: string[];
+  issueCodes: string[];
+};
+
+export type S6RequirementResolution =
+  | { kind: "geometry"; evidenceKind: "booth_fields"; predicateVersion: "booth-facts-v1"; boothFields: string[] }
+  | { kind: "object"; evidenceKind: "object_family"; objectType: S6PrimitiveKind; role: S6ObjectRole; primitiveKind: S6GeometryKind | null; materialFinishKind: S6MaterialFinishKind | null }
+  | { kind: "zone"; evidenceKind: "zone_region"; category: S5ZoneCategory | null }
+  | { kind: "scene"; evidenceKind: "scene_predicate"; predicateVersion: "entry-clear-v1" | "booth-containment-v1" | "maximum-height-v1"; predicate: "entry_clear" | "booth_containment" | "maximum_height" }
+  | { kind: "prohibited"; evidenceKind: "prohibited_absence"; predicateVersion: "forbidden-family-absence-v1"; family: "screen" | "enclosed_ceiling" }
+  | { kind: "unresolved"; evidenceKind: "unresolved"; issueCode: "REQUIREMENT_MAPPING_INVALID" | "S6_UNSUPPORTED_FORM" };
+
 export type S6ValidationReceipt = {
   schemaVersion: "s6-validation-receipt-v1";
   receiptId: UUID;
@@ -684,7 +722,7 @@ export type S6ValidationReceipt = {
   revisionId: UUID;
   revisionHash: Sha256;
   sourceS5Fingerprint: Sha256;
-  validatorVersion: "s6-validator-v1";
+  validatorVersion: "s6-validator-v1" | "s6-validator-v2";
   orderVersion: "s6-validation-order-v1";
   outcome: "pass" | "pass_with_warnings" | "acceptance_blocked" | "render_blocked" | "failed";
   errors: S6ValidationIssue[];
@@ -1355,90 +1393,49 @@ export type S8PublicationPhase =
   | "commit";
 
 export type S8ExportJob = {
-  schemaVersion: "s8-export-job-v2";
-  jobId: UUID;
-  projectId: UUID;
-  artifactId: UUID;
-  source: S8SourceStamp;
-  inputHash: Sha256;
-  idempotencyKey: string;
-  status: S8ExportStatus;
-  publicationPhase: S8PublicationPhase;
-  attempt: 1;
-  claimToken: UUID | null;
-  ownerId: string | null;
-  ownerProcessId: number | null;
-  claimedAt: Timestamp | null;
-  heartbeatAt: Timestamp | null;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-  terminalAt: Timestamp | null;
-  failureCode: string | null;
+  schemaVersion: "s8-export-job-v2" | "s8-export-job-v3";
+  jobId: UUID; projectId: UUID; artifactId: UUID; source: S8SourceStamp; inputHash: Sha256;
+  idempotencyKey: string; status: S8ExportStatus; publicationPhase: S8PublicationPhase;
+  attempt: 1 | 2; claimToken: UUID | null; ownerId: string | null; ownerProcessId: number | null;
+  claimedAt: Timestamp | null; heartbeatAt: Timestamp | null; createdAt: Timestamp; updatedAt: Timestamp;
+  terminalAt: Timestamp | null; failureCode: string | null;
+  nativeClaimToken?: UUID | null; headCheckpointSha256?: Sha256 | null;
+  terminalOutcomeId?: UUID | null; quarantineId?: UUID | null; retryDecisionId?: UUID | null;
 };
 
 export type S8ArtifactObjectHashes = {
-  artifactSha256: Sha256;
-  artifactByteSize: number;
-  writerReceiptSha256: Sha256;
-  nativeReadbackSha256: Sha256;
-  semanticReceiptSha256: Sha256;
-  publicationReceiptSha256: Sha256;
+  artifactSha256: Sha256; artifactByteSize: number; writerReceiptSha256: Sha256;
+  nativeReadbackSha256: Sha256; semanticReceiptSha256: Sha256; publicationReceiptSha256: Sha256 | null;
 };
 
 export type S8Artifact = {
-  schemaVersion: "s8-artifact-v2";
-  artifactId: UUID;
-  projectId: UUID;
-  jobId: UUID;
-  source: S8SourceStamp;
-  inputHash: Sha256;
-  profile: "swooshz-fbx-static-mesh-v1";
-  format: "fbx";
-  mimeType: "application/octet-stream";
-  downloadFileName: "swooshz-s8-scene.fbx";
-  status: S8ExportStatus;
-  publicationPhase: S8PublicationPhase;
-  payloadSha256: Sha256 | null;
-  objectHashes: S8ArtifactObjectHashes | null;
-  writerReceiptHash: Sha256 | null;
-  nativeReadbackHash: Sha256 | null;
-  semanticReceiptHash: Sha256 | null;
-  publicationReceiptHash: Sha256 | null;
-  validationReceiptId: UUID | null;
-  validationReceiptHash: Sha256 | null;
-  immutableReuseFingerprint: Sha256 | null;
-  privateStagingPrefix: string;
-  privateFinalPrefix: string;
-  attempt: 1;
-  retryOfArtifactId: UUID | null;
-  failureCode: string | null;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-  committedAt: Timestamp | null;
-  staleAt: Timestamp | null;
+  schemaVersion: "s8-artifact-v2" | "s8-artifact-v3";
+  artifactId: UUID; projectId: UUID; jobId: UUID; source: S8SourceStamp; inputHash: Sha256;
+  profile: "swooshz-fbx-static-mesh-v1"; format: "fbx"; mimeType: "application/octet-stream";
+  downloadFileName: "swooshz-s8-scene.fbx"; status: S8ExportStatus; publicationPhase: S8PublicationPhase;
+  payloadSha256: Sha256 | null; objectHashes: S8ArtifactObjectHashes | null;
+  writerReceiptHash: Sha256 | null; nativeReadbackHash: Sha256 | null; semanticReceiptHash: Sha256 | null;
+  publicationReceiptHash: Sha256 | null; validationReceiptId: UUID | null; validationReceiptHash: Sha256 | null;
+  immutableReuseFingerprint: Sha256 | null; privateStagingPrefix: string | null; privateFinalPrefix: string | null;
+  attempt: 1 | 2; retryOfArtifactId: UUID | null; failureCode: string | null;
+  createdAt: Timestamp; updatedAt: Timestamp; committedAt: Timestamp | null; staleAt: Timestamp | null;
+  headCheckpointSha256?: Sha256 | null; terminalOutcomeId?: UUID | null; quarantineId?: UUID | null;
 };
 
 export type S8ValidationReceipt = {
-  schemaVersion: "s8-validation-receipt-v2";
-  receiptId: UUID;
-  projectId: UUID;
-  artifactId: UUID;
-  source: S8SourceStamp;
-  payloadSha256: Sha256;
-  artifactSha256: Sha256;
-  artifactByteSize: number;
-  writerReceiptHash: Sha256;
-  nativeReadbackHash: Sha256;
-  semanticReceiptHash: Sha256;
-  nativeOutcome: "pass";
-  semanticOutcome: "pass";
-  fingerprintVersion: "s8-immutable-reuse-fingerprint-v2";
-  immutableReuseFingerprint: Sha256;
-  resourceLimitsHash: Sha256;
-  checkedAt: Timestamp;
-  receiptHash: Sha256;
+  schemaVersion: "s8-validation-receipt-v2" | "s8-validation-receipt-v3";
+  receiptId: UUID; projectId: UUID; artifactId: UUID; source: S8SourceStamp;
+  payloadSha256: Sha256; artifactSha256: Sha256; artifactByteSize: number;
+  writerReceiptHash: Sha256; nativeReadbackHash: Sha256; semanticReceiptHash: Sha256;
+  nativeOutcome: "pass"; semanticOutcome: "pass";
+  fingerprintVersion: "s8-immutable-reuse-fingerprint-v2" | "s8-immutable-reuse-fingerprint-v3";
+  immutableReuseFingerprint: Sha256; resourceLimitsHash: Sha256; checkedAt: Timestamp; receiptHash: Sha256;
+  jobId?: UUID; attempt?: 1 | 2; nativeClaimToken?: UUID; acceptedSourceDigest?: Sha256;
+  writerAttemptId?: UUID; writerAcceptanceSha256?: Sha256; validatorAttemptId?: UUID;
+  validatorAcceptanceSha256?: Sha256; stagedCheckpointSha256?: Sha256;
+  releaseManifestSha256?: Sha256; resourcePolicySha256?: Sha256;
+  writerReceiptBytes?: number; nativeReadbackBytes?: number; semanticReceiptBytes?: number;
 };
-
 export type S8IdempotencyRecord = {
   schemaVersion: "s8-idempotency-v2";
   projectId: UUID;
@@ -1451,6 +1448,60 @@ export type S8IdempotencyRecord = {
   createdAt: Timestamp;
 };
 
+export type S8ExportJobV3 = Omit<S8ExportJob, "schemaVersion" | "attempt"> & {
+  schemaVersion: "s8-export-job-v3"; attempt: 1 | 2; nativeClaimToken: UUID | null;
+  headCheckpointSha256: Sha256 | null; terminalOutcomeId: UUID | null;
+  quarantineId: UUID | null; retryDecisionId: UUID | null;
+};
+export type S8ArtifactV3 = Omit<S8Artifact, "schemaVersion" | "attempt" | "privateStagingPrefix" | "privateFinalPrefix"> & {
+  schemaVersion: "s8-artifact-v3"; attempt: 1 | 2; privateStagingPrefix: string | null;
+  privateFinalPrefix: string | null; headCheckpointSha256: Sha256 | null;
+  terminalOutcomeId: UUID | null; quarantineId: UUID | null;
+};
+export type S8ValidationReceiptV3 = Omit<S8ValidationReceipt, "schemaVersion" | "fingerprintVersion"> & {
+  schemaVersion: "s8-validation-receipt-v3"; receiptId: UUID; projectId: UUID;
+  jobId: UUID; artifactId: UUID; attempt: 1 | 2; nativeClaimToken: UUID;
+  source: S8SourceStamp; acceptedSourceDigest: Sha256; payloadSha256: Sha256;
+  artifactSha256: Sha256; artifactByteSize: number; writerReceiptHash: Sha256;
+  nativeReadbackHash: Sha256; semanticReceiptHash: Sha256; nativeOutcome: "pass";
+  semanticOutcome: "pass"; fingerprintVersion: "s8-immutable-reuse-fingerprint-v3";
+  immutableReuseFingerprint: Sha256; resourceLimitsHash: Sha256; checkedAt: Timestamp; receiptHash: Sha256;
+  writerReceiptBytes: number; nativeReadbackBytes: number; semanticReceiptBytes: number;
+  writerAttemptId: UUID; writerAcceptanceSha256: Sha256; validatorAttemptId: UUID;
+  validatorAcceptanceSha256: Sha256; stagedCheckpointSha256: Sha256;
+  releaseManifestSha256: Sha256; resourcePolicySha256: Sha256;
+};
+export type S8ValidationReceiptBytesV1 = {
+  schemaVersion: "s8-validation-receipt-bytes-v1"; receiptId: UUID;
+  canonicalBase64url: string; byteSize: number; sha256: Sha256;
+};
+export type S8NativeAttemptV2 = Record<string, unknown> & {
+  schemaVersion: "s8-native-operation-attempt-v2"; attemptId: UUID; projectId: UUID;
+  jobId: UUID; artifactId: UUID; attempt: 1 | 2; operation: "WRITER" | "VALIDATOR";
+  state: "DISPATCHING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
+};
+export type S8NativeOperationAttemptV1 = {
+  schemaVersion: "s8-native-operation-attempt-v1"; attemptId: UUID; projectId: UUID;
+  jobId: UUID; artifactId: UUID; claimToken: UUID; attempt: number;
+  operation: "WRITER" | "VALIDATOR"; state: "DISPATCHING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
+  inputSha256: Sha256; requestSha256: Sha256 | null; requestNonce: string | null;
+  responseSha256: Sha256 | null; releaseManifestSha256: Sha256 | null;
+  failureClass: "PERMANENT" | "TRANSIENT" | "UNCERTAIN" | null;
+  disposalState: "NOT_STARTED" | "REAPED_REMOVED" | "UNKNOWN";
+  createdAt: Timestamp; updatedAt: Timestamp; completedAt: Timestamp | null;
+};
+export type S8Checkpoint = { body: Record<string, unknown>; signature: string; checkpointSha256: Sha256 };
+export type S8TerminalOutcome = Record<string, unknown> & {
+  schemaVersion: "s8-native-terminal-outcome-v1"; outcomeId: UUID;
+  projectId: UUID; jobId: UUID; artifactId: UUID; attempt: 1 | 2;
+};
+export type S8QuarantineV2 = Record<string, unknown> & {
+  schemaVersion: "s8-native-proof-quarantine-v2"; quarantineId: UUID;
+};
+export type S8NativeLegacyQuarantineV1 = Record<string, unknown> & {
+  schemaVersion: "s8-native-legacy-quarantine-v1"; quarantineId: UUID;
+};
+export type S8IdempotencyRecordV2 = Omit<S8IdempotencyRecord, "schemaVersion"> & { schemaVersion: "s8-idempotency-v2" };
 export type S7CadPublicExport = Omit<S7CadExport, "privateFinalStorageKey" | "privateStagingStorageKey">;
 
 export type S7CadMetric<T> = {

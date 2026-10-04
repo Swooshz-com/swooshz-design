@@ -168,7 +168,7 @@ function makeValidationReceipt(model: S6SpatialModelRecord, receiptId = id(40)):
     revisionId: model.modelRevisionId,
     revisionHash: model.modelHash,
     sourceS5Fingerprint: model.sourceS5Fingerprint,
-    validatorVersion: "s6-validator-v1",
+    validatorVersion: "s6-validator-v2",
     orderVersion: "s6-validation-order-v1",
     outcome: "pass",
     errors: [],
@@ -428,6 +428,19 @@ test("validation receipt graph rejects dangling, mismatched, non-reciprocal, and
     failures.push(item.label);
   }
   assert.deepEqual(failures, []);
+});
+
+test("historical v1 receipts remain readable while unknown validator versions are rejected", () => {
+  const model = makeModel();
+  const historical = attachValidationReceipt(model);
+  historical.validatorVersion = "s6-validator-v1";
+  historical.validationHash = hashS6ValidationReceipt(historical);
+  assert.doesNotThrow(() => validateS6Graph(graphState([model], [historical])));
+
+  const unknown = clone(historical);
+  unknown.validatorVersion = "s6-validator-v9" as unknown as S6ValidationReceipt["validatorVersion"];
+  unknown.validationHash = hashS6ValidationReceipt(unknown);
+  assert.throws(() => validateS6Graph(graphState([model], [unknown])));
 });
 
 test("invalid validation receipt graph makes graph-dependent telemetry unavailable", () => {

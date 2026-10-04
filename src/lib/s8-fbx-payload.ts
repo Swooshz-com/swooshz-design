@@ -64,6 +64,25 @@ const POSITION_SCALE = 1_000_000;
 const UNIT_SCALE = 10_000_000_000;
 const SHA = /^[0-9a-f]{64}$/;
 
+const S8_ACCEPTED_PROVENANCE_KINDS = new Set([
+  "confirmed_project_input",
+  "user_confirmed_design_decision",
+  "bounded_design_inference",
+]);
+const S8_PROVENANCE_KEYS = ["acceptedByUser", "kind", "note", "sourceFingerprint", "sourceRef"] as const;
+const S8_PROVENANCE_CONTROL = /[\u0000-\u001f\u007f-\u009f]/u;
+
+function assertS8ObjectProvenance(value: unknown, sourceFingerprint: string): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) fail("S8_RIGID_PROVENANCE_REQUIRED");
+  const provenance = value as Record<string, unknown>;
+  const keys = Object.keys(provenance).sort(compareUtf8);
+  if (keys.length !== S8_PROVENANCE_KEYS.length || keys.some((key, index) => key !== S8_PROVENANCE_KEYS[index])) fail("S8_RIGID_PROVENANCE_REQUIRED");
+  if (typeof provenance.kind !== "string" || !S8_ACCEPTED_PROVENANCE_KINDS.has(provenance.kind)) fail("S8_RIGID_PROVENANCE_REQUIRED");
+  if (typeof provenance.sourceRef !== "string" || provenance.sourceRef.trim().length === 0 || Array.from(provenance.sourceRef).length > 240 || S8_PROVENANCE_CONTROL.test(provenance.sourceRef)) fail("S8_RIGID_PROVENANCE_REQUIRED");
+  if (typeof provenance.sourceFingerprint !== "string" || !SHA.test(provenance.sourceFingerprint) || provenance.sourceFingerprint !== sourceFingerprint) fail("S8_RIGID_PROVENANCE_REQUIRED");
+  if (typeof provenance.acceptedByUser !== "boolean") fail("S8_RIGID_PROVENANCE_REQUIRED");
+  if (provenance.note !== null && (typeof provenance.note !== "string" || provenance.note.trim().length === 0 || Array.from(provenance.note).length > 240 || S8_PROVENANCE_CONTROL.test(provenance.note))) fail("S8_RIGID_PROVENANCE_REQUIRED");
+}
 function fail(code: string, field = "payload"): never {
   throw new AppError(422, code, [{ field, code }]);
 }
@@ -127,7 +146,7 @@ function assertSource(s6: S6ToS7Handoff, s7: S7ToS8Handoff): void {
     if ([position.xMm, position.yMm, position.zMm].some((value) => typeof value !== "number" || !Number.isFinite(value))) fail("S8_RIGID_TRANSFORM_UNSUPPORTED");
     if ([rotation.xMd, rotation.yMd, rotation.zMd].some((value) => typeof value !== "number" || !Number.isSafeInteger(value))) fail("S8_RIGID_TRANSFORM_UNSUPPORTED");
     if (s8Utf8Bytes(object.identityKey) > S8_LIMITS.metadataBytesPerObject) fail("S8_RESOURCE_LIMIT", `objects.${object.objectId}.identityKey`);
-    if (!object.provenance || object.provenance.acceptedByUser !== true || object.provenance.sourceFingerprint !== s6.sourceS5Fingerprint || object.provenance.kind === "unknown_unresolved") fail("S8_RIGID_PROVENANCE_REQUIRED");
+    assertS8ObjectProvenance(object.provenance, s6.sourceS5Fingerprint);
     if (object.parentObjectId === object.objectId) fail("S8_HIERARCHY_INVALID");
   }
   for (const object of objects) if (object.parentObjectId !== null && !objectById.has(object.parentObjectId)) fail("S8_HIERARCHY_INVALID");

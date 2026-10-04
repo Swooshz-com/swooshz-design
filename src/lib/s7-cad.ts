@@ -9,12 +9,13 @@ import {
   type S7SourceStamp,
   type S7Telemetry,
   type S7ToS8Handoff,
+  type StoreState,
   type S7PublicState,
   type Timestamp,
   type UUID,
 } from "./types";
 import { JsonRepository, PrivateObjectStore } from "./store";
-import { S6WorkflowService } from "./s6";
+import { readS6ToS7Handoff, S6WorkflowService } from "./s6";
 import { decodeS7Manifest, parseS7Dxf } from "./s7-dxf-readback";
 import { writeS7Dxf } from "./s7-dxf-writer";
 import {
@@ -121,6 +122,25 @@ function sourceError(error: unknown): AppError {
 
 function cloneStamp(source: S7SourceStamp): S7SourceStamp {
   return { ...source };
+}
+
+export function readS7ToS8Handoff(state: StoreState, objects: PrivateObjectStore, projectId: UUID): S7ToS8Handoff {
+  const s6Handoff = readS6ToS7Handoff(state, objects, projectId);
+  const source = { handoff: s6Handoff, stamp: stampFromHandoff(s6Handoff) };
+  const committed = getS7Collections(state).exports.filter((item) => item.projectId === projectId && item.status === "committed" && sameS7Source(item.source, source.stamp)).sort((left, right) => {
+    const leftAt = left.committedAt ?? ""; const rightAt = right.committedAt ?? "";
+    return leftAt < rightAt ? 1 : leftAt > rightAt ? -1 : 0;
+  })[0];
+  if (!committed || committed.sha256 === null || committed.byteSize === null || committed.manifestHash === null || committed.readbackReceiptId === null || committed.readbackHash === null) fail(409, "S7_HANDOFF_NOT_READY");
+  const bytes = objects.read(committed.privateFinalStorageKey);
+  const manifestBytes = objects.read(s7FinalManifestStorageKey(projectId, committed.manifestId));
+  if (bytes.length !== committed.byteSize || sha256(bytes) !== committed.sha256 || sha256(manifestBytes) !== committed.manifestHash) fail(409, "S7_PUBLICATION_OBJECT_MISMATCH");
+  const manifest = decodeS7Manifest(manifestBytes);
+  if (manifest.manifestId !== committed.manifestId || manifest.projectId !== projectId || manifest.artifactId !== committed.artifactId) fail(409, "S7_PUBLICATION_OBJECT_MISMATCH");
+  const readback = parseS7Dxf(bytes, { expectedManifest: manifest, expectedSource: source.stamp });
+  const receipt = getS7Collections(state).receipts.find((item) => item.receiptId === committed.readbackReceiptId);
+  if (!receipt || receipt.receiptHash !== committed.readbackHash || receipt.sha256 !== committed.sha256 || receipt.byteSize !== committed.byteSize || receipt.readbackVersion !== S7_READBACK_VERSION || receipt.worldToPlanVersion !== S7_WORLD_TO_PLAN_VERSION || receipt.dxfVersion !== S7_DXF_VERSION || receipt.manifestId !== committed.manifestId || receipt.manifestHash !== committed.manifestHash || !sameS7Source(receipt.source, source.stamp) || receipt.correspondenceResult !== "pass" || receipt.outcome !== "pass" || readback.outcome !== "pass") fail(409, "S7_READBACK_FAILED");
+  return { schemaVersion: "s7-to-s8-handoff-v1", projectId, sourceRevisionId: source.stamp.sourceRevisionId, sourceRevisionHash: source.stamp.sourceRevisionHash, sourceS5Fingerprint: source.stamp.sourceS5Fingerprint, s7ArtifactId: committed.artifactId, s7ArtifactHash: committed.sha256, s7ArtifactByteSize: committed.byteSize, manifestId: committed.manifestId, manifestHash: committed.manifestHash, readbackReceiptId: committed.readbackReceiptId, readbackHash: committed.readbackHash, dxfVersion: S7_DXF_VERSION, worldToPlanVersion: S7_WORLD_TO_PLAN_VERSION, coordinateConvention: "booth-local-right-handed-v1", dxfIsNot3DAuthority: true, s8MustReadAcceptedS6Model: true };
 }
 
 export class S7CadService {

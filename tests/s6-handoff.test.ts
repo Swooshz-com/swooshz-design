@@ -5,6 +5,7 @@ import { compileS6Draft } from "../src/lib/s6-compiler";
 import { hashS6Model, hashS6ValidationReceipt, normalizeS6Geometry } from "../src/lib/s6-canonical";
 import { makeS6Source, representativeSources } from "./s6-fixture";
 import { buildS6Telemetry } from "../src/lib/s6-telemetry";
+import { buildS6Cameras } from "../src/lib/s6-camera";
 import { buildS6ToS7Handoff } from "../src/lib/s6-handoff";
 import type {
   S6PublicState,
@@ -29,37 +30,48 @@ function rehash(model: S6SpatialModelRecord): S6SpatialModelRecord {
 function acceptedModel(source = makeS6Source({ maxHeightMm: null })): S6SpatialModelRecord {
   const model = compileS6Draft({ source, revisionId: REVISION_ID, parentRevisionId: null, clock: () => AT });
   const physical = model.objects.filter((item) => item.role !== "booth_floor" && item.role !== "booth_wall" && item.role !== "zone");
-  assert.ok(physical.length >= 3);
-  physical[0]!.primitive = normalizeS6Geometry({
-    kind: "rect_prism",
-    dimensionsMm: { widthMm: 1200, depthMm: 500, heightMm: 900 },
-    geometryState: "exact",
-    localAnchor: "floor",
-  });
-  physical[1]!.primitive = normalizeS6Geometry({
-    kind: "round_prism",
-    radiusMm: 450,
-    heightMm: 1100,
-    geometryState: "exact",
-    localAnchor: "floor",
-  });
-  physical[2]!.primitive = normalizeS6Geometry({
-    kind: "profile_extrusion",
-    profile: {
-      winding: "ccw-from-positive-y-v1",
-      vertices: [
-        { xMm: 0, zMm: 0 },
-        { xMm: 1800, zMm: 0 },
-        { xMm: 1800, zMm: 400 },
-        { xMm: 1100, zMm: 400 },
-        { xMm: 1100, zMm: 900 },
-        { xMm: 0, zMm: 900 },
-      ],
-    },
-    heightMm: 2200,
-    geometryState: "exact",
-    localAnchor: "floor",
-  });
+  const rectangular = physical.find((item) => item.objectType === "counter") ?? physical[0];
+  if (rectangular) {
+    rectangular.primitive = normalizeS6Geometry({
+      kind: "rect_prism",
+      dimensionsMm: { widthMm: 1200, depthMm: 500, heightMm: 900 },
+      geometryState: "exact",
+      localAnchor: "floor",
+    });
+  }
+  const roundTable = physical.find((item) => item.objectType === "table" && item.objectId !== rectangular?.objectId);
+  if (roundTable) {
+    roundTable.primitive = normalizeS6Geometry({
+      kind: "round_prism",
+      radiusMm: 450,
+      heightMm: 1100,
+      geometryState: "exact",
+      localAnchor: "floor",
+    });
+    roundTable.transform.positionMm.zMm = Math.max(roundTable.transform.positionMm.zMm, 450);
+  }
+  const profileDisplay = physical.find((item) => item.objectType === "display_plinth");
+  if (profileDisplay) {
+    profileDisplay.primitive = normalizeS6Geometry({
+      kind: "profile_extrusion",
+      profile: {
+        winding: "ccw-from-positive-y-v1",
+        vertices: [
+          { xMm: 0, zMm: 0 },
+          { xMm: 1800, zMm: 0 },
+          { xMm: 1800, zMm: 400 },
+          { xMm: 1100, zMm: 400 },
+          { xMm: 1100, zMm: 900 },
+          { xMm: 0, zMm: 900 },
+        ],
+      },
+      heightMm: 2200,
+      geometryState: "exact",
+      localAnchor: "floor",
+    });
+    profileDisplay.transform.positionMm.xMm = 4000;
+    profileDisplay.transform.positionMm.zMm = 2000;
+  }
   for (const unknown of model.unknowns) {
     unknown.status = "resolved";
     unknown.resolutionKind = "represented";
@@ -74,6 +86,7 @@ function acceptedModel(source = makeS6Source({ maxHeightMm: null })): S6SpatialM
   model.designFormReview.explicitSimplificationUnknownIds = [];
   model.designFormReview.acceptedByUser = true;
   model.validationReceiptId = RECEIPT_ID;
+  model.cameras = buildS6Cameras(model);
   return rehash(model);
 }
 
@@ -85,7 +98,7 @@ function receipt(model: S6SpatialModelRecord, outcome: "pass" | "pass_with_warni
     revisionId: model.modelRevisionId,
     revisionHash: model.modelHash,
     sourceS5Fingerprint: model.sourceS5Fingerprint,
-    validatorVersion: "s6-validator-v1",
+    validatorVersion: "s6-validator-v2",
     orderVersion: "s6-validation-order-v1",
     outcome,
     errors: [],
@@ -130,7 +143,15 @@ test("telemetry reports exact zero and unavailable cost semantics", () => {
 });
 
 test("handoff includes accepted identity/hash/source fence/units/open sides and preserves canonical geometry", () => {
-  const source = makeS6Source({ maxHeightMm: null, openSides: ["north", "south"] });
+  const source = makeS6Source({
+    maxHeightMm: null,
+    openSides: ["north", "south"],
+    requirements: [
+      { name: "Welcome counter", details: "Reception counter", expected: "present" },
+      { name: "Round table", expected: "present" },
+      { name: "L-profile display plinth", expected: "present" },
+    ],
+  });
   const model = acceptedModel(source);
   const value: S6ToS7Handoff = buildS6ToS7Handoff(model, receipt(model, "pass_with_warnings"), source);
   assert.deepEqual(value.eligibility, { currentAccepted: true, sourceCurrent: true, stale: false });
@@ -146,9 +167,12 @@ test("handoff includes accepted identity/hash/source fence/units/open sides and 
   assert.deepEqual(value.hierarchy, model.objects.map((item) => ({ objectId: item.objectId, parentObjectId: item.parentObjectId })));
   assert.deepEqual(value.objects.map((item) => item.objectId), model.objects.map((item) => item.objectId));
   const physical = model.objects.filter((item) => item.role !== "booth_floor" && item.role !== "booth_wall" && item.role !== "zone");
-  const handoffRect = value.objects.find((item) => item.objectId === physical[0]!.objectId)!;
-  const handoffRound = value.objects.find((item) => item.objectId === physical[1]!.objectId)!;
-  const handoffProfile = value.objects.find((item) => item.objectId === physical[2]!.objectId)!;
+  const counter = physical.find((item) => item.objectType === "counter")!;
+  const table = physical.find((item) => item.objectType === "table")!;
+  const displayPlinth = physical.find((item) => item.objectType === "display_plinth")!;
+  const handoffRect = value.objects.find((item) => item.objectId === counter.objectId)!;
+  const handoffRound = value.objects.find((item) => item.objectId === table.objectId)!;
+  const handoffProfile = value.objects.find((item) => item.objectId === displayPlinth.objectId)!;
   assert.equal(handoffRect.geometry.kind, "rect_prism");
   assert.deepEqual(handoffRect.footprint, { kind: "rectangle", widthMm: 1200, depthMm: 500 });
   assert.equal(handoffRound.geometry.kind, "round_prism");
@@ -165,9 +189,9 @@ test("handoff includes accepted identity/hash/source fence/units/open sides and 
       { xMm: 1800, zMm: 0 },
     ],
   });
-  assert.deepEqual(handoffProfile.geometry, physical[2]!.primitive);
-  assert.deepEqual(handoffRound.provenance, physical[1]!.provenance);
-  assert.deepEqual(handoffRound.materialIds, physical[1]!.materialIds);
+  assert.deepEqual(handoffProfile.geometry, displayPlinth.primitive);
+  assert.deepEqual(handoffRound.provenance, table.provenance);
+  assert.deepEqual(handoffRound.materialIds, table.materialIds);
   assert.deepEqual(value.unknowns, model.unknowns);
   assert.equal(JSON.stringify(value).includes("activeAsset"), false);
   assert.equal(JSON.stringify(value).includes("storageKey"), false);
@@ -221,4 +245,22 @@ test("handoff refuses recomputed accepted-looking models with any divergent conf
     rehash(model);
     assert.throws(() => buildS6ToS7Handoff(model, receipt(model), source), /S6_(?:ACCEPTANCE_CONFLICT|HANDOFF)/u);
   }
+});
+
+test("handoff rejects legacy receipts and recomputes unsatisfied requirement evidence", () => {
+  const source = makeS6Source({ requirements: [{ name: "Demo table", expected: "exact_count", expectedCount: 2 }] });
+  const model = acceptedModel(source);
+  const legacy = receipt(model);
+  legacy.validatorVersion = "s6-validator-v1";
+  legacy.validationHash = hashS6ValidationReceipt(legacy);
+  assert.throws(() => buildS6ToS7Handoff(model, legacy, source), /S6_(?:ACCEPTANCE_CONFLICT|HANDOFF)/u);
+
+  const missing = structuredClone(model);
+  const table = missing.objects.find((object) => object.objectType === "table");
+  assert.ok(table);
+  missing.objects = missing.objects.filter((object) => object.objectId !== table.objectId);
+  missing.validationReceiptId = RECEIPT_ID;
+  missing.cameras = buildS6Cameras(missing);
+  rehash(missing);
+  assert.throws(() => buildS6ToS7Handoff(missing, receipt(missing), source), /S6_(?:ACCEPTANCE_CONFLICT|HANDOFF)/u);
 });

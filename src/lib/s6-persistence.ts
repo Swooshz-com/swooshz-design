@@ -390,7 +390,7 @@ function validateReceipt(value: unknown): void {
   const item = record(value, ["schemaVersion", "receiptId", "projectId", "revisionId", "revisionHash", "sourceS5Fingerprint", "validatorVersion", "orderVersion", "outcome", "errors", "warnings", "checkedAt", "validationHash"]);
   literal(item.schemaVersion, ["s6-validation-receipt-v1"]);
   uuid(item.receiptId); uuid(item.projectId); uuid(item.revisionId); sha(item.revisionHash); sha(item.sourceS5Fingerprint);
-  literal(item.validatorVersion, ["s6-validator-v1"]); literal(item.orderVersion, ["s6-validation-order-v1"]);
+  literal(item.validatorVersion, ["s6-validator-v1", "s6-validator-v2"]); literal(item.orderVersion, ["s6-validation-order-v1"]);
   enumValue(item.outcome, ["pass", "pass_with_warnings", "acceptance_blocked", "render_blocked", "failed"]);
   const errors = array(item.errors); const warnings = array(item.warnings);
   if (errors.length > 256 || warnings.length > 256) return invalid();
@@ -707,6 +707,7 @@ function validateValidationReceiptGraph(models: PersistedRecord[], modelById: Ma
   const receiptById = uniqueRecordIds(receipts, "receiptId");
   for (const receipt of receipts) {
     try {
+      validateReceipt(receipt);
       if (hashS6ValidationReceipt(receipt as unknown as S6ValidationReceipt) !== receipt.validationHash) return invalid("S6_RECEIPT_HASH_MISMATCH");
     } catch {
       return invalid("S6_RECEIPT_HASH_MISMATCH");

@@ -30,7 +30,9 @@ import type {
   S6Zone,
   Timestamp,
   UUID,
+  S6RequirementResolution,
 } from "./types";
+import { resolveS6Requirement } from "./s6-validation";
 
 export type S6CompilerInput = {
   source: S5ToS6Projection;
@@ -126,29 +128,6 @@ function requirementText(requirement: S2Requirement, zone: S5LayoutZone | undefi
 
 function unsupportedForm(text: string): boolean {
   return /(?:\bhole\b|\bholes\b|double[-\s]bent|free[-\s]?form|bezier|\bmesh\b|unsupported|arbitrary\s+(?:curve|path|shape))/iu.test(text);
-}
-
-function formHint(text: string): "round" | "profile" | "overhead" | "partition" | null {
-  if (hasAny(text, ["overhead"]) || hasAny(text, ["canopy"]) || hasAny(text, ["ceiling"])) return "overhead";
-  if (hasAny(text, ["partition"]) || hasAny(text, ["wall"]) || hasAny(text, ["angled"])) return "partition";
-  if (hasAny(text, ["round"]) || hasAny(text, ["circular"])) return "round";
-  if (hasAny(text, ["profile"]) || hasAny(text, ["fascia"]) || hasAny(text, ["stepped"]) || hasAny(text, ["non rectangular"]) || hasAny(text, ["l profile"])) return "profile";
-  return null;
-}
-
-function semanticFor(category: S5ZoneCategory, text: string): { objectType: S6PrimitiveKind; role: S6ObjectRole } | null {
-  if (hasAny(text, ["partition"]) || hasAny(text, ["wall"]) || hasAny(text, ["angled"])) return { objectType: "partition", role: "booth_partition" };
-  if (hasAny(text, ["overhead"]) || hasAny(text, ["canopy"]) || hasAny(text, ["ceiling"])) return { objectType: "overhead_volume", role: "overhead" };
-  if (hasAny(text, ["screen"]) || hasAny(text, ["monitor"])) return { objectType: "screen", role: "screen" };
-  if (hasAny(text, ["counter"]) || hasAny(text, ["desk"]) || category === "reception_welcome") return { objectType: "counter", role: "furniture" };
-  if (hasAny(text, ["table"]) || category === "consultation_meeting") return { objectType: "table", role: "furniture" };
-  if (hasAny(text, ["storage"]) || hasAny(text, ["cabinet"]) || category === "storage") return { objectType: "storage_volume", role: "storage" };
-  if (hasAny(text, ["display"]) || hasAny(text, ["showcase"]) || category === "presentation_display" || category === "demo_product" || category === "giveaway_brochure") {
-    return { objectType: "display_plinth", role: "display" };
-  }
-  if (category === "interactive_activity") return { objectType: "equipment_placeholder", role: "equipment" };
-  if (category === "photo_branding") return { objectType: "display_plinth", role: "display" };
-  return null;
 }
 
 function roleAllowsProfile(objectType: S6PrimitiveKind): boolean {
@@ -408,11 +387,12 @@ type RequirementRecord = {
   zone: S5LayoutZone | undefined;
   category: S5ZoneCategory;
   text: string;
+  resolution: S6RequirementResolution;
 };
 
 function expectedInstanceCount(requirement: S2Requirement): number {
   if (requirement.expected === "absent") return 0;
-  if (requirement.expected === "exact_count") return Math.max(0, requirement.expectedCount ?? 0);
+  if (requirement.expected === "exact_count") return requirement.expectedCount ?? 0;
   return 1;
 }
 
@@ -501,20 +481,14 @@ function makeZoneRegion(
       label: safeLabel(zone.label, "S6 zone"),
       category: zone.category,
       regionObjectId,
-      requirementIds: zone.requirementIds.slice().sort(),
+      requirementIds: zone.requirementIds.filter((requirementId) => {
+        const requirement = source.canonicalRequirements.find((item) => item.requirementId === requirementId);
+        return requirement !== undefined && resolveS6Requirement(requirement, source).kind === "zone";
+      }).sort(),
       unknownIds: [],
       provenance,
     },
   };
-}
-
-function shapeFor(text: string, objectType: S6PrimitiveKind): "round" | "profile" | null {
-  const hint = formHint(text);
-  if (hint === "round" && roleAllowsRound(objectType)) return "round";
-  if (hasAny(text, ["profile"]) && roleAllowsProfile(objectType)) return "profile";
-  if (hint === "profile" && roleAllowsProfile(objectType)) return "profile";
-  if (hint === "partition" && hasAny(text, ["angled", "non axis", "non-axis"])) return "profile";
-  return null;
 }
 
 function objectForRequirement(
@@ -525,9 +499,12 @@ function objectForRequirement(
   slot: number,
   materials: readonly S6MaterialFinishRef[],
   renderHeight: number,
-): { object: S6SpatialObject; unknown: S6Unknown } {
-  const semantic = semanticFor(record.category, record.text)!;
-  const shape = shapeFor(record.text, semantic.objectType);
+): { object: S6SpatialObject; unknown: S6Unknown } | null {
+  if (record.resolution.kind !== "object") return null;
+  const semantic = record.resolution;
+  if ((semantic.primitiveKind === "round_prism" && !roleAllowsRound(semantic.objectType)) ||
+      (semantic.primitiveKind === "profile_extrusion" && !roleAllowsProfile(semantic.objectType))) return null;
+  const shape = semantic.primitiveKind === "round_prism" ? "round" : semantic.primitiveKind === "profile_extrusion" ? "profile" : null;
   const dimensions = dimensionFor(semantic.objectType, booth.widthMm, booth.depthMm);
   const height = heightFor(semantic.objectType, renderHeight);
   const primitive = geometryFor(semantic.objectType, shape, dimensions.width, dimensions.depth, height);
@@ -536,7 +513,10 @@ function objectForRequirement(
   const objectId = compilerObjectId(source.projectId, compilerNamespace(source), stableKey);
   const unknownId = "design-form:" + objectId;
   const provenance = inferredProvenance(source, "s5:layoutPlan.zones." + (record.zone?.zoneId ?? "unmapped"), "Bounded S6 shape, placement, dimensions, and finish inferred from structured requirement semantics; S5 placement remains conceptual.");
-  const material = materialFor(materials, record.text, slot);
+  const material = semantic.materialFinishKind === null
+    ? materialFor(materials, record.requirement.text, slot)
+    : materials.find((item) => item.finishKind === semantic.materialFinishKind);
+  if (!material) return null;
   const object: S6SpatialObject = {
     objectId,
     identityKey: stableKey,
@@ -619,7 +599,7 @@ function compilerRequirements(source: S5ToS6Projection): RequirementRecord[] {
   for (const zone of zones) for (const requirementId of zone.requirementIds) if (!byRequirement.has(requirementId)) byRequirement.set(requirementId, zone);
   return source.canonicalRequirements.slice().sort((left, right) => left.requirementId < right.requirementId ? -1 : left.requirementId > right.requirementId ? 1 : 0).map((requirement) => {
     const zone = byRequirement.get(requirement.requirementId);
-    return { requirement, zone, category: categoryFor(zone, requirement), text: requirementText(requirement, zone) };
+    return { requirement, zone, category: categoryFor(zone, requirement), text: requirementText(requirement, zone), resolution: resolveS6Requirement(requirement, source) };
   }).sort((left, right) => categoryPriority(left.category) - categoryPriority(right.category) || (left.requirement.requirementId < right.requirement.requirementId ? -1 : left.requirement.requirementId > right.requirement.requirementId ? 1 : 0));
 }
 
@@ -677,21 +657,32 @@ export function compileS6Draft(input: S6CompilerInput): S6SpatialModelRecord {
   let placementSlot = 0;
   let hasUnsupported = false;
   for (const record of compilerRequirements(source)) {
-    const count = expectedInstanceCount(record.requirement);
-    if (count === 0) continue;
-    if (unsupportedForm(record.text) || unsupportedForm(source.visualIntent.visualDirection ?? "")) {
+    if (record.resolution.kind === "unresolved") {
+      const unsupported = record.resolution.issueCode === "S6_UNSUPPORTED_FORM";
+      const unknownId = "design-form:" + record.requirement.requirementId;
+      if (unsupported) {
+        unknowns.push(makeUnknown(source, unknownId, "design_form", "requirements." + record.requirement.requirementId, record.requirement.requirementId, "S6_UNSUPPORTED_FORM: choose a typed rect_prism, round_prism, profile_extrusion, or explicit simplification for " + safeLabel(record.requirement.text, "unsupported form") + ".", "Approved structured intent names a form outside the bounded S6 geometry union; no box substitute was created."));
+        hasUnsupported = true;
+      } else {
+        unknowns.push(makeUnknown(source, "requirement-mapping:" + record.requirement.requirementId, "requirement_mapping", "requirements." + record.requirement.requirementId, record.requirement.requirementId, "Map confirmed requirement " + safeLabel(record.requirement.text, "requirement") + " to an allowlisted S6 representation.", "S5 requirement meaning was not sufficiently specific for a safe metric representation."));
+      }
+      continue;
+    }
+    if (record.resolution.kind !== "object") continue;
+    if (unsupportedForm(source.visualIntent.visualDirection ?? "")) {
       const unknownId = "design-form:" + record.requirement.requirementId;
       unknowns.push(makeUnknown(source, unknownId, "design_form", "requirements." + record.requirement.requirementId, record.requirement.requirementId, "S6_UNSUPPORTED_FORM: choose a typed rect_prism, round_prism, profile_extrusion, or explicit simplification for " + safeLabel(record.requirement.text, "unsupported form") + ".", "Approved structured intent names a form outside the bounded S6 geometry union; no box substitute was created."));
       hasUnsupported = true;
       continue;
     }
-    const semantic = semanticFor(record.category, record.text);
-    if (!semantic) {
-      unknowns.push(makeUnknown(source, "requirement-mapping:" + record.requirement.requirementId, "requirement_mapping", "requirements." + record.requirement.requirementId, record.requirement.requirementId, "Map confirmed requirement " + safeLabel(record.requirement.text, "requirement") + " to an allowlisted S6 object family.", "S5 semantics were not sufficiently specific for a safe metric object."));
-      continue;
-    }
+    const count = expectedInstanceCount(record.requirement);
+    if (count === 0) continue;
     for (let index = 0; index < count; index += 1) {
       const built = objectForRequirement(source, booth, record, index, placementSlot, materials, renderHeight);
+      if (!built) {
+        unknowns.push(makeUnknown(source, "requirement-mapping:" + record.requirement.requirementId, "requirement_mapping", "requirements." + record.requirement.requirementId, record.requirement.requirementId, "Map confirmed requirement " + safeLabel(record.requirement.text, "requirement") + " to an available S6 metric representation.", "The resolved object family or required finish is not available in the current bounded S6 model."));
+        break;
+      }
       objects.push(built.object);
       unknowns.push(built.unknown);
       addUniqueProvenance(provenance, built.object.provenance);
