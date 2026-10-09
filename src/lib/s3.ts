@@ -203,10 +203,6 @@ function asCount(value: number): 0 | 1 | 2 {
   return value as 0 | 1 | 2;
 }
 
-function cloneTuple<T>(value: readonly T[]): T[] {
-  return Array.from(value);
-}
-
 export class S3WorkflowService {
   private readonly repository: JsonRepository;
   private readonly objects: PrivateObjectStore;

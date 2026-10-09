@@ -80,10 +80,6 @@ function stringArray(value: unknown, max = 4096): void {
   for (const item of array(value)) stringValue(item, max);
 }
 
-function uuidArray(value: unknown): void {
-  for (const item of array(value)) uuid(item);
-}
-
 function tupleOf(value: unknown, lengths: readonly number[], validator: (item: unknown) => void): void {
   const values = array(value);
   if (!lengths.includes(values.length)) return invalid();
