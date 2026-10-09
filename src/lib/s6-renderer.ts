@@ -48,10 +48,6 @@ function dimensionsFor(object: S6SpatialObject): S6Dimensions {
   return { widthMm: Math.max(...xs) - Math.min(...xs), depthMm: Math.max(...zs) - Math.min(...zs), heightMm: object.primitive.heightMm };
 }
 
-function finishFor(object: S6SpatialObject, materials: ReadonlyMap<string, S6MaterialFinishRef>): S6MaterialFinishRef | null {
-  return object.materialIds.map((id) => materials.get(id)).find((item): item is S6MaterialFinishRef => item !== undefined) ?? null;
-}
-
 function hexRgb(hex: string | null): [number, number, number] {
   const value = /^#[0-9a-f]{6}$/iu.test(hex ?? "") ? hex!.slice(1) : "808080";
   return [Number.parseInt(value.slice(0, 2), 16), Number.parseInt(value.slice(2, 4), 16), Number.parseInt(value.slice(4, 6), 16)];

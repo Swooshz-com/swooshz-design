@@ -106,11 +106,6 @@ function integer(value: unknown, minimum = Number.MIN_SAFE_INTEGER, maximum = Nu
   return value;
 }
 
-function bool(value: unknown): boolean {
-  if (typeof value !== "boolean") return invalid();
-  return value;
-}
-
 function enumValue(value: unknown, allowed: readonly string[]): string {
   const result = text(value);
   if (!allowed.includes(result)) return invalid();
