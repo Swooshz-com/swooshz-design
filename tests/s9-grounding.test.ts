@@ -4,9 +4,12 @@ import { compileS6Draft } from "../src/lib/s6-compiler";
 import { buildS6Cameras } from "../src/lib/s6-camera";
 import { hashS6Model, hashS6ValidationReceipt } from "../src/lib/s6-canonical";
 import { buildS6ToS7Handoff } from "../src/lib/s6-handoff";
+import { parseS7Dxf } from "../src/lib/s7-dxf-readback";
+import { writeS7Dxf } from "../src/lib/s7-dxf-writer";
 import { assertS9GroundingCurrent, prepareS9Grounding } from "../src/lib/s9-grounding";
+import { jcs, sha256 } from "../src/lib/utils";
 import { makeS6Source } from "./s6-fixture";
-import type { S6SpatialModelRecord, S6ValidationReceipt, UUID } from "../src/lib/types";
+import type { S6SpatialModelRecord, S6ValidationReceipt, S7SourceStamp, UUID } from "../src/lib/types";
 
 const AT = "2026-09-02T00:00:00.000Z";
 const RECEIPT_ID = "30000000-0000-4000-8000-000000000002" as UUID;
@@ -73,6 +76,37 @@ test("S9 controls bind the accepted booth revision and deterministic S6 cameras"
     assert.ok(control.controlSvgBytes.byteLength > 0);
     assert.equal(control.groundingHash, prepareS9Grounding(model, handoff, camera.viewId).groundingHash);
     assert.doesNotThrow(() => assertS9GroundingCurrent(control, model, handoff));
+  }
+});
+
+test("S6 source, S7 editable DXF readback, and S9 view controls bind one accepted booth", () => {
+  const { model, handoff } = accepted();
+  const source: S7SourceStamp = {
+    sourceRevisionId: handoff.acceptedRevisionId,
+    sourceRevisionHash: handoff.acceptedRevisionHash,
+    sourceS5Fingerprint: handoff.sourceS5Fingerprint,
+    validationReceiptId: handoff.validationReceipt.receiptId,
+    validationHash: handoff.validationReceipt.validationHash,
+    s6HandoffSchemaVersion: handoff.schemaVersion,
+    handoffDigest: sha256(jcs(handoff)),
+  };
+  const dxf = writeS7Dxf(handoff, {
+    artifactId: "40000000-0000-4000-8000-000000000001",
+    manifestId: "40000000-0000-4000-8000-000000000002",
+    source,
+  });
+  const readback = parseS7Dxf(dxf.bytes, { expectedManifest: dxf.manifest, expectedSource: source });
+  assert.equal(readback.outcome, "pass");
+  assert.equal(readback.correspondenceResult, "pass");
+  assert.match(dxf.bytes.toString("ascii"), /9000 mm/u);
+  assert.match(dxf.bytes.toString("ascii"), /6000 mm/u);
+  assert.match(dxf.bytes.toString("ascii"), /MAX HEIGHT 3500 mm/u);
+  for (const camera of model.cameras) {
+    const control = prepareS9Grounding(model, handoff, camera.viewId);
+    assert.equal(control.sourceRevisionId, source.sourceRevisionId);
+    assert.equal(control.sourceRevisionHash, source.sourceRevisionHash);
+    assert.equal(control.sourceS5Fingerprint, source.sourceS5Fingerprint);
+    assert.equal(control.s7ValidationHash, source.validationHash);
   }
 });
 
