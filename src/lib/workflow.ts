@@ -46,6 +46,9 @@ import { S6WorkflowService, type S6WorkflowServiceOptions } from "./s6";
 import { createS6SourceReader, type S6SourceReader } from "./s6-source";
 import { assertS5MutationAllowed } from "./s5-lock";
 import { S7CadService, type S7PublicationPhaseHook } from "./s7-cad";
+import { S8ExportService, type S8ExportAdapters, type S8PublicationPhaseHook } from "./s8";
+import { readS8RuntimeConfig } from "./s8-fbx-config";
+import type { S8WorkerConfig } from "./s8-fbx-worker";
 
 
 export type WorkflowServiceOptions = {
@@ -70,6 +73,9 @@ export type WorkflowServiceOptions = {
   s6SourceReader?: S6SourceReader;
   onS6PublicationPhase?: S6WorkflowServiceOptions["onPublicationPhase"];
   onS7PublicationPhase?: S7PublicationPhaseHook;
+  s8Adapters?: S8ExportAdapters;
+  s8WriterConfig?: S8WorkerConfig;
+  onS8PublicationPhase?: S8PublicationPhaseHook;
 };
 
 export type PublicGeneration = {
@@ -179,6 +185,7 @@ export class WorkflowService {
   readonly s5: S5WorkflowService;
   readonly s6: S6WorkflowService;
   readonly s7: S7CadService;
+  readonly s8: S8ExportService;
   private readonly clock: () => string;
   private readonly uuid: () => UUID;
   private readonly workerId: string;
@@ -284,6 +291,25 @@ export class WorkflowService {
       onPublicationPhase: options.onS7PublicationPhase,
     });
     this.s7.recoverPending();
+    this.s8 = new S8ExportService({
+      repository: this.repository,
+      objects: this.objects,
+      s6: this.s6,
+      s7: this.s7,
+      clock: this.clock,
+      uuid: this.uuid,
+      ownerId: this.workerId,
+      processId: this.processId,
+      isProcessAlive: this.isProcessAlive,
+      adapters: options.s8Adapters,
+      writerConfig: options.s8WriterConfig ?? readS8RuntimeConfig(),
+      onPublicationPhase: options.onS8PublicationPhase,
+    });
+    this.s8.recoverPending();
+  }
+
+  getS8Preparation(projectId: UUID): Omit<ReturnType<S8ExportService["getHandoff"]>, "payloadBytes"> {
+    return this.s8.getHandoff(projectId);
   }
 
   private state(): StoreState {

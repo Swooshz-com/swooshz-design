@@ -1,0 +1,138 @@
+name: S8 FBX end-to-end contract
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  s8-static:
+    name: S8 static and TypeScript floor
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Verify exact PR head
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Enable pnpm
+        run: corepack enable
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Secret preflight
+        shell: bash
+        run: |
+          if git grep -I -n -E '(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' -- .; then
+            echo "credential-like material detected in tracked files" >&2
+            exit 1
+          fi
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit --pretty false
+      - name: Test suite
+        run: pnpm test
+      - name: Writer contract regression
+        run: python3 scripts/s8/blender_writer_contract_regression.py
+      - name: Python syntax
+        run: python3 -m py_compile blender/s8-fbx-writer/writer.py scripts/s8/*.py
+      - name: Diff hygiene
+        run: git diff --check
+      - name: Application build
+        run: pnpm run build
+
+  s8-native:
+    name: S8 native validator and process runner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Verify exact PR head
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Build process runner
+        run: |
+          cmake -S native/s8-process-runner -B "$RUNNER_TEMP/s8-runner" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/s8-runner" --config Release --parallel
+          ctest --test-dir "$RUNNER_TEMP/s8-runner" --output-on-failure
+      - name: Build validator
+        run: |
+          cmake -S native/s8-fbx-validator -B "$RUNNER_TEMP/s8-validator" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/s8-validator" --config Release --parallel
+          ctest --test-dir "$RUNNER_TEMP/s8-validator" --output-on-failure
+          "$RUNNER_TEMP/s8-validator/s8-fbx-validator" --self-test
+
+  s8-pinned-blender:
+    name: S8 pinned Blender import/edit/reopen and sensitivity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Verify exact PR head
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Install sandbox dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes bubblewrap
+          fi
+          test -x /usr/bin/bwrap
+          launcher="$RUNNER_TEMP/s8-bwrap-launcher"
+          cat > "$launcher" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec sudo -n /usr/bin/bwrap "$@"
+          SH
+          chmod 700 "$launcher"
+          "$launcher" \
+            --unshare-user --unshare-net --die-with-parent --new-session \
+            --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp /usr/bin/true
+      - name: Download and verify pinned Blender
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/blender-5.2.2-linux-x64.tar.xz"
+          curl --fail --location --retry 3 --output "$archive" https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz
+          echo "84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168  $archive" | sha256sum --check --status
+          mkdir "$RUNNER_TEMP/blender"
+          tar -xJf "$archive" --directory "$RUNNER_TEMP/blender"
+      - name: Build native boundaries
+        run: |
+          cmake -S native/s8-process-runner -B "$RUNNER_TEMP/s8-runner" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/s8-runner" --config Release --parallel
+          cmake -S native/s8-fbx-validator -B "$RUNNER_TEMP/s8-validator" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/s8-validator" --config Release --parallel
+      - name: Execute pinned Blender sensitivity and reopen floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          blender_root="$RUNNER_TEMP/blender/blender-5.2.2-linux-x64"
+          python3 scripts/s8/s8_runtime_sensitivity.py \
+            --blender "$blender_root/blender" \
+            --writer "$GITHUB_WORKSPACE/blender/s8-fbx-writer/writer.py" \
+            --runner "$RUNNER_TEMP/s8-runner/s8-process-runner" \
+            --sandbox "$RUNNER_TEMP/s8-bwrap-launcher" \
+            --validator "$RUNNER_TEMP/s8-validator/s8-fbx-validator" \
+            --output-dir "$RUNNER_TEMP/s8-runtime-output"
